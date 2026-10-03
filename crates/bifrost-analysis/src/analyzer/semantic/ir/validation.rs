@@ -183,6 +183,7 @@ pub(super) fn measure_artifact_work(
         work.nested_entries = work
             .nested_entries
             .saturating_add(procedure.statement_entries.len())
+            .saturating_add(procedure.loop_sites.len())
             .saturating_add(procedure.guard_facts.len())
             .saturating_add(procedure.switch_facts.iter().fold(0usize, |total, fact| {
                 total.saturating_add(fact.cases.len().saturating_add(1))
@@ -246,6 +247,7 @@ pub(super) fn measure_artifact_work(
                 | MemoryLocationKind::Static { member } => account_locator(member, &mut work),
                 MemoryLocationKind::Property { key, .. } => account_text(key, &mut work),
                 MemoryLocationKind::Index { .. }
+                | MemoryLocationKind::Dereference { .. }
                 | MemoryLocationKind::LexicalCell { .. }
                 | MemoryLocationKind::Capture { .. } => {}
             }
@@ -964,6 +966,7 @@ fn validate_procedure(
 
     validate_blocks(procedure)?;
     validate_statement_entries(procedure)?;
+    validate_loop_sites(procedure)?;
     let control_edges = validate_control_edges(capabilities, procedure)?;
     validate_guard_facts(capabilities, procedure, &control_edges)?;
     validate_switch_facts(capabilities, procedure, &control_edges)?;
@@ -977,6 +980,43 @@ fn validate_procedure(
         &control_edges,
     )?;
     find_boundaries(procedure)?;
+    Ok(())
+}
+
+fn validate_loop_sites(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIrError> {
+    for site in &procedure.loop_sites {
+        validate_metadata(
+            procedure.id,
+            site.source,
+            site.evidence,
+            procedure,
+            "loop site",
+        )?;
+        ensure_point(
+            procedure.id,
+            site.header,
+            procedure.points.len(),
+            "loop header",
+        )?;
+        ensure_point(procedure.id, site.body, procedure.points.len(), "loop body")?;
+        let mapping = &procedure.source_mappings[site.source.index()];
+        let evidence = &procedure.evidence_rows[site.evidence.index()];
+        if mapping.kind != SourceMappingKind::Exact
+            || !mapping.locator.belongs_to_procedure(&procedure.locator)
+            || evidence.proof != ProofStatus::Proven
+            || evidence.completeness != EvidenceCompleteness::Complete
+            || !evidence.sources.contains(&site.source)
+        {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::SourceScope,
+                format!(
+                    "loop site at {:?} lacks an exact, complete source mapping {}",
+                    site.header, site.source
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1364,6 +1404,9 @@ fn validate_memory_location(
                     ),
                 ));
             }
+        }
+        MemoryLocationKind::Dereference { address } => {
+            ensure_value(id, *address, procedure.values.len(), "dereference address")?;
         }
         MemoryLocationKind::LexicalCell { binding } => {
             ensure_value(id, *binding, procedure.values.len(), "lexical-cell binding")?;
@@ -2822,6 +2865,7 @@ fn validate_callable_value(
             true,
             CallableReferenceKind::BoundMethod
             | CallableReferenceKind::UnboundMethod
+            | CallableReferenceKind::ModuleQualified { .. }
             | CallableReferenceKind::TypeQualifiedMethod { .. }
             | CallableReferenceKind::StaticMethod
             | CallableReferenceKind::Constructor,
@@ -2899,8 +2943,14 @@ fn validate_callable_value(
             }
         }
     }
-    if let CallableReferenceKind::TypeQualifiedMethod { qualifier } = callable.kind {
-        ensure_value(id, qualifier, procedure.values.len(), "type qualifier")?;
+    match callable.kind {
+        CallableReferenceKind::ModuleQualified { qualifier } => {
+            ensure_value(id, qualifier, procedure.values.len(), "module qualifier")?;
+        }
+        CallableReferenceKind::TypeQualifiedMethod { qualifier } => {
+            ensure_value(id, qualifier, procedure.values.len(), "type qualifier")?;
+        }
+        _ => {}
     }
     match (callable.kind, callable.bound_receiver) {
         (CallableReferenceKind::BoundMethod, Some(receiver)) => {
@@ -3074,6 +3124,10 @@ fn validate_memory_access_kind(
             )
             | (MemoryAccessKind::Static, MemoryLocationKind::Static { .. })
             | (MemoryAccessKind::Index, MemoryLocationKind::Index { .. })
+            | (
+                MemoryAccessKind::Dereference,
+                MemoryLocationKind::Dereference { .. }
+            )
             | (
                 MemoryAccessKind::LexicalCell,
                 MemoryLocationKind::LexicalCell { .. }
@@ -3558,6 +3612,7 @@ fn memory_location_capability(kind: &MemoryLocationKind) -> SemanticCapability {
         MemoryLocationKind::Property { .. } => SemanticCapability::FieldMemory,
         MemoryLocationKind::Static { .. } => SemanticCapability::StaticMemory,
         MemoryLocationKind::Index { .. } => SemanticCapability::IndexMemory,
+        MemoryLocationKind::Dereference { .. } => SemanticCapability::FieldMemory,
         MemoryLocationKind::LexicalCell { .. } => SemanticCapability::LocalFlow,
         MemoryLocationKind::Capture { .. } => SemanticCapability::Captures,
     }
@@ -3569,6 +3624,7 @@ fn memory_access_capability(kind: MemoryAccessKind) -> SemanticCapability {
         MemoryAccessKind::Property => SemanticCapability::FieldMemory,
         MemoryAccessKind::Static => SemanticCapability::StaticMemory,
         MemoryAccessKind::Index => SemanticCapability::IndexMemory,
+        MemoryAccessKind::Dereference => SemanticCapability::FieldMemory,
         MemoryAccessKind::LexicalCell => SemanticCapability::LocalFlow,
         MemoryAccessKind::Capture => SemanticCapability::Captures,
     }

@@ -366,13 +366,16 @@ fn scan_only_kotlin_seed_hydrates_from_durable_facts_after_workspace_reopen() {
     .expect("scan-only Kotlin prewarm");
     assert_eq!(prewarm.result.results.len(), 1, "{:#?}", prewarm.result);
     let prewarm_profile = prewarm.profile.expect("prewarm profile");
-    assert_eq!(prewarm_profile.cache.seed_structural_facts.extractions, 1);
     assert_eq!(
-        prewarm_profile
-            .cache
-            .seed_structural_facts
-            .persisted_hydrations,
-        0
+        (
+            prewarm_profile.cache.seed_structural_facts.extractions,
+            prewarm_profile
+                .cache
+                .seed_structural_facts
+                .persisted_hydrations,
+        ),
+        (0, 1),
+        "the first query hydrates canonical facts published during initialization"
     );
     drop(primed);
 
@@ -460,6 +463,116 @@ fn anchored_alternation_regex_uses_role_name_postings_and_skips_candidate_free_f
         indexed.work,
         scan.work
     );
+}
+
+#[test]
+fn unrestricted_warm_index_verification_work_is_bounded_by_candidate_files() {
+    let target_source = "pub fn read() -> String { std::fs::read_to_string(\"input\").unwrap() }\n";
+    let run = |unrelated_files: usize| {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write(target_source)
+            .expect("write candidate source");
+        for index in 0..unrelated_files {
+            ProjectFile::new(root.clone(), format!("src/unrelated-{index}.rs"))
+                .write("// read_to_string appears only in this comment.\nfn unrelated() {}\n")
+                .expect("write noncandidate source");
+        }
+        let analyzer = language_analyzer(Language::Rust, TestProject::new(root, Language::Rust));
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["rust"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "read_to_string" }
+            }
+        }))
+        .expect("query");
+        let warm_query = CodeQuery::from_json(&json!({
+            "languages": ["rust"],
+            "match": { "kind": "function", "name": "unrelated" }
+        }))
+        .expect("warm-up query");
+        let scan = execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::ScanOnly,
+            true,
+        )
+        .expect("scan access");
+        execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &warm_query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::IndexedRequired,
+            true,
+        )
+        .expect("warm structural index");
+        let indexed = execute_code_query_with_access_mode(
+            analyzer.as_ref(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::IndexedRequired,
+            true,
+        )
+        .expect("indexed access");
+        (scan, indexed)
+    };
+
+    let (small_scan, small_indexed) = run(0);
+    let (wide_scan, wide_indexed) = run(80);
+    for (scan, indexed) in [(&small_scan, &small_indexed), (&wide_scan, &wide_indexed)] {
+        assert_eq!(
+            serde_json::to_value(&indexed.result).expect("indexed result JSON"),
+            serde_json::to_value(&scan.result).expect("scan result JSON"),
+            "candidate restriction must preserve complete result semantics"
+        );
+        assert_eq!(indexed.result.results.len(), 1);
+        assert_eq!(indexed.work.scanned_files, 1);
+        assert_eq!(
+            indexed.work.scanned_source_bytes,
+            target_source.len() as u64
+        );
+        let profile = indexed.profile.as_ref().expect("indexed profile");
+        assert!(profile.access_path.selected.starts_with("posting:"));
+        assert_eq!(profile.access_path.cache_ready_lookups, 1);
+        assert_eq!(profile.access_path.candidate_files, 1);
+        assert_eq!(
+            profile.access_path.inspected_source_bytes,
+            target_source.len() as u64
+        );
+        assert!(profile.access_path.examined_fact_nodes > 0);
+    }
+
+    let small_profile = &small_indexed.profile.as_ref().unwrap().access_path;
+    let wide_profile = &wide_indexed.profile.as_ref().unwrap().access_path;
+    assert_eq!(
+        small_indexed.work.scanned_files,
+        wide_indexed.work.scanned_files
+    );
+    assert_eq!(
+        small_indexed.work.scanned_source_bytes,
+        wide_indexed.work.scanned_source_bytes
+    );
+    assert_eq!(small_indexed.work.fact_nodes, wide_indexed.work.fact_nodes);
+    assert_eq!(
+        small_profile.inspected_source_bytes,
+        wide_profile.inspected_source_bytes
+    );
+    assert_eq!(
+        small_profile.examined_fact_nodes,
+        wide_profile.examined_fact_nodes
+    );
+    assert_eq!(
+        small_profile.materialized_fact_nodes,
+        wide_profile.materialized_fact_nodes
+    );
+    assert_eq!(small_profile.candidate_facts, wide_profile.candidate_facts);
+    assert!(small_profile.examined_fact_nodes <= small_profile.scoped_fact_nodes);
+    assert!(wide_profile.scoped_files > small_profile.scoped_files);
+    assert!(wide_profile.scoped_fact_nodes > small_profile.scoped_fact_nodes);
+    assert!(wide_scan.work.scanned_files > wide_indexed.work.scanned_files);
 }
 
 fn run_required_index(analyzer: &dyn IAnalyzer, name: &str) -> DetailedCodeQueryResult {

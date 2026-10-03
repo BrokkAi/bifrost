@@ -17,7 +17,35 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
+/// Syntax view of one parser-derived JS/TS import row.
+///
+/// `ImportInfo` is the durable projection used by analyzer consumers. These
+/// nodes are retained only while the primary parser owns its tree, allowing
+/// consumers to intern exact declaration and binder identities without
+/// matching ranges or reparsing `raw_snippet`.
+#[derive(Clone)]
+pub struct JsTsImportSyntax<'tree> {
+    pub import: ImportInfo,
+    pub declaration: Node<'tree>,
+    pub target: Option<Node<'tree>>,
+    pub name: Option<Node<'tree>>,
+    pub alias: Option<Node<'tree>>,
+    pub kind: Option<ImportKind>,
+    pub is_static: bool,
+}
+
 pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    parse_es_import_syntaxes_from_node(node, source)
+        .into_iter()
+        .map(|syntax| syntax.import)
+        .collect()
+}
+
+/// Parse one ESM import statement while retaining its source nodes.
+pub fn parse_es_import_syntaxes_from_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<JsTsImportSyntax<'tree>> {
     if node.kind() != "import_statement" {
         return Vec::new();
     }
@@ -32,14 +60,22 @@ pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<Impo
     let path = structured_module_path(&module_specifier, node.start_byte());
 
     let Some(import_clause) = named_child_of_kind(node, "import_clause") else {
-        return vec![ImportInfo {
-            raw_snippet: raw,
-            is_wildcard: false,
-            is_global: false,
-            identifier: None,
+        return vec![JsTsImportSyntax {
+            import: ImportInfo {
+                raw_snippet: raw,
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: Some(path),
+                binder_span: None,
+            },
+            declaration: node,
+            target: Some(source_node),
+            name: None,
             alias: None,
-            path: Some(path.clone()),
-            binder_span: None,
+            kind: None,
+            is_static: false,
         }];
     };
 
@@ -50,14 +86,24 @@ pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<Impo
             "identifier" => {
                 let identifier = node_text(child, source).trim();
                 if !identifier.is_empty() {
-                    imports.push(ImportInfo {
-                        raw_snippet: raw.clone(),
-                        is_wildcard: false,
-                        is_global: false,
-                        identifier: Some(identifier.to_string()),
+                    imports.push(JsTsImportSyntax {
+                        import: ImportInfo {
+                            raw_snippet: raw.clone(),
+                            is_wildcard: false,
+                            is_global: false,
+                            identifier: Some(identifier.to_string()),
+                            alias: None,
+                            path: Some(path.clone()),
+                            binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(
+                                child,
+                            )),
+                        },
+                        declaration: node,
+                        target: Some(source_node),
+                        name: Some(child),
                         alias: None,
-                        path: Some(path.clone()),
-                        binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(child)),
+                        kind: Some(ImportKind::Default),
+                        is_static: true,
                     });
                 }
             }
@@ -65,27 +111,42 @@ pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<Impo
                 if let Some(alias_node) = first_identifier_child_node(child) {
                     let alias = node_text(alias_node, source).trim().to_string();
                     if !alias.is_empty() {
-                        imports.push(ImportInfo {
-                            raw_snippet: raw.clone(),
-                            is_wildcard: true,
-                            is_global: false,
-                            identifier: None,
-                            alias: Some(alias),
-                            path: Some(path.clone()),
-                            // A namespace import binds one name: its alias token.
-                            binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(
-                                alias_node,
-                            )),
+                        imports.push(JsTsImportSyntax {
+                            import: ImportInfo {
+                                raw_snippet: raw.clone(),
+                                is_wildcard: true,
+                                is_global: false,
+                                identifier: None,
+                                alias: Some(alias),
+                                path: Some(path.clone()),
+                                // A namespace import binds one name: its alias token.
+                                binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(
+                                    alias_node,
+                                )),
+                            },
+                            declaration: node,
+                            target: Some(source_node),
+                            name: None,
+                            alias: Some(alias_node),
+                            kind: Some(ImportKind::Namespace),
+                            is_static: true,
                         });
                     }
                 }
             }
-            "named_imports" => collect_named_es_imports(child, source, &raw, &mut imports),
+            "named_imports" => collect_named_es_import_syntaxes(
+                child,
+                source,
+                &raw,
+                source_node,
+                node,
+                &mut imports,
+            ),
             _ => {}
         }
     }
-    for import in &mut imports {
-        import.path = Some(path.clone());
+    for syntax in &mut imports {
+        syntax.import.path = Some(path.clone());
     }
     imports
 }
@@ -94,22 +155,19 @@ pub fn parse_commonjs_require_import_infos_from_node(
     node: Node<'_>,
     source: &str,
 ) -> Vec<ImportInfo> {
+    parse_commonjs_require_import_syntaxes_from_node(node, source)
+        .into_iter()
+        .map(|syntax| syntax.import)
+        .collect()
+}
+
+/// Parse CommonJS `require` imports while retaining their source nodes.
+pub fn parse_commonjs_require_import_syntaxes_from_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<JsTsImportSyntax<'tree>> {
     if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-        return parse_commonjs_require_bindings_from_node(node, source)
-            .into_iter()
-            .map(|binding| ImportInfo {
-                raw_snippet: binding.raw_snippet,
-                is_wildcard: false,
-                is_global: false,
-                identifier: Some(binding.imported_name),
-                alias: binding.alias,
-                path: Some(structured_module_path(
-                    &binding.module_specifier,
-                    node.start_byte(),
-                )),
-                binder_span: None,
-            })
-            .collect();
+        return commonjs_require_import_syntaxes_from_declaration(node, source);
     }
 
     if node.kind() == "expression_statement" {
@@ -120,14 +178,25 @@ pub fn parse_commonjs_require_import_infos_from_node(
         let Some(module_specifier) = direct_require_module_specifier(node, source) else {
             return Vec::new();
         };
-        return vec![ImportInfo {
-            raw_snippet: raw.to_string(),
-            is_wildcard: false,
-            is_global: false,
-            identifier: None,
+        return vec![JsTsImportSyntax {
+            import: ImportInfo {
+                raw_snippet: raw.to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: Some(structured_module_path(&module_specifier, node.start_byte())),
+                binder_span: None,
+            },
+            declaration: node,
+            target: direct_require_call(node, source).and_then(require_call_target_node),
+            name: None,
             alias: None,
-            path: Some(structured_module_path(&module_specifier, node.start_byte())),
-            binder_span: None,
+            // A side-effect require has no local binder. Keep its import leaf
+            // for source identity, but do not make graph consumers invent a
+            // binding for it.
+            kind: None,
+            is_static: false,
         }];
     }
 
@@ -150,115 +219,181 @@ pub enum CommonJsRequireBindingKind {
     Named,
 }
 
-pub fn parse_commonjs_require_bindings_from_node(
-    node: Node<'_>,
+fn commonjs_require_import_syntaxes_from_declaration<'tree>(
+    node: Node<'tree>,
     source: &str,
-) -> Vec<CommonJsRequireBinding> {
-    if !matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-        return Vec::new();
-    }
+) -> Vec<JsTsImportSyntax<'tree>> {
     let raw = node_text(node, source).trim().to_string();
     if raw.is_empty() {
         return Vec::new();
     }
 
-    let mut bindings = Vec::new();
+    let mut imports = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "variable_declarator" {
-            bindings.extend(commonjs_require_bindings_from_declarator(
-                child, &raw, source,
-            ));
+        if child.kind() != "variable_declarator" {
+            continue;
         }
+        let Some(module_specifier) =
+            commonjs_require_module_specifier_from_declarator(child, source)
+        else {
+            continue;
+        };
+        let Some(name) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let target = child
+            .child_by_field_name("value")
+            .and_then(require_call_target_node);
+        imports.extend(commonjs_require_import_syntaxes_from_name(
+            name,
+            node,
+            target,
+            &raw,
+            &module_specifier,
+            source,
+        ));
     }
-    bindings
+    imports
 }
 
-fn commonjs_require_bindings_from_declarator(
-    declarator: Node<'_>,
-    raw: &str,
-    source: &str,
-) -> Vec<CommonJsRequireBinding> {
-    let Some(module_specifier) =
-        commonjs_require_module_specifier_from_declarator(declarator, source)
-    else {
-        return Vec::new();
-    };
-    let Some(name) = declarator.child_by_field_name("name") else {
-        return Vec::new();
-    };
-    commonjs_require_bindings_from_name(name, raw, &module_specifier, source)
-}
-
-fn commonjs_require_bindings_from_name(
-    node: Node<'_>,
+fn commonjs_require_import_syntaxes_from_name<'tree>(
+    node: Node<'tree>,
+    declaration: Node<'tree>,
+    target: Option<Node<'tree>>,
     raw: &str,
     module_specifier: &str,
     source: &str,
-) -> Vec<CommonJsRequireBinding> {
+) -> Vec<JsTsImportSyntax<'tree>> {
+    let path = Some(structured_module_path(
+        module_specifier,
+        declaration.start_byte(),
+    ));
+    let import_info = |identifier: String, alias: Option<String>, binder_span| ImportInfo {
+        raw_snippet: raw.to_string(),
+        is_wildcard: false,
+        is_global: false,
+        identifier: Some(identifier),
+        alias,
+        path: path.clone(),
+        binder_span,
+    };
+
     match node.kind() {
         "identifier" | "type_identifier" => {
             let identifier = node_text(node, source).trim();
             if identifier.is_empty() {
                 Vec::new()
             } else {
-                vec![CommonJsRequireBinding {
-                    raw_snippet: raw.to_string(),
-                    module_specifier: module_specifier.to_string(),
-                    local_name: identifier.to_string(),
-                    imported_name: identifier.to_string(),
+                vec![JsTsImportSyntax {
+                    import: import_info(
+                        identifier.to_string(),
+                        None,
+                        Some(brokk_bifrost_core::analyzer::common::node_span(node)),
+                    ),
+                    declaration,
+                    target,
+                    name: Some(node),
                     alias: None,
-                    kind: CommonJsRequireBindingKind::ModuleObject,
+                    kind: Some(ImportKind::CommonJsRequire),
+                    is_static: false,
                 }]
             }
         }
         "object_pattern" => {
-            let mut bindings = Vec::new();
+            let mut imports = Vec::new();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 match child.kind() {
                     "shorthand_property_identifier_pattern" => {
                         let identifier = node_text(child, source).trim();
                         if !identifier.is_empty() {
-                            bindings.push(CommonJsRequireBinding {
-                                raw_snippet: raw.to_string(),
-                                module_specifier: module_specifier.to_string(),
-                                local_name: identifier.to_string(),
-                                imported_name: identifier.to_string(),
+                            imports.push(JsTsImportSyntax {
+                                import: import_info(
+                                    identifier.to_string(),
+                                    None,
+                                    Some(brokk_bifrost_core::analyzer::common::node_span(child)),
+                                ),
+                                declaration,
+                                target,
+                                name: Some(child),
                                 alias: None,
-                                kind: CommonJsRequireBindingKind::Named,
+                                kind: Some(ImportKind::Named),
+                                is_static: false,
                             });
                         }
                     }
                     "pair_pattern" => {
-                        let identifier = child
+                        let name = child
                             .child_by_field_name("key")
-                            .or_else(|| first_child_of_kind(child, "property_identifier"))
-                            .map(|key| node_text(key, source).trim().to_string())
-                            .filter(|text| !text.is_empty());
+                            .or_else(|| first_child_of_kind(child, "property_identifier"));
+                        let Some(name) = name else {
+                            continue;
+                        };
+                        let identifier = node_text(name, source).trim();
+                        if identifier.is_empty() {
+                            continue;
+                        }
                         let alias = child
                             .child_by_field_name("value")
-                            .and_then(|value| commonjs_pattern_local_name(value, source))
-                            .filter(|text| !text.is_empty());
-                        if let Some(identifier) = identifier {
-                            let local_name = alias.clone().unwrap_or_else(|| identifier.clone());
-                            bindings.push(CommonJsRequireBinding {
-                                raw_snippet: raw.to_string(),
-                                module_specifier: module_specifier.to_string(),
-                                local_name,
-                                imported_name: identifier,
-                                alias,
-                                kind: CommonJsRequireBindingKind::Named,
-                            });
-                        }
+                            .and_then(|value| commonjs_pattern_local_name_node(value, source));
+                        let alias_text =
+                            alias.map(|node| node_text(node, source).trim().to_string());
+                        imports.push(JsTsImportSyntax {
+                            import: import_info(
+                                identifier.to_string(),
+                                alias_text,
+                                Some(brokk_bifrost_core::analyzer::common::node_span(
+                                    alias.unwrap_or(name),
+                                )),
+                            ),
+                            declaration,
+                            target,
+                            name: Some(name),
+                            alias,
+                            kind: Some(ImportKind::Named),
+                            is_static: false,
+                        });
                     }
                     _ => {}
                 }
             }
-            bindings
+            imports
         }
         _ => Vec::new(),
     }
+}
+
+pub fn parse_commonjs_require_bindings_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
+    parse_commonjs_require_import_syntaxes_from_node(node, source)
+        .into_iter()
+        .filter_map(|syntax| {
+            let module_specifier = syntax
+                .import
+                .path
+                .as_ref()
+                .map(|path| path.render_segments("/"))
+                .filter(|path| !path.is_empty())?;
+            let local_name = syntax.import.local_name()?.to_owned();
+            let kind = match syntax.kind? {
+                ImportKind::CommonJsRequire => CommonJsRequireBindingKind::ModuleObject,
+                ImportKind::Named => CommonJsRequireBindingKind::Named,
+                _ => return None,
+            };
+            let imported_name = syntax.import.identifier.clone()?;
+            Some(CommonJsRequireBinding {
+                raw_snippet: syntax.import.raw_snippet,
+                module_specifier,
+                local_name,
+                imported_name,
+                alias: syntax.import.alias,
+                kind,
+            })
+        })
+        .collect()
 }
 
 pub fn commonjs_require_module_specifier_from_declarator(
@@ -287,15 +422,14 @@ pub fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<Str
     Some(unquote(node_text(first_argument, source)))
 }
 
-fn commonjs_pattern_local_name(node: Node<'_>, source: &str) -> Option<String> {
+fn commonjs_pattern_local_name_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     match node.kind() {
         "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
-            let text = node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
+            (!node_text(node, source).trim().is_empty()).then_some(node)
         }
         "assignment_pattern" => node
             .child_by_field_name("left")
-            .and_then(|left| commonjs_pattern_local_name(left, source)),
+            .and_then(|left| commonjs_pattern_local_name_node(left, source)),
         _ => None,
     }
 }
@@ -312,14 +446,28 @@ fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
         .any(|child| is_require_call(child, source))
 }
 
+fn direct_require_call<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| is_require_call(*child, source))
+}
+
 fn is_require_call(node: Node<'_>, source: &str) -> bool {
     require_call_module_specifier(node, source).is_some()
 }
 
 fn direct_require_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find_map(|child| require_call_module_specifier(child, source))
+    direct_require_call(node, source).and_then(|call| require_call_module_specifier(call, source))
+}
+
+fn require_call_target_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let argument = arguments.named_children(&mut cursor).next()?;
+    matches!(argument.kind(), "string" | "string_fragment").then_some(argument)
 }
 
 fn structured_module_path(
@@ -338,11 +486,13 @@ fn structured_module_path(
     }
 }
 
-fn collect_named_es_imports(
-    node: Node<'_>,
+fn collect_named_es_import_syntaxes<'tree>(
+    node: Node<'tree>,
     source: &str,
     raw: &str,
-    imports: &mut Vec<ImportInfo>,
+    target: Node<'tree>,
+    declaration: Node<'tree>,
+    imports: &mut Vec<JsTsImportSyntax<'tree>>,
 ) {
     let mut cursor = node.walk();
     for spec in node.named_children(&mut cursor) {
@@ -362,14 +512,22 @@ fn collect_named_es_imports(
             .filter(|_| alias.as_deref().is_some_and(|alias| !alias.is_empty()))
             .or(name_node)
             .map(brokk_bifrost_core::analyzer::common::node_span);
-        imports.push(ImportInfo {
-            raw_snippet: raw.to_string(),
-            is_wildcard: false,
-            is_global: false,
-            identifier,
-            alias,
-            path: None,
-            binder_span,
+        imports.push(JsTsImportSyntax {
+            import: ImportInfo {
+                raw_snippet: raw.to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier,
+                alias,
+                path: None,
+                binder_span,
+            },
+            declaration,
+            target: Some(target),
+            name: name_node,
+            alias: alias_node,
+            kind: Some(ImportKind::Named),
+            is_static: true,
         });
     }
 }
@@ -403,6 +561,34 @@ fn unquote(text: &str) -> String {
     stripped.unwrap_or(trimmed).to_string()
 }
 
+/// Resolve one parser-derived import to project files.
+///
+/// This is the canonical consumer path: the module specifier comes from the
+/// structured import path captured by the parser. If the parser could not
+/// provide that path, resolution stops instead of trying to recover it from
+/// the display snippet.
+pub fn resolve_js_ts_import_info_paths(
+    source_file: &ProjectFile,
+    import: &ImportInfo,
+    language: Language,
+    aliases: Option<&AliasResolver>,
+) -> Vec<ProjectFile> {
+    let Some(path) = import.path.as_ref() else {
+        return Vec::new();
+    };
+    let module_specifier = path.render_segments("/");
+    if module_specifier.is_empty() {
+        return Vec::new();
+    }
+    resolve_js_ts_module_specifier(source_file, &module_specifier, language, aliases)
+}
+
+/// Resolve an explicitly supplied raw import snippet.
+///
+/// This compatibility SPI remains available for callers that intentionally
+/// provide raw source. Analyzer consumers with [`ImportInfo`] must use
+/// [`resolve_js_ts_import_info_paths`] so stale display text cannot override
+/// the parser-captured path.
 pub fn resolve_js_ts_import_paths(
     source_file: &ProjectFile,
     raw_import: &str,
@@ -1001,7 +1187,15 @@ fn jsts_module_export_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node};
+    use super::{
+        node_text, parse_commonjs_require_bindings_from_node,
+        parse_commonjs_require_import_infos_from_node,
+        parse_commonjs_require_import_syntaxes_from_node, parse_es_import_infos_from_node,
+        parse_es_import_syntaxes_from_node, resolve_js_ts_import_info_paths,
+    };
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::model::ImportInfo;
+    use std::path::PathBuf;
     use tree_sitter::Parser;
 
     fn parse_typescript_import_infos(
@@ -1030,6 +1224,39 @@ mod tests {
             Some(&vec!["../types".to_string()]),
             imports[0].path.as_ref().map(|path| &path.segments)
         );
+    }
+
+    #[test]
+    fn retains_exact_esm_import_nodes_and_kind() {
+        let source = "import { original as current } from './module';";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let statement = root
+            .named_children(&mut root.walk())
+            .find(|child| child.kind() == "import_statement")
+            .unwrap();
+        let syntax = parse_es_import_syntaxes_from_node(statement, source);
+        assert_eq!(1, syntax.len());
+        let syntax = &syntax[0];
+        assert_eq!(
+            Some("original"),
+            syntax.name.map(|node| node_text(node, source))
+        );
+        assert_eq!(
+            Some("current"),
+            syntax.alias.map(|node| node_text(node, source))
+        );
+        assert_eq!(
+            Some("'./module'"),
+            syntax.target.map(|node| node_text(node, source))
+        );
+        assert_eq!(Some(super::ImportKind::Named), syntax.kind);
+        assert!(syntax.is_static);
+        assert_eq!(statement, syntax.declaration);
     }
 
     #[test]
@@ -1063,6 +1290,122 @@ mod tests {
         assert_eq!(
             Some(&vec!["./other".to_string()]),
             imports[0].path.as_ref().map(|path| &path.segments)
+        );
+    }
+
+    #[test]
+    fn retains_commonjs_require_target_and_named_binding_nodes() {
+        let source = "const { makeThing: localThing } = require('./other');";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let declaration = root
+            .named_children(&mut root.walk())
+            .find(|child| child.kind() == "lexical_declaration")
+            .unwrap();
+        let syntax = parse_commonjs_require_import_syntaxes_from_node(declaration, source);
+        assert_eq!(1, syntax.len());
+        let syntax = &syntax[0];
+        assert_eq!(
+            Some("makeThing"),
+            syntax.name.map(|node| node_text(node, source))
+        );
+        assert_eq!(
+            Some("localThing"),
+            syntax.alias.map(|node| node_text(node, source))
+        );
+        assert_eq!(
+            Some("'./other'"),
+            syntax.target.map(|node| node_text(node, source))
+        );
+        assert_eq!(Some(super::ImportKind::Named), syntax.kind);
+        assert!(!syntax.is_static);
+    }
+
+    #[test]
+    fn side_effect_require_has_no_local_binding_kind() {
+        let source = "require('./side-effect');";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let statement = tree.root_node().named_child(0).unwrap();
+
+        let syntax = parse_commonjs_require_import_syntaxes_from_node(statement, source);
+        assert_eq!(1, syntax.len());
+        assert_eq!(None, syntax[0].kind);
+        assert_eq!(
+            Some("'./side-effect'"),
+            syntax[0].target.map(|node| node_text(node, source))
+        );
+        assert!(parse_commonjs_require_bindings_from_node(statement, source).is_empty());
+    }
+
+    #[test]
+    fn canonical_import_resolution_ignores_stale_raw_snippet() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/main.ts"), "").unwrap();
+        std::fs::write(root.path().join("src/captured.ts"), "").unwrap();
+        std::fs::write(root.path().join("src/stale.ts"), "").unwrap();
+        let source_file = brokk_bifrost_core::analyzer::ProjectFile::new(
+            root.path().to_path_buf(),
+            PathBuf::from("src/main.ts"),
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser
+            .parse("import value from './captured';", None)
+            .unwrap();
+        let root_node = tree.root_node();
+        let statement = root_node
+            .named_children(&mut root_node.walk())
+            .next()
+            .unwrap();
+        let mut import =
+            parse_es_import_infos_from_node(statement, "import value from './captured';")
+                .pop()
+                .unwrap();
+        import.raw_snippet = "import value from './stale';".to_string();
+        let resolved =
+            resolve_js_ts_import_info_paths(&source_file, &import, Language::TypeScript, None);
+        assert_eq!(
+            vec![brokk_bifrost_core::analyzer::ProjectFile::new(
+                root.path().to_path_buf(),
+                PathBuf::from("src/captured.ts"),
+            )],
+            resolved
+        );
+    }
+
+    #[test]
+    fn canonical_import_resolution_reports_unavailable_structured_path() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/main.ts"), "").unwrap();
+        std::fs::write(root.path().join("src/stale.ts"), "").unwrap();
+        let source_file = brokk_bifrost_core::analyzer::ProjectFile::new(
+            root.path().to_path_buf(),
+            PathBuf::from("src/main.ts"),
+        );
+        let import = ImportInfo {
+            raw_snippet: "import value from './stale';".to_string(),
+            is_wildcard: false,
+            is_global: false,
+            identifier: Some("value".to_string()),
+            alias: None,
+            path: None,
+            binder_span: None,
+        };
+        assert!(
+            resolve_js_ts_import_info_paths(&source_file, &import, Language::TypeScript, None)
+                .is_empty()
         );
     }
 

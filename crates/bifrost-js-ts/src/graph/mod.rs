@@ -16,13 +16,14 @@ pub mod hits;
 pub mod inverted;
 pub mod receiver_analysis;
 pub mod resolver;
+pub mod source;
 
 use crate::graph::extractor::scan_files_for_seeds;
 use crate::graph::resolver::{JsTsUsageIndex, is_static_member, member_name};
-use crate::parse::js_ts_tree_sitter_language_for_file;
+use crate::graph::source::declaration_ids_for_unit;
 use crate::providers::JsTsSource;
-use crate::syntax::{direct_property_definitions, slice};
 use crate::tsconfig::AliasResolver;
+use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, UsageHit, UsageProof};
@@ -31,7 +32,6 @@ use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
-use tree_sitter::Parser;
 
 /// The JS/TS analyzers a workspace has, viewed as one scan surface.
 ///
@@ -89,7 +89,7 @@ pub fn scan_js_ts_target_usages(
     scan_scope: &UsageScanScope<'_>,
     language: Language,
 ) -> CandidateUsageHits {
-    let (seeds, exported_local_property) = target_seeds(analyzer, index, target, language);
+    let (seeds, exported_local_property) = target_seeds(host, analyzer, index, target, language);
     let scan_hits = if seeds.is_empty() {
         let mut scan_files: HashSet<ProjectFile> =
             scan_scope.candidate_files().iter().cloned().collect();
@@ -154,18 +154,20 @@ pub fn scan_js_ts_target_usages(
 }
 
 pub fn js_ts_target_candidate_files(
+    host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
     language: Language,
 ) -> HashSet<ProjectFile> {
-    let (seeds, _) = target_seeds(analyzer, index, target, language);
+    let (seeds, _) = target_seeds(host, analyzer, index, target, language);
     let mut files = index.importers_of_seeds(&seeds);
     files.insert(target.source().clone());
     files
 }
 
 fn target_seeds(
+    host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
@@ -178,8 +180,7 @@ fn target_seeds(
     let owner_seed_allowed = is_static_member(target)
         || !target.short_name().contains('.')
         || analyzer.parent_of(target).is_some();
-    let exported_local_property =
-        exported_local_property_binding(analyzer, index, target, language);
+    let exported_local_property = exported_local_property_binding(host, index, target, language);
     let mut seeds = index.seeds_for_target(
         target.source(),
         &target_seed,
@@ -228,7 +229,7 @@ struct ExportedLocalPropertyBinding {
 }
 
 fn exported_local_property_binding(
-    analyzer: &dyn CodeUnitIndex,
+    host: &dyn JsTsSource,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
     language: Language,
@@ -236,33 +237,23 @@ fn exported_local_property_binding(
     if language != Language::JavaScript || (!target.is_field() && !target.is_function()) {
         return None;
     }
-    let target_member = member_name(target)?;
-    let source = target.source().read_to_string().ok()?;
-    let mut parser = Parser::new();
-    let parser_language = js_ts_tree_sitter_language_for_file(target.source(), language)?;
-    parser.set_language(&parser_language).ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let receiver_root = direct_property_definitions(
-        tree.root_node(),
-        source.as_str(),
-        &analyzer.ranges(target),
-        &target_member,
-    )
-    .into_iter()
-    // Only a bare receiver may seed importers. The importer-side match treats the
-    // imported binding as the direct owner of the property
-    // (`expression_carries_target_object` in `extractor`), so a chained receiver
-    // such as `host.viaAssignment = { key: 1 }` would report `imported.key` --
-    // a property that does not exist -- while still missing the real
-    // `imported.viaAssignment.key` read. #1780 fixed the same-file inverse for
-    // those chains; carrying them across files needs a chain-aware importer match.
-    .find_map(|definition| {
-        definition
-            .receiver
-            .members
-            .is_empty()
-            .then(|| slice(definition.receiver.root, source.as_str()).to_string())
-    })?;
+    member_name(target)?;
+    let facts = host.source_facts(target.source())?;
+    let declarations = declaration_ids_for_unit(&facts, target);
+    let receiver_root = facts
+        .facts
+        .property_receivers
+        .iter()
+        .filter(|property| {
+            declarations.contains(&property.declaration)
+                && property.members.is_empty()
+                && matches!(
+                    property.binding,
+                    JsTsReceiverBinding::Program | JsTsReceiverBinding::Local
+                )
+        })
+        .map(|property| property.receiver_root.clone())
+        .next()?;
 
     let exported_names = index
         .exports_by_file

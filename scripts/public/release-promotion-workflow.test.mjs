@@ -217,7 +217,7 @@ test("GitHub releases use the exact curated changelog entry", () => {
   );
 });
 
-test("release readiness qualifies and assembles attributable semantic-pack partial bundles", () => {
+readinessTest("release readiness retires generated pack content but retains its installer", () => {
   const tool = jobBlock(readiness, "semantic-pack-tool");
   assert.match(tool, /^    needs: \[preflight, notices\]$/mu);
   assert.match(
@@ -225,41 +225,38 @@ test("release readiness qualifies and assembles attributable semantic-pack parti
     /cargo zigbuild --locked --release --features release-tooling[\s\S]*-p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack/u,
   );
   assert.match(tool, /sha256sum bifrost-semantic-pack > bifrost-semantic-pack\.sha256/u);
-  assert.match(tool, /name: semantic-pack-tool-\$\{\{ needs\.preflight\.outputs\.commit \}\}/u);
 
-  for (const [jobName, scriptName] of [
-    ["semantic-pack-jvm", "build-pinned-jvm-semantic-packs.sh"],
-    ["semantic-pack-python", "build-pinned-python-semantic-packs.sh"],
-    ["semantic-pack-typescript", "build-pinned-typescript-semantic-packs.sh"],
-    ["semantic-pack-rust", "build-pinned-rust-semantic-packs.sh"],
+  for (const retiredJob of [
+    "semantic-pack-jvm",
+    "semantic-pack-python",
+    "semantic-pack-typescript",
+    "semantic-pack-rust",
+    "semantic-pack-bundle",
   ]) {
-    const job = jobBlock(readiness, jobName);
-    assert.match(job, /^    needs: \[preflight, semantic-pack-tool\]$/mu);
-    assert.match(job, new RegExp(`scripts/public/${scriptName.replaceAll(".", "\\.")}`, "u"));
-    assert.match(job, /Download exact semantic-pack tool/u);
-    assert.match(job, /sha256sum --check bifrost-semantic-pack\.sha256/u);
-    assert.match(job, /BIFROST_SEMANTIC_PACK_BIN/u);
-    assert.match(job, /verify/u);
-    assert.match(job, /actions\/upload-artifact@/u);
+    assert.doesNotMatch(readiness, new RegExp("^  " + retiredJob + ":", "mu"));
   }
-  const assembler = jobBlock(readiness, "semantic-pack-bundle");
-  assert.match(
-    assembler,
-    /needs: \[preflight, semantic-pack-tool, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust\]/u,
-  );
-  assert.match(assembler, /actions\/download-artifact@/u);
-  assert.match(assembler, /"\$BIFROST_SEMANTIC_PACK_BIN" merge/u);
-  assert.match(assembler, /"\$BIFROST_SEMANTIC_PACK_BIN" verify/u);
-  assert.match(assembler, /measurements\.json/u);
-  assert.match(assembler, /bifrost-semantic-packs-\$\{RELEASE_TAG\}\.tar\.gz/u);
+  assert.doesNotMatch(readiness, /build-pinned-(?:jvm|python|typescript|rust)-semantic-packs\.sh/u);
+  assert.doesNotMatch(readiness, /semantic-pack-source-cache|bifrost-semantic-packs-/u);
 
   const qualification = jobBlock(readiness, "qualification");
+  assert.match(qualification, /^      - semantic-pack-tool$/mu);
+  assert.doesNotMatch(qualification, /semantic-pack-bundle/u);
   assert.match(qualification, /pattern: '!release-qualification-\*'/u);
   assert.match(
     qualification,
     /rm -f qualification-bundle\/bifrost-semantic-pack qualification-bundle\/bifrost-semantic-pack\.sha256/u,
   );
   assert.doesNotMatch(qualification, /rm -f[^\n]*x86_64-unknown-linux-gnu/u);
+
+  for (const retainedJob of [
+    "build-linux-x86-64",
+    "build",
+    "agent-plugin-smoke",
+    "policy-scan-smoke",
+    "qualification",
+  ]) {
+    assert.match(readiness, new RegExp("^  " + retainedJob + ":", "mu"));
+  }
 });
 
 readinessTest("release-promoted semantic-pack installer is target-qualified Linux", () => {
@@ -295,94 +292,7 @@ readinessTest("release-promoted semantic-pack installer is target-qualified Linu
     assetSelection,
     /\^bifrost-semantic-pack-v\.\*-x86_64-unknown-linux-gnu\\\\\.tar\\\\\.gz\(\\\\\.sha256\)\?\$/u,
   );
-});
-
-readinessTest("semantic-pack source caches are keyed to exact published checksums", () => {
-  const sourceCaches = [
-    {
-      jobName: "semantic-pack-jvm",
-      scriptName: "build-pinned-jvm-semantic-packs.sh",
-      path: "jvm",
-      checksums: [
-        "27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26",
-        "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5",
-        "59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261",
-      ],
-    },
-    {
-      jobName: "semantic-pack-python",
-      scriptName: "build-pinned-python-semantic-packs.sh",
-      path: "python",
-      checksums: [
-        "e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626",
-      ],
-    },
-    {
-      jobName: "semantic-pack-typescript",
-      scriptName: "build-pinned-typescript-semantic-packs.sh",
-      path: "typescript",
-      checksums: [
-        "da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08",
-        "7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3",
-      ],
-    },
-    {
-      jobName: "semantic-pack-rust",
-      scriptName: "build-pinned-rust-semantic-packs.sh",
-      path: "rust",
-      checksums: [
-        "0b18d55b97cee6756745744c0c169402ab6d3d506bb30267067b2438b3b5e000",
-      ],
-    },
-  ];
-
-  for (const { jobName, scriptName, path, checksums } of sourceCaches) {
-    const job = jobBlock(readiness, jobName);
-    const script = readFileSync(
-      new URL(`../../scripts/public/${scriptName}`, import.meta.url),
-      "utf8",
-    );
-    const cacheSteps = stepBlocks(job).filter((step) =>
-      /uses: actions\/cache@[0-9a-f]{40}/u.test(step) &&
-      step.includes("semantic-pack-source-cache"),
-    );
-    assert.equal(cacheSteps.length, 1, `${jobName} must have one source-input cache step`);
-    assert.match(cacheSteps[0], /actions\/cache@[0-9a-f]{40}/u);
-    assert.match(
-      cacheSteps[0],
-      new RegExp(`path: \\$\\{\\{ runner\\.temp \\}\\}/semantic-pack-source-cache/${path}`, "u"),
-    );
-    assert.doesNotMatch(cacheSteps[0], /restore-keys:/u);
-    for (const checksum of checksums) {
-      assert.match(
-        script,
-        new RegExp(checksum, "u"),
-        `${scriptName} no longer pins a checksum used by its cache key`,
-      );
-      assert.match(
-        cacheSteps[0],
-        new RegExp(checksum, "u"),
-        `${jobName} cache key omits pinned source checksum`,
-      );
-    }
-    assert.match(
-      job,
-      /SEMANTIC_PACK_SOURCE_CACHE: \$\{\{ runner\.temp \}\}\/semantic-pack-source-cache\//u,
-    );
-    assert.match(script, /fetch_pinned_archive/u);
-  }
-});
-
-readinessTest("semantic-pack measurements stay in the tarball and are published separately", () => {
-  const assembler = jobBlock(readiness, "semantic-pack-bundle");
-  const packaging = stepBlocks(assembler).find((step) => /Package semantic-pack bundle/u.test(step));
-  assert.ok(packaging, "expected semantic-pack packaging step");
-  assert.match(
-    packaging,
-    /cp "\$\{RUNNER_TEMP\}\/bifrost-semantic-packs\/measurements\.json" "dist\/bifrost-semantic-packs-\$\{RELEASE_TAG\}-measurements\.json"/u,
-  );
-  assert.doesNotMatch(packaging, /\bmv\b[^\n]*measurements\.json/u);
-  assert.match(packaging, /-C "\$\{RUNNER_TEMP\}" -cf - bifrost-semantic-packs/u);
+  assert.doesNotMatch(assetSelection, /bifrost-semantic-packs-/u);
 });
 
 test("promotion is byte-only and does not rebuild, package, or repack", () => {
@@ -465,13 +375,14 @@ test("publisher dependency order and protected identities remain explicit", () =
     jobBlock(release, "publish-crate-mcp"),
     /^    needs: \[release-context, promote-qualification, publish-crate-runtime\]$/mu,
   );
-  assert.match(
-    jobBlock(release, "publish-crate-lsp"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-runtime\]$/mu,
+  assert.doesNotMatch(
+    release,
+    /^  publish-crate-lsp:\n/mu,
+    "removed LSP crate must not have a release publisher",
   );
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-mcp\]$/mu,
   );
   assert.match(cratePublisher, /^      id-token:\s*write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
@@ -749,10 +660,28 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.doesNotMatch(jobBlock(readiness, "build"), /target: x86_64-unknown-linux-gnu/u);
 
   const policySmoke = jobBlock(readiness, "policy-scan-smoke");
-  assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, semantic-pack-bundle, build-linux-x86-64\]$/mu);
-  assert.match(policySmoke, /accept-offline-semantic-pack-install\.sh/u);
+  assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, build-linux-x86-64\]$/mu);
+  assert.match(policySmoke, /prepare-open-packs\.mjs/u);
+  for (const flag of ["--binary", "--cache-dir", "--receipt-path", "--env-path"]) {
+    assert.ok(policySmoke.includes(flag), "open-pack acquisition omits " + flag);
+  }
+  assert.match(policySmoke, /actions\/cache\/restore@/u);
+  assert.match(policySmoke, /actions\/cache\/save@/u);
+  assert.match(policySmoke, /steps\.pack-profile\.outputs\.sha256/u);
+  assert.match(policySmoke, /steps\.open-packs\.outputs\.(?:selection_id|receipt_sha256)/u);
+  assert.match(policySmoke, /BIFROST_OPEN_SEMANTIC_PACK_BUNDLE/u);
+  assert.match(policySmoke, /BIFROST_OPEN_POLICY_PACK_ROOT/u);
+  assert.match(policySmoke, /Upload typed policy smoke status and pack selection receipt/u);
   assert.match(offlinePackAcceptance, /docker run --rm --network none/u);
   assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_DOWNLOAD=off/u);
+  assert.match(offlinePackAcceptance, /BIFROST_OPEN_SEMANTIC_PACK_BUNDLE/u);
+  assert.match(offlinePackAcceptance, /BIFROST_OPEN_POLICY_PACK_ROOT/u);
+  assert.match(offlinePackAcceptance, /BIFROST_SEMANTIC_PACK_CACHE_ROOT/u);
+  assert.match(offlinePackAcceptance, /open-packs-receipt\.json/u);
+  assert.match(offlinePackAcceptance, /if \[\[ \$# -ne 8 \]\]/u);
+  assert.match(offlinePackAcceptance, /mounted_java_home=/u);
+  assert.match(offlinePackAcceptance, /missing-JAVA_HOME acceptance unexpectedly selected/u);
+  assert.match(offlinePackAcceptance, /\[\[ "\$label" == "missing" \|\| "\$label" == "positive" \]\]/u);
   assert.match(offlinePackAcceptance, /positiveStatus === 2/u);
   assert.match(offlinePackAcceptance, /reasons\[0\] === "partial_discovery"/u);
   assert.match(offlinePackAcceptance, /call_binding_dispatch_partial/u);

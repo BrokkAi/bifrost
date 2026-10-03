@@ -723,8 +723,9 @@ fn rewrite_path_constrained_values_report_their_allowed_set() {
 }
 
 /// Hover help and validation ranges for the class-set type-flow steps, in
-/// RQL source. Each form takes exactly one query and no option axis, so
-/// an extra argument or a borrowed option is reported rather than ignored.
+/// RQL source. Class-set takes exactly one query, and absent-member takes only
+/// its `:proof` option, so an extra argument or a borrowed option is reported
+/// rather than ignored.
 #[test]
 fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
     for form in ["class-set", "absent-member"] {
@@ -746,11 +747,60 @@ fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
     let rql = "(absent-member :plan-ref test:flow (function))";
     let diagnostic = validate_query_source(rql)
         .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("absent-member takes no option axis");
-    assert!(
-        diagnostic.message.contains("absent-member"),
-        "{diagnostic:?}"
+        .find(|diagnostic| diagnostic.code == "unknown-property")
+        .expect("absent-member accepts only its proof option");
+    assert_eq!(&rql[diagnostic.range.clone()], ":plan-ref");
+    assert!(diagnostic.message.contains(":proof"), "{diagnostic:?}");
+}
+
+#[test]
+fn absent_member_proof_option_help_validation_and_row_domain_are_typed() {
+    let rql = "(absent-member :proof conditional (procedure-of (function)))";
+    for token in ["absent-member", ":proof"] {
+        let offset = rql.find(token).expect("absent-member proof token");
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no absent-member help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    let offset = rql.find(":proof").expect("proof option");
+    let help = query_source_help_at(rql, offset).expect("proof help");
+    assert!(help.description.contains("conditional"), "{help:?}");
+    for proof in ["proven", "conditional", "any"] {
+        let rql = format!("(absent-member :proof {proof} (procedure-of (function)))");
+        assert!(validate_query_source(&rql).is_empty(), "{rql}");
+    }
+
+    let invalid = "(absent-member :proof unproven (procedure-of (function)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("unproven"))
+        .expect("invalid proof tier diagnostic");
+    assert_eq!(&invalid[diagnostic.range.clone()], "unproven");
+    for allowed in ["proven", "conditional", "any"] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+
+    let duplicate = "(absent-member :proof any :proof proven (procedure-of (function)))";
+    let diagnostic = validate_query_source(duplicate)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "duplicate-property")
+        .expect("duplicate proof option diagnostic");
+    assert_eq!(&duplicate[diagnostic.range.clone()], ":proof");
+
+    let fields =
+        crate::structural::search::DetailedCodeQueryDomain::AbsentMemberFinding.row_fields();
+    let proof = fields
+        .iter()
+        .find(|field| field.name == "proof")
+        .expect("absent-member proof field");
+    assert_eq!(
+        proof.scalar_type,
+        crate::structural::search::CodeQueryRowScalarType::ConstrainedEnum
+    );
+    assert_eq!(
+        proof.value_domain.and_then(|domain| domain.labels()),
+        Some(["proven", "conditional"].as_slice())
     );
 }
 
@@ -1167,6 +1217,37 @@ fn result_contract_use_form_help_and_diagnostics_are_range_precise() {
         "result-contract-use-summary",
         "{diagnostic:?}"
     );
+}
+
+#[test]
+fn result_subject_uses_form_help_and_diagnostics_are_range_precise() {
+    for label in ["result-subject-uses", "result_subject_uses"] {
+        let source = format!("({label} (call-results (call-shape (call :callee \"build\"))))");
+        let offset = source.find(label).unwrap();
+        let help = query_source_help_at(&source, offset)
+            .unwrap_or_else(|| panic!("no result-subject-uses help for {label}"));
+        assert_eq!(&source[help.range], label);
+        assert!(
+            help.description
+                .contains("normal-result reference provenance")
+        );
+        assert!(help.description.contains("freshness"));
+        assert!(validate_query_source(&source).is_empty(), "{source}");
+
+        let wrong_upstream = format!("({label} (call-shape (call)))");
+        let diagnostic = validate_query_source(&wrong_upstream)
+            .into_iter()
+            .find(|diagnostic| {
+                diagnostic.code == "invalid-query"
+                    && diagnostic.message.contains("requires call_result")
+            })
+            .expect("call-result upstream diagnostic");
+        assert_eq!(
+            &wrong_upstream[diagnostic.range.clone()],
+            label,
+            "{diagnostic:?}"
+        );
+    }
 }
 
 #[test]

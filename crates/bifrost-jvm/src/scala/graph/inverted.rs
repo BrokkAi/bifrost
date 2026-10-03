@@ -51,11 +51,11 @@ use super::syntax::{
     is_scala_case_pattern_binder_with_parents, is_scala_class_reference_with_parents,
     is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
     is_stable_type_qualifier_with_parents, is_terminal_stable_field_reference,
-    named_argument_invocation_owner_with_parents, node_text, parenthesized_arity,
+    named_argument_invocation_owner_with_parents, node_text,
     qualified_stable_type_reference_with_parents, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_definition_binder_names, scala_import_is_visible_at_byte,
-    scala_pattern_binder_names, scala_source_facts, scala_union_type_alternative_paths,
+    scala_pattern_binder_names, scala_union_type_alternative_paths,
     stable_identifier_prefix_reference, stable_identifier_reference_with_parents,
     stable_path_segments, stable_type_prefix_reference, template_direct_term_member_named,
     template_self_types, terminal_invocation_owner_name,
@@ -75,8 +75,7 @@ use crate::scala::wildcard_imports::{
     scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
 };
 use crate::scala::{
-    scala_member_signature_arity, scala_nested_type_candidates, scala_short_name_terminal_segment,
-    scala_simple_type_name,
+    scala_nested_type_candidates, scala_short_name_terminal_segment, scala_simple_type_name,
 };
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CallableFacts, ImportInfo, Language, ScalaExportInfo, ScalaExportSelector,
@@ -929,10 +928,6 @@ impl ProjectTypes {
             .into_iter()
             .filter(|fact| fact.declaration == *declaration)
             .min_by_key(|fact| fact.signature_ordinal);
-        let signature = fact
-            .as_ref()
-            .map(|fact| fact.signature.as_str())
-            .or_else(|| declaration.signature());
         let metadata = fact.as_ref().and_then(|fact| fact.metadata.as_ref());
         let return_type_fqn = metadata
             .and_then(SignatureMetadata::return_type_identity)
@@ -947,7 +942,14 @@ impl ProjectTypes {
                 )
             });
         Some(CallableFacts {
-            arity: signature.and_then(scala_member_signature_arity),
+            arity: metadata
+                .and_then(SignatureMetadata::callable_arity)
+                .map(|arity| arity.total())
+                .or_else(|| {
+                    metadata
+                        .and_then(SignatureMetadata::extension_receiver_type)
+                        .map(|_| 0)
+                }),
             callable_arity: metadata.and_then(SignatureMetadata::callable_arity),
             return_type_fqn,
             is_function: declaration.is_function(),
@@ -958,19 +960,31 @@ impl ProjectTypes {
         self.type_aliases.contains(unit)
     }
 
-    /// Whether this declaration is the term-namespace half of a name. Scala
-    /// permits a type alias and a `val` with the same name in one owner, and
-    /// since #2878 those are two declarations: the alias is a `Class` carrying
-    /// a `Type` segment, the `val` a `Field` carrying a `Member` segment.
-    pub fn is_term_field_declaration(&self, unit: &CodeUnit) -> bool {
+    /// Whether this field-shaped declaration identity also has a term-level
+    /// declaration. Scala permits a type alias and a `val` with the same name
+    /// in one owner; the analyzer intentionally coalesces those declarations
+    /// into one CodeUnit while retaining both parser-recorded signatures.
+    pub fn has_term_field_declaration(&self, scala: &dyn ScalaSource, unit: &CodeUnit) -> bool {
         unit.is_field()
+            && (!self.type_aliases.contains(unit)
+                || scala
+                    .canonical_source_facts(unit.source())
+                    .is_some_and(|bundle| bundle.for_unit(unit).any(|fact| fact.is_term_field)))
     }
 
-    fn term_field_declaration_is_globally_unique(&self, unit: &CodeUnit) -> bool {
+    fn is_exclusive_type_alias(&self, scala: &dyn ScalaSource, unit: &CodeUnit) -> bool {
+        self.type_aliases.contains(unit) && !self.has_term_field_declaration(scala, unit)
+    }
+
+    fn term_field_declaration_is_globally_unique(
+        &self,
+        scala: &dyn ScalaSource,
+        unit: &CodeUnit,
+    ) -> bool {
         self.index
             .by_fqn(&unit.fq_name())
             .iter()
-            .filter(|candidate| self.is_term_field_declaration(candidate))
+            .filter(|candidate| self.has_term_field_declaration(scala, candidate))
             .count()
             == 1
     }
@@ -1589,7 +1603,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_name(&owner, member)
                         .into_iter()
-                        .filter(|unit| self.is_term_field_declaration(unit)),
+                        .filter(|unit| self.has_term_field_declaration(scala, unit)),
                 );
                 next.extend(
                     self.direct_field_ancestors_for_owner(scala, &owner)
@@ -1634,7 +1648,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_unit(scala, &owner, member)
                         .into_iter()
-                        .filter(|unit| self.is_term_field_declaration(unit)),
+                        .filter(|unit| self.has_term_field_declaration(scala, unit)),
                 );
                 let ancestors = match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                     ScalaDirectAncestorResolution::Resolved(ancestors)
@@ -2358,7 +2372,7 @@ impl ProjectTypes {
     }
 
     fn member_blocks_callable_lookup(&self, scala: &dyn ScalaSource, member: &CodeUnit) -> bool {
-        self.is_term_field_declaration(member)
+        self.has_term_field_declaration(scala, member)
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
@@ -2381,7 +2395,7 @@ impl ProjectTypes {
         if member.is_class() && self.type_is_stable_owner(scala, member) {
             return true;
         }
-        call.is_unapplied() && self.is_term_field_declaration(member)
+        call.is_unapplied() && self.has_term_field_declaration(scala, member)
     }
 
     pub fn callable_parameter_function_shape(
@@ -4577,7 +4591,7 @@ impl ProjectTypes {
         let declarations = self.index.by_normalized_fqn(normalized_fqn);
         let candidates = declarations
             .iter()
-            .filter(|unit| unit.is_function() || self.is_term_field_declaration(unit))
+            .filter(|unit| unit.is_function() || self.has_term_field_declaration(scala, unit))
             .collect::<Vec<_>>();
         if let [candidate] = candidates.as_slice() {
             return vec![(*candidate).clone()];
@@ -4601,7 +4615,7 @@ impl ProjectTypes {
         };
         let stable_members = candidates
             .into_iter()
-            .filter(|unit| self.is_term_field_declaration(unit))
+            .filter(|unit| self.has_term_field_declaration(scala, unit))
             .filter(|unit| unit.source() == source_file)
             .filter(|unit| {
                 self.exact_structural_parent(scala, unit)
@@ -4621,7 +4635,7 @@ impl ProjectTypes {
 
     fn exact_field(
         &self,
-        _scala: &dyn ScalaSource,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
     ) -> Option<CodeUnit> {
@@ -4630,7 +4644,7 @@ impl ProjectTypes {
             .index
             .by_fqn(&field_fqn)
             .into_iter()
-            .filter(|unit| self.is_term_field_declaration(unit))
+            .filter(|unit| self.has_term_field_declaration(scala, unit))
             .collect::<Vec<_>>();
         (fields.len() == 1).then(|| fields[0].clone())
     }
@@ -5918,8 +5932,9 @@ impl ProjectTypes {
             .clone();
         cell.get_or_init(|| {
             Arc::new(
-                self.source_for_file(scala, file)
-                    .and_then(|source| scala_source_facts(&source))
+                scala
+                    .canonical_source_facts(file)
+                    .map(|bundle| ScalaSourceFacts::from_canonical(&bundle.facts, &bundle.source))
                     .unwrap_or_default(),
             )
         })
@@ -9296,7 +9311,7 @@ fn record_exact_import_path_reference(
         }
         let role = if target.is_function() {
             ScalaReferenceRole::Callable
-        } else if ctx.types.is_term_field_declaration(&target) {
+        } else if ctx.types.has_term_field_declaration(ctx.scala, &target) {
             ScalaReferenceRole::Field
         } else if target.is_class() && target.short_name().ends_with('$') {
             ScalaReferenceRole::StableObject
@@ -9441,7 +9456,7 @@ fn exact_import_targets_for_candidate(
     ) {
         if member.is_function() {
             exact.callable_targets.insert(member.clone());
-        } else if ctx.types.is_term_field_declaration(&member) {
+        } else if ctx.types.has_term_field_declaration(ctx.scala, &member) {
             exact.field_targets.insert(member.clone());
         }
     }
@@ -9992,11 +10007,12 @@ fn record_reference(
                     let imported_type_alias_only = !resolved_member_units.is_empty()
                         && resolved_member_units
                             .iter()
-                            .all(|unit| ctx.types.is_type_alias(ctx.scala, unit));
+                            .all(|unit| ctx.types.is_exclusive_type_alias(ctx.scala, unit));
                     let imported_units = resolved_member_units
                         .into_iter()
                         .filter(|unit| {
-                            unit.is_function() || ctx.types.is_term_field_declaration(unit)
+                            unit.is_function()
+                                || ctx.types.has_term_field_declaration(ctx.scala, unit)
                         })
                         .collect::<Vec<_>>();
                     if !imported_units.is_empty()
@@ -10012,13 +10028,15 @@ fn record_reference(
                     if !imported_units.is_empty() {
                         let imported_fields = imported_units
                             .iter()
-                            .filter(|unit| ctx.types.is_term_field_declaration(unit))
+                            .filter(|unit| ctx.types.has_term_field_declaration(ctx.scala, unit))
                             .cloned()
                             .collect::<Vec<_>>();
                         if !imported_fields.is_empty() {
                             if let [field] = imported_fields.as_slice()
                                 && (field.source() == ctx.source_file
-                                    || ctx.types.term_field_declaration_is_globally_unique(field))
+                                    || ctx.types.term_field_declaration_is_globally_unique(
+                                        ctx.scala, field,
+                                    ))
                             {
                                 ctx.record_exact(
                                     field.clone(),
@@ -11330,7 +11348,7 @@ fn record_unqualified_applied_field(
         LexicalFieldReferenceResolution::NoMatch => {}
     }
     if let Some(target) = ctx.resolver.resolve_member_unit(name)
-        && ctx.types.is_term_field_declaration(&target)
+        && ctx.types.has_term_field_declaration(ctx.scala, &target)
         && !ctx.types.is_type_alias(ctx.scala, &target)
     {
         ctx.record_exact(target, ScalaReferenceRole::Field, function);
@@ -13460,19 +13478,15 @@ fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_, '_>) 
         owner,
         &method_fqn,
         name,
-        function_definition_arity(node, ctx.source),
+        ctx.types
+            .source_facts_for_file(ctx.scala, ctx.source_file)
+            .callable_alternatives_by_range
+            .get(&(node.start_byte(), node.end_byte()))
+            .map(|callable| callable.shape.first().map_or(0, |list| list.arity.total())),
     );
     for target in targets.iter().cloned() {
         ctx.record_with_caller(method_fqn.clone(), target, name_node);
     }
-}
-
-fn function_definition_arity(node: Node<'_>, source: &str) -> Option<usize> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == "parameters")
-        .and_then(|parameters| parenthesized_arity(node_text(parameters, source)))
-        .or(Some(0))
 }
 
 fn seed_parameters(

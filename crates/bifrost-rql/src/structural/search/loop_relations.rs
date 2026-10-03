@@ -1,4 +1,4 @@
-//! Java source-loop repetition rows over exact procedure control flow.
+//! Source-loop repetition rows over exact procedure control flow.
 
 use super::results::{
     CodeQueryLoopReason, CodeQueryLoopRelation, CodeQueryRange, CodeQueryResultRef,
@@ -6,9 +6,7 @@ use super::results::{
 };
 use super::*;
 use crate::analyzer::semantic::LengthDelimitedDigest;
-use brokk_bifrost_analysis::analyzer::{
-    JavaLoopCandidate, JavaLoopCoordinates, JavaLoopKind, java_loop_candidates,
-};
+use brokk_bifrost_analysis::analyzer::{LoopCandidate, LoopCoordinates, LoopKind, loop_candidates};
 use brokk_bifrost_flow::flow_state::{
     FlowStateAxis, FlowStateRequest, LoopRepeatAnswer, LoopRepeatIncompleteReason, LoopSourceKind,
     LoopSourceSite,
@@ -24,7 +22,7 @@ pub(super) struct LoopRelationValue {
     pub(super) row: CodeQueryLoopRelation,
 }
 
-fn public_range(coordinates: JavaLoopCoordinates) -> CodeQueryRange {
+fn public_range(coordinates: LoopCoordinates) -> CodeQueryRange {
     CodeQueryRange {
         start_line: coordinates.start_line,
         start_column: coordinates.start_column,
@@ -35,7 +33,7 @@ fn public_range(coordinates: JavaLoopCoordinates) -> CodeQueryRange {
 
 fn row(
     procedure: &semantic::SemanticProcedureValue,
-    candidate: JavaLoopCandidate,
+    candidate: LoopCandidate,
     verdict: &'static str,
     reasons: Vec<CodeQueryLoopReason>,
     repeat_edge_id: Option<String>,
@@ -52,13 +50,19 @@ fn row(
             id: digest.finish().to_string(),
             procedure_id,
             path: rel_path_string(procedure.file()),
-            language: Language::Java.config_label(),
+            language: procedure
+                .handle
+                .artifact()
+                .key()
+                .language()
+                .language()
+                .config_label(),
             range: public_range(candidate.coordinates),
             body_range: candidate.body_coordinates.map(public_range),
             loop_kind: match candidate.kind {
-                JavaLoopKind::While => "while",
-                JavaLoopKind::For => "for",
-                JavaLoopKind::Do => "do",
+                LoopKind::While => "while",
+                LoopKind::For => "for",
+                LoopKind::Do => "do",
             },
             verdict,
             reasons,
@@ -117,11 +121,7 @@ pub(super) fn loop_relation_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
-    if procedure.handle.artifact().key().language().language() != Language::Java {
-        report_open(procedure, "unsupported_language", diagnostics);
-        return Vec::new();
-    }
-    let candidates = java_loop_candidates(workspace, &procedure.handle, cancellation);
+    let candidates = loop_candidates(workspace, &procedure.handle, cancellation);
     if !candidates.complete {
         report_open(procedure, candidates.reason, diagnostics);
         return Vec::new();
@@ -178,7 +178,7 @@ pub(super) fn loop_relation_expansions(
     };
     flow_state_cache.report_completeness(
         &procedure.wire_id(),
-        Language::Java,
+        procedure.handle.artifact().key().language().language(),
         &derivation.completeness,
         LOOP_AXES,
         derivation.generation,
@@ -205,9 +205,9 @@ pub(super) fn loop_relation_expansions(
             }
             let site = candidate.site.expect("qualified loop has a source site");
             let kind = match site.kind {
-                JavaLoopKind::While => LoopSourceKind::While,
-                JavaLoopKind::For => LoopSourceKind::For,
-                JavaLoopKind::Do => LoopSourceKind::Do,
+                LoopKind::While => LoopSourceKind::While,
+                LoopKind::For => LoopSourceKind::For,
+                LoopKind::Do => LoopSourceKind::Do,
             };
             let answer = derivation.loop_body_reaches_own_repeat(
                 &procedure.handle,

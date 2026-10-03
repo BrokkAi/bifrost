@@ -69,6 +69,8 @@ pub(super) fn class_set_snapshot(
 pub struct MemberAccessSite {
     pub procedure: ProcedureHandle,
     pub point: ProgramPointHandle,
+    /// The semantic value whose class set this member access reads.
+    pub receiver: ValueId,
     /// Present exactly for a call-shaped access; load-shaped field access has
     /// no call-site identity.
     pub call: Option<CallSiteId>,
@@ -213,6 +215,9 @@ fn observable_value_dependencies(procedure: &ProcedureHandle) -> HashSet<ValueId
         match location.kind {
             MemoryLocationKind::Field { base, .. } | MemoryLocationKind::Property { base, .. } => {
                 relevant.insert(base);
+            }
+            MemoryLocationKind::Dereference { address } => {
+                relevant.insert(address);
             }
             MemoryLocationKind::Index { base, index, .. } => {
                 relevant.insert(base);
@@ -515,6 +520,10 @@ struct SeedTables {
     sources: Vec<(ValueFlowSourceSpec, ClassAtom, SourceSite)>,
     sinks: Vec<(ValueFlowSinkSpec, MemberAccessSite)>,
     member_surface_sources: HashSet<ValueFlowEventKey>,
+    /// Python's `*args` and `**kwargs` values are containers. Their element
+    /// arguments remain ordinary value-flow inputs for other clients, but do
+    /// not define the container's runtime class in this class-set plan.
+    container_parameter_ports: HashSet<ProcedurePortHandle>,
     /// Distinct ordinals at each stable source location. Several program
     /// points can share a source mapping.
     ordinals: HashMap<(SemanticLocator, ValueFlowEventKind), u32>,
@@ -527,6 +536,7 @@ impl SeedTables {
             sinks: Vec::new(),
             ordinals: HashMap::default(),
             member_surface_sources: HashSet::default(),
+            container_parameter_ports: HashSet::default(),
         }
     }
 
@@ -1974,6 +1984,7 @@ impl TypeFlowPlan {
             sources,
             sinks,
             member_surface_sources,
+            container_parameter_ports,
             ..
         } = tables;
         // The ValueFlowPlan sorts specs by event key and rejects duplicates,
@@ -2018,6 +2029,7 @@ impl TypeFlowPlan {
             edge_kills,
             call_behavior,
         )?;
+        value_flow = value_flow.without_call_value_inputs_to(&container_parameter_ports);
         if let Some(active) = provider.oracle().active_semantic_models()
             && !unmaterialized_external_targets.is_empty()
         {
@@ -2967,19 +2979,37 @@ fn seed_procedure(
             } => {
                 let span = mapping_span(procedure, value.source);
                 if multiplicity.is_rest() {
-                    // A rest parameter collects caller values into a container
-                    // this engine does not model element-wise, under every
-                    // caller and with no caller.
-                    seed_port(
-                        workspace,
-                        procedure,
-                        *ordinal,
-                        &entry,
-                        ClassAtom::Unknown(UnknownReason::VariadicParameter),
-                        span,
-                        SourceSiteKind::Unknown,
-                        tables,
-                    );
+                    let container = if adapter.language() == crate::analyzer::Language::Python {
+                        adapter.declared_parameter_class(workspace, procedure, *ordinal)
+                    } else {
+                        ClassSeed::NotApplicable
+                    };
+                    if matches!(container, ClassSeed::NotApplicable) {
+                        // An unmodeled rest formal collects caller values into
+                        // a container whose class this adapter cannot state.
+                        seed_port(
+                            workspace,
+                            procedure,
+                            *ordinal,
+                            &entry,
+                            ClassAtom::Unknown(UnknownReason::VariadicParameter),
+                            span,
+                            SourceSiteKind::Unknown,
+                            tables,
+                        );
+                    } else {
+                        tables.container_parameter_ports.insert(
+                            ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
+                                .expect("a retained parameter has a valid parameter port"),
+                        );
+                        for atom in container.into_atoms() {
+                            let kind =
+                                source_kind_for_atom(&atom, SourceSiteKind::DeclaredParameter);
+                            seed_port(
+                                workspace, procedure, *ordinal, &entry, atom, span, kind, tables,
+                            );
+                        }
+                    }
                     continue;
                 }
                 let seed = adapter.declared_parameter_class(workspace, procedure, *ordinal);
@@ -3525,6 +3555,7 @@ fn push_member_sink(
         MemberAccessSite {
             procedure: procedure.clone(),
             point: point.clone(),
+            receiver: base,
             call,
             file,
             span,

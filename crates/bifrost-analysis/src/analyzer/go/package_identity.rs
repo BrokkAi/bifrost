@@ -104,6 +104,15 @@ pub(crate) struct GoOverlayPackages<'a> {
     overlay: Option<&'a SemanticModelOverlay>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GoModeledPackageIdentity {
+    pub(crate) package_name: String,
+    pub(crate) symbol_id: String,
+    pub(crate) pack_id: String,
+    pub(crate) pack_digest: String,
+    pub(crate) record_id: String,
+}
+
 impl<'a> GoOverlayPackages<'a> {
     pub(crate) fn new(overlay: Option<&'a SemanticModelOverlay>) -> Self {
         Self { overlay }
@@ -220,7 +229,38 @@ impl<'a> GoOverlayPackages<'a> {
     /// unaliased `import "example.com/m/postgres"` of `package pg` binds `pg`
     /// rather than `postgres`.
     pub(crate) fn declared_package_name(&self, import_path: &str) -> Option<String> {
-        self.unique_symbol(import_path)?.aliases.first().cloned()
+        self.modeled_package_identity(import_path)
+            .map(|identity| identity.package_name)
+    }
+
+    /// Exact file-less package identity from one unambiguous Go module record.
+    /// The package clause name comes from the record alias; import-path
+    /// components are never used to infer it.
+    pub(crate) fn modeled_package_identity(
+        &self,
+        import_path: &str,
+    ) -> Option<GoModeledPackageIdentity> {
+        let symbol = self.unique_symbol(import_path)?;
+        if symbol.qualified_name != import_path
+            || symbol.language != "go"
+            || symbol.kind != SemanticModelSymbolKind::Module
+            || symbol.owner_id.is_some()
+            || symbol.visibility == Visibility::Private
+            || symbol.provenance.ambiguous
+        {
+            return None;
+        }
+        let package_name = symbol.aliases.first()?.clone();
+        if package_name.is_empty() || matches!(package_name.as_str(), "_" | ".") {
+            return None;
+        }
+        Some(GoModeledPackageIdentity {
+            package_name,
+            symbol_id: symbol.id.clone(),
+            pack_id: symbol.provenance.pack_id.clone(),
+            pack_digest: symbol.provenance.pack_digest.clone(),
+            record_id: symbol.provenance.record_id.clone(),
+        })
     }
 
     /// How completely the activated packs describe `import_path`.

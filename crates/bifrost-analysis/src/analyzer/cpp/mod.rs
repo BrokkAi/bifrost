@@ -10,6 +10,9 @@ mod identity;
 mod imports;
 mod projection;
 mod semantic;
+pub(crate) mod source_publication;
+pub(crate) mod source_publication_context;
+pub(crate) mod source_storage;
 mod structural;
 #[cfg(test)]
 mod tests;
@@ -25,7 +28,7 @@ use crate::analyzer::languages::{
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
+use crate::analyzer::tree_sitter_analyzer::{BulkFileStateSource, LanguageAdapter};
 use crate::analyzer::usages::cpp_graph::{
     CppDeadCodeBulkEligibility, CppUsageGraphStrategy, build_cpp_usage_edge_weights,
     build_cpp_usage_edges, build_rooted_cpp_usage_edges, dead_code_bulk_eligibility,
@@ -87,9 +90,8 @@ pub(crate) use brokk_bifrost_cpp::declarations::{
 };
 use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 pub(crate) use brokk_bifrost_cpp::identity::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
-    cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
-    cpp_range_is_pure_virtual_declaration,
+    CppCallableUnitRole, CppOccurrenceRole, cpp_indexed_callable_linkage,
+    cpp_is_range_for_binding_name, cpp_range_is_pure_virtual_declaration,
 };
 
 #[derive(Clone)]
@@ -97,6 +99,7 @@ struct MacroComposedField {
     unit: CodeUnit,
     owner: CodeUnit,
     ranges: Vec<Range>,
+    source: Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
 }
 pub use brokk_bifrost_cpp::identity::{
     cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
@@ -113,6 +116,15 @@ use imports::TransitiveReverseTuIndex;
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
     memo_budget: u64,
+    canonical_source_facts: Cache<
+        (
+            crate::analyzer::store::GenerationId,
+            git2::Oid,
+            ProjectFile,
+            String,
+        ),
+        Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
+    >,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     /// Owner-specific fields materialized from object-like macros in the
     /// owner's include closure. This remains an analyzer overlay because the
@@ -545,12 +557,31 @@ impl CppAnalyzer {
         let Some(prepared) = self.prepared_syntax(token, owner_file) else {
             return Vec::new();
         };
-        let parsed = parse_cpp_file_with_object_macro_fields(
+        let mut parsed = parse_cpp_file_with_object_macro_fields(
             owner_file,
             prepared.source(),
             prepared.tree(),
             macro_fields,
         );
+        let parsed_source = parsed
+            .source_facts
+            .take()
+            .expect("macro composition parser publishes canonical source facts");
+        let cpp_facts = parsed_source
+            .cpp
+            .expect("macro composition parser publishes C++ source facts");
+        let mut declaration_units: HashMap<_, Vec<CodeUnit>> = HashMap::default();
+        for (declaration, unit) in &parsed.source_declaration_units {
+            declaration_units
+                .entry(*declaration)
+                .or_default()
+                .push(unit.clone());
+        }
+        let source = Arc::new(brokk_bifrost_cpp::source_facts::CppFileSourceFacts::new(
+            parsed_source.occurrences,
+            cpp_facts,
+            declaration_units,
+        ));
         let owners = self
             .inner
             .declarations(owner_file)
@@ -565,10 +596,15 @@ impl CppAnalyzer {
                 let owner_fq = unit.fq().parent()?;
                 let owner = owners.iter().find(|owner| owner.fq() == &owner_fq)?.clone();
                 let ranges = parsed.declaration_ranges(unit).to_vec();
+                assert!(
+                    source.for_unit(unit).next().is_some(),
+                    "synthetic macro field has no canonical source fact: {unit:?}"
+                );
                 Some(MacroComposedField {
                     unit: unit.clone(),
                     owner,
                     ranges,
+                    source: Arc::clone(&source),
                 })
             })
             .collect()
@@ -634,6 +670,12 @@ impl CppAnalyzer {
         let analyzer = Self {
             inner,
             memo_budget,
+            canonical_source_facts: build_weighted_cache(
+                memo_budget / 8,
+                |_, facts: &Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>| {
+                    facts.estimated_retained_bytes().min(u32::MAX as usize) as u32
+                },
+            ),
             imported_code_units: build_weighted_cache(
                 memo_budget / 4,
                 weight_code_unit_set_by_file,
@@ -870,6 +912,12 @@ impl CppAnalyzer {
         let analyzer = Self {
             inner,
             memo_budget: self.memo_budget,
+            canonical_source_facts: build_weighted_cache(
+                self.memo_budget / 8,
+                |_, facts: &Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>| {
+                    facts.estimated_retained_bytes().min(u32::MAX as usize) as u32
+                },
+            ),
             imported_code_units: build_weighted_cache(
                 self.memo_budget / 4,
                 weight_code_unit_set_by_file,
@@ -1098,6 +1146,57 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    fn canonical_source_for_unit(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<(
+        Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
+        Vec<CodeUnit>,
+    )> {
+        let source = self.declaration_source_facts(token, unit.source())?;
+        let mut physical_units = Vec::new();
+        if source.for_unit(unit).next().is_some() {
+            physical_units.push(unit.clone());
+        }
+        // Reconciliation can retain a declaration and rekey its out-of-line
+        // definition in the same file. Both exact physical bridges contribute
+        // occurrences to the published unit. Only callable identities can be
+        // rekeyed; type-property reads must not scan global callable candidates.
+        if unit.is_callable()
+            && let Some(physical) = self.reconciled_provisional(unit)
+            && physical != *unit
+            && source.for_unit(&physical).next().is_some()
+        {
+            physical_units.push(physical);
+        }
+        if !physical_units.is_empty() {
+            return Some((source, physical_units));
+        }
+        // The alternate header reading has its own content-owned arena.
+        // Select its mounted bridge before interpreting any of its source IDs.
+        if brokk_bifrost_cpp::identity::cpp_source_path_is_header(unit.source())
+            && let Some(c_source) = self.inner.canonical_cpp_source_facts(
+                unit.source(),
+                "cpp:c",
+                &self.canonical_source_facts,
+            )
+            && c_source.for_unit(unit).next().is_some()
+        {
+            return Some((c_source, vec![unit.clone()]));
+        }
+        if unit.is_field()
+            && unit.is_synthetic()
+            && let Some(field) = self
+                .macro_composed_fields(unit.source())
+                .iter()
+                .find(|field| field.unit == *unit)
+        {
+            return Some((Arc::clone(&field.source), vec![unit.clone()]));
+        }
+        None
+    }
+
     pub(crate) fn import_statements_from_projection(
         &self,
         token: QueryToken<'_>,
@@ -1220,17 +1319,6 @@ impl CppAnalyzer {
                 .external_header_parse_count
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
-    }
-
-    pub(crate) fn prepared_syntax_limited_cancellable(
-        &self,
-        token: QueryToken<'_>,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-        cancellation: Option<&crate::cancellation::CancellationToken>,
-    ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
-        self.inner
-            .prepared_syntax_limited_cancellable(token, file, max_source_bytes, cancellation)
     }
 
     pub(crate) fn bulk_file_states_for_query(&self, files: impl IntoIterator<Item = ProjectFile>) {
@@ -1686,13 +1774,87 @@ use crate::analyzer::CodeUnitIndex;
 /// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
 impl CppSource for CppAnalyzer {
+    fn declaration_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>> {
+        let lang = CppAdapter.storage_language_key_for_file(file);
+        self.inner
+            .canonical_cpp_source_facts(file, lang, &self.canonical_source_facts)
+    }
+
+    fn declaration_source_properties(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>> {
+        let (source, physical) = self.canonical_source_for_unit(token, unit)?;
+        let mut seen = HashSet::default();
+        Some(
+            physical
+                .iter()
+                .flat_map(|unit| source.for_unit(unit))
+                .filter(|fact| seen.insert(fact.declaration))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn declaration_source_occurrences(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<brokk_bifrost_cpp::source_facts::CppDeclarationOccurrence>> {
+        let (source, physical) = self.canonical_source_for_unit(token, unit)?;
+        let mut seen = HashSet::default();
+        Some(
+            physical
+                .iter()
+                .flat_map(|unit| source.declaration_occurrences(unit))
+                .filter(|occurrence| seen.insert(occurrence.fact.declaration))
+                .collect(),
+        )
+    }
+
+    fn declaration_navigation_occurrences(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<brokk_bifrost_cpp::source_facts::CppNavigationOccurrence>> {
+        let (source, physical) = self.canonical_source_for_unit(token, unit)?;
+        let mut seen = HashSet::default();
+        Some(
+            physical
+                .iter()
+                .flat_map(|unit| source.for_unit(unit))
+                .filter(|fact| seen.insert(fact.declaration))
+                .map(|fact| {
+                    let declaration = source.source.declaration(fact.declaration);
+                    let range = source.source.occurrence(declaration.occurrence).range;
+                    let conditional_family = fact.conditional_family.map(|id| {
+                        let range = source.source.occurrence(id).range;
+                        (range.start_byte, range.end_byte)
+                    });
+                    brokk_bifrost_cpp::source_facts::CppNavigationOccurrence {
+                        range,
+                        role: fact.occurrence_role,
+                        conditional_family,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn visibility_import_statements(
         &self,
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Vec<String> {
         let _streaming = crate::analyzer::AnalyzerStreamingFileScope::new(self, file);
-        self.import_statements_from_projection(token, file)
+        self.declaration_source_facts(token, file)
+            .map(|source| brokk_bifrost_cpp::imports::canonical_include_statements(&source))
+            .unwrap_or_default()
     }
 
     fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -1723,10 +1885,6 @@ impl CppSource for CppAnalyzer {
 
     fn include_target_index(&self) -> &IncludeTargetIndex {
         CppAnalyzer::include_target_index(self)
-    }
-
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(code_unit)
     }
 
     fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
@@ -2318,6 +2476,10 @@ impl CodeUnitIndex for CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        self.inner.source_file_inventory()
+    }
+
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
         self.inner.active_query_cancellation()
     }
@@ -3061,6 +3223,36 @@ impl LanguageSupport for CppSupport {
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>> {
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.ranges_limited(unit, limit))
+    }
+
+    fn declaration_navigation_occurrences(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<Vec<crate::analyzer::languages::DeclarationNavigationOccurrence>> {
+        use crate::analyzer::languages::{
+            DeclarationNavigationOccurrence, DeclarationNavigationRole,
+        };
+        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let occurrences = resolve_analyzer::<CppAnalyzer>(analyzer)?
+            .declaration_navigation_occurrences(scope.token(), unit)?;
+        Some(
+            occurrences
+                .into_iter()
+                .map(|occurrence| DeclarationNavigationOccurrence {
+                    range: occurrence.range,
+                    role: match occurrence.role {
+                        CppOccurrenceRole::DeclarationOnly => {
+                            DeclarationNavigationRole::Declaration
+                        }
+                        CppOccurrenceRole::Definition => DeclarationNavigationRole::Definition,
+                        CppOccurrenceRole::Both => DeclarationNavigationRole::Both,
+                        CppOccurrenceRole::Unknown => DeclarationNavigationRole::Unknown,
+                    },
+                })
+                .collect(),
+        )
     }
 
     fn forward_query_provider<'a>(

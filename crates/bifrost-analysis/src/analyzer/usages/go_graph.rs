@@ -10,10 +10,13 @@
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
-use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
+use crate::analyzer::usages::common::{
+    analyzed_files_for_language, classify_recursive_hits, language_for_target,
+};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    parse_and_collect_with_domain,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
+    build_edge_output_with_completeness, build_file_declarations,
+    parse_source_and_collect_with_declarations_and_domain,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
 use crate::analyzer::usages::outcome::{
@@ -30,12 +33,26 @@ pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
 };
 use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_graph_with_edge_index,
+    GoEdgeIndex, GoGraphBuildError, GoGraphSource, GoProjectGraph, TargetSpec,
+    build_go_graph_with_edge_index,
 };
 use std::sync::Arc;
 
-pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
-pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_name_parts};
+/// Classify Go's runtime/test entry points from the persisted package clause.
+/// Only a function named `main` needs that fact; the Go crate owns the pure shape and
+/// test-file rules, while this shim supplies the analyzer's structured property.
+pub(crate) fn go_implicit_entry_point(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> Option<bool> {
+    let package_clause = (candidate.is_function() && candidate.identifier() == "main")
+        .then(|| {
+            resolve_analyzer::<GoAnalyzer>(analyzer)
+                .and_then(|go| go.package_clause_of(candidate.source()))
+        })
+        .flatten();
+    brokk_bifrost_go::graph::go_implicit_entry_point(candidate, package_clause.as_deref())
+}
 
 /// Build every Go `caller -> callee` edge in one pass over the workspace.
 ///
@@ -56,26 +73,30 @@ pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_
 /// closure returns, so live trees are bounded by the worker count rather than
 /// the workspace size (#200). Cross-file resolution comes from the tree-free
 /// [`GoEdgeIndex`] and the index's per-file import facts -- no other file's tree
-/// is read during a scan.
+/// is read during a scan. Missing indexed source or an incomplete parse is
+/// returned as an explicit error instead of being published as an empty graph.
 fn build_go_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     index: &GoEdgeIndex,
     domain: EdgeNodeDomain<'_>,
     keep_file: F,
-) -> Output
+) -> Result<Output, GoGraphBuildError>
 where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = index.files().cloned().collect();
     let language = tree_sitter_go::LANGUAGE.into();
-    build_edge_output(&files, keep_file, |file| {
+    let result = build_edge_output_with_completeness(&files, keep_file, |file| {
+        let source = analyzer.indexed_source(file)?;
         let file_pkg = index.package_name_of(file)?;
-        parse_and_collect_with_domain(
-            analyzer,
+        let declarations = build_file_declarations(analyzer, file);
+        parse_source_and_collect_with_declarations_and_domain(
+            source,
             file,
             domain,
             brokk_bifrost_go::parse::go_parse_spec(&language),
+            declarations,
             |input| {
                 let (alias_packages, dot_packages) = index.namespace_packages(file);
                 let import_binding_names = index.import_binding_names(file);
@@ -89,52 +110,95 @@ where
                 )
             },
         )
-    })
+    });
+    match result {
+        UsageEdgeBuildResult::Complete(output) => Ok(output),
+        UsageEdgeBuildResult::Uncacheable { omitted_files, .. } => {
+            Err(GoGraphBuildError::from_files(omitted_files))
+        }
+    }
 }
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
-/// the workspace (see [`build_go_edges`]). Returns `None` when the analyzer
-/// exposes no Go files. `nodes` is the set of node fqns and `keep_file` drops
+/// the workspace (see [`build_go_edges`]). `Ok(None)` means the analyzer does
+/// not expose Go files. An error means selected input was unavailable, not an
+/// empty graph. `nodes` is the set of node fqns and `keep_file` drops
 /// out-of-scope caller files; the per-file definition ranges used to exclude
 /// self-declarations are derived inside the shared driver.
 pub(crate) fn build_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> Result<Option<UsageEdges>, GoGraphBuildError>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    let Some(resolver) = GoEdgeResolver::try_new(analyzer, token)? else {
+        return Ok(None);
+    };
+    resolver.build_edges(analyzer, nodes, keep_file).map(Some)
 }
 
 pub(crate) fn build_rooted_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     callers: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> Result<Option<UsageEdges>, GoGraphBuildError>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
+    let Some(resolver) = GoEdgeResolver::try_new(analyzer, token)? else {
+        return Ok(None);
+    };
+    resolver
+        .build_rooted_edges(analyzer, callers, keep_file)
+        .map(Some)
 }
 
 pub(crate) fn build_go_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdgeWeights>
+) -> Result<Option<UsageEdgeWeights>, GoGraphBuildError>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    let Some(resolver) = GoEdgeResolver::try_new(analyzer, token)? else {
+        return Ok(None);
+    };
+    resolver
+        .build_edge_weights(analyzer, nodes, keep_file)
+        .map(Some)
 }
 
 /// The strategy name every Go usage diagnostic reports.
 const GO_STRATEGY: &str = "GoUsageGraphStrategy";
+
+fn unavailable_go_graph_diagnostic(
+    target: &CodeUnit,
+    error: &GoGraphBuildError,
+) -> UsageAnalysisDiagnostic {
+    let mut diagnostic =
+        GraphFailureReason::UnavailableCanonicalFacts("Go graph indexed source was unavailable")
+            .diagnostic(target.fq_name(), GO_STRATEGY);
+    diagnostic.reason = format!(
+        "{}; unavailable files: {:?}",
+        diagnostic.reason, error.unavailable_files
+    );
+    diagnostic
+}
+
+fn cancelled_go_graph_diagnostic(target: &CodeUnit) -> UsageAnalysisDiagnostic {
+    GraphFailureReason::Cancelled("Go graph construction was cancelled")
+        .diagnostic(target.fq_name(), GO_STRATEGY)
+}
+
+fn cancelled_go_graph_outcome(target: &CodeUnit) -> GraphUsageOutcome {
+    GraphUsageOutcome::TerminalFailure(cancelled_go_graph_diagnostic(target))
+}
 
 pub(crate) struct GoQueryResolver<'a> {
     go: &'a GoAnalyzer,
@@ -150,6 +214,8 @@ pub(crate) fn go_graph_source<'a>(go: &'a GoAnalyzer, token: QueryToken<'a>) -> 
         imports: go,
         type_aliases: go,
         workspace_paths: go.workspace_path_index(),
+        package_clauses: go,
+        source_facts: go,
     }
 }
 
@@ -176,20 +242,53 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         // while retaining/scanning only the requested candidate trees. The
         // complete file inventory lets the Go crate discover that dependency
         // closure without parsing unrelated packages.
-        let edge_index = self.go.usage_edge_index();
-        union_candidate_usages(overloads, max_usages, |target| {
+        if scan_scope.is_cancelled() {
+            return cancelled_go_graph_outcome(
+                overloads.first().expect("non-empty Go usage target group"),
+            );
+        }
+        let edge_index = match self.go.usage_edge_index() {
+            Ok(edge_index) => edge_index,
+            Err(error) => {
+                if scan_scope.is_cancelled() {
+                    return cancelled_go_graph_outcome(
+                        overloads.first().expect("non-empty Go usage target group"),
+                    );
+                }
+                let diagnostic = unavailable_go_graph_diagnostic(
+                    overloads.first().expect("non-empty Go usage target group"),
+                    &error,
+                );
+                return GraphUsageOutcome::TerminalFailure(diagnostic);
+            }
+        };
+        let graph_scope = AnalyzerQueryScope::new(self.go);
+        let graph_source = go_graph_source(self.go, graph_scope.token());
+        let mut graph_failure = None;
+        let outcome = union_candidate_usages(overloads, max_usages, |target| {
             // The graph is seeded from the candidate's own file, so a target
             // group holding declarations in different packages (#1779) builds
             // one graph per candidate.
-            let graph = build_go_graph_with_edge_index(
+            let graph_result = build_go_graph_with_edge_index(
+                graph_source,
                 Arc::clone(&edge_index),
                 candidate_files,
                 target,
                 scan_scope.cancellation(),
             );
             if scan_scope.is_cancelled() {
-                return Ok(CandidateUsageHits::default());
+                let diagnostic = cancelled_go_graph_diagnostic(target);
+                graph_failure = Some(diagnostic.clone());
+                return Err(diagnostic);
             }
+            let graph = match graph_result {
+                Ok(graph) => graph,
+                Err(error) => {
+                    let diagnostic = unavailable_go_graph_diagnostic(target, &error);
+                    graph_failure = Some(diagnostic.clone());
+                    return Err(diagnostic);
+                }
+            };
             scan_candidate_with_graph(
                 analyzer,
                 self.go,
@@ -198,7 +297,17 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
                 candidate_files,
                 scan_scope,
             )
-        })
+        });
+        if scan_scope.is_cancelled() {
+            return cancelled_go_graph_outcome(
+                overloads.first().expect("non-empty Go usage target group"),
+            );
+        }
+        if let Some(diagnostic) = graph_failure {
+            GraphUsageOutcome::TerminalFailure(diagnostic)
+        } else {
+            outcome
+        }
     }
 }
 
@@ -211,26 +320,29 @@ pub(crate) struct GoEdgeResolver {
 /// analyzer once, then walk every file once and finalize into either site-bearing edges or
 /// reference-kind weights.
 impl GoEdgeResolver {
-    /// The index is the generation's shared one, not a fresh build.
-    ///
-    /// This used to call `build_go_edge_index` itself, which parsed every Go
-    /// file again even though `GoAnalyzer::workspace_indexes` already parses
-    /// the workspace once and derives both indexes from that parse (#1748).
-    /// The two file-set rules -- `analyzed_files_for_language` here,
-    /// `get_analyzed_files` filtered to Go in the memo -- name the same files:
-    /// both read the Go analyzer's own analyzed set, and both then keep only
-    /// Go paths, so build-tagged files, `_test.go` files and overlays are in
-    /// or out of each together. Checked on kubernetes (17,266 files each,
-    /// identical fact digests) before this switch landed (#3066).
-    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
-        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-        // A tree-free resolution index; the per-file walk re-parses on demand and
-        // drops each tree, so the whole-workspace build retains no syntax trees.
-        let index = go.usage_edge_index();
-        // A workspace with no indexed Go file states no edges at all; the
-        // callers report the language as unhandled rather than an empty answer.
-        let has_go_files = index.files().next().is_some();
-        has_go_files.then_some(Self { index })
+    pub(crate) fn try_new(
+        analyzer: &dyn IAnalyzer,
+        _token: QueryToken<'_>,
+    ) -> Result<Option<Self>, GoGraphBuildError> {
+        let files = analyzed_files_for_language(analyzer, Language::Go);
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+            return if files.is_empty() {
+                Ok(None)
+            } else {
+                Err(GoGraphBuildError::from_files(files))
+            };
+        };
+        if !go.graph_inventory_complete() {
+            return Err(GoGraphBuildError::from_files(files));
+        }
+        if files.is_empty() {
+            return Ok(None);
+        }
+        // Reuse the analyzer's memoized source-authoritative edge index. The
+        // per-file walk re-parses only its selected source tree on demand and
+        // drops it, so the whole-workspace build retains no syntax trees.
+        let index = go.usage_edge_index()?;
+        Ok(Some(Self { index }))
     }
 
     pub(crate) fn build_edges<F>(
@@ -238,7 +350,7 @@ impl GoEdgeResolver {
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Result<UsageEdges, GoGraphBuildError>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -255,7 +367,7 @@ impl GoEdgeResolver {
         analyzer: &dyn IAnalyzer,
         callers: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Result<UsageEdges, GoGraphBuildError>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -272,7 +384,7 @@ impl GoEdgeResolver {
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdgeWeights
+    ) -> Result<UsageEdgeWeights, GoGraphBuildError>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -374,4 +486,87 @@ fn scan_candidate_with_graph(
             .filter(|hit| &hit.enclosing != target)
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod file_scope_tests {
+    use super::*;
+    use crate::analyzer::{CodeUnitIndex, EmptyAnalyzer};
+    use crate::inline_project::InlineTestProject;
+    use std::collections::BTreeSet;
+
+    // Canonical graph resolution is separate from enclosing attribution.
+    // EmptyAnalyzer supplies only the latter and makes no completeness claim.
+    #[test]
+    fn canonical_go_reference_without_enclosing_declaration_keeps_file_scope_hit() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("target.go", "package sample\nfunc target() {}\n")
+            .file("caller.go", "package sample\nfunc caller() { target() }\n")
+            .build();
+        let go = GoAnalyzer::new(project.project_dyn());
+        let target = go
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "target")
+            .expect("canonical target declaration");
+        let caller = project.file("caller.go");
+        let candidates = [caller.clone()].into_iter().collect();
+        let index = go.usage_edge_index().expect("complete canonical graph");
+        let scope = AnalyzerQueryScope::new(&go);
+        let source = go_graph_source(&go, scope.token());
+        let graph = build_go_graph_with_edge_index(source, index, &candidates, &target, None)
+            .expect("canonical candidate facts");
+        let spec = TargetSpec::new(source, &graph, &target);
+        assert!(spec.has_scan_seed());
+        let attribution = EmptyAnalyzer::new(project.project_dyn());
+        let result = scan_files_for_target(&attribution, &graph, candidates, &spec, None);
+        assert_eq!(result.hits.len(), 1, "{:?}", result.hits);
+        let hit = result.hits.first().unwrap();
+        assert_eq!(hit.enclosing, CodeUnit::file_scope(caller));
+        assert_eq!(
+            &graph.parsed[&hit.file].source[hit.start_offset..hit.end_offset],
+            "target"
+        );
+    }
+
+    #[test]
+    fn ruby_reference_without_enclosing_declaration_keeps_file_scope_hit() {
+        let source = "target()\n";
+        let project = InlineTestProject::with_language(Language::Ruby)
+            .file("caller.rb", source)
+            .build();
+        let file = project.file("caller.rb");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let call = tree.root_node().named_child(0).unwrap();
+        let node = call.child_by_field_name("method").unwrap();
+        let attribution = EmptyAnalyzer::new(project.project_dyn());
+        let mut hits = BTreeSet::new();
+        brokk_bifrost_ruby::graph::hits::record_usage_hit(
+            &attribution,
+            &file,
+            source,
+            &[0],
+            &mut hits,
+            node,
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = hits.first().unwrap();
+        assert_eq!(hit.enclosing, CodeUnit::file_scope(file));
+        assert_eq!(&source[hit.start_offset..hit.end_offset], "target");
+        let mut unproven = BTreeSet::new();
+        brokk_bifrost_ruby::graph::hits::record_unproven_usage_hit(
+            &attribution,
+            &hit.file,
+            source,
+            &[0],
+            &mut unproven,
+            node,
+        );
+        assert_eq!(unproven.len(), 1, "{unproven:?}");
+        assert_eq!(unproven.first().unwrap().enclosing, hit.enclosing);
+    }
 }

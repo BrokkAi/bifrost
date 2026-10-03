@@ -12,7 +12,9 @@ use brokk_bifrost_core::analyzer::capabilities::{
     DescendantIndexScope, DirectDescendantIndex, TypeHierarchyProvider,
 };
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
-use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Language, Range};
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnit, ImportInfo, Language, Range, SignatureMetadata,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -79,33 +81,68 @@ pub trait JavaHierarchyFact: Clone {
     fn raw_supertypes(&self) -> &[String];
 }
 
+/// Why a hierarchy member-selection fact could not be established from the
+/// canonical Java declaration metadata.
+///
+/// The hierarchy walk deliberately keeps this separate from a missing member:
+/// an absent or disagreeing type property must not let the walk continue and
+/// manufacture a lower-confidence owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JavaHierarchyFactError {
+    MetadataUnavailable,
+}
+
 /// Whether `code_unit` is declared as an interface rather than a class.
-pub fn java_is_interface(source: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    code_unit.is_class()
-        && source.signatures(code_unit).iter().any(|signature| {
-            signature
-                .split_whitespace()
-                .any(|token| token == "interface")
-        })
+///
+/// The answer is a canonical declaration property, so a missing metadata row
+/// or disagreeing alternatives is deliberately unavailable instead of being
+/// interpreted as an ordinary class.
+pub fn java_is_interface(
+    source: &dyn CodeUnitIndex,
+    code_unit: &CodeUnit,
+) -> Result<bool, JavaHierarchyFactError> {
+    if !code_unit.is_class() {
+        return Ok(false);
+    }
+    java_interface_metadata_value(&source.signature_metadata(code_unit))
+}
+
+fn java_interface_metadata_value(
+    alternatives: &[SignatureMetadata],
+) -> Result<bool, JavaHierarchyFactError> {
+    let first = alternatives
+        .first()
+        .ok_or(JavaHierarchyFactError::MetadataUnavailable)?;
+    let is_interface = first.class_like_is_interface();
+    alternatives
+        .iter()
+        .all(|alternative| alternative.class_like_is_interface() == is_interface)
+        .then_some(is_interface)
+        .ok_or(JavaHierarchyFactError::MetadataUnavailable)
 }
 
 /// Prefer class owners over interface owners at one Java hierarchy
 /// level. When no class declares the applicable member, every interface owner
-/// remains a peer so callers can preserve honest ambiguity.
+/// remains a peer so callers can preserve honest ambiguity. A single owner is
+/// already unambiguous and does not require the interface marker.
 pub fn java_preferred_declaring_owners(
     source: &dyn CodeUnitIndex,
     owners: &[CodeUnit],
-) -> Vec<CodeUnit> {
-    let class_owners = owners
-        .iter()
-        .filter(|owner| !java_is_interface(source, owner))
-        .cloned()
-        .collect::<Vec<_>>();
-    if class_owners.is_empty() {
+) -> Result<Vec<CodeUnit>, JavaHierarchyFactError> {
+    if owners.len() <= 1 {
+        return Ok(owners.to_vec());
+    }
+    let mut class_owners = Vec::new();
+    for owner in owners {
+        if !java_is_interface(source, owner)? {
+            class_owners.push(owner.clone());
+        }
+    }
+    Ok(if class_owners.is_empty() {
         owners.to_vec()
     } else {
         class_owners
-    }
+    })
 }
 
 /// The owners on the *nearest* supertype level of `owner` that declare the
@@ -117,17 +154,18 @@ pub fn java_preferred_declaring_owners(
 /// declaration of the same name is the one that level's declaration overrides,
 /// never a competing candidate.
 ///
-/// `None` means no ancestor level declares the member at all -- either the
+/// `Ok(None)` means no ancestor level declares the member at all -- either the
 /// hierarchy is exhausted or the declaring supertype is outside the workspace.
 /// A returned vector holding more than one owner is honest ambiguity: two
 /// unrelated interfaces at the same distance both declare the name, and no
-/// caller may choose between them.
+/// caller may choose between them. `Err` means the caller's canonical fact
+/// predicate could not answer, so the walk must remain unproven.
 pub fn java_nearest_declaring_ancestors(
     source: &dyn CodeUnitIndex,
     provider: &dyn TypeHierarchyProvider,
     owner: &CodeUnit,
-    mut declares: impl FnMut(&CodeUnit) -> bool,
-) -> Option<Vec<CodeUnit>> {
+    mut declares: impl FnMut(&CodeUnit) -> Result<bool, JavaHierarchyFactError>,
+) -> Result<Option<Vec<CodeUnit>>, JavaHierarchyFactError> {
     let mut seen = HashSet::from_iter([owner.clone()]);
     let mut level = provider.get_direct_ancestors(owner);
     while !level.is_empty() {
@@ -137,17 +175,17 @@ pub fn java_nearest_declaring_ancestors(
             if !seen.insert(ancestor.clone()) {
                 continue;
             }
-            if declares(&ancestor) {
+            if declares(&ancestor)? {
                 declaring_owners.push(ancestor.clone());
             }
             next_level.extend(provider.get_direct_ancestors(&ancestor));
         }
         if !declaring_owners.is_empty() {
-            return Some(java_preferred_declaring_owners(source, &declaring_owners));
+            return java_preferred_declaring_owners(source, &declaring_owners).map(Some);
         }
         level = next_level;
     }
-    None
+    Ok(None)
 }
 
 /// The uncached half of the analyzer's `get_direct_ancestors`.
@@ -652,5 +690,33 @@ fn same_source_hierarchy_identity<F: JavaHierarchyFact>(
         exact
     } else {
         resolved
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn interface_fact_requires_complete_agreement() {
+        let interface =
+            SignatureMetadata::new("interface I {}", Vec::new()).with_class_like_interface(true);
+        let class = SignatureMetadata::new("class I {}", Vec::new());
+        assert_eq!(
+            java_interface_metadata_value(std::slice::from_ref(&interface)),
+            Ok(true)
+        );
+        assert_eq!(
+            java_interface_metadata_value(&[interface.clone(), interface.clone()]),
+            Ok(true)
+        );
+        assert_eq!(
+            java_interface_metadata_value(&[interface, class]),
+            Err(JavaHierarchyFactError::MetadataUnavailable)
+        );
+        assert_eq!(
+            java_interface_metadata_value(&[]),
+            Err(JavaHierarchyFactError::MetadataUnavailable)
+        );
     }
 }

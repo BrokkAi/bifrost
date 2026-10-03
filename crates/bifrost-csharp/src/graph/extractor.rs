@@ -67,10 +67,11 @@ pub struct PreparedCSharpFile {
     using_aliases: Arc<HashMap<String, String>>,
 }
 
-pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<PreparedCSharpFile> {
-    let Ok(source) = file.read_to_string() else {
-        return None;
-    };
+pub fn prepare_file(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    source: String,
+) -> Option<PreparedCSharpFile> {
     if source.is_empty() {
         return None;
     }

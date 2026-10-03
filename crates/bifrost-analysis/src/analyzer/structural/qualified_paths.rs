@@ -524,6 +524,10 @@ fn resolve_segments(
                 SegmentResolutionStatus::Unresolved
             }
             DefinitionLookupStatus::UnresolvableImportBoundary
+            | DefinitionLookupStatus::Unavailable
+            | DefinitionLookupStatus::Incomplete
+            | DefinitionLookupStatus::Cancelled
+            | DefinitionLookupStatus::ExceededBudget(_)
             | DefinitionLookupStatus::UnsupportedLanguage
             | DefinitionLookupStatus::InvalidLocation => SegmentResolutionStatus::Incomplete,
         };

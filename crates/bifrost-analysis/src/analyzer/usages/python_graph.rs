@@ -11,10 +11,11 @@ use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
+use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    parse_and_collect_with_domain,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
+    build_edge_output_with_completeness, parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
@@ -90,7 +91,7 @@ fn build_python_edges<Output, F>(
     domain: EdgeNodeDomain<'_>,
     targets: Option<&HashSet<String>>,
     keep_file: F,
-) -> Output
+) -> Option<Output>
 where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
@@ -101,35 +102,52 @@ where
         PythonEdgeScan::new(domain.callers(), targets)
     });
     let scope = AnalyzerQueryScope::new(analyzer);
-    let cancellation = crate::CancellationToken::new();
-    match crate::analyzer::relational_frontier::resolve_relational_frontier(
-        analyzer,
-        &cancellation,
-        |frontier| {
-            let graph = PythonGraphSource {
-                token: scope.token(),
-                index: analyzer,
-                hierarchy: analyzer.type_hierarchy_provider(),
-                imports: analyzer.import_analysis_provider(),
-                definitions: frontier,
-            };
-            build_edge_output(&files, &keep_file, |file| {
-                parse_and_collect_with_domain(
+    let result = build_edge_output_with_completeness(&files, keep_file, |file| {
+        let mut unavailable = false;
+        let edges = parse_and_collect_with_domain(
+            analyzer,
+            file,
+            domain,
+            ParseSpec::whole(&language),
+            |input| {
+                let cancellation = crate::CancellationToken::new();
+                match crate::analyzer::relational_frontier::resolve_relational_frontier(
                     analyzer,
-                    file,
-                    domain,
-                    ParseSpec::whole(&language),
-                    |input| scan.scan_file(&graph, py, file, input),
-                )
-            })
-        },
-    ) {
-        crate::analyzer::RelationalFrontierOutcome::Complete(edges) => edges,
-        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            unreachable!("an uncancelled Python edge frontier cannot cancel")
-        }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            panic!("Python relational edge frontier failed: {error:?}")
+                    &cancellation,
+                    |frontier| {
+                        let graph = PythonGraphSource {
+                            token: scope.token(),
+                            index: analyzer,
+                            hierarchy: analyzer.type_hierarchy_provider(),
+                            imports: analyzer.import_analysis_provider(),
+                            definitions: frontier,
+                        };
+                        scan.scan_file(&graph, py, file, input)
+                    },
+                ) {
+                    crate::analyzer::RelationalFrontierOutcome::Complete(edges) => edges,
+                    crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                        unreachable!("an uncancelled Python edge frontier cannot cancel")
+                    }
+                    crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+                        panic!("Python relational edge frontier failed: {error:?}")
+                    }
+                }
+                .unwrap_or_else(|_| {
+                    unavailable = true;
+                    Default::default()
+                })
+            },
+        );
+        (!unavailable).then_some(edges).flatten()
+    });
+    match result {
+        UsageEdgeBuildResult::Complete(output) => Some(output),
+        UsageEdgeBuildResult::Uncacheable { omitted_files, .. } => {
+            analyzer.record_query_failure(StoreError::new(format!(
+                "Python usage edge build omitted files: {omitted_files:?}"
+            )));
+            None
         }
     }
 }
@@ -143,13 +161,13 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
-    Some(build_python_edges(
+    build_python_edges(
         analyzer,
         resolver.py,
         EdgeNodeDomain::Rooted(callers),
         None,
         keep_file,
-    ))
+    )
 }
 
 /// Build caller nodes for the whole Python graph while resolving only the
@@ -164,7 +182,7 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
     targets: &HashSet<String>,
 ) -> Option<Arc<UsageEdges>> {
     let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-    let edges = py.usage_edges_for_targets(nodes, targets, || {
+    py.usage_edges_for_targets(nodes, targets, || {
         let resolver = PythonEdgeResolver::try_new(analyzer)
             .expect("resolved Python analyzer must construct a Python edge resolver");
         build_python_edges(
@@ -174,8 +192,7 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
             Some(targets),
             |_| true,
         )
-    });
-    Some(edges)
+    })
 }
 
 pub(crate) fn build_python_usage_edge_weights<F>(
@@ -187,7 +204,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    resolver.build_edge_weights(analyzer, nodes, keep_file)
 }
 
 pub(crate) fn python_usage_candidate_files(
@@ -299,14 +316,31 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             ) {
                 crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(
                     results,
-                ) => results.into_iter().fold(
-                    brokk_bifrost_python::graph::extractor::ScanResult::default(),
-                    |mut result, file_result| {
-                        result.hits.extend(file_result.hits);
-                        result.unproven_hits.extend(file_result.unproven_hits);
-                        result
-                    },
-                ),
+                ) => {
+                    let mut result = brokk_bifrost_python::graph::extractor::ScanResult::default();
+                    let mut missing_files = HashSet::default();
+                    for file_result in results {
+                        match file_result {
+                            Ok(file_result) => {
+                                result.hits.extend(file_result.hits);
+                                result.unproven_hits.extend(file_result.unproven_hits);
+                            }
+                            Err(file) => {
+                                missing_files.insert(file);
+                            }
+                        }
+                    }
+                    if !missing_files.is_empty() {
+                        analyzer.record_query_failure(StoreError::new(format!(
+                            "Python usage scan omitted files: {missing_files:?}"
+                        )));
+                        return Err(GraphFailureReason::UnsupportedTargetShape(
+                            "canonical Python source facts were unavailable",
+                        )
+                        .diagnostic(target.fq_name(), PYTHON_STRATEGY));
+                    }
+                    result
+                }
                 crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(
                     _,
                 ) => return Ok(CandidateUsageHits::default()),
@@ -355,7 +389,7 @@ impl<'a> PythonEdgeResolver<'a> {
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdgeWeights
+    ) -> Option<UsageEdgeWeights>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -422,40 +456,23 @@ mod tests {
     use super::{build_cached_python_usage_edges_for_targets, build_rooted_python_usage_edges};
     use crate::analyzer::usages::python_graph::with_python_graph_source;
     use crate::analyzer::{AnalyzerQueryScope, AnalyzerTestHooks, QueryScope};
-    use crate::analyzer::{CodeUnitIndex, Language, PythonAnalyzer, TestProject};
+    use crate::analyzer::{CodeUnitIndex, ImportAnalysisProvider, Language, PythonAnalyzer};
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_python::graph::extractor::{
         collect_scope_facts_from_parsed_source, with_callable_return_type_lookup_counter_for_test,
     };
     use brokk_bifrost_python::graph_support::PythonSource;
-    use std::fs;
 
-    /// The imported-factory return-type walk must read the analyzer's prepared
-    /// syntax, not clone the file source and build its own parser per class
-    /// member.
-    ///
-    /// Both counter arms are asserted. `reparsed == 0` alone would pass
-    /// vacuously on a fixture that never reaches the walk, so `prepared > 0`
-    /// is what proves the walk ran at all.
+    /// Imported annotations remain available from captured declaration metadata
+    /// when the declaration's source file is no longer readable.
     #[test]
-    fn imported_factory_return_walk_uses_prepared_syntax_not_a_reparse() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let write = |path: &str, contents: &str| {
-            let full = root.join(path);
-            if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent).expect("create parent directories");
-            }
-            fs::write(&full, contents).expect("write fixture");
-        };
-        write(
-            "models.py",
-            "class User:\n    @property\n    def normalized_name(self) -> str:\n        return \"n\"\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls()\n",
-        );
+    fn imported_factory_return_walk_uses_canonical_declarations() {
         let consumer_source = "from models import User\n\n\ndef run():\n    user = User.guest()\n    return user.normalized_name\n";
-        write("consumer.py", consumer_source);
-
-        let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("models.py", "class User:\n    @property\n    def normalized_name(self) -> str:\n        return \"n\"\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls()\n")
+            .file("consumer.py", consumer_source)
+            .build();
+        let analyzer = PythonAnalyzer::new(fixture.project_dyn());
         assert!(
             !analyzer
                 .get_definitions("models.User.normalized_name")
@@ -472,8 +489,14 @@ mod tests {
             .prepared_syntax(scope.token(), &consumer)
             .expect("consumer prepared syntax");
 
-        let (_facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {
+        let (facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {
             with_python_graph_source(&analyzer, |graph| {
+                let models = fixture.file("models.py");
+                let captured = analyzer
+                    .prepared_syntax(graph.token, &models)
+                    .expect("capture foreign declaration snapshot");
+                assert!(captured.source().contains("def guest"));
+                std::fs::remove_file(models.abs_path()).expect("remove declaration source");
                 collect_scope_facts_from_parsed_source(
                     &graph,
                     &analyzer,
@@ -481,16 +504,197 @@ mod tests {
                     prepared.source(),
                     prepared.tree().root_node(),
                 )
+                .expect("captured Python scope facts")
             })
         });
 
+        assert!(!facts.is_empty());
         assert!(
-            counts.prepared > 0,
+            counts.canonical > 0,
             "fixture must exercise the return-type walk: {counts:?}"
         );
         assert_eq!(
-            counts.reparsed, 0,
-            "return-type extraction must reuse the analyzer's prepared syntax rather than reparsing the file per class member: {counts:?}"
+            counts.body, 0,
+            "annotated returns must use captured metadata without body inference: {counts:?}"
+        );
+    }
+    #[test]
+    fn export_index_uses_captured_scope_and_order_after_source_removal() {
+        use brokk_bifrost_core::analyzer::usages::model::ExportEntry;
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("source.py", "class Target:\n    pass\n")
+            .file("exports.py", "from source import Target as early\nearly = 1\nlate = 2\nfrom source import Target as late\ndef hidden():\n    from source import Target as local\nmatch 1:\n    case 1:\n        from source import Target as matched\n")
+            .build();
+        let analyzer = PythonAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("exports.py");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let declarations = analyzer.top_level_declarations(&file);
+        assert!(
+            declarations.iter().any(|unit| unit.identifier() == "early"),
+            "captured declarations: {declarations:?}"
+        );
+        let imports = analyzer.import_info_of(scope.token(), &file);
+        assert_eq!(imports.len(), 4);
+        std::fs::remove_file(file.abs_path()).expect("remove exported module source");
+        let exports = analyzer.export_index_of(scope.token(), &file);
+        assert!(matches!(
+            exports.exports_by_name.get("early"),
+            Some(ExportEntry::Local { .. })
+        ));
+        assert!(matches!(
+            exports.exports_by_name.get("late"),
+            Some(ExportEntry::ReexportedNamed { .. })
+        ));
+        assert!(matches!(
+            exports.exports_by_name.get("matched"),
+            Some(ExportEntry::ReexportedNamed { .. })
+        ));
+        assert!(!exports.exports_by_name.contains_key("local"));
+    }
+
+    #[test]
+    fn module_replacement_uses_canonical_import_statement_order() {
+        use brokk_bifrost_python::imports::module_replacement_of;
+        for (source, expected) in [
+            (
+                "import sys as runtime, target as chosen\nruntime.modules[__name__] = chosen\n",
+                Some("target"),
+            ),
+            (
+                "import target as chosen\nruntime.modules[__name__] = chosen\nimport sys as runtime\n",
+                None,
+            ),
+            (
+                "import sys as runtime, target as chosen\nruntime = object()\nruntime.modules[__name__] = chosen\n",
+                None,
+            ),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Python)
+                .file("target.py", "class Target:\n    pass\n")
+                .file("facade.py", source)
+                .build();
+            let analyzer = PythonAnalyzer::new(fixture.project_dyn());
+            let file = fixture.file("facade.py");
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let imports = analyzer.import_info_of(scope.token(), &file);
+            assert_eq!(imports.len(), 2);
+            let replacement = module_replacement_of(&analyzer, &file, source, &imports);
+            assert_eq!(
+                replacement
+                    .as_ref()
+                    .map(|value| value.target_module.as_str()),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_index_uses_unsaved_import_scope_instead_of_disk() {
+        use crate::analyzer::{OverlayProject, Project};
+        use brokk_bifrost_core::analyzer::usages::model::ExportEntry;
+        use std::sync::Arc;
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("source.py", "class Target:\n    pass\n")
+            .file("exports.py", "from source import Target as disk\n")
+            .build();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let file = fixture.file("exports.py");
+        assert!(overlay.set(file.abs_path(), "from source import Target as unsaved\ndef hidden():\n    from source import Target as local\n".to_owned()));
+        let analyzer = PythonAnalyzer::new(overlay as Arc<dyn Project>);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let exports = analyzer.export_index_of(scope.token(), &file);
+        assert!(matches!(
+            exports.exports_by_name.get("unsaved"),
+            Some(ExportEntry::ReexportedNamed { .. })
+        ));
+        assert!(!exports.exports_by_name.contains_key("disk"));
+        assert!(!exports.exports_by_name.contains_key("local"));
+    }
+    #[test]
+    fn python_primary_facts_survive_reopen_and_unsaved_replacement() {
+        use crate::analyzer::structural::provider::{
+            StructuralFactsCacheOutcome, StructuralFactsLimitedOutcome,
+        };
+        use crate::analyzer::{AnalyzerConfig, OverlayProject, Project, WorkspaceAnalyzer};
+        use crate::gitblob::test_repo::{commit_all, init_repo};
+        use std::sync::Arc;
+        let source_a = "from typing import Optional\nclass User:\n    pass\ndef create() -> Optional[User]:\n    return User()\n";
+        let source_b = "from typing import Optional\nclass Other:\n    pass\ndef create() -> Optional[Other]:\n    return Other()\n";
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("models.py", source_a)
+            .build();
+        let repo = init_repo(fixture.root());
+        commit_all(&repo, "Python canonical source fixture");
+        let file = fixture.file("models.py");
+        let first = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            fixture.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("publish Python source facts");
+        assert!(first.persisted_store_path().is_some());
+        drop(first);
+        let reopened = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            fixture.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("reopen Python source facts");
+        let provider = reopened
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .next()
+            .expect("Python provider");
+        let StructuralFactsLimitedOutcome::Available {
+            facts,
+            cache_outcome,
+        } = provider.structural_facts_limited(&file, source_a, usize::MAX, None)
+        else {
+            panic!("ready persisted Python facts");
+        };
+        assert_eq!(facts.source(), source_a);
+        assert!(!facts.nodes().is_empty());
+        assert_ne!(cache_outcome, StructuralFactsCacheOutcome::Extracted);
+        assert_eq!(provider.structural_extraction_count(), 0);
+        let create = reopened
+            .analyzer()
+            .definitions("models.create")
+            .next()
+            .expect("persisted callable");
+        let metadata = reopened.analyzer().signature_metadata(&create);
+        assert_eq!(
+            metadata[0]
+                .return_type_identity()
+                .and_then(|identity| identity.nominal_name())
+                .map(|name| name.path()),
+            Some(["User".to_owned()].as_slice())
+        );
+
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(file.abs_path(), source_b.to_owned()));
+        let dirty = reopened.clone_with_project(overlay as Arc<dyn Project>);
+        let provider = dirty
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .next()
+            .expect("dirty Python provider");
+        let facts = provider
+            .structural_facts(&file)
+            .expect("dirty canonical Python facts");
+        assert_eq!(facts.source(), source_b);
+        let create = dirty
+            .analyzer()
+            .definitions("models.create")
+            .next()
+            .expect("dirty callable");
+        let metadata = dirty.analyzer().signature_metadata(&create);
+        assert_eq!(
+            metadata[0]
+                .return_type_identity()
+                .and_then(|identity| identity.nominal_name())
+                .map(|name| name.path()),
+            Some(["Other".to_owned()].as_slice())
         );
     }
 
@@ -615,6 +819,53 @@ mod tests {
                 .any(|(_, callee)| callee == "real.helper"),
             "a namespace-fallback candidate outside the requested target set must not be \
              recorded as an edge in bounded mode: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// An empty `pkg/__init__.py` is ordinary Python: it declares the package and
+    /// contributes no edges. The whole-workspace inverted pass fails closed on any
+    /// file whose scan produced no per-file result, so an empty file that the
+    /// on-demand parse refuses to parse takes the entire graph down with it -- the
+    /// build returns `None` and every caller of `usage_graph` on a package with an
+    /// empty `__init__.py` gets "Python usage edge build omitted files".
+    ///
+    /// `build_rooted_python_usage_edges` returns `Some` only when the driver saw a
+    /// result for every kept file: the other `None` is a workspace with no Python
+    /// files at all, which the assertion below rules out.
+    #[test]
+    fn empty_package_init_is_scanned_rather_than_omitted() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("pkg/__init__.py", "")
+            .file("pkg/models.py", "def load():\n    return 1\n")
+            .file(
+                "consumer.py",
+                "from pkg.models import load\n\n\ndef run():\n    return load()\n",
+            )
+            .build();
+
+        let analyzer = PythonAnalyzer::from_project(project.project().clone());
+        let package_init = project.file("pkg/__init__.py");
+        let analyzed = analyzer.get_analyzed_files();
+        assert!(
+            analyzed.contains(&package_init),
+            "the empty package init must be part of the scanned workspace: {analyzed:?}"
+        );
+        let callers: crate::hash::HashSet<String> = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+
+        let edges = build_rooted_python_usage_edges(&analyzer, &callers, |_| true).expect(
+            "an empty package init contributes no edges and must not be reported as omitted",
+        );
+
+        assert!(
+            edges
+                .edges
+                .contains_key(&("consumer.run".to_string(), "pkg.models.load".to_string())),
+            "the rest of the package must still resolve: {:?}",
             edges.edges.keys().collect::<Vec<_>>()
         );
     }

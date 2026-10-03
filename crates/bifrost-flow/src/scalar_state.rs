@@ -8,13 +8,14 @@
 #[cfg(test)]
 use crate::analyzer::semantic::MoveInvalidation;
 use crate::analyzer::semantic::{
-    CallSiteId, CaptureMode, CaptureSource, ControlEdgeId, GuardFact, GuardPredicate,
-    IntegerComparison, MemoryLocationKind, ProcedureHandle, ProcedureId, ProcedureSemantics,
-    ProgramPointId, SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapImpact,
-    SemanticGapSubject, SemanticValueKind, TransferKind, TransferOperation, ValueFlowKind, ValueId,
-    ValuePreservation, ValueTransfer,
+    BindingOriginIndex, CallSiteId, CaptureMode, CaptureSource, ControlEdgeId, GuardFact,
+    GuardPredicate, IntegerComparison, MemoryLocationKind, ProcedureHandle, ProcedureId,
+    ProcedureSemantics, ProgramPointId, SemanticCapability, SemanticEffect, SemanticGapDischarge,
+    SemanticGapImpact, SemanticGapSubject, SemanticValueKind, TransferKind, TransferOperation,
+    ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::go_scalar_binding::{GoScalarType, go_scalar_binding_types};
 use brokk_bifrost_analysis::analyzer::java_integral_parameter::{
     JavaIntegralDomain, JavaScalarType, java_scalar_binding_types,
 };
@@ -605,6 +606,11 @@ pub enum ScalarBindingType {
     DynamicBinary64,
     /// A statically typed Boolean binding, which holds no number.
     Boolean,
+    /// A binding whose numeric representation the producer did not
+    /// establish. A number stored in it is unknown, because its width and
+    /// conversion decide what arithmetic on it yields; nil and Boolean facts
+    /// are kept.
+    UnknownNumeric,
 }
 
 /// Numeric typing for one procedure's bindings: explicit per-value types and
@@ -625,6 +631,14 @@ impl ScalarTyping {
 
     /// Every local and parameter is a JavaScript-style binary64 number
     /// whenever it holds a number.
+    /// Give every local and parameter without an explicit type `binding_type`.
+    pub fn with_default(self, binding_type: ScalarBindingType) -> Self {
+        Self {
+            default_binding: Some(binding_type),
+            ..self
+        }
+    }
+
     pub fn dynamic_binary64() -> Self {
         Self {
             bindings: HashMap::default(),
@@ -678,7 +692,7 @@ impl ScalarBindingType {
                 Some(ScalarFact::Float(ScalarFloatRange::any()))
             }
             ScalarBindingType::Boolean => Some(ScalarFact::EitherBoolean),
-            ScalarBindingType::DynamicBinary64 => None,
+            ScalarBindingType::DynamicBinary64 | ScalarBindingType::UnknownNumeric => None,
         }
     }
 
@@ -718,6 +732,10 @@ impl ScalarBindingType {
             (ScalarBindingType::DynamicBinary64, ScalarFact::NonExactInteger) => {
                 ScalarFact::Unknown
             }
+            (
+                ScalarBindingType::UnknownNumeric,
+                ScalarFact::Integer(_) | ScalarFact::NonExactInteger | ScalarFact::Float(_),
+            ) => ScalarFact::Unknown,
             (
                 ScalarBindingType::Boolean,
                 ScalarFact::Integer(_) | ScalarFact::NonExactInteger | ScalarFact::Float(_),
@@ -853,18 +871,18 @@ pub struct ScalarEntryFact {
 /// primitive or boxed numeric formal and local, so each write takes the
 /// declared type.
 #[derive(Debug, Clone)]
-pub struct JavaScalarSeeds {
+pub struct ScalarSeeds {
     pub entry_facts: Vec<ScalarEntryFact>,
     pub typing: ScalarTyping,
 }
 
-/// Derive [`JavaScalarSeeds`] from declarations. The source tree must be
+/// Derive [`ScalarSeeds`] from declarations. The source tree must be
 /// acquired from the same analyzer snapshot as `procedure`; unsupported
 /// declaration shapes have no seed and stay untyped and unknown.
 pub fn java_scalar_seeds(
     procedure: &ProcedureHandle,
     prepared: &PreparedSyntaxTree,
-) -> JavaScalarSeeds {
+) -> ScalarSeeds {
     let semantics = procedure.semantics();
     let mut entry_facts = Vec::new();
     let mut bindings = Vec::new();
@@ -908,9 +926,47 @@ pub fn java_scalar_seeds(
             });
         }
     }
-    JavaScalarSeeds {
+    ScalarSeeds {
         entry_facts,
         typing: ScalarTyping::with_bindings(bindings),
+    }
+}
+
+/// Derive [`ScalarSeeds`] for a Go procedure from declarations; see
+/// [`go_scalar_binding_types`]. Every other local and parameter keeps no
+/// numeric fact, because its integer width is unknown. A typed formal starts
+/// in its full domain, since Go has no boxing.
+pub fn go_scalar_seeds(procedure: &ProcedureHandle, prepared: &PreparedSyntaxTree) -> ScalarSeeds {
+    let semantics = procedure.semantics();
+    let mut entry_facts = Vec::new();
+    let mut bindings = Vec::new();
+    for (target, scalar_type) in go_scalar_binding_types(procedure, prepared) {
+        let binding_type = match scalar_type {
+            GoScalarType::Signed(bits) => {
+                ScalarBindingType::MachineInteger(ScalarIntegerDomain::signed(bits))
+            }
+            GoScalarType::Unsigned(bits) => {
+                ScalarBindingType::MachineInteger(ScalarIntegerDomain::unsigned(bits))
+            }
+            GoScalarType::Boolean => ScalarBindingType::Boolean,
+        };
+        bindings.push((target, binding_type));
+        if semantics
+            .value(target)
+            .is_some_and(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+        {
+            entry_facts.push(ScalarEntryFact {
+                target,
+                fact: binding_type
+                    .static_domain()
+                    .expect("a Go scalar type has a static domain"),
+            });
+        }
+    }
+    ScalarSeeds {
+        entry_facts,
+        typing: ScalarTyping::with_bindings(bindings)
+            .with_default(ScalarBindingType::UnknownNumeric),
     }
 }
 
@@ -974,8 +1030,24 @@ impl ScalarStateDerivation {
         let semantics = procedure.semantics();
         let value_count = semantics.values().len();
         let point_count = semantics.points().len();
-        let closed_cells = closed_scalar_cells(procedure, call_effects.modeled_address_calls);
-        let shared_captures = shared_capture_bindings(procedure);
+        let binding_origins = BindingOriginIndex::new(procedure);
+        let address_taken_bindings = address_taken_bindings(&binding_origins);
+        let (escaped_address_bindings, address_escape_bindings_by_point) = address_escape_bindings(
+            procedure,
+            call_effects.modeled_address_calls,
+            &address_taken_bindings,
+        );
+        let transfer_context = ScalarTransferContext {
+            procedure,
+            binding_origins,
+            modeled_address_calls: call_effects.modeled_address_calls,
+            closed_cells: closed_scalar_cells(procedure, call_effects.modeled_address_calls),
+            address_taken_bindings,
+            escaped_address_bindings,
+            address_escape_bindings_by_point,
+            shared_captures: shared_capture_bindings(procedure),
+            typing,
+        };
         let mut states = vec![None::<Box<[ScalarFact]>>; point_count];
         let mut incoming = vec![None::<Box<[ScalarFact]>>; point_count];
         let mut entry = vec![ScalarFact::Unreachable; value_count];
@@ -1022,15 +1094,7 @@ impl ScalarStateDerivation {
             let Some(mut state) = incoming[point.index()].clone() else {
                 continue;
             };
-            transfer_point(
-                procedure,
-                point,
-                &mut state,
-                call_effects.modeled_address_calls,
-                &closed_cells,
-                &shared_captures,
-                typing,
-            );
+            transfer_point(&transfer_context, point, &mut state);
             if states[point.index()].as_ref() == Some(&state) {
                 continue;
             }
@@ -1191,6 +1255,130 @@ fn guard_operand(guard: &GuardFact) -> Option<ValueId> {
     }
 }
 
+/// The predicate of each non-constant guard whose operand reads a formal
+/// parameter directly, paired with that formal. The binding is the one the
+/// derivation's refinement reads, so an entry fact on the formal decides the
+/// guard exactly when [`guard_decides`] says so. A guard on a local copied
+/// from a formal is not listed.
+pub(crate) fn formal_guards(procedure: &ProcedureHandle) -> Vec<(GuardPredicate, ValueId)> {
+    let semantics = procedure.semantics();
+    let mut guards = semantics
+        .guard_facts()
+        .iter()
+        .filter(|guard| !matches!(guard.predicate, GuardPredicate::ConstantBoolean { .. }))
+        .filter_map(|guard| Some((guard.predicate, guard_operand(guard)?)))
+        .peekable();
+    if guards.peek().is_none() {
+        return Vec::new();
+    }
+    let origins = BindingOriginIndex::new(procedure);
+    guards
+        .filter_map(|(predicate, operand)| {
+            let binding = origins.unique_binding_origin(operand).unwrap_or(operand);
+            matches!(
+                semantics.value(binding)?.kind,
+                SemanticValueKind::Parameter { .. }
+            )
+            .then_some((predicate, binding))
+        })
+        .collect()
+}
+
+/// Which values of one procedure a parameter entry fact can change in its
+/// scalar derivation.
+///
+/// Entry facts seed only formal parameters. This is a flow-insensitive
+/// forward closure from them over every edge along which the derivation's
+/// transfer copies a fact: assignments, value flows (including integer
+/// offsets and transfers), and stores to and loads from lexical cells. A value
+/// outside the closure takes its fact from constants and unknowns alone, so
+/// an entry fact can change it only by changing control: by deciding a guard
+/// whose operand is in the closure. One such guard anywhere makes every value
+/// dependent.
+///
+/// The test over-approximates. A flow the derivation would drop (an escaping
+/// cell, a value-changing conversion) still counts, and a dependent guard
+/// counts for values it does not dominate. What it does not model is
+/// widening: the per-point join count can differ between a derivation with
+/// entry facts and one without, and that can move where an integer bound is
+/// widened away.
+pub(crate) struct ParameterDependence {
+    every_value: bool,
+    values: HashSet<ValueId>,
+}
+
+impl ParameterDependence {
+    pub(crate) fn new(procedure: &ProcedureHandle) -> Self {
+        let semantics = procedure.semantics();
+        let mut successors = HashMap::<ValueId, Vec<ValueId>>::default();
+        for point in semantics.points() {
+            for event in &point.events {
+                let (source, target) = match event.effect {
+                    SemanticEffect::Assignment { target, value } => (value, target),
+                    SemanticEffect::ValueFlow {
+                        kind:
+                            ValueFlowKind::Local
+                            | ValueFlowKind::BackingStore { .. }
+                            | ValueFlowKind::Parameter
+                            | ValueFlowKind::Receiver
+                            | ValueFlowKind::Return
+                            | ValueFlowKind::IndexedReturn { .. }
+                            | ValueFlowKind::IntegerOffset { .. }
+                            | ValueFlowKind::Transfer(_),
+                        source,
+                        target,
+                    } => (source, target),
+                    SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } => match semantics.memory_location(location).map(|row| &row.kind) {
+                        Some(MemoryLocationKind::LexicalCell { binding }) => (*binding, result),
+                        _ => continue,
+                    },
+                    SemanticEffect::MemoryStore {
+                        location, value, ..
+                    } => match semantics.memory_location(location).map(|row| &row.kind) {
+                        Some(MemoryLocationKind::LexicalCell { binding }) => (value, *binding),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                successors.entry(source).or_default().push(target);
+            }
+        }
+        let mut pending = semantics
+            .values()
+            .iter()
+            .filter(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        let mut values = HashSet::default();
+        while let Some(value) = pending.pop() {
+            if values.insert(value) {
+                pending.extend(successors.get(&value).into_iter().flatten().copied());
+            }
+        }
+        let origins = BindingOriginIndex::new(procedure);
+        let every_value = semantics.guard_facts().iter().any(|guard| {
+            !matches!(guard.predicate, GuardPredicate::ConstantBoolean { .. })
+                && guard_operand(guard).is_some_and(|operand| {
+                    values.contains(&operand)
+                        || origins
+                            .unique_binding_origin(operand)
+                            .is_some_and(|binding| values.contains(&binding))
+                })
+        });
+        Self {
+            every_value,
+            values,
+        }
+    }
+
+    /// Whether an entry fact can change the derived fact of any of `values`.
+    pub(crate) fn any(&self, values: impl IntoIterator<Item = ValueId>) -> bool {
+        self.every_value || values.into_iter().any(|value| self.values.contains(&value))
+    }
+}
+
 /// Every guard's refinements keyed by the edge that applies them, and per
 /// guard ID the binding its refinement reads.
 struct GuardRefinements {
@@ -1318,6 +1506,35 @@ fn closed_scalar_cells(
         .collect()
 }
 
+/// Bindings whose addresses are represented in this procedure's semantic IR.
+fn address_taken_bindings(origins: &BindingOriginIndex) -> HashSet<ValueId> {
+    origins.address_taken_bindings().into_iter().collect()
+}
+
+/// Address escape points grouped by their possible binding origins. Calls and
+/// suspensions also release every escaped binding, because a retained writer
+/// can run again there.
+fn address_escape_bindings(
+    procedure: &ProcedureHandle,
+    modeled_address_calls: &[CallSiteId],
+    address_taken: &HashSet<ValueId>,
+) -> (HashSet<ValueId>, HashMap<ProgramPointId, HashSet<ValueId>>) {
+    let semantics = procedure.semantics();
+    let mut escaped_bindings = HashSet::default();
+    let mut escapes_by_point = HashMap::<ProgramPointId, HashSet<ValueId>>::default();
+    for &binding in address_taken {
+        let aliases =
+            crate::flow_state::address_alias_values(semantics, &HashSet::from_iter([binding]));
+        for point in
+            crate::flow_state::address_escape_points(semantics, &aliases, modeled_address_calls)
+        {
+            escaped_bindings.insert(binding);
+            escapes_by_point.entry(point).or_default().insert(binding);
+        }
+    }
+    (escaped_bindings, escapes_by_point)
+}
+
 /// Bindings a closure in this procedure shares by reference rather than by
 /// copy. The closure can rebind them whenever it runs. A copying capture, such
 /// as Java's effectively final one, and a captured receiver cannot rebind the
@@ -1364,20 +1581,39 @@ fn shared_capture_bindings(procedure: &ProcedureHandle) -> HashSet<ValueId> {
         .collect()
 }
 
+struct ScalarTransferContext<'procedure, 'calls, 'typing> {
+    procedure: &'procedure ProcedureHandle,
+    binding_origins: BindingOriginIndex,
+    modeled_address_calls: &'calls [CallSiteId],
+    closed_cells: HashSet<ValueId>,
+    address_taken_bindings: HashSet<ValueId>,
+    escaped_address_bindings: HashSet<ValueId>,
+    address_escape_bindings_by_point: HashMap<ProgramPointId, HashSet<ValueId>>,
+    shared_captures: HashSet<ValueId>,
+    typing: &'typing ScalarTyping,
+}
+
 fn transfer_point(
-    procedure: &ProcedureHandle,
+    context: &ScalarTransferContext<'_, '_, '_>,
     point: ProgramPointId,
     state: &mut [ScalarFact],
-    modeled_address_calls: &[CallSiteId],
-    closed_cells: &HashSet<ValueId>,
-    shared_captures: &HashSet<ValueId>,
-    typing: &ScalarTyping,
 ) {
+    let procedure = context.procedure;
+    let binding_origins = &context.binding_origins;
+    let modeled_address_calls = context.modeled_address_calls;
+    let closed_cells = &context.closed_cells;
+    let address_taken_bindings = &context.address_taken_bindings;
+    let escaped_address_bindings = &context.escaped_address_bindings;
+    let address_escape_bindings_by_point = &context.address_escape_bindings_by_point;
+    let shared_captures = &context.shared_captures;
+    let typing = context.typing;
     let semantics = procedure.semantics();
-    // Any call may run a closure, and a suspension lets other code run one.
-    // A binding a closure shares by reference is then no longer known.
-    let release_shared = |state: &mut [ScalarFact]| {
+    // Calls and suspensions can run closures or retained address writers.
+    let release_external_writers = |state: &mut [ScalarFact]| {
         for binding in shared_captures {
+            state[binding.index()] = ScalarFact::Unknown;
+        }
+        for binding in escaped_address_bindings {
             state[binding.index()] = ScalarFact::Unknown;
         }
     };
@@ -1387,6 +1623,11 @@ fn transfer_point(
     let point = semantics
         .point(point)
         .expect("scalar worklist point belongs to its procedure");
+    if let Some(bindings) = address_escape_bindings_by_point.get(&point.id) {
+        for binding in bindings {
+            state[binding.index()] = ScalarFact::Unknown;
+        }
+    }
     for event in &point.events {
         match event.effect {
             SemanticEffect::Assignment { target, value } => {
@@ -1458,7 +1699,7 @@ fn transfer_point(
                 result: Some(target),
                 ..
             } => {
-                release_shared(state);
+                release_external_writers(state);
                 state[target.index()] = ScalarFact::Unknown;
             }
             SemanticEffect::MemoryLoad {
@@ -1473,6 +1714,16 @@ fn transfer_point(
                     {
                         fact_of(semantics, state, *binding)
                     }
+                    Some(MemoryLocationKind::Dereference { address }) => {
+                        let origins = binding_origins.addressed_binding_origins(*address);
+                        if let Some(binding) = origins.unique_binding()
+                            && closed_cells.contains(&binding)
+                        {
+                            fact_of(semantics, state, binding)
+                        } else {
+                            ScalarFact::Unknown
+                        }
+                    }
                     _ => ScalarFact::Unknown,
                 };
                 write(state, result, loaded);
@@ -1480,12 +1731,33 @@ fn transfer_point(
             SemanticEffect::MemoryStore {
                 location, value, ..
             } => {
-                if let Some(MemoryLocationKind::LexicalCell { binding }) = semantics
-                    .memory_location(location)
-                    .map(|location| &location.kind)
-                    && closed_cells.contains(binding)
-                {
-                    write(state, *binding, fact_of(semantics, state, value));
+                if let Some(location) = semantics.memory_location(location) {
+                    match &location.kind {
+                        MemoryLocationKind::LexicalCell { binding }
+                            if closed_cells.contains(binding) =>
+                        {
+                            write(state, *binding, fact_of(semantics, state, value));
+                        }
+                        MemoryLocationKind::Dereference { address } => {
+                            let origins = binding_origins.addressed_binding_origins(*address);
+                            if let Some(binding) = origins.unique_binding()
+                                && closed_cells.contains(&binding)
+                            {
+                                write(state, binding, fact_of(semantics, state, value));
+                            } else {
+                                if origins.is_complete() {
+                                    for &binding in origins.bindings() {
+                                        state[binding.index()] = ScalarFact::Unknown;
+                                    }
+                                } else {
+                                    for binding in address_taken_bindings {
+                                        state[binding.index()] = ScalarFact::Unknown;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             SemanticEffect::Allocation { allocation } => {
@@ -1499,7 +1771,7 @@ fn transfer_point(
                 state[result.index()] = ScalarFact::NonNil;
             }
             SemanticEffect::Invoke { call_site } => {
-                release_shared(state);
+                release_external_writers(state);
                 if modeled_address_calls.contains(&call_site) {
                     continue;
                 }
@@ -1534,7 +1806,7 @@ fn transfer_point(
                             | SemanticCapability::AsyncSuspendResume
                     )
                 {
-                    release_shared(state);
+                    release_external_writers(state);
                 }
             }
             SemanticEffect::Entry
@@ -1549,7 +1821,7 @@ fn transfer_point(
             | SemanticEffect::Throw { .. } => {}
             SemanticEffect::AsyncSuspend { .. }
             | SemanticEffect::AsyncResume { result: None, .. } => {
-                release_shared(state);
+                release_external_writers(state);
             }
         }
     }
@@ -2070,65 +2342,6 @@ fn refine_integer_interval(
     Some(ScalarIntegerInterval::new(lower, upper, interval.domain()))
 }
 
-pub(crate) struct BindingOriginIndex<'procedure> {
-    procedure: &'procedure ProcedureHandle,
-    predecessors: HashMap<ValueId, Vec<ValueId>>,
-}
-
-impl<'procedure> BindingOriginIndex<'procedure> {
-    pub(crate) fn new(procedure: &'procedure ProcedureHandle) -> Self {
-        let semantics = procedure.semantics();
-        let mut predecessors = HashMap::<ValueId, Vec<ValueId>>::default();
-        for point in semantics.points() {
-            for event in &point.events {
-                match event.effect {
-                    SemanticEffect::Assignment { target, value }
-                        if !semantics.value(target).is_some_and(|value| {
-                            matches!(
-                                value.kind,
-                                SemanticValueKind::Local
-                                    | SemanticValueKind::Parameter { .. }
-                                    | SemanticValueKind::Receiver { .. }
-                            )
-                        }) =>
-                    {
-                        predecessors.entry(target).or_default().push(value);
-                    }
-                    SemanticEffect::ValueFlow { source, target, .. } => {
-                        predecessors.entry(target).or_default().push(source);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Self {
-            procedure,
-            predecessors,
-        }
-    }
-
-    pub(crate) fn unique_binding_origin(&self, subject: ValueId) -> Option<ValueId> {
-        let semantics = self.procedure.semantics();
-        let mut pending = vec![subject];
-        let mut visited = HashSet::default();
-        let mut bindings = HashSet::default();
-        while let Some(value) = pending.pop() {
-            if !visited.insert(value) {
-                continue;
-            }
-            match semantics.value(value)?.kind {
-                SemanticValueKind::Local
-                | SemanticValueKind::Parameter { .. }
-                | SemanticValueKind::Receiver { .. } => {
-                    bindings.insert(value);
-                }
-                _ => pending.extend(self.predecessors.get(&value).into_iter().flatten().copied()),
-            }
-        }
-        (bindings.len() == 1).then(|| *bindings.iter().next().expect("one binding"))
-    }
-}
-
 pub fn unique_binding_origin(procedure: &ProcedureHandle, subject: ValueId) -> Option<ValueId> {
     BindingOriginIndex::new(procedure).unique_binding_origin(subject)
 }
@@ -2173,7 +2386,7 @@ mod tests {
         }
 
         /// Java declaration seeds from `source`, which built this fixture.
-        fn java_seeds(&self, source: &str) -> JavaScalarSeeds {
+        fn java_seeds(&self, source: &str) -> ScalarSeeds {
             let file = self._project.file("C.java");
             let tree =
                 parse_tree_for_language(&file, Language::Java, source).expect("Java source parses");
@@ -2284,6 +2497,151 @@ mod tests {
                     })
                 })
                 .collect()
+        }
+    }
+
+    fn assert_equality_keeps_both_arms(fixture: &Fixture, constant: u128) {
+        let semantics = fixture.procedure.semantics();
+        let guard = semantics
+            .guard_facts()
+            .iter()
+            .find(|guard| {
+                matches!(
+                    guard.predicate,
+                    GuardPredicate::ConstantEquality {
+                        negated: false,
+                        constant: value,
+                    } if semantics.value(value).is_some_and(|value| {
+                        matches!(value.kind, SemanticValueKind::UnsignedInteger(value) if value == constant)
+                    })
+                )
+            })
+            .unwrap_or_else(|| panic!("missing equality guard against {constant}: {semantics:#?}"));
+        let derivation = ScalarStateDerivation::derive(&fixture.procedure);
+        assert_eq!(
+            derivation.guard_operand_fact(&fixture.procedure, guard),
+            Some(ScalarFact::Unknown),
+            "the equality operand must stay unknown: {semantics:#?}"
+        );
+        assert!(derivation.is_reachable(guard.point));
+        assert!(derivation.edge_is_feasible(guard.true_edge.expect("true arm")));
+        assert!(derivation.edge_is_feasible(guard.false_edge.expect("false arm")));
+    }
+
+    #[test]
+    fn scalar_state_dereference_load_after_unmodeled_pointer_escape_keeps_both_arms() {
+        let fixture = Fixture::go(
+            r#"package sample
+func retainAndWriteLater(pointer *int) {
+    go func() { *pointer = 1 }()
+}
+func run() bool {
+    value := 0
+    pointer := &value
+    retainAndWriteLater(pointer)
+    if *pointer == 0 { return true }
+    return false
+}
+"#,
+            "run",
+        );
+        assert_equality_keeps_both_arms(&fixture, 0);
+    }
+
+    #[test]
+    fn scalar_state_call_after_pointer_escape_invalidates_the_origin_binding() {
+        let fixture = Fixture::go(
+            r#"package sample
+func retainAndWriteLater(pointer *int) {
+    go func() { *pointer = 1 }()
+}
+func run() bool {
+    value := 0
+    pointer := &value
+    retainAndWriteLater(pointer)
+    if value == 0 { return true }
+    return false
+}
+"#,
+            "run",
+        );
+        assert_equality_keeps_both_arms(&fixture, 0);
+    }
+
+    #[test]
+    fn scalar_state_dereference_store_through_branch_assigned_second_pointer_keeps_both_arms() {
+        let fixture = Fixture::go(
+            r#"package sample
+func run(flag bool) bool {
+    value := 0
+    other := 0
+    pointer := &value
+    alias := pointer
+    if flag { alias = &other }
+    *alias = 2
+    if value == 2 { return true }
+    return false
+}
+"#,
+            "run",
+        );
+        assert_equality_keeps_both_arms(&fixture, 2);
+    }
+
+    #[test]
+    fn scalar_state_dereference_store_with_two_branch_targets_keeps_both_arms() {
+        let fixture = Fixture::go(
+            r#"package sample
+func run(flag bool) bool {
+    value := 0
+    other := 0
+    pointer := &value
+    if flag { pointer = &other }
+    *pointer = 2
+    if value == 2 { return true }
+    return false
+}
+"#,
+            "run",
+        );
+        assert_equality_keeps_both_arms(&fixture, 2);
+    }
+
+    #[test]
+    fn boolean_entry_facts_select_only_feasible_branches() {
+        let fixture = Fixture::go(
+            "package sample\nfunc yes() {}\nfunc no() {}\nfunc run(stop bool) { if stop { yes() } else { no() } }\n",
+            "run",
+        );
+        let semantics = fixture.procedure.semantics();
+        let formal = semantics
+            .values()
+            .iter()
+            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
+            .expect("Boolean formal")
+            .id;
+        let [yes, no] = semantics.call_sites() else {
+            panic!("two branch calls");
+        };
+        for (fact, expected) in [
+            (ScalarFact::True, [true, false]),
+            (ScalarFact::False, [false, true]),
+            (ScalarFact::Unknown, [true, true]),
+        ] {
+            let state = ScalarStateDerivation::derive_with_entry_facts(
+                &fixture.procedure,
+                ScalarCallEffects::default(),
+                &[ScalarEntryFact {
+                    target: formal,
+                    fact,
+                }],
+            );
+            assert_eq!(
+                [state.is_reachable(yes.point), state.is_reachable(no.point)],
+                expected,
+                "entry {fact:?}, guards {:?}",
+                semantics.guard_facts()
+            );
         }
     }
 
@@ -3522,11 +3880,20 @@ func run() int {
 
     #[test]
     fn modeled_address_calls_do_not_close_published_or_indirectly_mutated_cells() {
-        for body in [
-            "mutate(&value); out <- &value",
-            "mutate(&value); go func() { value = nil }()",
-            "alias := &value; mutate(&value); *alias = nil",
-            "alias := &value; mutate(&value); unknown(alias)",
+        for (body, expected) in [
+            ("mutate(&value); out <- &value", ScalarFact::Unknown),
+            (
+                "mutate(&value); go func() { value = nil }()",
+                ScalarFact::Unknown,
+            ),
+            (
+                "alias := &value; mutate(&value); *alias = nil",
+                ScalarFact::Unknown,
+            ),
+            (
+                "alias := &value; mutate(&value); unknown(alias)",
+                ScalarFact::Unknown,
+            ),
         ] {
             let fixture = Fixture::go(
                 &format!(
@@ -3566,7 +3933,7 @@ func run(out chan **item) int {{
             );
             assert_eq!(
                 fixture.field_base_facts_from(&derivation),
-                vec![ScalarFact::Unknown],
+                vec![expected],
                 "{body}: {semantics:#?}"
             );
         }

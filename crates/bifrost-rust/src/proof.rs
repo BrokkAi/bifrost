@@ -66,6 +66,10 @@ pub enum RustNameProof {
 /// identify what to go and fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustProofGap {
+    /// The source publication required by this lookup could not be read.
+    CanonicalFactsUnavailable,
+    /// The lookup was interrupted before its evidence was complete.
+    Cancelled,
     /// Nothing past the workspace is retained for the crate this path enters,
     /// or what is retained does not claim to cover it. `boundary` names how far
     /// the lookup saw.
@@ -85,6 +89,12 @@ pub enum RustProofGap {
 impl RustProofGap {
     pub fn into_reason(self) -> SemanticDiagnosticIncompleteReason {
         match self {
+            Self::CanonicalFactsUnavailable => {
+                SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                    detail: "canonical Rust Cargo routes are unavailable".to_string(),
+                }
+            }
+            Self::Cancelled => SemanticDiagnosticIncompleteReason::Cancelled,
             Self::ExternalBoundary { boundary } => {
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary }
             }

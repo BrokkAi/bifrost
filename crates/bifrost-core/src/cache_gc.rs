@@ -23,6 +23,62 @@ pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
 pub const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
 const GC_CLAIM_TTL_SECS: i64 = 3600;
 
+const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
+     WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3
+       AND NOT EXISTS (
+         SELECT 1
+         FROM workspace_file_versions AS versions
+           INDEXED BY idx_workspace_file_versions_blob_root
+         WHERE versions.input_kind = 'source' AND versions.blob_oid = ?1
+           AND versions.lang = ?2
+           AND versions.generation = ?3
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM workspace_resolution_content_roots AS roots
+         WHERE roots.blob_id = blobs.id
+       )";
+
+// Deterministic test rendezvous after the real candidate snapshot and before
+// its deletion transaction. The hook belongs only to its collector test thread.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static RESOLUTION_ROOT_HOOK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped rendezvous for testing publication between the real GC snapshot and deletion.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ResolutionRootSnapshotGuard(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ResolutionRootSnapshotGuard {
+    fn drop(&mut self) {
+        AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        RESOLUTION_ROOT_HOOK_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn after_resolution_candidate_snapshot_for_test(
+    publish: impl FnOnce() + 'static,
+) -> ResolutionRootSnapshotGuard {
+    RESOLUTION_ROOT_HOOK_ACTIVE.with(|active| {
+        assert!(
+            !active.replace(true),
+            "nested resolution root snapshot hook"
+        );
+    });
+    AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT
+        .with(|hook| *hook.borrow_mut() = Some(Box::new(publish)));
+    ResolutionRootSnapshotGuard(std::marker::PhantomData)
+}
+
+#[cfg(test)]
+#[path = "cache_gc_resolution_roots_tests.rs"]
+mod resolution_roots_tests;
+
 static AUTO_BLOB_THRESHOLD: AtomicI64 = AtomicI64::new(GC_AUTO_BLOB_THRESHOLD);
 static MIN_INTERVAL_SECS: AtomicI64 = AtomicI64::new(GC_MIN_INTERVAL_SECS);
 
@@ -405,6 +461,9 @@ pub fn refresh_planner_statistics(conn: &Connection) -> Result<PlannerStatistics
         .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
     conn.execute_batch("ANALYZE;")
         .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    // ANALYZE can change the chosen plan for every cached statement. Do not
+    // let this connection reuse statements prepared against the old stats.
+    conn.flush_prepared_statement_cache();
     let elapsed = started.elapsed();
     Ok(PlannerStatisticsRefresh {
         elapsed,
@@ -431,23 +490,13 @@ pub fn planner_statistics_row_count(conn: &Connection) -> Result<i64, String> {
         .map_err(|err| format!("planner statistics SQLite error: {err}"))
 }
 
-/// Whether the stored statistics still describe this database.
-///
-/// The first field of a `sqlite_stat1` row is the table's exact row count at
-/// the time `ANALYZE` ran -- `analysis_limit` bounds the per-index sampling,
-/// not that total -- so comparing the recorded `blobs` count against the
-/// current one answers "has anything been persisted or collected since the
-/// last refresh?" exactly, with one indexed query and no new counter. Every
-/// persisted blob adds a `blobs` row and every collected blob removes one, so
-/// an unchanged count means the statistics are still the ones this store's
-/// content produced.
+/// Whether the stored statistics still describe the current blob cardinality.
+/// This is deliberately a staleness proxy: edits that replace one blob with
+/// another without changing the count are not detected here.
 pub fn planner_statistics_describe_database(conn: &Connection) -> Result<bool, String> {
     if planner_statistics_row_count(conn)? == 0 {
-        // `ANALYZE` has never run here, or ran when the database held nothing.
         return Ok(false);
     }
-    // `ANALYZE` writes no row for an empty table, so a missing `blobs` entry
-    // means the last refresh saw no blobs, which is a recorded count of zero.
     let recorded: i64 = conn
         .query_row(
             "SELECT COALESCE(
@@ -677,6 +726,13 @@ fn sweep_with_claim(
            WHERE blobs.generation = COALESCE(epochs.generation, 0);",
     )?;
 
+    #[cfg(any(test, feature = "test-support"))]
+    AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT.with(|hook| {
+        let publish = hook.borrow_mut().take();
+        if let Some(publish) = publish {
+            publish();
+        }
+    });
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Retained workspace revisions also own their blobs, including immutable
     // diff images whose objects need not be reachable from any Git ref. Read
@@ -684,7 +740,8 @@ fn sweep_with_claim(
     // during the Git walk is protected too. Stream them once rather than
     // scanning workspace history separately for every candidate blob.
     {
-        let mut stmt = tx.prepare("SELECT blob_oid FROM workspace_file_versions")?;
+        let mut stmt =
+            tx.prepare("SELECT blob_oid FROM workspace_file_versions WHERE input_kind = 'source'")?;
         let roots = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for root in roots {
             live.insert(root?);
@@ -754,7 +811,7 @@ fn maintain_collected_store(
     conn: &mut Connection,
     analyzer_dropped: usize,
 ) -> Result<i64, GcStopped> {
-    conn.pragma_update(None, "incremental_vacuum", 0)?;
+    cache_db::drain_free_pages(conn)?;
 
     // A collection that removed rows changed the cardinalities the planner
     // reasons from, so the statistics it left behind now describe a database
@@ -781,7 +838,7 @@ fn maintain_collected_store(
         (cache_db::now_unix_seconds(), total),
     )?;
     tx.commit()?;
-    conn.pragma_update(None, "incremental_vacuum", 0)?;
+    cache_db::drain_free_pages(conn)?;
     Ok(total)
 }
 
@@ -789,10 +846,7 @@ fn delete_analyzer_candidates(
     tx: &rusqlite::Transaction<'_>,
     candidates: &[(String, String, i64)],
 ) -> Result<usize, GcStopped> {
-    let mut delete = tx.prepare(
-        "DELETE FROM blobs
-             WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3",
-    )?;
+    let mut delete = tx.prepare(DELETE_ANALYZER_CANDIDATE_SQL)?;
     let mut dropped = 0usize;
     for (oid, lang, generation) in candidates {
         dropped += delete.execute((oid, lang, generation))?;
@@ -999,6 +1053,56 @@ mod tests {
         assert!(!automatic_gc_enabled(Some(OsStr::new("0"))));
         assert!(!automatic_gc_enabled(Some(OsStr::new("off"))));
         assert!(!automatic_gc_enabled(Some(OsStr::new("disabled"))));
+    }
+
+    #[test]
+    fn planner_statistics_refresh_tracks_blob_cardinality() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        cache_db::configure_connection(&mut conn).unwrap();
+        cache_db::migrate(&mut conn).unwrap();
+        conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1;")
+            .unwrap();
+        assert_eq!(planner_statistics_row_count(&conn).unwrap(), 0);
+        assert!(!planner_statistics_describe_database(&conn).unwrap());
+
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'rust', 0)",
+            [],
+        )
+        .unwrap();
+        let evidence = refresh_planner_statistics(&conn).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "analysis_limit", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            PLANNER_ANALYSIS_LIMIT
+        );
+        assert_eq!(
+            evidence.stat1_rows,
+            planner_statistics_row_count(&conn).unwrap()
+        );
+        assert!(evidence.stat1_rows > 0);
+        assert!(planner_statistics_describe_database(&conn).unwrap());
+
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('2222222222222222222222222222222222222222', 'rust', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(!planner_statistics_describe_database(&conn).unwrap());
+        let repaired = repair_planner_statistics_on_open(&conn).unwrap();
+        assert!(repaired.is_some());
+        assert!(planner_statistics_describe_database(&conn).unwrap());
+    }
+
+    #[test]
+    fn planner_statistics_switch_recognizes_disabled_values() {
+        assert!(statistics_enabled(None));
+        assert!(statistics_enabled(Some(OsStr::new("on"))));
+        assert!(!statistics_enabled(Some(OsStr::new("0"))));
+        assert!(!statistics_enabled(Some(OsStr::new("off"))));
+        assert!(!statistics_enabled(Some(OsStr::new("disabled"))));
     }
 
     /// Issue #1963: a workspace rooted inside a Git-ignored subtree. The
@@ -1219,15 +1323,20 @@ mod tests {
         assert_eq!(outcome.analyzer_dropped, 1);
     }
 
+    /// A collection has to return every page its deletes freed, not one page.
+    /// `PRAGMA incremental_vacuum` emits a result row per page it moves, so a
+    /// caller that steps it once frees one page and leaves the rest of the
+    /// freelist in the file. This fixture deletes enough rows to free far more
+    /// than the two pages the two pragma calls in a collection used to reclaim,
+    /// which is what makes the assertion fail against that code.
     #[test]
-    fn gc_leaves_orphaned_semantic_cache_rows_untouched() {
+    fn collection_returns_every_freed_page_to_the_filesystem() {
         let temp = tempfile::tempdir().unwrap();
         let repo_root = temp.path().canonicalize().unwrap();
         let repo = gitblob::test_repo::init_repo(&repo_root);
-        let dead_oid = "2222222222222222222222222222222222222222";
-        let vector_hash = [7_u8; 32];
 
         let db_path = gitblob::cache_db_path(&repo_root);
+        let filler = "x".repeat(4096);
         {
             let conn = cache_db::open_unified_connection(&db_path).unwrap();
             conn.execute(
@@ -1235,45 +1344,389 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            for index in 0..200 {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation)
+                     VALUES(printf('%040x', ?1), 'go', 1)",
+                    [index],
+                )
+                .unwrap();
+                let blob_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO blob_meta(
+                       blob_id, lang, contains_tests, content_package,
+                       stored_unit_count, range_count, signature_count,
+                       signature_metadata_count, supertype_count, child_count,
+                       import_statement_count, type_identifier_count, is_complete
+                     ) VALUES(?1, 'go', 0, ?2, 0, 0, 0, 0, 0, 0, 0, 0, 1)",
+                    rusqlite::params![blob_id, filler],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            cache_db::checkpoint_wal_for_close(&conn).unwrap();
+        }
+        let pages_before: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+
+        let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert_eq!(outcome.analyzer_dropped, 200);
+
+        let conn = cache_db::open_unified_connection(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a collection must leave no page on the freelist"
+        );
+        let pages_after: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            pages_after < pages_before,
+            "the file must shrink: {pages_before} -> {pages_after} pages"
+        );
+    }
+
+    #[test]
+    fn forced_gc_keeps_blob_reachable_only_from_retained_workspace_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let retained_oid = "4444444444444444444444444444444444444444";
+        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let projection_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let db_path = gitblob::cache_db_path(&repo_root);
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
             conn.execute(
-                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
-                [dead_oid],
+                "INSERT INTO analysis_epochs(lang, epoch, generation)
+                 VALUES('java', 'active', 1)",
+                [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO semantic_files(blob_oid, rel_path, language)
-                 VALUES(?1, 'old.go', 'go')",
-                [dead_oid],
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES(?1, 'java', 1)",
+                [retained_oid],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES(?1, 1, X'00')",
-                [&vector_hash[..]],
+                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+                 VALUES(?1, 'java', 1, 1)",
+                [workspace_id],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO semantic_file_chunks(
-                   blob_oid, rel_path, chunk_ord, symbol, vector_hash
-                 ) VALUES(?1, 'old.go', 0, 'old', ?2)",
-                rusqlite::params![dead_oid, &vector_hash[..]],
+                "INSERT INTO workspace_file_versions(
+                   workspace_id, lang, generation, rel_path, blob_oid,
+                   projection_digest, valid_from, valid_until
+                 ) VALUES(?1, 'java', 1, 'src/Retained.java', ?2, ?3, 1, 2)",
+                rusqlite::params![workspace_id, retained_oid, projection_digest],
             )
             .unwrap();
         }
 
         let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
         assert!(outcome.ran);
-        assert_eq!(outcome.analyzer_dropped, 1);
-        assert_eq!(outcome.total_blobs_after, 0);
+        assert_eq!(outcome.analyzer_dropped, 0);
 
         let conn = Connection::open(&db_path).unwrap();
-        for table in ["semantic_files", "semantic_file_chunks", "semantic_vectors"] {
-            let count = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                [retained_oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// R5.3: a sealed resolution interior is reclaimed by collecting the blob
+    /// that owns it, and nothing else. While a retained workspace revision
+    /// still names the blob the whole interior stays; once that revision is
+    /// retired the next collection drops the blob and its foreign keys take
+    /// the interior and every family hanging off it.
+    #[test]
+    fn forced_gc_reclaims_sealed_resolution_interiors_once_the_revision_retires() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let oid = "5555555555555555555555555555555555555555";
+        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let projection_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let interior_tables = [
+            "resolution_fragment_interiors",
+            "resolution_reference_lookup_identities",
+        ];
+
+        let db_path = gitblob::cache_db_path(&repo_root);
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation)
+                 VALUES('java', 'active', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
+                [oid],
+            )
+            .unwrap();
+            let blob_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                    [oid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO blob_meta(
+                   blob_id, lang, contains_tests, content_package,
+                   stored_unit_count, range_count, signature_count,
+                   signature_metadata_count, supertype_count, child_count,
+                   import_statement_count, type_identifier_count, is_complete
+                 ) VALUES(?1, 'java', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1)",
+                [blob_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest, expected_semantic_site_count, expected_reference_lookup_identity_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 'java', 'java', 'resolution-v1', zeroblob(32), 0, 2, 4, 64, 'building')",
+                [blob_id],
+            )
+            .unwrap();
+            for semantic_key in [0, 1] {
+                conn.execute(
+                    "INSERT INTO resolution_identities(id, identity_digest)
+                     VALUES(?1, randomblob(32))",
+                    [semantic_key + 1],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_reference_lookup_identities(
+                       blob_id, semantic_key, identity_id
+                     ) VALUES(?1, ?2, ?3)",
+                    rusqlite::params![blob_id, semantic_key, semantic_key + 1],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE resolution_fragment_interiors
+                 SET publication_state = 'complete' WHERE blob_id = ?1",
+                [blob_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+                 VALUES(?1, 'java', 1, 1)",
+                [workspace_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_file_versions(
+                   workspace_id, lang, generation, rel_path, blob_oid,
+                   projection_digest, valid_from, valid_until
+                 ) VALUES(?1, 'java', 1, 'src/Retained.java', ?2, ?3, 1, 2)",
+                rusqlite::params![workspace_id, oid, projection_digest],
+            )
+            .unwrap();
+        }
+
+        let pinned = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert!(pinned.ran);
+        assert_eq!(
+            pinned.analyzer_dropped, 0,
+            "a retained revision still pins the blob"
+        );
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            for table in interior_tables {
+                assert!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap()
+                        > 0,
+                    "{table} must survive while the revision is retained"
+                );
+            }
+            // Retiring the revision cascades its file versions, so nothing
+            // roots the blob any longer.
+            conn.execute(
+                "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
+                [workspace_id],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
                     row.get::<_, i64>(0)
                 })
-                .unwrap();
-            assert_eq!(count, 1, "{table} must remain untouched");
+                .unwrap(),
+                0
+            );
         }
+
+        let retired = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert!(retired.ran);
+        assert_eq!(retired.analyzer_dropped, 1);
+        assert_eq!(retired.total_blobs_after, 0);
+
+        let conn = Connection::open(&db_path).unwrap();
+        for table in interior_tables {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "the blob cascade must reclaim {table}"
+            );
+        }
+        let violations: Vec<String> = conn
+            .prepare("SELECT \"table\" FROM pragma_foreign_key_check")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            violations.is_empty(),
+            "a reclaimed interior must leave no dangling rows: {violations:?}"
+        );
+    }
+
+    /// Operator measurement for R5.3: how many bytes a collection returns to a
+    /// populated store without `VACUUM`, and how long it takes.
+    ///
+    /// Two collections run against one copy. The first keeps the store's
+    /// retained workspace revisions, which root every blob they name; the
+    /// second runs after those revisions are retired, which is the state a
+    /// reclaim actually happens in. Reporting both is what distinguishes "the
+    /// sweep found nothing" from "the sweep cannot reclaim".
+    ///
+    /// `BIFROST_R53_STORE_PATH` names a populated `bifrost_cache.v117.db`. The
+    /// store is copied into a temporary directory first, so this measurement
+    /// can never collect the named store itself.
+    ///
+    /// `BIFROST_R53_REPO_PATH` names the repository whose reachability drives
+    /// the sweep. Without it the sweep runs against an empty repository, which
+    /// makes every analyzer blob unreachable.
+    #[test]
+    #[ignore = "operator measurement: needs a populated store"]
+    fn measure_reclaim_on_a_disposable_store_copy() {
+        let source = std::path::PathBuf::from(
+            std::env::var("BIFROST_R53_STORE_PATH").expect("BIFROST_R53_STORE_PATH"),
+        );
+        let empty_repo = tempfile::tempdir().unwrap();
+        let repo = match std::env::var("BIFROST_R53_REPO_PATH") {
+            Ok(path) => Repository::discover(path).expect("open the reachability repository"),
+            Err(_) => gitblob::test_repo::init_repo(empty_repo.path()),
+        };
+        let workspace_root = repo
+            .workdir()
+            .expect("the repository needs a working tree")
+            .to_path_buf();
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(cache_db::cache_db_file_name());
+        std::fs::copy(&source, &db_path).expect("copy the store");
+        // A copied store may carry an unapplied WAL; checkpoint it into the
+        // copy so the before-size is the size of the data being collected.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = source.with_file_name(format!(
+                "{}{suffix}",
+                source.file_name().unwrap().to_string_lossy()
+            ));
+            if sidecar.exists() {
+                std::fs::copy(
+                    &sidecar,
+                    db_path.with_file_name(format!(
+                        "{}{suffix}",
+                        db_path.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("checkpoint the copy");
+        }
+
+        let checkpointed_bytes = |path: &std::path::Path| {
+            let conn = cache_db::open_unified_connection(path).unwrap();
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("checkpoint the store");
+            drop(conn);
+            std::fs::metadata(path).unwrap().len()
+        };
+        let collect = |label: &str| {
+            let bytes_before = checkpointed_bytes(&db_path);
+            let blobs_before = total_blob_count(&db_path).unwrap();
+            let started = std::time::Instant::now();
+            let outcome = force_gc(&db_path, &repo, &workspace_root).unwrap();
+            let elapsed = started.elapsed();
+            let bytes_after = checkpointed_bytes(&db_path);
+            println!(
+                "R5.3 reclaim [{label}]: ran={} blobs {} -> {} (dropped {}), \
+                 bytes {} -> {} (freed {}), version stores removed {}, {:.3} s",
+                outcome.ran,
+                blobs_before,
+                outcome.total_blobs_after,
+                outcome.analyzer_dropped,
+                bytes_before,
+                bytes_after,
+                bytes_before.saturating_sub(bytes_after),
+                outcome.version_stores_removed,
+                elapsed.as_secs_f64(),
+            );
+            assert!(outcome.ran, "the {label} collection must run");
+            assert!(
+                bytes_after <= bytes_before,
+                "the {label} collection must not grow the store: \
+                 {bytes_before} -> {bytes_after}"
+            );
+            outcome
+        };
+
+        let retained = collect("revisions retained");
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            // `workspace_heads` names its revision through a foreign key with
+            // no delete action, so retiring a revision starts by dropping the
+            // head that points at it.
+            conn.execute("DELETE FROM workspace_heads", [])
+                .expect("drop the workspace heads");
+            let revisions = conn
+                .execute("DELETE FROM workspace_revisions", [])
+                .expect("retire the workspace revisions");
+            let versions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                versions, 0,
+                "retiring a revision cascades its file versions"
+            );
+            println!("R5.3 reclaim: retired {revisions} workspace revisions");
+        }
+        let retired = collect("revisions retired");
+        assert!(
+            retired.analyzer_dropped >= retained.analyzer_dropped,
+            "retiring revisions cannot protect blobs it used to root"
+        );
     }
 
     #[test]
@@ -1322,6 +1775,89 @@ mod tests {
             )
             .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn analyzer_gc_candidate_cannot_delete_blob_rooted_only_by_retained_revision() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        cache_db::configure_connection(&mut conn).unwrap();
+        cache_db::migrate(&mut conn).unwrap();
+        let oid = "2222222222222222222222222222222222222222";
+        let workspace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let projection_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        conn.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+             VALUES('java', 'active', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
+            [oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+             VALUES(?1, 'java', 1, 1)",
+            [workspace_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_file_versions(
+               workspace_id, lang, generation, rel_path, blob_oid,
+               projection_digest, valid_from, valid_until
+             ) VALUES(?1, 'java', 1, 'src/Retained.java', ?2, ?3, 1, 2)",
+            rusqlite::params![workspace_id, oid, projection_digest],
+        )
+        .unwrap();
+
+        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
+        let tx = conn.transaction().unwrap();
+        assert_eq!(delete_analyzer_candidates(&tx, &candidate).unwrap(), 0);
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "closed file-version intervals still root retained revisions"
+        );
+    }
+
+    #[test]
+    fn retained_revision_root_probe_uses_the_blob_identity_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        cache_db::configure_connection(&mut conn).unwrap();
+        cache_db::migrate(&mut conn).unwrap();
+        let details = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {DELETE_ANALYZER_CANDIDATE_SQL}"
+            ))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["2222222222222222222222222222222222222222", "java", 1],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH versions USING COVERING INDEX idx_workspace_file_versions_blob_root",
+                )
+            }),
+            "retained-revision roots must be point-probed by blob identity: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("SCAN versions")),
+            "retained-revision root checks must not scan file-version history: {details:?}"
         );
     }
 

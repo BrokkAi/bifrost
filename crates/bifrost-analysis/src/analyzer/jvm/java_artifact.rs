@@ -39,6 +39,7 @@ pub(super) struct JavaApiType {
     pub(super) visibility: Visibility,
     is_abstract: bool,
     is_sealed: bool,
+    callable_surface_complete: bool,
     type_parameters: Vec<String>,
     hierarchy: Vec<HierarchyFact>,
     locator: Locator,
@@ -53,6 +54,7 @@ struct JavaApiMember {
     is_static: bool,
     is_abstract: bool,
     is_virtual: bool,
+    non_overridable: Option<super::super::semantic_model::NonOverridableEvidence>,
     /// Whether exact binary metadata accounted for this member's complete
     /// owner/name callable family. Source declarations cannot make this claim
     /// independently of the binary artifact they describe.
@@ -597,6 +599,9 @@ pub(super) fn java_api_facts(
             visibility: declaration.visibility,
             is_abstract: declaration.is_abstract,
             is_sealed: declaration.is_sealed,
+            callable_surface_complete: declaration.callable_surface_complete
+                && declaration.members.len()
+                    < max_records.saturating_sub(types.len() + members.len()),
             has_explicit_type_terms: false,
             type_parameters: declaration.type_parameters,
             type_parameter_constraints: Vec::new(),
@@ -669,6 +674,7 @@ pub(super) fn java_api_facts(
                 signature.parameters[0].name = Some(formal_name.to_owned());
             }
             members.push(MemberFact {
+                non_overridable: member.non_overridable,
                 ambient_use: None,
                 id,
                 owner: type_id.clone(),
@@ -715,7 +721,7 @@ fn curated_jdk_formal_name(
     match curated_jdk_member_ids(owner, kind, is_static, name, parameter_types)? {
         "member.system.getenv-string" => Some("name"),
         "member.runtime.exec-string" => Some("command"),
-        "member.statement.execute" => Some("sql"),
+        "member.statement.execute" | "member.statement.executequery" => Some("sql"),
         "member.files.delete-if-exists-path" => Some("path"),
         "member.string.trim" | "member.string.strip" => None,
         _ => unreachable!("reviewed JDK member IDs have reviewed formal names"),
@@ -765,6 +771,9 @@ fn curated_jdk_member_ids(
         }
         ("java.sql.Statement", false, "execute", "java.lang.String") => {
             Some("member.statement.execute")
+        }
+        ("java.sql.Statement", false, "executeQuery", "java.lang.String") => {
+            Some("member.statement.executequery")
         }
         ("java.nio.file.Files", true, "deleteIfExists", "java.nio.file.Path") => {
             Some("member.files.delete-if-exists-path")
@@ -836,7 +845,7 @@ pub(super) fn source_api_types(
         let type_kind = source_type_kind(node.kind()).expect("stack holds Java types");
         let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
         let type_parameters = source_type_parameters(node, source);
-        let hierarchy = source_hierarchy(
+        let (hierarchy, hierarchy_complete) = source_hierarchy(
             node,
             source,
             &resolution,
@@ -864,6 +873,50 @@ pub(super) fn source_api_types(
                 diagnostics,
                 source_path,
             );
+            // Reconcile the complete direct AST method inventory with the
+            // retained records. Unsupported signatures or budget truncation
+            // reduce the retained count and cannot silently license absence.
+            let callable_surface_complete =
+                matches!(type_kind, TypeKind::Interface | TypeKind::Class)
+                    && !root.has_error()
+                    && hierarchy_complete
+                    && !*record_limit_hit
+                    && node.child_by_field_name("body").is_some_and(|body| {
+                        let default_visibility = if type_kind == TypeKind::Interface {
+                            Visibility::Public
+                        } else {
+                            Visibility::Package
+                        };
+                        let mut declared = 0;
+                        let mut has_constructor = false;
+                        for child in named_children_iter(body) {
+                            has_constructor |= child.kind() == "constructor_declaration";
+                            if matches!(
+                                child.kind(),
+                                "method_declaration" | "constructor_declaration"
+                            ) && matches!(
+                                source_visibility(child, default_visibility),
+                                Visibility::Public | Visibility::Protected
+                            ) {
+                                declared += 1;
+                            }
+                        }
+                        // The source producer retains the implicit constructor
+                        // of an ordinary class at the class's own visibility.
+                        if type_kind == TypeKind::Class && !has_constructor {
+                            declared += 1;
+                        }
+                        declared
+                            == members
+                                .iter()
+                                .filter(|member| {
+                                    matches!(
+                                        member.member_kind,
+                                        MemberKind::Method | MemberKind::Constructor
+                                    )
+                                })
+                                .count()
+                    });
             result.push(JavaApiType {
                 name: name.clone(),
                 package_name: package_name.clone(),
@@ -872,6 +925,7 @@ pub(super) fn source_api_types(
                 is_abstract: modifiers.contains(&"abstract")
                     || matches!(type_kind, TypeKind::Interface | TypeKind::Annotation),
                 is_sealed: modifiers.contains(&"final") || modifiers.contains(&"sealed"),
+                callable_surface_complete,
                 type_parameters,
                 hierarchy,
                 locator: Locator::Source {
@@ -1025,6 +1079,12 @@ fn source_members(
                     break;
                 }
                 result.push(JavaApiMember {
+                    non_overridable: (!constructor
+                        && !modifiers.contains(&"static")
+                        && modifiers.contains(&"final"))
+                    .then_some(
+                        super::super::semantic_model::NonOverridableEvidence::JavaFinalMethod,
+                    ),
                     name: name.to_owned(),
                     member_kind: if constructor {
                         MemberKind::Constructor
@@ -1096,6 +1156,7 @@ fn source_members(
                         break;
                     }
                     result.push(JavaApiMember {
+                        non_overridable: None,
                         name: name.to_owned(),
                         member_kind: if node.kind() == "constant_declaration" {
                             MemberKind::Constant
@@ -1255,6 +1316,7 @@ fn source_members(
             remaining_records,
             record_limit_hit,
             JavaApiMember {
+                non_overridable: None,
                 name: "<init>".to_owned(),
                 member_kind: MemberKind::Constructor,
                 visibility: owner_visibility,
@@ -1289,6 +1351,7 @@ fn generated_java_member(
     source_path: &str,
 ) -> JavaApiMember {
     JavaApiMember {
+        non_overridable: None,
         name: name.to_owned(),
         member_kind,
         visibility,
@@ -1446,7 +1509,7 @@ fn source_hierarchy(
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
     declaration: &str,
-) -> Vec<HierarchyFact> {
+) -> (Vec<HierarchyFact>, bool) {
     let mut containers = Vec::new();
     for (field, hierarchy_kind) in [
         ("superclass", HierarchyKind::Extends),
@@ -1471,8 +1534,19 @@ fn source_hierarchy(
         }
     }
     let mut result = Vec::new();
+    let mut complete = true;
     for (container, hierarchy_kind) in containers {
-        for candidate in hierarchy_type_nodes(container) {
+        let Some(candidates) = hierarchy_type_nodes(container) else {
+            complete = false;
+            diagnostics.warning_for_declaration(
+                "java.source.unsupported_hierarchy_type",
+                Some(source_path.to_owned()),
+                declaration,
+                "could not enumerate Java hierarchy syntax",
+            );
+            continue;
+        };
+        for candidate in candidates {
             if let Some(target) = source_type_ref(
                 candidate,
                 source,
@@ -1488,6 +1562,7 @@ fn source_hierarchy(
                     declaration_ordinal: None,
                 });
             } else {
+                complete = false;
                 diagnostics.warning_for_declaration(
                     "java.source.unsupported_hierarchy_type",
                     Some(source_path.to_owned()),
@@ -1497,23 +1572,30 @@ fn source_hierarchy(
             }
         }
     }
-    result
+    (result, complete)
 }
 
-fn hierarchy_type_nodes(container: Node<'_>) -> Vec<Node<'_>> {
-    if is_source_type_node(container.kind()) {
-        return vec![container];
-    }
-    (0..container.named_child_count())
-        .filter_map(|index| container.named_child(index))
-        .flat_map(|child| {
-            if is_source_type_node(child.kind()) {
-                vec![child]
-            } else {
-                hierarchy_type_nodes(child)
+pub(crate) fn hierarchy_type_nodes(container: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut result = Vec::new();
+    let mut stack = vec![container];
+    while let Some(node) = stack.pop() {
+        if is_source_type_node(node.kind()) {
+            result.push(node);
+        } else if matches!(
+            node.kind(),
+            "superclass" | "super_interfaces" | "extends_interfaces" | "type_list"
+        ) {
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(
+                    node.named_child(index)
+                        .expect("named child index is in bounds"),
+                );
             }
-        })
-        .collect()
+        } else if !matches!(node.kind(), "line_comment" | "block_comment") {
+            return None;
+        }
+    }
+    (!result.is_empty()).then_some(result)
 }
 
 fn source_type_ref(
@@ -1856,16 +1938,20 @@ impl<'a> SourceTypeResolution<'a> {
         if self.known_types.contains(&same_package) {
             return Some(same_package);
         }
-        if JAVA_LANG_TYPES.contains(&name) {
-            return Some(format!("java.lang.{name}"));
-        }
-        let mut candidates = self
-            .wildcard_imports
-            .iter()
-            .map(|package| format!("{package}.{name}"))
-            .filter(|candidate| self.known_types.contains(candidate));
-        let candidate = candidates.next()?;
-        candidates.next().is_none().then_some(candidate)
+        let java_lang = format!("java.lang.{name}");
+        let implicit = (self.known_types.contains(&java_lang) || JAVA_LANG_TYPES.contains(&name))
+            .then_some(java_lang);
+        let candidates: HashSet<_> = implicit
+            .into_iter()
+            .chain(
+                self.wildcard_imports
+                    .iter()
+                    .map(|package| format!("{package}.{name}"))
+                    .filter(|candidate| self.known_types.contains(candidate)),
+            )
+            .collect();
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next().expect("one candidate exists"))
     }
 }
 
@@ -2021,6 +2107,7 @@ pub(crate) struct JavaClassSurfaceMember {
     pub(super) member_kind: MemberKind,
     pub(super) is_abstract: bool,
     pub(super) is_virtual: bool,
+    pub(super) non_overridable: Option<super::super::semantic_model::NonOverridableEvidence>,
     pub(super) callable_family_complete: bool,
     pub(super) signature: Option<Signature>,
     pub(super) locator: Locator,
@@ -2074,6 +2161,7 @@ pub(crate) fn class_surface(
                     .members
                     .into_iter()
                     .map(|member| JavaClassSurfaceMember {
+                        non_overridable: member.non_overridable,
                         name: member.name,
                         visibility: member.visibility,
                         is_static: member.is_static,
@@ -2113,6 +2201,7 @@ pub(crate) fn class_surface_facts(
         visibility: surface.visibility,
         is_abstract: surface.is_abstract,
         is_sealed: surface.is_sealed,
+        callable_surface_complete: false,
         type_parameters: surface.type_parameters,
         hierarchy: surface.hierarchy,
         locator: surface.locator,
@@ -2120,6 +2209,7 @@ pub(crate) fn class_surface_facts(
             .members
             .into_iter()
             .map(|member| JavaApiMember {
+                non_overridable: member.non_overridable,
                 name: member.name,
                 member_kind: member.member_kind,
                 visibility: member.visibility,
@@ -2280,6 +2370,7 @@ fn class_api_type(
                 .attributes()
                 .iter()
                 .any(|attribute| matches!(attribute, Attribute::PermittedSubclasses { .. })),
+        callable_surface_complete: false,
         type_parameters,
         hierarchy,
         locator: Locator::Artifact {
@@ -2337,6 +2428,7 @@ fn class_field_member(
     };
     normalize_binary_type_ref(&mut field_type, class_file);
     Some(JavaApiMember {
+        non_overridable: None,
         name: name.clone(),
         member_kind: if flags.contains(FieldFlags::ACC_FINAL)
             && flags.contains(FieldFlags::ACC_STATIC)
@@ -2464,6 +2556,10 @@ fn class_method_member(
         .collect();
     let constructor = binary_name == "<init>";
     Some(JavaApiMember {
+        non_overridable: (!constructor
+            && !flags.contains(MethodFlags::ACC_STATIC)
+            && flags.contains(MethodFlags::ACC_FINAL))
+        .then_some(super::super::semantic_model::NonOverridableEvidence::JavaFinalMethod),
         name: binary_name.to_owned(),
         member_kind: if constructor {
             MemberKind::Constructor
@@ -3023,6 +3119,236 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jdbc_execute_query_alias_requires_exact_structured_identity() {
+        let string = named_type("java.lang.String".to_owned());
+        assert_eq!(
+            curated_jdk_member_ids(
+                "java.sql.Statement",
+                MemberKind::Method,
+                false,
+                "executeQuery",
+                std::slice::from_ref(&string)
+            ),
+            Some("member.statement.executequery")
+        );
+        assert_eq!(
+            curated_jdk_formal_name(
+                "java.sql.Statement",
+                MemberKind::Method,
+                false,
+                "executeQuery",
+                std::slice::from_ref(&string)
+            ),
+            Some("sql")
+        );
+        for (owner, kind, is_static, parameters) in [
+            (
+                "fixture.Statement",
+                MemberKind::Method,
+                false,
+                vec![string.clone()],
+            ),
+            (
+                "java.sql.PreparedStatement",
+                MemberKind::Method,
+                false,
+                vec![],
+            ),
+            (
+                "java.sql.Statement",
+                MemberKind::Method,
+                true,
+                vec![string.clone()],
+            ),
+            (
+                "java.sql.Statement",
+                MemberKind::Constructor,
+                false,
+                vec![string.clone()],
+            ),
+            (
+                "java.sql.Statement",
+                MemberKind::Method,
+                false,
+                vec![TypeRef::Array {
+                    element: Box::new(string.clone()),
+                }],
+            ),
+            (
+                "java.sql.Statement",
+                MemberKind::Method,
+                false,
+                vec![string.clone(), named_type("int".to_owned())],
+            ),
+        ] {
+            assert_eq!(
+                curated_jdk_member_ids(owner, kind, is_static, "executeQuery", &parameters),
+                None,
+                "{owner} {kind:?} static={is_static} parameters={parameters:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_JDK_SOURCE_ZIP pointing to Temurin 21.0.8 src.zip"]
+    fn pinned_jdk_execute_query_family_has_one_structured_declaration() {
+        use sha2::{Digest, Sha256};
+        let path = std::env::var_os("BIFROST_JDK_SOURCE_ZIP").expect("set BIFROST_JDK_SOURCE_ZIP");
+        let path = PathBuf::from(path);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "5440baccc6c54b18671ab9cb9bf6ffdd7698d3a85ee74faa0b47b111312f200c"
+        );
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let entry = "java.sql/java/sql/Statement.java";
+        let mut source = String::new();
+        archive
+            .by_name(entry)
+            .unwrap()
+            .read_to_string(&mut source)
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(source.as_bytes())),
+            "a39ef7455400ad8ef34cb6343c4a8ec2ae8332992cd825c5ed6580e85c07fc0d"
+        );
+        let tree = parse_tree(&source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let known = [
+            "java.lang.String",
+            "java.sql.Statement",
+            "java.sql.ResultSet",
+            "java.sql.Wrapper",
+            "java.sql.SQLWarning",
+            "java.sql.Connection",
+            "java.lang.AutoCloseable",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut remaining = limits.max_records;
+        let mut truncated = false;
+        let declarations = source_api_types(
+            entry,
+            &source,
+            &known,
+            limits.max_signature_depth,
+            &mut remaining,
+            &mut truncated,
+            &mut diagnostics,
+        );
+        assert!(!truncated);
+        let (source_diagnostics, suppressed) = diagnostics.finish();
+        assert_eq!(suppressed.total(), 0);
+        // The selected declaration index supplies the implicit java.lang
+        // import, including AutoCloseable, without a type-name whitelist.
+        assert!(source_diagnostics.is_empty(), "{source_diagnostics:#?}");
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let jmod = path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("jmods/java.sql.jmod");
+        let binary_bytes = fs::read(jmod).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&binary_bytes)),
+            "bb044edbda73bba35f2cd5c5c482652322f9c07cf353a2ae0ecc5ba79a791ec8"
+        );
+        let mut binary = ZipArchive::new(Cursor::new(binary_bytes)).unwrap();
+        let mut class = Vec::new();
+        binary
+            .by_name("classes/java/sql/Statement.class")
+            .unwrap()
+            .read_to_end(&mut class)
+            .unwrap();
+        let ClassEntryResult::Declaration(binary_owner) = class_api_type(
+            "java.sql.jmod",
+            "classes/java/sql/Statement.class",
+            &class,
+            limits.max_signature_depth,
+            &mut remaining,
+            &mut truncated,
+            &mut diagnostics,
+        ) else {
+            panic!("exact JDK class must declare Statement");
+        };
+        assert!(!truncated);
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.finish());
+        assert_eq!(binary_owner.name, "java.sql.Statement");
+        let binary_family = binary_owner
+            .members
+            .iter()
+            .filter(|member| member.name == "executeQuery")
+            .collect::<Vec<_>>();
+        assert_eq!(binary_family.len(), 1, "{binary_family:#?}");
+        assert!(binary_family[0].callable_family_complete);
+        eprintln!("Pinned binary executeQuery family: {binary_family:#?}");
+        let owner = declarations
+            .iter()
+            .find(|owner| owner.name == "java.sql.Statement")
+            .unwrap();
+        assert_eq!(owner.type_kind, TypeKind::Interface);
+        let family = owner
+            .members
+            .iter()
+            .filter(|member| member.name == "executeQuery")
+            .collect::<Vec<_>>();
+        assert_eq!(family.len(), 1, "{family:#?}");
+        let member = family[0];
+        assert_eq!(member.member_kind, MemberKind::Method);
+        assert!(!member.is_static);
+        assert!(member.is_abstract && member.is_virtual);
+        let signature = member.signature.as_ref().unwrap();
+        assert_eq!(signature.parameters.len(), 1);
+        assert_eq!(signature.parameters[0].name.as_deref(), Some("sql"));
+        assert_eq!(
+            signature.parameters[0].r#type,
+            named_type("java.lang.String".to_owned())
+        );
+        assert!(!signature.parameters[0].variadic);
+        assert_eq!(
+            signature.returns,
+            Some(named_type("java.sql.ResultSet".to_owned()))
+        );
+        let binary_signature = binary_family[0].signature.as_ref().unwrap();
+        assert_eq!(binary_family[0].member_kind, member.member_kind);
+        assert_eq!(binary_family[0].is_static, member.is_static);
+        assert_eq!(
+            binary_signature.parameters.len(),
+            signature.parameters.len()
+        );
+        assert_eq!(
+            binary_signature.parameters[0].r#type,
+            signature.parameters[0].r#type
+        );
+        assert_eq!(binary_signature.returns, signature.returns);
+        eprintln!("Pinned Statement.executeQuery structured family: {member:#?}");
+        let (types, members) = java_api_facts(declarations, limits.max_records, &mut diagnostics);
+        let owner = types
+            .iter()
+            .find(|owner| owner.name == "java.sql.Statement")
+            .unwrap();
+        let generated = members
+            .iter()
+            .filter(|member| member.owner == owner.id && member.name == "executeQuery")
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 1);
+        let generated = generated[0];
+        assert_eq!(generated.aliases, ["member.statement.executequery"]);
+        assert!(generated.callable_family_complete);
+        assert_eq!(
+            generated.signature.as_ref().unwrap().parameters[0]
+                .name
+                .as_deref(),
+            Some("sql")
+        );
+        eprintln!("Pinned generated executeQuery identity: {generated:#?}");
+    }
+
     struct JavaFixture {
         _temp: tempfile::TempDir,
         source_jar: PathBuf,
@@ -3101,7 +3427,7 @@ mod tests {
             pack_version: "1.0.0".to_owned(),
             ecosystem: "maven".to_owned(),
             compatibility: Compatibility {
-                bifrost: ">=0.8.0, <1.0.0".to_owned(),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
@@ -3490,6 +3816,147 @@ mod tests {
     }
 
     #[test]
+    fn source_callable_inventory_is_scoped_and_clears_on_loss() {
+        let source = "package fixture; public interface Good { void run(); } public interface Deep { java.util.List<java.lang.String> get(); } public class Root { public int hashCode() { return 1; } private Root(int hidden) {} public Root() {} } public class Empty {}";
+        let limits = ArtifactProducerLimits::default();
+        let names = source_declared_type_names(source).into_iter().collect();
+        for (depth, budget, expected) in [
+            (32, 100, [true, true]),
+            (1, 100, [true, false]),
+            (32, 1, [false, false]),
+        ] {
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            let mut remaining = budget;
+            let mut exhausted = false;
+            let types = source_api_types(
+                "fixture/Good.java",
+                source,
+                &names,
+                depth,
+                &mut remaining,
+                &mut exhausted,
+                &mut diagnostics,
+            );
+            for (name, complete) in ["fixture.Good", "fixture.Deep"].into_iter().zip(expected) {
+                let observed = types
+                    .iter()
+                    .find(|ty| ty.name == name)
+                    .is_some_and(|ty| ty.callable_surface_complete);
+                assert_eq!(observed, complete, "{name}, depth {depth}, budget {budget}");
+            }
+            if budget == 100 {
+                for name in ["fixture.Root", "fixture.Empty"] {
+                    assert!(
+                        types
+                            .iter()
+                            .find(|ty| ty.name == name)
+                            .unwrap()
+                            .callable_surface_complete
+                    );
+                }
+            }
+            if budget == 100 && depth == 32 {
+                let (facts, _) = java_api_facts(types, 1, &mut diagnostics);
+                assert!(
+                    !facts[0].callable_surface_complete,
+                    "fact retention must preserve the coverage boundary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_final_method_attestation_does_not_infer_from_default_virtuality() {
+        let source = "package fixture; public class Methods { public final void fixed() {} public void open() {} public static void utility() {} public Methods() {} }";
+        let names = source_declared_type_names(source).into_iter().collect();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut remaining = limits.max_records;
+        let mut exhausted = false;
+        let types = source_api_types(
+            "fixture/Methods.java",
+            source,
+            &names,
+            limits.max_signature_depth,
+            &mut remaining,
+            &mut exhausted,
+            &mut diagnostics,
+        );
+        let methods = &types[0].members;
+        for method in methods {
+            assert_eq!(
+                method.non_overridable.is_some(),
+                method.name == "fixed",
+                "{method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_hierarchy_resolves_implicit_java_lang_from_selected_declarations() {
+        let limits = ArtifactProducerLimits::default();
+        for (imports, extra_type, expected) in [
+            ("", None, Some("java.lang.AutoCloseable")),
+            ("import java.lang.*;", None, Some("java.lang.AutoCloseable")),
+            ("import other.*;", Some("other.AutoCloseable"), None),
+            (
+                "import other.AutoCloseable;",
+                Some("other.AutoCloseable"),
+                Some("other.AutoCloseable"),
+            ),
+            (
+                "",
+                Some("fixture.AutoCloseable"),
+                Some("fixture.AutoCloseable"),
+            ),
+        ] {
+            let source = format!(
+                "package fixture; {imports} public interface Base<T, S extends Base<T, S>> extends AutoCloseable {{ void close(); }}"
+            );
+            let mut names: HashSet<_> = source_declared_type_names(&source).into_iter().collect();
+            names.insert("java.lang.AutoCloseable".to_owned());
+            names.extend(extra_type.map(str::to_owned));
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            let mut remaining = limits.max_records;
+            let mut exhausted = false;
+            let types = source_api_types(
+                "fixture/Base.java",
+                &source,
+                &names,
+                limits.max_signature_depth,
+                &mut remaining,
+                &mut exhausted,
+                &mut diagnostics,
+            );
+            assert!(!exhausted);
+            let base = types.iter().find(|ty| ty.name == "fixture.Base").unwrap();
+            assert_eq!(
+                base.callable_surface_complete,
+                expected.is_some(),
+                "{imports}"
+            );
+            let observed = base
+                .hierarchy
+                .iter()
+                .map(|edge| &edge.target)
+                .collect::<Vec<_>>();
+            let expected = expected.map(|name| TypeRef::Named {
+                name: name.to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            });
+            assert_eq!(observed, expected.iter().collect::<Vec<_>>(), "{imports}");
+            let (diagnostics, suppressed) = diagnostics.finish();
+            assert_eq!(
+                diagnostics.is_empty(),
+                expected.is_some(),
+                "{diagnostics:?}"
+            );
+            assert_eq!(suppressed.total(), 0);
+        }
+    }
+
+    #[test]
     fn source_interface_contract_distinguishes_abstract_static_and_sealed() {
         let source = r#"package fixture;
             import other.Closed;
@@ -3522,6 +3989,7 @@ mod tests {
         assert_eq!(suppressed.total(), 0, "{suppressed:?}");
         let action = types.iter().find(|ty| ty.name == "fixture.Action").unwrap();
         assert!(!action.is_sealed);
+        assert!(action.callable_surface_complete);
         let run = action
             .members
             .iter()

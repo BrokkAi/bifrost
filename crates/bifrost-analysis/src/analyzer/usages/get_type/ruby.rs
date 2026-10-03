@@ -33,6 +33,12 @@ pub(crate) fn resolve_ruby_type_bounded(
             "Ruby source could not be parsed",
         ));
     };
+    if !session.observe_cancellation() || !ruby.canonical_sources_ready() {
+        return session.finish(no_type(
+            "ruby_source_facts_unavailable",
+            "Canonical Ruby source facts are unavailable",
+        ));
+    }
     let support = RubyDefinitionProvider::new(ruby, &session);
     let Some(resolution) =
         ruby_type_lookup_resolution_bounded(&support, file, source, tree.root_node(), site)

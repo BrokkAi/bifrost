@@ -22,8 +22,14 @@ impl CppAnalyzer {
         self.cached_complete_read(&self.visible_type_units_by_file, file, || {
             #[cfg(any(test, feature = "test-support"))]
             self.record_visible_type_units_build_for_test();
-            build_cpp_visible_type_units(self, file, ALWAYS)
-                .expect("an include-closure walk that cannot stop always completes")
+            let scope = AnalyzerQueryScope::new(self);
+            build_cpp_visible_type_units(self, scope.token(), file, ALWAYS).unwrap_or_else(|| {
+                assert!(
+                    scope.read_completion().is_err(),
+                    "an unstopped visible-type walk must report an incomplete dependency"
+                );
+                Vec::new()
+            })
         })
     }
 
@@ -34,8 +40,7 @@ impl CppAnalyzer {
     /// base specifier resolved against it afterwards would silently lose its
     /// ancestor -- the failure the complete-or-nothing rule exists to prevent.
     ///
-    /// This path deliberately does not single-flight, unlike the uncancellable
-    /// one above. moka's `try_get_with` hands the leader's failure to every
+    /// This path deliberately does not single-flight. moka's `try_get_with` hands the leader's failure to every
     /// waiter, so one request whose budget had expired would report a stopped
     /// walk to an unrelated request that still had time. A race costs one
     /// duplicate include-closure walk; the misreport would cost a correct
@@ -52,7 +57,12 @@ impl CppAnalyzer {
         #[cfg(any(test, feature = "test-support"))]
         self.record_visible_type_units_build_for_test();
         let scope = AnalyzerQueryScope::new(self);
-        let built = Arc::new(build_cpp_visible_type_units(self, file, keep_going)?);
+        let built = Arc::new(build_cpp_visible_type_units(
+            self,
+            scope.token(),
+            file,
+            keep_going,
+        )?);
         if scope.read_completion().is_err() {
             return None;
         }
@@ -73,7 +83,7 @@ impl CppAnalyzer {
             return Some((*cached).clone());
         }
         let scope = AnalyzerQueryScope::new(self);
-        let resolved = cpp_resolve_direct_ancestors(self, code_unit, keep_going)?;
+        let resolved = cpp_resolve_direct_ancestors(self, scope.token(), code_unit, keep_going)?;
         if scope.read_completion().is_err() {
             return None;
         }
@@ -87,15 +97,17 @@ impl TypeHierarchyProvider for CppAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.cached_complete_read(&self.direct_ancestors, code_unit, || {
             let scope = AnalyzerQueryScope::new(self);
-            cpp_resolve_direct_ancestors(self, code_unit, ALWAYS).unwrap_or_else(|| {
-                assert!(
-                    scope.read_completion().is_err(),
-                    "an unstopped ancestor walk must report an incomplete dependency"
-                );
-                // cached_complete_read propagates the recorded reason and
-                // refuses to publish this compatibility value.
-                Vec::new()
-            })
+            cpp_resolve_direct_ancestors(self, scope.token(), code_unit, ALWAYS).unwrap_or_else(
+                || {
+                    assert!(
+                        scope.read_completion().is_err(),
+                        "an unstopped ancestor walk must report an incomplete dependency"
+                    );
+                    // cached_complete_read propagates the recorded reason and
+                    // refuses to publish this compatibility value.
+                    Vec::new()
+                },
+            )
         })
         .as_ref()
         .clone()

@@ -47,7 +47,7 @@ use crate::graph::extractor::ruby_type_owner;
 use crate::graph::resolver::RubySemanticIndex;
 use crate::graph::syntax::is_declaration_constant;
 use crate::graph_support::RubySource;
-use crate::imports::{parse_ruby_require_call, ruby_symbol_name, ruby_zeitwerk_visible_files_for};
+use crate::imports::{ruby_symbol_name, ruby_zeitwerk_visible_files_for};
 use crate::syntax::single_static_string_content_node;
 use brokk_bifrost_core::analyzer::model::{
     Range, SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
@@ -60,7 +60,6 @@ use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use std::borrow::Cow;
 use tree_sitter::Node;
 
 pub const RUBY_UNRECOGNIZED_SYMBOL: &str = "ruby_unrecognized_symbol";
@@ -142,6 +141,18 @@ pub fn collect_ruby_semantic_diagnostics(
         report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         return report;
     }
+    if !graph.index.indexed_source_matches(file, source) {
+        report.push_incomplete(
+            None,
+            vec![
+                SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                    detail: "Ruby diagnostic source does not match the indexed source facts"
+                        .to_owned(),
+                },
+            ],
+        );
+        return report;
+    }
     let Some(tree) = parse_ruby_tree(source) else {
         report.push_incomplete(
             None,
@@ -166,7 +177,19 @@ pub fn collect_ruby_semantic_diagnostics(
         );
         return report;
     }
-    if let Some(detail) = open_runtime_boundary_detail(tree.root_node(), source) {
+    let Some(file_facts) = ruby.source_facts(file) else {
+        report.push_incomplete(
+            None,
+            vec![
+                SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                    detail: "canonical Ruby source facts are unavailable".to_owned(),
+                },
+            ],
+        );
+        return report;
+    };
+    if let Some(boundary) = file_facts.runtime_boundary {
+        let detail = boundary.detail();
         // A run-time constant boundary makes every constant in the file
         // unjudgeable: the set of bindings is decided while the program runs.
         report.push_incomplete(
@@ -491,46 +514,46 @@ fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tre
     }
 }
 
-/// The run-time constant boundary this file opens, named, if it opens one.
-fn open_runtime_boundary_detail(root: Node<'_>, source: &str) -> Option<String> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call"
-            && let Some(method) = node.child_by_field_name("method")
-        {
-            let name = node_text(method, source);
-            match name {
-                "const_get" | "const_set" | "remove_const" | "const_missing" | "class_eval"
-                | "module_eval" | "eval" => {
-                    return Some(format!(
-                        "`{name}` can define or read a constant at run time"
-                    ));
-                }
-                "autoload" => {
-                    return Some("`autoload` defers a constant to a run-time load".to_string());
-                }
-                "require" | "require_relative" | "load"
-                    if parse_ruby_require_call(node, source).is_none() =>
-                {
-                    return Some(format!(
-                        "`{name}` takes an argument this pass cannot resolve statically"
-                    ));
-                }
-                _ => {}
+/// Classify one primary node without traversing declaration source again.
+pub(crate) fn runtime_boundary_for_node(
+    node: Node<'_>,
+    source: &str,
+    load: Option<&crate::imports::RubyLoadSyntax<'_>>,
+) -> Option<brokk_bifrost_core::analyzer::ruby_facts::RubyRuntimeBoundary> {
+    use brokk_bifrost_core::analyzer::ruby_facts::RubyRuntimeBoundary as Boundary;
+    if node.kind() == "call"
+        && let Some(method) = node.child_by_field_name("method")
+    {
+        match node_text(method, source) {
+            "const_get" => return Some(Boundary::ConstGet),
+            "const_set" => return Some(Boundary::ConstSet),
+            "remove_const" => return Some(Boundary::RemoveConst),
+            "const_missing" => return Some(Boundary::ConstMissingCall),
+            "class_eval" => return Some(Boundary::ClassEval),
+            "module_eval" => return Some(Boundary::ModuleEval),
+            "eval" => return Some(Boundary::Eval),
+            "autoload" => return Some(Boundary::Autoload),
+            "require" if load.is_none_or(|load| load.has_receiver) => {
+                return Some(Boundary::DynamicRequire);
             }
+            "require_relative" if load.is_none_or(|load| load.has_receiver) => {
+                return Some(Boundary::DynamicRequireRelative);
+            }
+            "load" if load.is_none_or(|load| load.has_receiver) => {
+                return Some(Boundary::DynamicLoad);
+            }
+            _ => {}
         }
-        if defines_const_missing_dynamically(node, source) {
-            return Some("`const_missing` is defined dynamically".to_string());
-        }
-        if matches!(node.kind(), "method" | "singleton_method")
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source) == "const_missing")
-        {
-            return Some("`const_missing` is defined in this file".to_string());
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+    }
+    if defines_const_missing_dynamically(node, source) {
+        return Some(Boundary::DynamicConstMissingDefinition);
+    }
+    if matches!(node.kind(), "method" | "singleton_method")
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source) == "const_missing")
+    {
+        return Some(Boundary::ConstMissingDefinition);
     }
     None
 }
@@ -572,8 +595,17 @@ fn unresolved_load_directive_reason(
     gems: &dyn RubyGemSurface,
     file: &ProjectFile,
 ) -> Option<SemanticDiagnosticIncompleteReason> {
-    for import in ruby.import_info_of(token, file).iter() {
-        if crate::imports::resolve_required_file(file, import).is_some() {
+    let _ = token;
+    let Some(facts) = ruby.source_facts(file) else {
+        return Some(
+            SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                detail: "canonical Ruby load facts are unavailable".to_owned(),
+            },
+        );
+    };
+    for load in facts.loads.iter().filter(|load| load.generic) {
+        let import = &load.import;
+        if crate::imports::resolve_required_file(file, load).is_some() {
             continue;
         }
         let Some(load_path) = import.identifier.as_deref() else {
@@ -581,7 +613,7 @@ fn unresolved_load_directive_reason(
                 detail: format!("load directive `{}` names no path", import.raw_snippet),
             });
         };
-        if import.raw_snippet.starts_with("require_relative") {
+        if load.kind == brokk_bifrost_core::analyzer::ruby_facts::RubyLoadKind::RequireRelative {
             return Some(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!("`require_relative \"{load_path}\"` names no project file"),
             });
@@ -606,7 +638,7 @@ fn visible_surface_reason(
     ruby: &dyn RubySource,
     gems: &dyn RubyGemSurface,
     file: &ProjectFile,
-    source: &str,
+    _source: &str,
     visible_files: &HashSet<ProjectFile>,
 ) -> Option<SemanticDiagnosticIncompleteReason> {
     let mut remaining_bytes = MAX_RUBY_DIAGNOSTIC_VISIBLE_SOURCE_BYTES;
@@ -620,35 +652,18 @@ fn visible_surface_reason(
         {
             return Some(reason);
         }
-        let visible_source = if visible_file == file {
-            (source.len() <= remaining_bytes).then_some(Cow::Borrowed(source))
-        } else {
-            graph
-                .index
-                .project()
-                .read_source_limited(visible_file, remaining_bytes)
-                .ok()
-                .flatten()
-                .map(Cow::Owned)
+        let Some(facts) = ruby.source_facts(visible_file) else {
+            return Some(
+                SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                    detail: format!("canonical Ruby source facts unavailable for {visible_file:?}"),
+                },
+            );
         };
-        let Some(visible_source) = visible_source else {
-            return Some(SemanticDiagnosticIncompleteReason::Truncated);
-        };
-        let Some(next_remaining_bytes) = remaining_bytes.checked_sub(visible_source.len()) else {
+        let Some(next_remaining_bytes) = remaining_bytes.checked_sub(facts.source_bytes) else {
             return Some(SemanticDiagnosticIncompleteReason::Truncated);
         };
         remaining_bytes = next_remaining_bytes;
-        let Some(tree) = parse_ruby_tree(&visible_source) else {
-            return Some(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                detail: format!(
-                    "visible file {} did not parse",
-                    visible_file.rel_path().display()
-                ),
-            });
-        };
-        let mut parse_errors = Vec::new();
-        collect_parse_errors(tree.root_node(), &mut parse_errors);
-        if !parse_errors.is_empty() {
+        if facts.has_parse_errors {
             return Some(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!(
                     "visible file {} has parse errors",
@@ -656,7 +671,8 @@ fn visible_surface_reason(
                 ),
             });
         }
-        if let Some(detail) = open_runtime_boundary_detail(tree.root_node(), &visible_source) {
+        if let Some(boundary) = facts.runtime_boundary {
+            let detail = boundary.detail();
             return Some(SemanticDiagnosticIncompleteReason::DynamicBehavior {
                 detail: format!(
                     "visible file {}: {detail}",

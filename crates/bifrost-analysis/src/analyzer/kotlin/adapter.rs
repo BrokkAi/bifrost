@@ -54,6 +54,14 @@ impl LanguageAdapter for KotlinAdapter {
         parse_kotlin_file(file, source, tree)
     }
 
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&KOTLIN_COGNITIVE_CONFIG)
     }

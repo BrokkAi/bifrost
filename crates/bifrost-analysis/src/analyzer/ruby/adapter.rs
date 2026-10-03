@@ -17,6 +17,22 @@ use tree_sitter::Tree;
 pub struct RubyAdapter;
 
 impl LanguageAdapter for RubyAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::ruby::source_publication::SOURCE_STORAGE)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn ruby_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::ruby_facts::RUBY_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::Ruby
     }

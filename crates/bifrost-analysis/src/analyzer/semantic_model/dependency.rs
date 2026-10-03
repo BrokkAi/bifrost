@@ -1729,6 +1729,7 @@ pub fn prepare_dependency_semantic_packs(
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error);
+    crate::profiling::note_with(|| format!("semantic_pack.preparation_profile {profile:?}"));
     DependencyPackPreparationOutcome {
         packs,
         installed_packs,

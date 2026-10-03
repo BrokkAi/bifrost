@@ -620,6 +620,10 @@ fn project_modeled_call_target_lookup(
                         potentially_modeled_residual = true;
                     }
                     DefinitionLookupStatus::UnsupportedLanguage
+                    | DefinitionLookupStatus::Unavailable
+                    | DefinitionLookupStatus::Incomplete
+                    | DefinitionLookupStatus::Cancelled
+                    | DefinitionLookupStatus::ExceededBudget(_)
                     | DefinitionLookupStatus::InvalidLocation => unsupported = true,
                     DefinitionLookupStatus::UnresolvableImportBoundary => {
                         potentially_modeled_residual = true;

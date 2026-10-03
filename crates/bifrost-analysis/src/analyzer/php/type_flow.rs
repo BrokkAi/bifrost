@@ -260,6 +260,10 @@ fn resolve_constructor(
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
     }
     match outcome.status {
+        TypeLookupStatus::Unavailable => ClassSeed::Unknown(UnknownReason::UncertainFlow),
+        TypeLookupStatus::Incomplete | TypeLookupStatus::Cancelled => {
+            ClassSeed::Unknown(UnknownReason::UncertainFlow)
+        }
         TypeLookupStatus::ExceededBudget(_) => ClassSeed::Unknown(UnknownReason::SemanticBudget),
         TypeLookupStatus::Ambiguous => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
         TypeLookupStatus::Resolved => {

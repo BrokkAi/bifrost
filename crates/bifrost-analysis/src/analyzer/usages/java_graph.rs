@@ -35,8 +35,6 @@ use brokk_bifrost_jvm::java::graph::return_type::{
 use std::ffi::OsStr;
 use std::sync::Mutex;
 
-pub(in crate::analyzer::usages) use brokk_bifrost_jvm::java::graph::resolver::signature_arity as java_signature_arity;
-
 /// Run `visit` with the [`JavaGraphSource`] built from the *dispatching*
 /// analyzer.
 ///
@@ -46,7 +44,6 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
     analyzer: &dyn IAnalyzer,
     mut visit: impl FnMut(JavaGraphSource<'_>) -> R,
 ) -> R {
-    let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
     let scope = AnalyzerQueryScope::new(analyzer);
     let cancellation = crate::CancellationToken::new();
     match crate::analyzer::relational_frontier::resolve_relational_frontier(
@@ -58,7 +55,6 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
                 index: analyzer,
                 hierarchy: analyzer.type_hierarchy_provider(),
                 relational_definitions: frontier,
-                import_statements: &import_statements,
             })
         },
     ) {
@@ -87,13 +83,11 @@ pub(crate) fn build_java_file_usage_evidence(
     cancellation: &crate::CancellationToken,
 ) -> JavaFileEvidenceBuildOutcome {
     let outcome = relational_session.resolve_owned("java_semantic_scan", |frontier| {
-        let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
         let graph = JavaGraphSource {
             token,
             index: analyzer,
             hierarchy: analyzer.type_hierarchy_provider(),
             relational_definitions: frontier.as_ref(),
-            import_statements: &import_statements,
         };
         extractor::scan_file_evidence(
             java,
@@ -631,7 +625,11 @@ fn is_java_module_descriptor(file: &ProjectFile) -> bool {
 mod relational_inverted_tests {
     use super::*;
     use crate::analyzer::TestProject;
+    use crate::analyzer::usages::model::{UsageHitKind, UsageProof};
+    use crate::inline_project::InlineTestProject;
     use brokk_bifrost_core::analyzer::CodeUnitIndex;
+    use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+    use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 
     #[test]
     fn java_inverted_type_and_member_resolution_builds_no_global_definition_shard() {
@@ -692,6 +690,59 @@ mod relational_inverted_tests {
             .into_fuzzy_result();
 
         assert_eq!(outcome.all_hits_including_imports().len(), 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn java_type_reference_reaches_each_duplicate_source_copy() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "copy-one/api/Owner.java",
+                "package api; public class Owner {}\n",
+            )
+            .file(
+                "copy-two/api/Owner.java",
+                "package api; public class Owner {}\n",
+            )
+            .file(
+                "consumer/app/Consumer.java",
+                "package app; import api.Owner; public class Consumer { Owner value; }\n",
+            )
+            .build();
+        let analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let targets: Vec<_> = analyzer
+            .get_definitions("api.Owner")
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
+        assert_eq!(2, targets.len());
+        let candidates = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let scan_scope = UsageScanScope::new(&candidates);
+
+        for target in &targets {
+            let outcome = JavaUsageGraphStrategy::new()
+                .find_graph_usages(&analyzer, std::slice::from_ref(target), &scan_scope, 100)
+                .into_fuzzy_result();
+            let FuzzyResult::Success {
+                hits_by_overload, ..
+            } = &outcome
+            else {
+                panic!("expected complete Java type usages for {target:?}: {outcome:#?}");
+            };
+            let target_hits = hits_by_overload.get(target).unwrap_or_else(|| {
+                panic!("missing hit bucket for {target:?}: {hits_by_overload:#?}")
+            });
+            assert!(
+                target_hits
+                    .iter()
+                    .any(|hit| hit.kind == UsageHitKind::Reference
+                        && hit.proof == UsageProof::Proven
+                        && hit.snippet.contains("Owner value")),
+                "each physical source copy must receive the proven FQ reference: {outcome:#?}"
+            );
+        }
     }
 
     #[test]

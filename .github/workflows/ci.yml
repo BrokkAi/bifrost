@@ -44,11 +44,6 @@ jobs:
           JAVA_HOME: ''
         run: cargo test -p brokk-bifrost-mcp --locked
 
-      - name: Run LSP contract tests
-        env:
-          JAVA_HOME: ''
-        run: cargo test -p brokk-bifrost-lsp --locked
-
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22

@@ -552,7 +552,7 @@ fn python_dependency_production_request(
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: dependency
                 .evidence
                 .toolchain
@@ -653,7 +653,11 @@ fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Optio
     python_module_name_from_relative(path.strip_prefix(import_root).ok()?)
 }
 
-fn python_module_name_from_relative(relative: &Path) -> Option<String> {
+pub(super) fn python_module_name_from_relative(relative: &Path) -> Option<String> {
+    Some(python_module_components_from_relative(relative)?.join("."))
+}
+
+pub(super) fn python_module_components_from_relative(relative: &Path) -> Option<Vec<String>> {
     let mut components = relative
         .components()
         .map(|component| component.as_os_str().to_str().map(str::to_owned))
@@ -663,7 +667,7 @@ fn python_module_name_from_relative(relative: &Path) -> Option<String> {
     if stem != "__init__" {
         components.push(stem.to_owned());
     }
-    (!components.is_empty()).then(|| components.join("."))
+    (!components.is_empty()).then_some(components)
 }
 
 fn python_locator_file_name(path: &Path) -> String {
@@ -1047,6 +1051,9 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 .child_by_field_name("superclasses")
                 .map(|bases| {
                     named_children(bases)
+                        // `metaclass=` configures class-object lookup; it is
+                        // not an instance superclass and must not enter MRO.
+                        .filter(|base| base.kind() != "keyword_argument")
                         .filter(|base| !self.is_typing_marker_base(*base, &owner, guard))
                         .map(|base| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
@@ -1565,6 +1572,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             visibility: python_visibility(&name),
             is_abstract: false,
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters,
             type_parameter_constraints: Vec::new(),
@@ -1656,6 +1664,7 @@ fn member_fact(
             .and_then(|signature| signature.returns.as_ref()),
     });
     MemberFact {
+        non_overridable: None,
         ambient_use: None,
         id,
         owner: owner_id,
@@ -3834,7 +3843,7 @@ fn artifact_role(kind: ExternalArtifactKind) -> DependencyArtifactRole {
     }
 }
 
-fn metadata_header(metadata: &str, name: &str) -> Option<String> {
+pub(super) fn metadata_header(metadata: &str, name: &str) -> Option<String> {
     metadata.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         (key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
@@ -3842,7 +3851,7 @@ fn metadata_header(metadata: &str, name: &str) -> Option<String> {
     })
 }
 
-fn normalize_distribution_name(name: &str) -> String {
+pub(super) fn normalize_distribution_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
 }
 
@@ -4086,7 +4095,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                 pack_version: "1.0.0".to_owned(),
                 ecosystem: "python".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
@@ -4192,7 +4201,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
             pack_version: "1.0.0".to_owned(),
             ecosystem: "python".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {
@@ -4361,7 +4370,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                 pack_version: "1.0.0".to_owned(),
                 ecosystem: "python".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
@@ -4626,7 +4635,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                 pack_version: "1.0.0".to_owned(),
                 ecosystem: "python".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {

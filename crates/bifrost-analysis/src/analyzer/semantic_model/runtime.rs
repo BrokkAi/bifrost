@@ -39,9 +39,9 @@ use crate::hash::{HashMap, map_with_capacity};
 /// one durable index key ([`semantic_pack_realm`]), so the same active pack set
 /// resolves a Kotlin or Scala call differently than the label-exact keying did.
 /// A recorded identity from before this change must not satisfy the new
-/// contract, so the version moves even though no pack changed. Version 7
-/// retains all highest-rank activation evidence for exact artifact matching.
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 7;
+/// contract, so the version moves even though no pack changed. Version 8
+/// retains the explicit no-concurrency-effects procedure claim.
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 8;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -247,6 +247,8 @@ pub struct ActiveSemanticModelSnapshot {
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     overlay_measurement: Option<SemanticModelOverlayMeasurement>,
     jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    python_runtime:
+        Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
 }
 
 impl ActiveSemanticModelSnapshot {
@@ -255,6 +257,9 @@ impl ActiveSemanticModelSnapshot {
         semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
         overlay_measurement: Option<SemanticModelOverlayMeasurement>,
         jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
+        python_runtime: Option<
+            crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication,
+        >,
     ) -> Self {
         debug_assert_eq!(
             semantic_model_overlay.is_some(),
@@ -266,6 +271,7 @@ impl ActiveSemanticModelSnapshot {
             semantic_model_overlay,
             overlay_measurement,
             jdk_artifacts_by_configured_home,
+            python_runtime,
         }
     }
 
@@ -279,6 +285,12 @@ impl ActiveSemanticModelSnapshot {
 
     pub fn overlay_measurement(&self) -> Option<SemanticModelOverlayMeasurement> {
         self.overlay_measurement
+    }
+
+    pub(crate) fn python_runtime(
+        &self,
+    ) -> Option<&crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication> {
+        self.python_runtime.as_ref()
     }
 
     /// Exact prepared JDK artifact selected by a configured source binding in
@@ -483,6 +495,53 @@ impl ResolvedActiveSemanticModels {
             target.has_receiver,
             target.parameter_count,
         )
+    }
+
+    /// Select summaries for an exact unmaterialized external target, applying
+    /// Python distribution artifact evidence before evidence ranking and claim
+    /// deduplication. The member-only lookup remains available for callers
+    /// that need shape-based model-presence discovery.
+    pub fn procedure_summaries_for_external_target(
+        &self,
+        target: &UnmaterializedExternalTarget,
+    ) -> ProcedureSummaryMatch<'_> {
+        let shapes = self
+            .indexes
+            .procedure_summaries_by_member
+            .get(semantic_pack_realm(target.language().semantic_pack_label()))
+            .and_then(|owners| owners.get(target.owner_fqn()))
+            .and_then(|members| members.get(target.member()));
+        let mut parameter_counts = vec![target.arity()];
+        if let Some(formal_count) = target.python_formal_parameter_count() {
+            parameter_counts.push(formal_count);
+        }
+        let incomplete = std::cell::Cell::new(false);
+        let rejected_artifact = std::cell::Cell::new(false);
+        let mut matched = resolve_applicable_procedure_postings_where_for_counts(
+            &self.shards,
+            shapes,
+            target.has_receiver(),
+            &parameter_counts,
+            |shard, summary| {
+                let artifact_applies = python_artifact_applies_to_target(shard, target);
+                let shape_applies =
+                    procedure_summary_shape_applies_to_target(shard, summary, target);
+                if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
+                    rejected_artifact.set(true);
+                }
+                if python_shard_requires_distribution_artifact(shard, target)
+                    && !shape_applies
+                    && artifact_applies
+                {
+                    incomplete.set(true);
+                }
+                artifact_applies && shape_applies
+            },
+        );
+        if incomplete.get() || (matched.records.is_empty() && rejected_artifact.get()) {
+            matched.applicability = ProcedureSummaryApplicability::Incomplete;
+        }
+        matched
     }
 
     /// Select reviewed-JDK candidates only after pinning the exact artifact
@@ -708,6 +767,100 @@ impl ResolvedActiveSemanticModels {
     }
 }
 
+fn python_artifact_applies_to_target(
+    shard: &ActiveSemanticModelShard,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    if !python_shard_requires_distribution_artifact(shard, target) {
+        return true;
+    }
+    target.selected_python_artifact().is_some_and(|selected| {
+        evidence_is_exact_python_distribution_artifact(selected)
+            && shard.matching_evidence.binary_search(selected).is_ok()
+            && target
+                .selected_python_model_manifest_sha256()
+                .is_some_and(|digest| digest == shard.manifest.content_sha256)
+    })
+}
+
+fn python_shard_requires_distribution_artifact(
+    shard: &ActiveSemanticModelShard,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    target.language().semantic_pack_label() == "python"
+        && shard.manifest.language == "python"
+        && shard.shard.activation().iter().any(|selector| {
+            selector
+                .package
+                .as_ref()
+                .is_some_and(|package| package.name.starts_with("pkg:pypi/"))
+        })
+}
+
+fn procedure_summary_shape_applies_to_target(
+    shard: &ActiveSemanticModelShard,
+    summary: &CompiledProcedureSummary,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    if python_shard_requires_distribution_artifact(shard, target) {
+        let reordered = target.python_actual_to_formal().is_some_and(|mapping| {
+            mapping
+                .iter()
+                .enumerate()
+                .any(|(actual, formal)| actual != *formal as usize)
+        });
+        // Parameter transfers use the proven alias map. Other formal-input
+        // consumers do not yet carry that map, so their claims stay
+        // inapplicable for reordered calls instead of reading the wrong value.
+        let mapped_claims_supported = !reordered
+            || (summary.locations.is_empty()
+                && summary.effects.is_empty()
+                && summary.concurrency_effects.is_empty()
+                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
+                && summary.result_contracts.is_empty()
+                && summary.result_use_obligations.is_empty()
+                && summary.conditional_result_refinements.is_empty()
+                && summary.conditional_indirect_writes.is_empty()
+                && summary.normal_return_refinements.is_empty()
+                && summary.normal_return_type_refinements.is_empty()
+                && summary.class_decorator_identity.is_none());
+        mapped_claims_supported
+            && !summary.target.variadic
+            && target.python_formal_parameter_count() == Some(summary.target.parameter_count)
+            && target.python_formal_call_shape_accepts_arity(target.arity()) == Some(true)
+    } else {
+        summary.target.accepts_parameter_count(target.arity())
+    }
+}
+
+fn evidence_is_exact_python_distribution_artifact(
+    evidence: &SemanticModelActivationEvidence,
+) -> bool {
+    if evidence.language != "python" || evidence.ecosystem != "python" {
+        return false;
+    }
+    let (Some(package), Some(artifact_sha256)) = (
+        evidence.package.as_ref(),
+        evidence.artifact_sha256.as_deref(),
+    ) else {
+        return false;
+    };
+    if !package.name.starts_with("pkg:pypi/") || package.version.is_some() {
+        return false;
+    }
+    let artifact = super::csmi::CsmiArtifactSelector {
+        purl: package.name.clone(),
+        version_range: None,
+        digests: vec![super::csmi::CsmiArtifactDigest {
+            algorithm: super::csmi::CsmiDigestAlgorithm::Sha256,
+            coverage: "artifact".to_owned(),
+            canonicalization: None,
+            value: artifact_sha256.to_owned(),
+        }],
+    };
+    super::csmi::validate_python_artifact(&artifact).is_ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticModelMatchDisposition {
     Empty,
@@ -835,6 +988,7 @@ pub struct ActivatedProcedureSummary<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmaterializedExternalSummaryCallShapeBinding {
     actual_locator: SemanticLocator,
+    actual_to_formal: Option<Box<[u32]>>,
     formal_locator: SemanticLocator,
     model_id: Box<str>,
     content: StableDigest,
@@ -845,6 +999,12 @@ pub struct UnmaterializedExternalSummaryCallShapeBinding {
 impl UnmaterializedExternalSummaryCallShapeBinding {
     pub fn actual_locator(&self) -> &SemanticLocator {
         &self.actual_locator
+    }
+
+    /// Proven formal ordinal for each actual argument. Generic runtime calls
+    /// retain their established positional binding with no explicit map.
+    pub fn actual_to_formal(&self) -> Option<&[u32]> {
+        self.actual_to_formal.as_deref()
     }
 
     pub fn formal_locator(&self) -> &SemanticLocator {
@@ -883,19 +1043,21 @@ impl<'a> ActivatedProcedureSummary<'a> {
                 .language()
                 .accepts_semantic_pack_language(&self.shard.manifest.language)
             || self.record.target.has_receiver != target.has_receiver()
-            || !self.record.target.accepts_parameter_count(target.arity())
+            || !procedure_summary_shape_applies_to_target(self.shard, self.record, target)
             || target.locator_for_arity(target.arity()) != *target.locator()
             || authored_procedure_target_identity(
                 &self.record.target.path,
                 &self.record.target.symbol,
             )
             .is_none_or(|(owner, member)| owner != target.owner_fqn() || member != target.member())
+            || !python_artifact_applies_to_target(self.shard, target)
         {
             return None;
         }
         Some(UnmaterializedExternalSummaryCallShapeBinding {
             actual_locator: target.locator().clone(),
-            formal_locator: target.locator_for_arity(self.record.target.parameter_count),
+            actual_to_formal: target.python_actual_to_formal().map(Into::into),
+            formal_locator: target.formal_summary_locator(self.record.target.parameter_count),
             model_id: self.record.model_id.clone().into_boxed_str(),
             content: StableDigest::from_array(content),
             contract_version: self.record.contract_version,
@@ -924,6 +1086,12 @@ impl<'a> ActivatedProcedureSummary<'a> {
     /// receiver and argument values.
     pub fn concurrency_effects(&self) -> &'a [CompiledConcurrencyEffect] {
         &self.record.concurrency_effects
+    }
+
+    /// Whether this exact activated record explicitly claims that the call has
+    /// no synchronization or concurrent retention effects.
+    pub const fn no_concurrency_effects(&self) -> bool {
+        self.record.no_concurrency_effects
     }
 
     /// Reviewed predicates required of this exact procedure invocation's
@@ -1026,8 +1194,16 @@ impl<'a> ActivatedProcedureSummary<'a> {
     }
 }
 
+/// Applicability coverage is independent of selected model presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcedureSummaryApplicability {
+    Complete,
+    Incomplete,
+}
+
 #[derive(Debug)]
 pub struct ProcedureSummaryMatch<'a> {
+    pub applicability: ProcedureSummaryApplicability,
     pub records: Vec<ActivatedProcedureSummary<'a>>,
     pub disposition: SemanticModelMatchDisposition,
     pub candidates_examined: usize,
@@ -1873,6 +2049,7 @@ fn procedure_claims_agree(
 ) -> bool {
     left.completeness == right.completeness
         && left.ordinary_heap_unchanged == right.ordinary_heap_unchanged
+        && left.no_concurrency_effects == right.no_concurrency_effects
         && left.covers_overrides == right.covers_overrides
         && left.normal_continuation_absent == right.normal_continuation_absent
         && left.normal_result_count == right.normal_result_count
@@ -1932,27 +2109,43 @@ fn resolve_applicable_procedure_postings_where<'a>(
     actual_parameter_count: u32,
     accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
 ) -> ProcedureSummaryMatch<'a> {
+    resolve_applicable_procedure_postings_where_for_counts(
+        shards,
+        shapes,
+        has_receiver,
+        &[actual_parameter_count],
+        accepts_record,
+    )
+}
+
+fn resolve_applicable_procedure_postings_where_for_counts<'a>(
+    shards: &'a [ActiveSemanticModelShard],
+    shapes: Option<&ProcedureSummaryShapePostings>,
+    has_receiver: bool,
+    actual_parameter_counts: &[u32],
+    accepts_record: impl Fn(&ActiveSemanticModelShard, &CompiledProcedureSummary) -> bool,
+) -> ProcedureSummaryMatch<'a> {
     let Some(shapes) = shapes else {
         return empty_procedure_match();
     };
-    // A variadic target's total formal count is one greater than its minimum
-    // accepted actual count. Saturation keeps the full valid prefix available
-    // for the largest representable call shape without iterating by arity.
-    let maximum_variadic_formals = actual_parameter_count.saturating_add(1);
-    let variadic = shapes
-        .variadic
-        .range((has_receiver, 1)..=(has_receiver, maximum_variadic_formals))
-        .map(|(_key, posting)| posting);
-    resolve_procedure_postings_where(
-        shards,
-        shapes
-            .fixed
-            .get(&(has_receiver, actual_parameter_count))
-            .into_iter()
-            .chain(variadic),
-        procedure_claims_agree,
-        accepts_record,
-    )
+    let mut parameter_counts = actual_parameter_counts.to_vec();
+    parameter_counts.sort_unstable();
+    parameter_counts.dedup();
+    let mut postings = Vec::new();
+    for actual_parameter_count in parameter_counts {
+        // A variadic target's total formal count is one greater than its
+        // minimum accepted actual count. Saturation keeps the full valid
+        // prefix available for the largest representable call shape.
+        let maximum_variadic_formals = actual_parameter_count.saturating_add(1);
+        postings.extend(shapes.fixed.get(&(has_receiver, actual_parameter_count)));
+        postings.extend(
+            shapes
+                .variadic
+                .range((has_receiver, 1)..=(has_receiver, maximum_variadic_formals))
+                .map(|(_key, posting)| posting),
+        );
+    }
+    resolve_procedure_postings_where(shards, postings, procedure_claims_agree, accepts_record)
 }
 
 fn procedure_match_proves_normal_continuation_absent(matched: &ProcedureSummaryMatch<'_>) -> bool {
@@ -1965,6 +2158,7 @@ fn procedure_match_proves_normal_continuation_absent(matched: &ProcedureSummaryM
 
 fn empty_procedure_match<'a>() -> ProcedureSummaryMatch<'a> {
     ProcedureSummaryMatch {
+        applicability: ProcedureSummaryApplicability::Complete,
         records: Vec::new(),
         disposition: SemanticModelMatchDisposition::Empty,
         candidates_examined: 0,
@@ -2026,6 +2220,7 @@ fn resolve_procedure_postings_where<'a, 'posting>(
         }
     }
     ProcedureSummaryMatch {
+        applicability: ProcedureSummaryApplicability::Complete,
         disposition: match records.len() {
             0 => SemanticModelMatchDisposition::Empty,
             1 => SemanticModelMatchDisposition::Unique,
@@ -2228,12 +2423,14 @@ impl SemanticModelRuntimeCache {
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
         dependency_evidence: Option<&[DependencyEvidencePublication]>,
-        jdk_artifacts_by_configured_home: Option<
-            &HashMap<PathBuf, SemanticModelActivationEvidence>,
-        >,
+        runtime_artifacts: RuntimeArtifactPublication<'_>,
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<ActiveSemanticModelSnapshot>, SemanticModelOverlayBuildError> {
+        let RuntimeArtifactPublication {
+            jdk_artifacts_by_configured_home,
+            python_runtime,
+        } = runtime_artifacts;
         let _scope = crate::profiling::scope("semantic_pack.publish_overlay");
         {
             let published = self
@@ -2242,6 +2439,7 @@ impl SemanticModelRuntimeCache {
                 .expect("semantic-model publication mutex poisoned");
             if dependency_evidence.is_none()
                 && jdk_artifacts_by_configured_home.is_none()
+                && python_runtime.is_none()
                 && let Some(snapshot) = published.snapshot.as_ref()
                 && Arc::ptr_eq(snapshot.active_models(), active)
             {
@@ -2262,6 +2460,7 @@ impl SemanticModelRuntimeCache {
             .expect("semantic-model publication mutex poisoned");
         if dependency_evidence.is_none()
             && jdk_artifacts_by_configured_home.is_none()
+            && python_runtime.is_none()
             && let Some(current) = published.snapshot.as_ref()
             && Arc::ptr_eq(current.active_models(), active)
         {
@@ -2299,6 +2498,12 @@ impl SemanticModelRuntimeCache {
             Some(overlay),
             Some(overlay_measurement),
             jdk_artifacts_by_configured_home,
+            python_runtime.cloned().or_else(|| {
+                published
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.python_runtime.clone())
+            }),
         ));
         published.snapshot = Some(Arc::clone(&snapshot));
         Ok(snapshot)
@@ -2749,6 +2954,12 @@ pub fn resolve_active_semantic_models(
     report.phase_measurements.catalog_sql_statements = catalog
         .sql_statement_count()
         .saturating_sub(activation_sql_start);
+    crate::profiling::note_with(|| {
+        format!(
+            "semantic_pack.activation_phases {:?}",
+            report.phase_measurements
+        )
+    });
     let resolved = ResolvedActiveSemanticModels {
         active_model_set_hash,
         shards,
@@ -2798,29 +3009,42 @@ pub fn acquire_active_semantic_models_with_evidence(
     dependency_evidence: Option<&[DependencyEvidencePublication]>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
-    acquire_active_semantic_models_with_jdk_artifacts(
+    acquire_active_semantic_models_with_runtime_artifacts(
         analyzer,
         catalog,
         persistence,
         request,
         dependency_evidence,
-        None,
+        RuntimeArtifactPublication::default(),
         cancellation,
     )
 }
 
-/// Publish the exact source-binding artifact map with the activated models.
-/// Only the host activation stage supplies this map; ordinary model acquisition
-/// preserves an existing map when it publishes another ecosystem.
-pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
+/// Borrowed runtime-artifact evidence committed with one model publication.
+/// Neither ecosystem can be updated independently of that publication boundary.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RuntimeArtifactPublication<'a> {
+    pub(crate) jdk_artifacts_by_configured_home:
+        Option<&'a HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    pub(crate) python_runtime:
+        Option<&'a crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
+}
+
+/// Publish runtime source-binding evidence with the activated models. Ordinary
+/// acquisition preserves existing evidence when publishing another ecosystem.
+pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     analyzer: &dyn IAnalyzer,
     catalog: &SemanticPackCatalog,
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     request: &SemanticModelActivationRequest,
     dependency_evidence: Option<&[DependencyEvidencePublication]>,
-    jdk_artifacts_by_configured_home: Option<&HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    runtime_artifacts: RuntimeArtifactPublication<'_>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    let RuntimeArtifactPublication {
+        jdk_artifacts_by_configured_home,
+        python_runtime,
+    } = runtime_artifacts;
     let request_key = match runtime_request_key(request) {
         Ok(key) => key,
         Err(reason) => {
@@ -2839,8 +3063,13 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
         Ok(identity) => identity,
         Err(error) => return catalog_lifecycle_error(request.limits, "identify", error),
     };
+    let provider_identity = python_runtime
+        .map(|publication| {
+            crate::analyzer::canonical_hash::lower_hex_string(&publication.evidence_digest)
+        })
+        .unwrap_or_default();
     let key = format!(
-        "{request_key}:{}:{}:{}",
+        "{request_key}:{provider_identity}:{}:{}:{}",
         catalog_identity.instance_identity,
         catalog_identity.mutation_generation,
         catalog_identity.sqlite_data_version
@@ -2852,7 +3081,10 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
     let snapshot_content = analyzer.workspace_content_identity();
     let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
     let Some(caches) = analyzer.snapshot_caches() else {
-        let outcome = resolve_active_semantic_models(catalog, request, cancellation);
+        let outcome = with_python_provider_identity(
+            resolve_active_semantic_models(catalog, request, cancellation),
+            python_runtime,
+        );
         if !content_is_current() {
             return stale_generation_outcome(request.limits);
         }
@@ -2865,6 +3097,7 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
             outcome,
             SemanticModelRuntimeLifecycle::Uncached,
             jdk_artifacts_by_configured_home,
+            python_runtime,
         );
     };
     let (acquisition, _) = caches.semantic_models().values.acquire(&key, cancellation);
@@ -2880,7 +3113,7 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
                 analyzer,
                 &value,
                 dependency_evidence,
-                jdk_artifacts_by_configured_home,
+                runtime_artifacts,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
@@ -2894,12 +3127,16 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
             }
         }
         CompleteValueAcquisition::Leader { permit } => {
-            let outcome = resolve_active_semantic_models(catalog, request, cancellation);
+            let outcome = with_python_provider_identity(
+                resolve_active_semantic_models(catalog, request, cancellation),
+                python_runtime,
+            );
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
                 return runtime_outcome(
                     outcome,
                     SemanticModelRuntimeLifecycle::Built,
                     jdk_artifacts_by_configured_home,
+                    python_runtime,
                 );
             };
             if !content_is_current() {
@@ -2913,7 +3150,7 @@ pub(crate) fn acquire_active_semantic_models_with_jdk_artifacts(
                 analyzer,
                 &active,
                 dependency_evidence,
-                jdk_artifacts_by_configured_home,
+                runtime_artifacts,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
@@ -3019,10 +3256,34 @@ fn catalog_lifecycle_error(
     SemanticModelRuntimeOutcome::Unavailable(report)
 }
 
+fn with_python_provider_identity(
+    mut outcome: SemanticModelResolutionOutcome,
+    publication: Option<&crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
+) -> SemanticModelResolutionOutcome {
+    if let Some(publication) = publication {
+        let active = match &mut outcome {
+            SemanticModelResolutionOutcome::Ready(active) => Some(active),
+            SemanticModelResolutionOutcome::Incomplete { usable, .. } => usable.as_mut(),
+            _ => None,
+        };
+        if let Some(active) = active {
+            let mut hasher = Sha256::new();
+            hasher.update(b"bifrost.python-runtime-active-set.v1\0");
+            hasher.update(active.active_model_set_hash.as_bytes());
+            hasher.update(publication.evidence_digest);
+            active.active_model_set_hash = format!("{:x}", hasher.finalize());
+        }
+    }
+    outcome
+}
+
 fn runtime_outcome(
     outcome: SemanticModelResolutionOutcome,
     lifecycle: SemanticModelRuntimeLifecycle,
     jdk_artifacts_by_configured_home: Option<&HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    python_runtime: Option<
+        &crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication,
+    >,
 ) -> SemanticModelRuntimeOutcome {
     match outcome {
         SemanticModelResolutionOutcome::Ready(active) => {
@@ -3036,6 +3297,7 @@ fn runtime_outcome(
                         .cloned()
                         .unwrap_or_default(),
                 ),
+                python_runtime.cloned(),
             ));
             SemanticModelRuntimeOutcome::Ready {
                 active,
@@ -3100,8 +3362,12 @@ fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<Strin
     controls.sort_unstable();
     controls.dedup();
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v1\0");
+    hasher.update(b"bifrost.semantic-model.runtime-request.v2\0");
     hash_key_part(&mut hasher, &request.bifrost_version.to_string());
+    hasher.update((super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64).to_be_bytes());
+    for schema_version in super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS {
+        hasher.update(schema_version.to_be_bytes());
+    }
     for row in &evidence {
         hash_activation_evidence(&mut hasher, row);
     }
@@ -3287,8 +3553,11 @@ fn strict_activation_match(
     evidence: &[SemanticModelActivationEvidence],
     bifrost_version: &Version,
 ) -> Option<StrictActivationMatch> {
-    let bifrost = VersionReq::parse(&manifest.compatibility.bifrost).ok()?;
-    if !bifrost.matches(bifrost_version) {
+    if !manifest
+        .compatibility
+        .matches_engine(manifest.schema_version, bifrost_version)
+        .ok()?
+    {
         return None;
     }
     let toolchains = manifest
@@ -3864,6 +4133,24 @@ mod semantic_diagnostic_runtime_tests {
     use crate::analyzer::SemanticDiagnosticIncompleteReason;
 
     #[test]
+    fn runtime_request_key_binds_engine_and_supported_schema_contract() {
+        let request = |bifrost_version| SemanticModelActivationRequest {
+            bifrost_version,
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let version = Version::parse("0.12.0").unwrap();
+        let key = runtime_request_key(&request(version.clone())).unwrap();
+        assert_ne!(
+            key,
+            runtime_request_key(&request(Version::parse("0.13.0").unwrap())).unwrap()
+        );
+        let _supported_schemas_are_bound_by_runtime_request_key =
+            super::super::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
+    }
+
+    #[test]
     fn runtime_outcomes_map_to_shared_suppression_reasons() {
         let report = SemanticModelActivationReport::default();
         assert_eq!(
@@ -3957,6 +4244,20 @@ mod unmaterialized_call_shape_binding_tests {
     }"#;
 
     fn target(member: &str, arity: u32) -> UnmaterializedExternalTarget {
+        target_for_language(
+            crate::analyzer::Language::Java,
+            "com.acme.Api",
+            member,
+            arity,
+        )
+    }
+
+    fn target_for_language(
+        language: crate::analyzer::Language,
+        owner: &str,
+        member: &str,
+        arity: u32,
+    ) -> UnmaterializedExternalTarget {
         let position = SourcePosition::new(0, 0, 0);
         let anchor = SourceAnchor::new(
             SourceSpan::new(position, position).expect("fixture span is ordered"),
@@ -3970,12 +4271,136 @@ mod unmaterialized_call_shape_binding_tests {
         let locator = SemanticLocator::new(
             unmaterialized_external_mount(),
             unmaterialized_external_path(),
-            SemanticLanguage::Standard(crate::analyzer::Language::Java),
+            SemanticLanguage::Standard(language),
             declaration,
             SemanticRole::Procedure,
             anchor,
         );
-        UnmaterializedExternalTarget::new("com.acme.Api", member, arity, false, locator)
+        UnmaterializedExternalTarget::new(owner, member, arity, false, locator)
+    }
+
+    fn python_evidence(digest_byte: char) -> SemanticModelActivationEvidence {
+        SemanticModelActivationEvidence {
+            language: "python".to_owned(),
+            ecosystem: "python".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "pkg:pypi/example@1.2.3".to_owned(),
+                version: None,
+            }),
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: Some(std::iter::repeat_n(digest_byte, 64).collect()),
+        }
+    }
+
+    fn python_artifact_shard(
+        evidence: &SemanticModelActivationEvidence,
+        source_rank: u8,
+    ) -> ActiveSemanticModelShard {
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["language"] = "python".into();
+        source["ecosystem"] = "python".into();
+        source["shards"][0]["activation"] = serde_json::json!([{
+            "package": {"name": evidence.package.as_ref().unwrap().name.clone()},
+            "artifact_sha256": evidence.artifact_sha256.as_ref().unwrap().clone(),
+        }]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("exact-PyPI fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("exact-PyPI fixture decodes");
+        ActiveSemanticModelShard {
+            manifest: Arc::new(compiled.manifest),
+            shard,
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: format!("test:pypi:{}", evidence.artifact_sha256.as_deref().unwrap()),
+            matched_evidence: evidence.clone(),
+            matching_evidence: vec![evidence.clone()],
+            evidence_rank: EvidenceRank::ExactArtifact,
+            source_rank,
+        }
+    }
+
+    fn python_pypi_wildcard_shard(
+        evidence: &SemanticModelActivationEvidence,
+        source_rank: u8,
+    ) -> ActiveSemanticModelShard {
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["language"] = "python".into();
+        source["ecosystem"] = "python".into();
+        source["shards"][0]["activation"] = serde_json::json!([{
+            "package": {"name": evidence.package.as_ref().unwrap().name.clone()},
+        }]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("PyPI wildcard fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("PyPI wildcard fixture decodes");
+        ActiveSemanticModelShard {
+            manifest: Arc::new(compiled.manifest),
+            shard,
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:pypi-wildcard".to_owned(),
+            matched_evidence: evidence.clone(),
+            matching_evidence: vec![evidence.clone()],
+            evidence_rank: EvidenceRank::NamedCoordinate,
+            source_rank,
+        }
+    }
+
+    fn python_generic_shard() -> ActiveSemanticModelShard {
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["language"] = "python".into();
+        source["ecosystem"] = "python".into();
+        source["shards"][0]["activation"] = serde_json::json!([{}]);
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("generic Python fixture compiles");
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("generic Python fixture decodes");
+        let evidence = SemanticModelActivationEvidence {
+            language: "python".to_owned(),
+            ecosystem: "python".to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        };
+        ActiveSemanticModelShard {
+            manifest: Arc::new(compiled.manifest),
+            shard,
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:generic-python".to_owned(),
+            matched_evidence: evidence.clone(),
+            matching_evidence: vec![evidence],
+            evidence_rank: EvidenceRank::Language,
+            source_rank: 0,
+        }
     }
 
     #[test]
@@ -4065,6 +4490,112 @@ mod unmaterialized_call_shape_binding_tests {
         )
         .expect("the JDK 21 artifact activates the shard");
         assert_eq!(matched.matching_evidence, vec![java21]);
+    }
+
+    #[test]
+    fn schema8_activation_is_engine_independent_but_keeps_toolchain_and_artifact_checks() {
+        let artifact_sha256 = "a".repeat(64);
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["schema_version"] = 8.into();
+        source["ecosystem"] = "jdk".into();
+        source["compatibility"] = serde_json::json!({
+            "toolchains": [{
+                "name": "jdk",
+                "requirement": ">=21.0.0, <22.0.0"
+            }]
+        });
+        source["completeness"] = "partial".into();
+        for summary in source["shards"][0]["payload"]["summaries"]
+            .as_array_mut()
+            .expect("fixture summaries are an array")
+        {
+            summary["completeness"] = "partial".into();
+        }
+        source["shards"][0]["activation"] = serde_json::json!([{
+            "toolchain": {"name": "jdk", "version": "=21.0.8"},
+            "artifact_sha256": artifact_sha256
+        }]);
+
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("schema 8 fixture compiles");
+        assert_eq!(compiled.manifest.schema_version, 8);
+        assert_eq!(
+            compiled.manifest.completeness,
+            crate::analyzer::semantic_model::Completeness::Partial
+        );
+        assert!(compiled.manifest.compatibility.bifrost.is_none());
+        let shard = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("schema 8 fixture decodes");
+        let crate::analyzer::semantic_model::CompiledPayload::ProcedureSummaries { summaries } =
+            shard.payload()
+        else {
+            panic!("schema 8 fixture carries procedure summaries");
+        };
+        assert!(summaries.iter().all(|summary| {
+            summary.completeness == crate::analyzer::semantic_model::Completeness::Partial
+        }));
+        let evidence = |jdk_version: &str, digest: &str| SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse(jdk_version).expect("valid JDK version")),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: Some(digest.to_owned()),
+        };
+
+        let matching = evidence("21.0.8", &artifact_sha256);
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &shard,
+                std::slice::from_ref(&matching),
+                &Version::parse("99.0.0").expect("valid cross-engine version"),
+            )
+            .is_some()
+        );
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &shard,
+                &[evidence("22.0.1", &artifact_sha256)],
+                &Version::parse("99.0.0").expect("valid cross-engine version"),
+            )
+            .is_none()
+        );
+        assert!(
+            strict_activation_match(
+                &compiled.manifest,
+                &shard,
+                &[evidence("21.0.8", &"b".repeat(64))],
+                &Version::parse("99.0.0").expect("valid cross-engine version"),
+            )
+            .is_none()
+        );
+
+        let mut unknown_schema = compiled.manifest.clone();
+        unknown_schema.schema_version = 9;
+        assert!(
+            strict_activation_match(
+                &unknown_schema,
+                &shard,
+                std::slice::from_ref(&matching),
+                &Version::parse("99.0.0").expect("valid cross-engine version"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -4237,6 +4768,517 @@ mod unmaterialized_call_shape_binding_tests {
                 )
                 .disposition,
             SemanticModelMatchDisposition::Empty
+        );
+    }
+
+    #[test]
+    fn python_exact_pypi_binding_requires_the_selected_artifact_before_ranking() {
+        let selected_evidence = python_evidence('a');
+        let other_evidence = python_evidence('b');
+        let higher_rank_other_artifact = python_artifact_shard(&other_evidence, 1);
+        let lower_rank_selected_artifact = python_artifact_shard(&selected_evidence, 0);
+        let shards = vec![higher_rank_other_artifact, lower_rank_selected_artifact];
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            &shards,
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("same-spelling Python artifact shards index");
+        let active = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:two-python-artifacts".to_owned(),
+            shards,
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+        let selected_target = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        )
+        .with_selected_python_for_test(selected_evidence.clone())
+        .with_python_model_manifest_for_test(&active.shards[1].manifest.content_sha256);
+
+        let different_model = selected_target
+            .clone()
+            .with_python_model_manifest_for_test(&"f".repeat(64));
+        let rejected = active.procedure_summaries_for_external_target(&different_model);
+        assert_eq!(rejected.disposition, SemanticModelMatchDisposition::Empty);
+        assert_eq!(
+            rejected.applicability,
+            ProcedureSummaryApplicability::Incomplete
+        );
+        let matched = active.procedure_summaries_for_external_target(&selected_target);
+        assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+        assert_eq!(matched.records.len(), 1);
+        assert_eq!(matched.records[0].shard.matched_evidence, selected_evidence);
+        assert_eq!(
+            matched.records[0].shard.source_rank, 0,
+            "a higher-ranked same-spelling summary for another digest is filtered first"
+        );
+        assert!(
+            matched.records[0]
+                .bind_unmaterialized_call_shape(&selected_target)
+                .is_some()
+        );
+
+        let selected_shard = active
+            .shards
+            .iter()
+            .find(|shard| shard.matched_evidence == selected_evidence)
+            .unwrap();
+        let payload = selected_shard
+            .shard
+            .payload()
+            .procedure_summaries()
+            .unwrap();
+        let selected_summary = ActivatedProcedureSummary {
+            record: &payload[0],
+            shard: selected_shard,
+            payload,
+        };
+        let missing_target = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        );
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&missing_target)
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "an exact PyPI shard is not applicable without selected provider evidence"
+        );
+        assert_ne!(
+            active
+                .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                    "python",
+                    "com.acme.Api",
+                    "fixed",
+                    false,
+                    3,
+                ))
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "shape-only discovery still sees the active model"
+        );
+        assert!(
+            selected_summary
+                .bind_unmaterialized_call_shape(&missing_target)
+                .is_none()
+        );
+
+        let different_digest_target = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        )
+        .with_selected_python_for_test(python_evidence('c'));
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&different_digest_target)
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "same distribution name and version with a different digest is not applicable"
+        );
+        assert_ne!(
+            active
+                .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                    "python",
+                    "com.acme.Api",
+                    "fixed",
+                    false,
+                    3,
+                ))
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "a wrong artifact remains distinct from model absence"
+        );
+        assert!(
+            selected_summary
+                .bind_unmaterialized_call_shape(&different_digest_target)
+                .is_none()
+        );
+        let other_shard = active
+            .shards
+            .iter()
+            .find(|shard| shard.matched_evidence == other_evidence)
+            .unwrap();
+        let other_payload = other_shard.shard.payload().procedure_summaries().unwrap();
+        let other_summary = ActivatedProcedureSummary {
+            record: &other_payload[0],
+            shard: other_shard,
+            payload: other_payload,
+        };
+        assert!(
+            other_summary
+                .bind_unmaterialized_call_shape(&selected_target)
+                .is_none()
+        );
+
+        let generic_shard = python_generic_shard();
+        let mut generic_report = SemanticModelActivationReport::default();
+        let generic_indexes = MatcherIndexes::build(
+            std::slice::from_ref(&generic_shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut generic_report,
+        )
+        .expect("generic Python summary indexes");
+        let generic_active = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:generic-python".to_owned(),
+            shards: vec![generic_shard],
+            indexes: generic_indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report: generic_report,
+        };
+        let generic_target = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        );
+        let generic_match = generic_active.procedure_summaries_for_external_target(&generic_target);
+        assert_eq!(
+            generic_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        assert!(
+            generic_match.records[0]
+                .bind_unmaterialized_call_shape(&generic_target)
+                .is_some()
+        );
+        let generic_target_with_selected_distribution = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        )
+        .with_selected_python_for_test(python_evidence('d'));
+        let generic_match = generic_active
+            .procedure_summaries_for_external_target(&generic_target_with_selected_distribution);
+        assert_eq!(
+            generic_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        assert!(
+            generic_match.records[0]
+                .bind_unmaterialized_call_shape(&generic_target_with_selected_distribution)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn python_same_artifact_requires_the_selected_model_applicability() {
+        let evidence = python_evidence('a');
+        let compatible = python_artifact_shard(&evidence, 0);
+
+        let mut source: serde_json::Value = serde_json::from_slice(PACK).unwrap();
+        source["language"] = "python".into();
+        source["ecosystem"] = "python".into();
+        source["shards"][0]["activation"] = serde_json::json!([{
+            "package": {"name": evidence.package.as_ref().unwrap().name.clone()},
+            "artifact_sha256": evidence.artifact_sha256.as_ref().unwrap().clone(),
+        }]);
+        source["shards"][0]["payload"]["summaries"][0]["target"]["variadic"] = true.into();
+        let incompatible_compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("same-artifact variadic model compiles");
+        let incompatible = ActiveSemanticModelShard {
+            manifest: Arc::new(incompatible_compiled.manifest),
+            shard: decode_shard(
+                &incompatible_compiled.shards[0].descriptor,
+                &incompatible_compiled.shards[0].bytes,
+                &DecodeLimits::default(),
+            )
+            .expect("same-artifact variadic model decodes"),
+            source_kind: CatalogPackSourceKind::Embedded,
+            source_id: "test:pypi:variadic-model".to_owned(),
+            matched_evidence: evidence.clone(),
+            matching_evidence: vec![evidence.clone()],
+            evidence_rank: EvidenceRank::ExactArtifact,
+            source_rank: 1,
+        };
+        assert_eq!(compatible.matching_evidence, incompatible.matching_evidence);
+        assert_ne!(
+            compatible.manifest.content_sha256, incompatible.manifest.content_sha256,
+            "independently compiled payload applicability must identify distinct models"
+        );
+
+        let shards = vec![compatible, incompatible];
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            &shards,
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("same-artifact Python models index");
+        let active = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:same-python-artifact-two-models".to_owned(),
+            shards,
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+        let target_for_model = |manifest: &str| {
+            target_for_language(
+                crate::analyzer::Language::Python,
+                "com.acme.Api",
+                "fixed",
+                3,
+            )
+            .with_selected_python_for_test(evidence.clone())
+            .with_python_model_manifest_for_test(manifest)
+        };
+
+        let compatible_target = target_for_model(&active.shards[0].manifest.content_sha256);
+        let compatible_match = active.procedure_summaries_for_external_target(&compatible_target);
+        assert_eq!(
+            compatible_match.applicability,
+            ProcedureSummaryApplicability::Complete
+        );
+        assert_eq!(
+            compatible_match.disposition,
+            SemanticModelMatchDisposition::Unique
+        );
+        assert_eq!(compatible_match.records.len(), 1);
+        assert_eq!(
+            compatible_match.records[0].shard.manifest.content_sha256,
+            active.shards[0].manifest.content_sha256
+        );
+        assert!(
+            compatible_match.records[0]
+                .bind_unmaterialized_call_shape(&compatible_target)
+                .is_some()
+        );
+
+        let incompatible_target = target_for_model(&active.shards[1].manifest.content_sha256);
+        let incompatible_match =
+            active.procedure_summaries_for_external_target(&incompatible_target);
+        assert_eq!(
+            incompatible_match.applicability,
+            ProcedureSummaryApplicability::Incomplete
+        );
+        assert_eq!(
+            incompatible_match.disposition,
+            SemanticModelMatchDisposition::Empty,
+            "the compatible model cannot authorize the same artifact's incompatible model"
+        );
+        assert!(incompatible_match.records.is_empty());
+    }
+
+    #[test]
+    fn python_pypi_wildcard_selector_requires_selected_artifact_evidence() {
+        let evidence = python_evidence('a');
+        let shard = python_pypi_wildcard_shard(&evidence, 0);
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            std::slice::from_ref(&shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("PyPI wildcard summary indexes");
+        let active = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:pypi-wildcard".to_owned(),
+            shards: vec![shard],
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+        let target = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        );
+
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&target)
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "a package-only PyPI selector cannot bind without selected artifact proof"
+        );
+        assert_ne!(
+            active
+                .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                    "python",
+                    "com.acme.Api",
+                    "fixed",
+                    false,
+                    3,
+                ))
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "the active model remains discoverable; only this boundary lacks proof"
+        );
+
+        let selected_target = target
+            .with_selected_python_for_test(evidence)
+            .with_python_model_manifest_for_test(&active.shards[0].manifest.content_sha256);
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&selected_target)
+                .disposition,
+            SemanticModelMatchDisposition::Unique,
+            "the same selector applies once an exact artifact is selected"
+        );
+    }
+
+    #[test]
+    fn python_argument_permutations_have_distinct_aliases_and_checked_formals() {
+        let evidence = python_evidence('a');
+        let shard = python_artifact_shard(&evidence, 0);
+        let payload = shard.shard.payload().procedure_summaries().unwrap();
+        let selected = ActivatedProcedureSummary {
+            record: &payload[0],
+            shard: &shard,
+            payload,
+        };
+        let target = || {
+            target_for_language(
+                crate::analyzer::Language::Python,
+                "com.acme.Api",
+                "fixed",
+                3,
+            )
+            .with_selected_python_for_test(evidence.clone())
+            .with_python_model_manifest_for_test(&shard.manifest.content_sha256)
+        };
+        let positional = target().with_python_mapping_for_test(Some(vec![0, 1, 2]));
+        let reordered = target().with_python_mapping_for_test(Some(vec![2, 0, 1]));
+        assert_ne!(positional.locator(), reordered.locator());
+        let positional_binding = selected
+            .bind_unmaterialized_call_shape(&positional)
+            .unwrap();
+        let reordered_binding = selected.bind_unmaterialized_call_shape(&reordered).unwrap();
+        assert_eq!(
+            positional_binding.formal_locator(),
+            reordered_binding.formal_locator()
+        );
+        assert_eq!(
+            reordered_binding.actual_to_formal(),
+            Some([2, 0, 1].as_slice())
+        );
+        for mapping in [
+            None,
+            Some(vec![0, 0, 2]),
+            Some(vec![0, 1]),
+            Some(vec![0, 1, 3]),
+        ] {
+            assert!(
+                selected
+                    .bind_unmaterialized_call_shape(&target().with_python_mapping_for_test(mapping))
+                    .is_none()
+            );
+        }
+        let mut unsupported = payload[0].clone();
+        unsupported.ordinary_heap_unchanged = true;
+        unsupported.preconditions = Some(vec![super::super::CompiledOperationPrecondition {
+            input: super::super::CompiledSummaryInput::Parameter { ordinal: 0 },
+            predicate: super::super::CompiledResultPredicate::NonNull,
+        }]);
+        let selected_unsupported = ActivatedProcedureSummary {
+            record: &unsupported,
+            shard: &shard,
+            payload,
+        };
+        assert!(
+            selected_unsupported
+                .bind_unmaterialized_call_shape(&reordered)
+                .is_none()
+        );
+        assert!(
+            selected_unsupported
+                .bind_unmaterialized_call_shape(&positional)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn python_omitted_default_boundary_is_incomplete_but_full_positional_call_binds() {
+        let evidence = python_evidence('a');
+        let shard = python_artifact_shard(&evidence, 0);
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            std::slice::from_ref(&shard),
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .expect("exact Python summary indexes");
+        let active = ResolvedActiveSemanticModels {
+            active_model_set_hash: "test:python-formal-shape".to_owned(),
+            shards: vec![shard],
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        };
+
+        let omitted_default = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            2,
+        )
+        .with_python_formal_shape_for_test(evidence.clone(), 3, 2)
+        .with_python_model_manifest_for_test(&active.shards[0].manifest.content_sha256);
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&omitted_default)
+                .applicability,
+            ProcedureSummaryApplicability::Incomplete,
+        );
+        assert_eq!(
+            active
+                .procedure_summaries_for_external_target(&omitted_default)
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "the default-omitting call stays an incomplete boundary while the kernel is positional"
+        );
+        assert_ne!(
+            active
+                .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                    "python",
+                    "com.acme.Api",
+                    "fixed",
+                    false,
+                    3,
+                ))
+                .disposition,
+            SemanticModelMatchDisposition::Empty,
+            "the activated summary is present and must not be diagnosed as unused"
+        );
+
+        let full_positional = target_for_language(
+            crate::analyzer::Language::Python,
+            "com.acme.Api",
+            "fixed",
+            3,
+        )
+        .with_python_formal_shape_for_test(evidence, 3, 2)
+        .with_python_model_manifest_for_test(&active.shards[0].manifest.content_sha256);
+        let matched = active.procedure_summaries_for_external_target(&full_positional);
+        assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+        assert!(
+            matched.records[0]
+                .bind_unmaterialized_call_shape(&full_positional)
+                .is_some()
         );
     }
 
@@ -4466,7 +5508,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 7);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 8);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());
@@ -4560,6 +5602,7 @@ mod procedure_claim_agreement_tests {
             },
             completeness: Completeness::Complete,
             ordinary_heap_unchanged: false,
+            no_concurrency_effects: false,
             covers_overrides: false,
             normal_continuation_absent: false,
             normal_result_count: None,
@@ -4740,6 +5783,24 @@ mod procedure_claim_agreement_tests {
             procedure_claims_agree(&matching, &right),
             "identical heap-preservation certifications still make one claim"
         );
+    }
+
+    #[test]
+    fn a_different_no_concurrency_effects_claim_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.no_concurrency_effects = true;
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "the explicit no-concurrency claim changes whether a call boundary is modeled"
+        );
+
+        let mut matching = left.clone();
+        matching.no_concurrency_effects = true;
+        assert!(procedure_claims_agree(&matching, &right));
     }
 
     #[test]

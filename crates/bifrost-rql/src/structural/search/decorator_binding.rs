@@ -18,6 +18,7 @@ use crate::analyzer::semantic::{
     DurablePortIdentity, ProcedurePortHandle, SemanticValueKind, StructuralNodeIdentity,
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
+use crate::analyzer::{JavaAnnotationTypeStatus, resolve_java_annotation_type};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 pub(super) const BINDING_STATUS: &[&str] = &[
@@ -51,6 +52,7 @@ pub(super) fn expansions_for_seed(
     seed: &SeedMatch,
     declarations: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
     semantic: Option<&mut SemanticQueryContext<'_>>,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<PipelineExpansion> {
     let parameter = seed.facts.node(seed.fact_match.node);
     let parameter_range = seed_range(seed);
@@ -112,7 +114,11 @@ pub(super) fn expansions_for_seed(
             let (decorator_name, binding) = match structured_name {
                 Some(name) => (
                     name.to_owned(),
-                    decorator_binding(&environment, name, decorator_range.start_byte),
+                    if seed.language == Language::Java {
+                        java_annotation_binding(analyzer, seed, &decorator_range, cancellation)
+                    } else {
+                        decorator_binding(&environment, name, decorator_range.start_byte)
+                    },
                 ),
                 None => (
                     "<unknown>".to_string(),
@@ -170,6 +176,8 @@ pub(super) fn expansions_for_seed(
                 parameter_ordinal: identity.ordinal,
                 port_id: identity.port_id,
                 decorator_name,
+                annotation_type: binding.annotation_type,
+                annotation_status: binding.annotation_status,
                 local_name: binding.local_name,
                 imported_name: binding.imported_name,
                 module: binding.module,
@@ -199,6 +207,59 @@ struct DecoratorBinding {
     imported_name: Option<String>,
     module: Option<String>,
     reason: Option<String>,
+    annotation_type: Option<Box<CodeQueryDeclaration>>,
+    annotation_status: Option<JavaAnnotationTypeStatus>,
+}
+
+fn java_annotation_binding(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    range: &Range,
+    cancellation: Option<&CancellationToken>,
+) -> DecoratorBinding {
+    let local_cancellation = CancellationToken::new();
+    let resolved = resolve_java_annotation_type(
+        analyzer,
+        &seed.file,
+        seed.facts.source(),
+        range,
+        cancellation.unwrap_or(&local_cancellation),
+    );
+    let annotation_type = if resolved.status == JavaAnnotationTypeStatus::Resolved {
+        let unit = resolved
+            .source_declaration
+            .expect("resolved annotation has a declaration");
+        let range = resolved
+            .declaration_range
+            .expect("resolved annotation has an exact range");
+        let declaration = DeclarationValue::new(unit, range);
+        Some(Box::new(render_declaration(
+            analyzer,
+            &declaration,
+            CodeQueryResultDetail::Full,
+            &mut PipelineRenderCache::default(),
+        )))
+    } else {
+        None
+    };
+    DecoratorBinding {
+        status: match resolved.status {
+            JavaAnnotationTypeStatus::Resolved => "local",
+            JavaAnnotationTypeStatus::Ambiguous => "ambiguous",
+            JavaAnnotationTypeStatus::Unsupported => "unsupported",
+            _ => "incomplete",
+        },
+        boundary: if annotation_type.is_some() {
+            BoundaryStatus::WorkspaceLocal.label()
+        } else {
+            BoundaryStatus::ExternalUnknown.label()
+        },
+        complete: annotation_type.is_some(),
+        reason: resolved.reason,
+        annotation_type,
+        annotation_status: Some(resolved.status),
+        ..DecoratorBinding::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +358,7 @@ fn decorator_binding(
         reason: (!complete).then(|| {
             "import binder coverage or structured module/symbol identity is incomplete".to_string()
         }),
+        ..DecoratorBinding::default()
     }
 }
 

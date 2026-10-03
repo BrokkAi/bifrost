@@ -6142,17 +6142,25 @@ fn decode_row_predicates(expr: &Expr) -> Result<Vec<RowPredicate>, PolicySourceE
 fn decode_row_literal(expr: &Expr) -> Result<RowLiteral, PolicySourceError> {
     Ok(match &expr.kind {
         ExprKind::String(value) => RowLiteral::String(value.clone()),
+        ExprKind::List(values) | ExprKind::Vector(values) => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value.as_string().map(str::to_owned).ok_or_else(|| {
+                        source_error(
+                            "invalid-row-literal",
+                            value.range.clone(),
+                            "string-list row literals contain only strings",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            RowLiteral::StringList(values)
+        }
         ExprKind::Number(value) => RowLiteral::Integer(*value),
         ExprKind::Symbol(value) if value == "true" => RowLiteral::Boolean(true),
         ExprKind::Symbol(value) if value == "false" => RowLiteral::Boolean(false),
         ExprKind::Symbol(value) => RowLiteral::ConstrainedEnum(value.clone()),
-        ExprKind::List(_) | ExprKind::Vector(_) => {
-            return Err(source_error(
-                "invalid-row-literal",
-                expr.range.clone(),
-                "row predicate literal must be a string, integer, boolean, or constrained atom",
-            ));
-        }
     })
 }
 

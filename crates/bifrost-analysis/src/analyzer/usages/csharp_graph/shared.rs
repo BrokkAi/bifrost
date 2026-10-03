@@ -72,7 +72,8 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
         let prepared_files = roots
             .iter()
             .filter_map(|file| {
-                prepare_file(resolver.csharp, file)
+                let source = analyzer.project().read_source(file).ok()?;
+                prepare_file(resolver.csharp, file, source)
                     .map(|prepared| (file.clone(), Arc::new(prepared)))
             })
             .collect();
@@ -312,7 +313,13 @@ impl CSharpQueryResolver<'_> {
             }
             let local_prepared = prepared_files
                 .is_none()
-                .then(|| prepare_file(self.csharp, &file))
+                .then(|| {
+                    analyzer
+                        .project()
+                        .read_source(&file)
+                        .ok()
+                        .and_then(|source| prepare_file(self.csharp, &file, source))
+                })
                 .flatten();
             let prepared = prepared_files
                 .and_then(|files| files.get(&file).map(Arc::as_ref))

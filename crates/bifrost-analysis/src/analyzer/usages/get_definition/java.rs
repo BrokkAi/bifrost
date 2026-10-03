@@ -1,6 +1,9 @@
+pub(super) mod lambda;
+
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::java::imports::JavaTypeResolution;
+use crate::analyzer::languages::{ExternalCalleeSite, ImportedExternalCallee};
 use crate::analyzer::structural::resolution::RejectionReason;
 use crate::analyzer::usages::applicability::{
     ApplicabilityOutcome, CandidateApplicability, arity_applicability,
@@ -10,16 +13,22 @@ use crate::analyzer::usages::receiver_analysis::{
 };
 use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
+use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
-use brokk_bifrost_jvm::java::graph::resolver::argument_list_arity;
+use brokk_bifrost_jvm::java::graph::resolver::{
+    argument_list_arity, java_field_type_text_from_metadata,
+};
 use brokk_bifrost_jvm::java::graph::return_type::{
-    is_java_local_type_scope_node, java_local_type_scope_contains,
+    is_java_local_type_scope_node, java_type_name_components,
 };
 use brokk_bifrost_jvm::java::graph_support::{JavaSource, normalize_java_type_text};
-use brokk_bifrost_jvm::java::hierarchy::java_preferred_declaring_owners;
+use brokk_bifrost_jvm::java::hierarchy::{JavaHierarchyFactError, java_preferred_declaring_owners};
+use brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -324,24 +333,12 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_rows(|| analyzer.ranges(unit))
     }
 
-    fn signatures(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
-        self.query_rows(|| analyzer.signatures(unit))
-    }
-
     fn signature_metadata(
         &self,
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Vec<crate::analyzer::SignatureMetadata> {
         self.query_rows(|| analyzer.signature_metadata(unit))
-    }
-
-    fn read_source(&self, file: &ProjectFile) -> Option<String> {
-        self.query_optional_row(|| file.read_to_string().ok())
-    }
-
-    fn parse_java_source(&self, source: &str) -> Option<Tree> {
-        self.structured_query(|| parse_java_tree(source)).flatten()
     }
 
     fn smallest_named_node_covering<'tree>(
@@ -629,17 +626,18 @@ fn resolve_java_in_session(
             if let Some(creation) = java_enclosing_object_creation(session, node)
                 && java_object_creation_focus_is_terminal_type(session, creation, node)
             {
-                return finish_java(
-                    session,
-                    resolve_java_constructor_call(
-                        analyzer, token, java, session, file, source, creation,
-                    ),
+                let (outcome, evidence) = resolve_java_constructor_call(
+                    analyzer, token, java, session, file, source, creation,
                 );
+                return session.finish(JavaDefinitionResolution { outcome, evidence });
             }
             resolve_java_type_reference(analyzer, java, session, file, source, node)
         }
         "object_creation_expression" => {
-            resolve_java_constructor_call(analyzer, token, java, session, file, source, node)
+            let (outcome, evidence) =
+                resolve_java_constructor_call(analyzer, token, java, session, file, source, node);
+            call_evidence = evidence;
+            outcome
         }
         "method_invocation" => {
             let (outcome, evidence) =
@@ -878,22 +876,6 @@ fn java_declaration_name_type(
             name.end_byte(),
         ),
     }
-}
-
-/// Memoized on exact source bytes (#2679): the resolver re-parses the file it
-/// is resolving in once per local-type candidate, and its cross-file receiver
-/// and return-type probes re-parse the same declaring files once per
-/// occurrence.
-static JAVA_TREES: super::TreeParseMemo = super::TreeParseMemo::new();
-
-pub(super) fn parse_java_tree(source: &str) -> Option<Tree> {
-    JAVA_TREES.parse(source, |source| {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .ok()?;
-        parser.parse(source, None)
-    })
 }
 
 fn java_next_named_preorder<'tree>(
@@ -1269,6 +1251,107 @@ fn java_method_invocation_binding(
     ))
 }
 
+pub(crate) enum JavaSourceInvocationReturn {
+    /// One exact source declaration with a statically applicable zero-argument
+    /// call shape. This proves a declared return type, not runtime dispatch.
+    Source { declaration: CodeUnit, range: Range },
+    /// The bounded source lookup completed without selecting a source callable.
+    /// An independent external resolver may still prove an external declaration.
+    NoSourceDeclaration,
+    /// More than one source callable remains possible; external fallback must
+    /// not turn that ambiguity into a singleton.
+    Ambiguous,
+    /// A source callable was found, but this resolver cannot prove that its
+    /// signature applies to the written arguments.
+    UnprovenApplicability,
+    /// Resolution, syntax, metadata, or the work budget did not produce a
+    /// complete answer.
+    Incomplete,
+}
+
+/// Resolve a Java invocation through the existing bounded source resolver and
+/// expose only a source callable whose zero-argument applicability is proven.
+/// This is static return-type evidence only; it does not prove that the body
+/// executes or identify a runtime dispatch target. Non-zero argument calls
+/// remain unknown until complete source-signature conversions are available.
+pub(crate) fn java_source_invocation_return_declaration(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+) -> JavaSourceInvocationReturn {
+    if call.kind() != "method_invocation" || call.has_error() || call.is_missing() {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+
+    let mut root = call;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let binding =
+        java_method_invocation_binding(analyzer, token, session, file, source, root, call);
+    if session.is_stopped() {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+    if binding.outcome.status == DefinitionLookupStatus::Ambiguous {
+        return JavaSourceInvocationReturn::Ambiguous;
+    }
+    if binding.outcome.definitions.is_empty() {
+        return match binding.outcome.status {
+            DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::UnresolvableImportBoundary => {
+                JavaSourceInvocationReturn::NoSourceDeclaration
+            }
+            _ => JavaSourceInvocationReturn::Incomplete,
+        };
+    }
+    if binding.outcome.status != DefinitionLookupStatus::Resolved {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+
+    let [callable] = binding.outcome.definitions.as_slice() else {
+        return JavaSourceInvocationReturn::Ambiguous;
+    };
+    let callable = callable.clone();
+    if callable.kind() != CodeUnitType::Function
+        || callable.is_synthetic()
+        || callable.source().language() != Language::Java
+    {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+    if argument_list_arity(call) != 0 {
+        return JavaSourceInvocationReturn::UnprovenApplicability;
+    }
+    let metadata = session.signature_metadata(analyzer, &callable);
+    if session.is_stopped() {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+    let [metadata] = metadata.as_slice() else {
+        return if metadata.is_empty() {
+            JavaSourceInvocationReturn::Incomplete
+        } else {
+            JavaSourceInvocationReturn::Ambiguous
+        };
+    };
+    if !metadata
+        .callable_arity()
+        .is_some_and(|arity| arity.accepts(0))
+    {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+
+    let mut ranges = session.ranges(analyzer, &callable);
+    if session.is_stopped() || ranges.len() != 1 {
+        return JavaSourceInvocationReturn::Incomplete;
+    }
+    JavaSourceInvocationReturn::Source {
+        declaration: callable,
+        range: ranges.pop().expect("one declaration range exists"),
+    }
+}
+
 /// Member lookup against every type a receiver can have.
 ///
 /// One type is the ordinary case and keeps its own outcome exactly. Several
@@ -1373,7 +1456,7 @@ fn resolve_java_method_reference(
         // A constructor reference names one type. An intersection bound has no
         // constructor of its own, so several owners are not a target.
         if let [only] = owner.as_slice() {
-            return java_constructor_outcome(analyzer, session, only.unit.clone(), None);
+            return java_constructor_outcome(analyzer, java, session, only.unit.clone(), None);
         }
         return no_definition(
             "unsupported_java_receiver",
@@ -1460,9 +1543,12 @@ fn resolve_java_constructor_call(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-) -> DefinitionLookupOutcome {
+) -> (DefinitionLookupOutcome, CallEvidence) {
     let Some(type_node) = node.child_by_field_name("type") else {
-        return no_definition("no_indexed_definition", "Java constructor call has no type");
+        return (
+            no_definition("no_indexed_definition", "Java constructor call has no type"),
+            CallEvidence::default(),
+        );
     };
     let owner =
         java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
@@ -1479,23 +1565,159 @@ fn resolve_java_constructor_call(
                 )
             });
     if let Some(owner) = owner {
-        return java_constructor_outcome(analyzer, session, owner, Some(argument_list_arity(node)));
+        return (
+            java_constructor_outcome(
+                analyzer,
+                java,
+                session,
+                owner,
+                Some(argument_list_arity(node)),
+            ),
+            CallEvidence::default(),
+        );
     }
-    resolve_java_type_reference(analyzer, java, session, file, source, type_node)
+    if let Some((owner, member, parameter_count)) =
+        java_external_constructor(analyzer, token, java, session, file, source, node)
+    {
+        let canonical = format!("{owner}.{member}");
+        trace::record_named_boundary(canonical.clone());
+        let mut outcome = boundary_unchecked(
+            format!("`{canonical}` names an external Java constructor declaration"),
+            UnindexedClaim::external_boundary(canonical.clone(), ClaimSubjectRole::Member),
+        );
+        outcome.reference = Some(ResolvedReferenceSite {
+            path: file.to_string(),
+            text: canonical,
+            range: node_range(node),
+            focus_start_byte: type_node.start_byte(),
+            focus_end_byte: type_node.end_byte(),
+        });
+        let proof =
+            ExactExternalCallProof::java_external_constructor(&owner, &member, parameter_count);
+        let evidence = CallEvidence {
+            call_application: proof.call_application(),
+            dispatch_extensibility: proof.dispatch_extensibility(),
+            exact_external_call: Some(proof),
+            external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                Language::Java,
+                owner,
+                member,
+            )),
+        };
+        return (outcome, evidence);
+    }
+    (
+        resolve_java_type_reference(analyzer, java, session, file, source, type_node),
+        CallEvidence::default(),
+    )
+}
+
+/// Select a declared external constructor family, never an inherited method
+/// with the same spelling. Argument conversions remain a separate obligation.
+pub(crate) fn java_external_constructor(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<(String, String, u32)> {
+    use crate::analyzer::semantic_model::{SemanticModelCallableKey, SemanticModelSymbolKind};
+    let type_node = node.child_by_field_name("type")?;
+    // Generic and qualified-inner construction need additional substitution
+    // and enclosing-instance contracts; do not publish a partial shape.
+    if !matches!(
+        type_node.kind(),
+        "type_identifier" | "scoped_type_identifier"
+    ) || {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| child.end_byte() <= type_node.start_byte())
+    } || java_type_from_node_with_context(
+        analyzer, token, java, session, file, source, type_node,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    let components = java_type_name_components(type_node, source)?;
+    let overlay = analyzer.semantic_model_overlay()?;
+    let resolved = session.query_optional_row(|| {
+        java.resolve_type_name_with_external(
+            token,
+            Some(overlay.clone()),
+            file,
+            &components.join("."),
+        )
+    })?;
+    let JavaTypeResolution::External(owner) = resolved else {
+        return None;
+    };
+    let arity = u32::try_from(argument_list_arity(node)).ok()?;
+    let crate::analyzer::jvm::external::JvmExternalDeclarationSource::SemanticPack {
+        declaration_id,
+        ..
+    } = owner.source()
+    else {
+        return None;
+    };
+    let members = session.query_rows(|| overlay.members_of(declaration_id).records);
+    let mut matching = members.into_iter().filter(|symbol| {
+        symbol.language == "java"
+            && symbol.kind == SemanticModelSymbolKind::Constructor
+            && !symbol.has_receiver()
+            && symbol.visibility == crate::analyzer::semantic_model::Visibility::Public
+            && symbol
+                .structured_signature
+                .as_ref()
+                .is_some_and(|signature| {
+                    signature.parameters.len() == arity as usize
+                        && signature
+                            .parameters
+                            .iter()
+                            .all(|parameter| !parameter.variadic)
+                })
+    });
+    let selected = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    // Producers may name a constructor with its source name or the JVM
+    // <init> member name. Kind and owner identity select the declaration;
+    // its recorded name then supplies the shared callable key.
+    let key = SemanticModelCallableKey::new("java", owner.fqn(), &selected.name, false, arity);
+    session.query_optional_row(|| overlay.callable_family_id_for_target(key))?;
+    Some((owner.fqn().to_owned(), selected.name.clone(), arity))
 }
 
 fn java_constructor_outcome(
     analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: CodeUnit,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let support: &dyn BoundedDefinitionLookup = session;
-    let mut constructors = support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()));
-    constructors.retain(|unit| {
-        unit.is_function() && !unit.is_synthetic() && unit.source() == owner.source()
-    });
-    constructors = java_filter_candidates_by_arity(analyzer, session, constructors, arity);
+    let candidates = support
+        .fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()))
+        .into_iter()
+        .filter(|unit| {
+            unit.is_function() && !unit.is_synthetic() && unit.source() == owner.source()
+        })
+        .collect::<Vec<_>>();
+    let Some(context) = java.constructor_context(&owner, candidates, arity) else {
+        return diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            "unavailable_java_constructor_facts",
+            format!(
+                "canonical constructor metadata for `{}` is absent or conflicting",
+                owner.fq_name()
+            ),
+        );
+    };
+    let constructors =
+        java_filter_candidates_by_arity(analyzer, session, context.constructors, arity);
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
     }
@@ -1511,15 +1733,16 @@ fn java_constructor_outcome(
         );
     }
 
-    let indexed_owner = support
-        .fqn(&owner.fq_name())
-        .into_iter()
-        .filter(|candidate| candidate.source() == owner.source())
-        .collect::<Vec<_>>();
-    if indexed_owner.is_empty() {
+    if context.owner_shape_accepts {
         candidates_outcome(vec![owner])
     } else {
-        candidates_outcome(indexed_owner)
+        no_definition(
+            "no_applicable_java_constructor",
+            format!(
+                "`{}` has no indexed constructor matching this call",
+                owner.fq_name()
+            ),
+        )
     }
 }
 
@@ -1665,7 +1888,7 @@ fn java_candidate_applicability(
     call_site: Option<JavaCallSite<'_, '_>>,
 ) -> ApplicabilityOutcome {
     let arity_result = arity_applicability(candidates, arity, |unit| {
-        Some(java_declared_arity(analyzer, Some(session), unit))
+        java_declared_arity(analyzer, Some(session), unit)
     });
     if arity_result.winners.len() < 2 {
         return arity_result;
@@ -1789,22 +2012,21 @@ fn java_strict_primitive_applicability(
     Some(ApplicabilityOutcome::from_verdicts(verdicts))
 }
 
-/// The parameter list a Java callable declares, as the resolver has always read
-/// it: the persisted arity when the extractor recorded one, and otherwise the
-/// count the indexed signature states. Java therefore always has a declared
-/// arity, which is why a Java candidate is never an undecided verdict once the
-/// call's argument count is known.
+/// The parameter list a Java callable declares, when every canonical metadata
+/// alternative agrees. A missing or conflicting alternative stays unknown so
+/// applicability cannot turn an unavailable read into a false rejection.
 fn java_declared_arity(
     analyzer: &dyn IAnalyzer,
     session: Option<&JavaResolutionSession<'_>>,
     unit: &CodeUnit,
-) -> crate::analyzer::CallableArity {
-    java_signature_metadata(analyzer, session, unit)
-        .into_iter()
-        .find_map(|metadata| metadata.callable_arity())
-        .unwrap_or_else(|| {
-            crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
-        })
+) -> Option<crate::analyzer::CallableArity> {
+    let alternatives = java_signature_metadata(analyzer, session, unit);
+    let metadata = alternatives.first()?;
+    let arity = metadata.callable_arity()?;
+    alternatives
+        .iter()
+        .all(|alternative| alternative.callable_arity() == Some(arity))
+        .then_some(arity)
 }
 
 /// Narrow `candidates` to the overloads that accept the call, binding nothing
@@ -2097,14 +2319,21 @@ fn java_unresolved_receiver_outcome(
         .as_ref()
         .and_then(|owner| {
             let parameter_count = owner.applicable_parameter_count?;
-            Some(java_external_call_evidence(
+            let mut evidence = java_external_call_evidence(
                 &owner.fqn,
                 member,
                 owner.form,
                 parameter_count,
                 java.and_then(|java| java_selected_jdk_artifact(analyzer, java, file)),
                 owner.jdk_artifact_sha256.as_deref(),
-            ))
+            );
+            if owner.non_overridable.is_some() {
+                evidence.dispatch_extensibility = Some(DispatchExtensibility::Closed);
+                if let Some(proof) = evidence.exact_external_call.as_mut() {
+                    proof.dispatch_extensibility = Some(DispatchExtensibility::Closed);
+                }
+            }
+            Some(evidence)
         })
         .unwrap_or_default();
     (outcome, evidence)
@@ -2226,6 +2455,7 @@ enum JavaExternalReceiverForm {
 
 #[derive(Debug)]
 struct JavaExternalOwner {
+    non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     fqn: String,
     member_declared: bool,
     form: JavaExternalReceiverForm,
@@ -2236,11 +2466,20 @@ struct JavaExternalOwner {
 }
 
 impl JavaExternalOwner {
+    fn with_non_overridable(
+        mut self,
+        non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
+    ) -> Self {
+        self.non_overridable = non_overridable;
+        self
+    }
+
     /// The owner type is decided, the member is not.
     fn type_only(fqn: String, form: JavaExternalReceiverForm) -> Self {
         Self {
             fqn,
             member_declared: false,
+            non_overridable: None,
             form,
             jdk_artifact_sha256: None,
             applicable_parameter_count: None,
@@ -2257,6 +2496,7 @@ impl JavaExternalOwner {
         Self {
             fqn,
             member_declared: true,
+            non_overridable: None,
             form,
             jdk_artifact_sha256,
             applicable_parameter_count,
@@ -2440,6 +2680,53 @@ fn java_external_call_return_type_fqn(
     call: Node<'_>,
     chain_budget: usize,
 ) -> Option<JavaExternalCallReturn> {
+    let (owner, member) = java_external_invocation_member(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        source,
+        root,
+        call,
+        chain_budget,
+    )?;
+    let instance_receiver = matches!(owner.form, JavaExternalReceiverForm::BoundValue);
+    if owner.applicable_parameter_count.is_some()
+        && let Some(selected) =
+            member.applicable_return_type_fqn(instance_receiver, argument_list_arity(call))
+    {
+        return Some(JavaExternalCallReturn {
+            fqn: selected.to_owned(),
+            proven: true,
+        });
+    }
+    member
+        .declared_return_type_fqn()
+        .map(|fqn| JavaExternalCallReturn {
+            fqn: fqn.to_owned(),
+            proven: false,
+        })
+}
+
+/// Resolve the receiver and declared member once for both receiver chaining
+/// and argument typing. The caller decides whether an unproved declaration is
+/// useful as a navigation hint; conversion requires proved applicability.
+#[allow(clippy::too_many_arguments)]
+fn java_external_invocation_member(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+    chain_budget: usize,
+) -> Option<(
+    JavaExternalOwner,
+    crate::analyzer::jvm::external::JvmExternalMember,
+)> {
     let remaining = chain_budget.checked_sub(1)?;
     let member_name = java_node_text(call.child_by_field_name("name")?, source);
     if member_name.is_empty() {
@@ -2468,22 +2755,47 @@ fn java_external_call_return_type_fqn(
             &format!("{}.{member_name}", owner.fqn),
         )
     })?;
-    let instance_receiver = matches!(owner.form, JavaExternalReceiverForm::BoundValue);
-    if owner.applicable_parameter_count.is_some()
-        && let Some(selected) =
-            member.applicable_return_type_fqn(instance_receiver, argument_list_arity(call))
-    {
-        return Some(JavaExternalCallReturn {
-            fqn: selected.to_owned(),
-            proven: true,
-        });
+    Some((owner, member))
+}
+
+/// The full declared return term of a uniquely selected external invocation.
+/// This is static typing evidence only; it does not close runtime dispatch.
+/// Reuse the receiver ladder, including its shadowing and depth bounds, and
+/// reject a name-only or incomplete overload selection.
+pub(crate) fn java_external_invocation_return_type(
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+) -> Option<crate::analyzer::semantic_model::TypeRef> {
+    if call.has_error() || call.is_missing() {
+        return None;
     }
+    let mut root = call;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let arity = argument_list_arity(call);
+    let (owner, member) = java_external_invocation_member(
+        java,
+        token,
+        java,
+        session,
+        file,
+        source,
+        root,
+        call,
+        JAVA_CHAINED_RECEIVER_LIMIT,
+    )?;
+    owner.applicable_parameter_count?;
     member
-        .declared_return_type_fqn()
-        .map(|fqn| JavaExternalCallReturn {
-            fqn: fqn.to_owned(),
-            proven: false,
-        })
+        .applicable_return_type(
+            matches!(owner.form, JavaExternalReceiverForm::BoundValue),
+            arity,
+        )
+        .cloned()
 }
 
 /// The static type one chained call hands its outer receiver, and whether the
@@ -2541,15 +2853,25 @@ fn java_resolved_type_owner_fqn(
                     )
                 })
                 .filter(|_| receiver_proven);
-            return Some(JavaExternalOwner::with_declared_member(
-                member
-                    .fqn()
-                    .rsplit_once('.')
-                    .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
-                form,
-                applicable,
-                member.jdk_artifact_sha256().map(str::to_owned),
-            ));
+            return Some(
+                JavaExternalOwner::with_declared_member(
+                    member
+                        .fqn()
+                        .rsplit_once('.')
+                        .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
+                    form,
+                    applicable,
+                    member.jdk_artifact_sha256().map(str::to_owned),
+                )
+                .with_non_overridable(applicable.and(call_arity).and_then(
+                    |arity| {
+                        member.non_overridable_at(
+                            matches!(form, JavaExternalReceiverForm::BoundValue),
+                            arity,
+                        )
+                    },
+                )),
+            );
         }
         return Some(JavaExternalOwner::type_only(
             external_type.fqn().to_owned(),
@@ -2906,6 +3228,19 @@ struct JavaTypeSpelling {
     end_byte: usize,
 }
 
+/// A receiver's generic argument is either a live AST spelling from the active
+/// query file or a source-arena node from a mounted foreign file. The latter is
+/// an explicit producer link, so foreign substitution never reparses or
+/// reconciles a name/range against a new tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JavaTypeArgument {
+    Active(JavaTypeSpelling),
+    Captured {
+        file: ProjectFile,
+        type_id: JavaSourceTypeId,
+    },
+}
+
 impl JavaTypeSpelling {
     fn new(file: &ProjectFile, node: Node<'_>) -> Self {
         Self {
@@ -2935,7 +3270,7 @@ enum JavaLocalType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct JavaReceiverType {
     unit: CodeUnit,
-    arguments: Vec<JavaTypeSpelling>,
+    arguments: Vec<JavaTypeArgument>,
 }
 
 impl JavaReceiverType {
@@ -3063,7 +3398,7 @@ fn java_enclosing_receiver_type(
             brokk_bifrost_jvm::java::graph_support::java_declared_type_parameters(declaration)
                 .into_iter()
                 .filter_map(brokk_bifrost_jvm::java::graph_support::java_type_parameter_name_node)
-                .map(|name| JavaTypeSpelling::new(file, name))
+                .map(|name| JavaTypeArgument::Active(JavaTypeSpelling::new(file, name)))
                 .collect()
         })
         .unwrap_or_default();
@@ -3121,7 +3456,14 @@ fn java_receiver_types_for_java(
             if let Some(binding) = first_precise(&bindings, name) {
                 let types = match binding {
                     JavaLocalType::Declared(declared) => java_receiver_types_of_spelling(
-                        analyzer, token, java, session, file, source, root, &declared,
+                        analyzer,
+                        token,
+                        java,
+                        session,
+                        file,
+                        source,
+                        root,
+                        &JavaTypeArgument::Active(declared),
                     ),
                     JavaLocalType::Initializer(initializer) => {
                         debug_assert_eq!(&initializer.file, file);
@@ -3257,9 +3599,8 @@ fn java_field_access_type(
     let qualified_name = format!("{}.{}", owner.fq_name(), field);
     let candidates = session.fqn(&qualified_name);
     if let Some(field_unit) = candidates.iter().find(|unit| unit.is_field()) {
-        let type_text = java_signature_metadata(analyzer, Some(session), field_unit)
-            .into_iter()
-            .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?;
+        let metadata = java_signature_metadata(analyzer, Some(session), field_unit);
+        let type_text = java_field_type_text_from_metadata(&metadata)?;
         // A field's declared type is written in the field's own compilation
         // unit, so its simple name resolves through that file's nesting,
         // imports and package -- never through the imports of whatever file
@@ -3351,7 +3692,7 @@ fn java_receiver_types_in_tree(
         unit,
         arguments: brokk_bifrost_jvm::java::graph_support::java_type_argument_nodes(type_node)
             .into_iter()
-            .map(|argument| JavaTypeSpelling::new(file, argument))
+            .map(|argument| JavaTypeArgument::Active(JavaTypeSpelling::new(file, argument)))
             .collect(),
     })
     .into_iter()
@@ -3405,10 +3746,347 @@ fn java_type_parameter_types(
     expanded
 }
 
+enum CapturedTypeFrame {
+    Visit(JavaSourceTypeId),
+    FinishGeneric {
+        arguments: Vec<JavaSourceTypeId>,
+    },
+    FinishArray,
+    FinishAnnotated,
+    FinishParameter {
+        parameter: brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+        bound_count: usize,
+    },
+}
+
+/// Resolve a type shape published by a foreign Java file. Generic arguments
+/// remain captured IDs on the returned receiver even when an argument is a
+/// wildcard, primitive, or otherwise unsupported; member lookup only needs the
+/// known generic base, while later return substitution can fail closed on that
+/// individual argument.
+#[allow(clippy::too_many_arguments)]
+fn java_receiver_types_from_source_type(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    root: JavaSourceTypeId,
+) -> Vec<JavaReceiverType> {
+    let Some(mounted) = session.query_optional_row(|| java.declaration_source_facts(token, file))
+    else {
+        return Vec::new();
+    };
+    if !mounted.facts.valid_links(&mounted.source) {
+        return Vec::new();
+    }
+    java_receiver_types_from_source_type_facts(analyzer, token, java, session, file, &mounted, root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_receiver_types_from_source_type_facts(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    mounted: &JavaFileSourceFacts,
+    root: JavaSourceTypeId,
+) -> Vec<JavaReceiverType> {
+    if root.index() >= mounted.facts.types.len() {
+        return Vec::new();
+    }
+    let mut frames = vec![CapturedTypeFrame::Visit(root)];
+    let mut values: Vec<Vec<JavaReceiverType>> = Vec::new();
+    let mut active_parameters = HashSet::default();
+    while let Some(frame) = frames.pop() {
+        if !session.charge_scope_step() {
+            return Vec::new();
+        }
+        match frame {
+            CapturedTypeFrame::Visit(id) => {
+                let Some(fact) = mounted.facts.types.get(id.index()) else {
+                    return Vec::new();
+                };
+                match &fact.shape {
+                    JavaTypeSyntaxShape::Named { name, parameter } => {
+                        if let Some(parameter) = parameter {
+                            let Some(parameter_fact) = mounted
+                                .facts
+                                .type_parameters
+                                .iter()
+                                .find(|fact| fact.declaration == *parameter)
+                            else {
+                                values.push(Vec::new());
+                                continue;
+                            };
+                            if !active_parameters.insert(*parameter) {
+                                values.push(Vec::new());
+                                continue;
+                            }
+                            let bounds = parameter_fact.bounds.clone();
+                            frames.push(CapturedTypeFrame::FinishParameter {
+                                parameter: *parameter,
+                                bound_count: bounds.len(),
+                            });
+                            for bound in bounds.into_iter().rev() {
+                                frames.push(CapturedTypeFrame::Visit(bound));
+                            }
+                        } else {
+                            values.push(
+                                java_resolve_captured_name(
+                                    analyzer,
+                                    token,
+                                    java,
+                                    session,
+                                    file,
+                                    mounted,
+                                    fact.occurrence,
+                                    name,
+                                )
+                                .map(JavaReceiverType::plain)
+                                .into_iter()
+                                .collect(),
+                            );
+                        }
+                    }
+                    JavaTypeSyntaxShape::Generic { base, arguments } => {
+                        frames.push(CapturedTypeFrame::FinishGeneric {
+                            arguments: arguments.clone(),
+                        });
+                        frames.push(CapturedTypeFrame::Visit(*base));
+                    }
+                    JavaTypeSyntaxShape::Array { element, .. } => {
+                        frames.push(CapturedTypeFrame::FinishArray);
+                        frames.push(CapturedTypeFrame::Visit(*element));
+                    }
+                    JavaTypeSyntaxShape::Annotated(inner) => {
+                        frames.push(CapturedTypeFrame::FinishAnnotated);
+                        frames.push(CapturedTypeFrame::Visit(*inner));
+                    }
+                    JavaTypeSyntaxShape::NonNominal | JavaTypeSyntaxShape::Unknown => {
+                        values.push(Vec::new());
+                    }
+                }
+            }
+            CapturedTypeFrame::FinishGeneric { arguments } => {
+                let Some(mut base_types) = values.pop() else {
+                    return Vec::new();
+                };
+                for candidate in &mut base_types {
+                    candidate.arguments = arguments
+                        .iter()
+                        .copied()
+                        .map(|type_id| JavaTypeArgument::Captured {
+                            file: file.clone(),
+                            type_id,
+                        })
+                        .collect();
+                }
+                values.push(base_types);
+            }
+            CapturedTypeFrame::FinishArray | CapturedTypeFrame::FinishAnnotated => {
+                let Some(inner) = values.pop() else {
+                    return Vec::new();
+                };
+                values.push(inner);
+            }
+            CapturedTypeFrame::FinishParameter {
+                parameter,
+                bound_count,
+            } => {
+                if values.len() < bound_count {
+                    return Vec::new();
+                }
+                let start = values.len() - bound_count;
+                let mut expanded = Vec::new();
+                for branch in values.drain(start..) {
+                    for candidate in branch {
+                        java_push_receiver_type(&mut expanded, candidate);
+                    }
+                }
+                active_parameters.remove(&parameter);
+                values.push(expanded);
+            }
+        }
+    }
+    values.pop().unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_resolve_captured_name(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    mounted: &JavaFileSourceFacts,
+    occurrence: SourceOccurrenceId,
+    name: &brokk_bifrost_core::analyzer::model::StructuredTypeName,
+) -> Option<CodeUnit> {
+    let (local_candidate, local_type) =
+        java_resolve_captured_local_type(analyzer, session, file, mounted, occurrence, name);
+    if local_candidate {
+        return local_type;
+    }
+    let package = java.cached_package_name(file).unwrap_or_default();
+    let mut scope_depth = name.lexical_scope().len();
+    loop {
+        let mut components = Vec::new();
+        if !package.is_empty() {
+            components.push(package.as_ref());
+        }
+        components.extend(
+            name.lexical_scope()
+                .iter()
+                .take(scope_depth)
+                .map(String::as_str),
+        );
+        components.extend(name.path().iter().map(String::as_str));
+        let fqn = components.join(".");
+        let mut candidates = session.fqn(&fqn).into_iter().filter(CodeUnit::is_class);
+        let first = candidates.next();
+        if first.is_some() && candidates.next().is_none() {
+            return first;
+        }
+        if scope_depth == 0 {
+            break;
+        }
+        scope_depth -= 1;
+    }
+    let written = name.path().join(".");
+    if let Some(unit) = session.resolve_type_name_in_file(token, java, file, &written) {
+        return Some(unit);
+    }
+    for split in 1..name.path().len() {
+        let prefix = name.path()[..split].join(".");
+        let Some(mut owner) = session.resolve_type_name_in_file(token, java, file, &prefix) else {
+            continue;
+        };
+        let mut resolved = true;
+        for component in &name.path()[split..] {
+            let mut candidates = session
+                .fqn(&format!("{}.{}", owner.fq_name(), component))
+                .into_iter()
+                .filter(CodeUnit::is_class);
+            let Some(next) = candidates.next() else {
+                resolved = false;
+                break;
+            };
+            if candidates.next().is_some() {
+                resolved = false;
+                break;
+            }
+            owner = next;
+        }
+        if resolved {
+            return Some(owner);
+        }
+    }
+    None
+}
+
+/// Resolve an unqualified captured type through the source-owned local-class
+/// fact. The bool distinguishes "a local declaration shadows this name but
+/// its nested path is unavailable" from "no local declaration was in scope",
+/// so a failed local lookup cannot silently fall through to imports/package
+/// lookup. The nearest containing lexical scope wins by its source extent.
+fn java_resolve_captured_local_type(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    mounted: &JavaFileSourceFacts,
+    occurrence: SourceOccurrenceId,
+    name: &brokk_bifrost_core::analyzer::model::StructuredTypeName,
+) -> (bool, Option<CodeUnit>) {
+    if name.is_absolute() || name.path().is_empty() {
+        return (false, None);
+    }
+    let first = name.path()[0].as_str();
+    let use_byte = mounted.source.occurrence(occurrence).range.start_byte;
+    let mut candidates = Vec::new();
+    for local in &mounted.facts.local_types {
+        let declaration_occurrence = mounted.source.declaration(local.declaration).occurrence;
+        let declaration_range = mounted.source.occurrence(declaration_occurrence).range;
+        let scope_range = mounted.source.occurrence(local.lexical_scope).range;
+        if declaration_range.start_byte >= use_byte
+            || scope_range.start_byte > use_byte
+            || use_byte >= scope_range.end_byte
+        {
+            continue;
+        }
+        let Some(units) = mounted.declaration_units.get(&local.declaration) else {
+            // The source rows retain no declaration-name text. A relevant
+            // visible local with no declaration bridge cannot be shown
+            // unrelated to this spelling, so prevent import/package fallback.
+            return (true, None);
+        };
+        let scope_width = scope_range.end_byte.saturating_sub(scope_range.start_byte);
+        for unit in units {
+            if unit.is_class()
+                && unit.source() == file
+                && unit.identifier() == first
+                && !candidates.iter().any(
+                    |(existing, width, declaration, scope): &(
+                        CodeUnit,
+                        usize,
+                        brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+                        SourceOccurrenceId,
+                    )| {
+                        existing == unit
+                            && *width == scope_width
+                            && *declaration == local.declaration
+                            && *scope == local.lexical_scope
+                    },
+                )
+            {
+                candidates.push((
+                    unit.clone(),
+                    scope_width,
+                    local.declaration,
+                    local.lexical_scope,
+                ));
+            }
+        }
+    }
+    let Some(nearest_width) = candidates.iter().map(|(_, width, _, _)| *width).min() else {
+        return (false, None);
+    };
+    candidates.retain(|(_, width, _, _)| *width == nearest_width);
+    let identities = candidates
+        .iter()
+        .map(|(_, _, declaration, scope)| (*declaration, *scope))
+        .collect::<HashSet<_>>();
+    if identities.len() != 1 || candidates.len() != 1 {
+        return (true, None);
+    }
+    let (mut binding, _, _, _) = candidates
+        .pop()
+        .expect("one nearest captured local type candidate exists");
+    for component in &name.path()[1..] {
+        let mut nested = session
+            .direct_children(analyzer, &binding)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.source() == file
+                    && candidate.identifier() == component
+            });
+        let Some(next) = nested.next() else {
+            return (true, None);
+        };
+        if nested.next().is_some() {
+            return (true, None);
+        }
+        binding = next;
+    }
+    (true, Some(binding))
+}
+
 /// Every class the type written at `spelling` gives member lookup. The caller's
-/// tree serves when the spelling is written in the caller's own file; any other
-/// file is read and parsed, because a simple name resolves through the
-/// compilation unit that writes it.
+/// tree serves when the spelling is written in the caller's own file; foreign
+/// type arguments are captured source-arena IDs and are resolved through their
+/// mounted declaration facts.
 #[allow(clippy::too_many_arguments)]
 fn java_receiver_types_of_spelling(
     analyzer: &dyn IAnalyzer,
@@ -3418,35 +4096,24 @@ fn java_receiver_types_of_spelling(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    spelling: &JavaTypeSpelling,
+    spelling: &JavaTypeArgument,
 ) -> Vec<JavaReceiverType> {
-    if &spelling.file == file {
-        return session
-            .smallest_named_node_covering(root, spelling.start_byte, spelling.end_byte)
-            .map(|node| {
-                java_receiver_types_in_tree(analyzer, token, java, session, file, source, node)
-            })
-            .unwrap_or_default();
+    let JavaTypeArgument::Active(spelling) = spelling else {
+        let JavaTypeArgument::Captured { file, type_id } = spelling else {
+            unreachable!("Java type argument has one source representation")
+        };
+        return java_receiver_types_from_source_type(
+            analyzer, token, java, session, file, *type_id,
+        );
+    };
+    if &spelling.file != file {
+        // Foreign receiver arguments are always captured source IDs. An
+        // active spelling with another file has no legitimate AST authority.
+        return Vec::new();
     }
-    let Some(other_source) = session.read_source(&spelling.file) else {
-        return Vec::new();
-    };
-    let Some(tree) = session.parse_java_source(&other_source) else {
-        return Vec::new();
-    };
     session
-        .smallest_named_node_covering(tree.root_node(), spelling.start_byte, spelling.end_byte)
-        .map(|node| {
-            java_receiver_types_in_tree(
-                analyzer,
-                token,
-                java,
-                session,
-                &spelling.file,
-                &other_source,
-                node,
-            )
-        })
+        .smallest_named_node_covering(root, spelling.start_byte, spelling.end_byte)
+        .map(|node| java_receiver_types_in_tree(analyzer, token, java, session, file, source, node))
         .unwrap_or_default()
 }
 
@@ -3461,6 +4128,107 @@ enum JavaReturnType {
         index: usize,
         bounds: Vec<JavaReceiverType>,
     },
+    /// Several canonical source declarations project to this CodeUnit. Keep
+    /// each source result until the caller can combine it with receiver
+    /// substitution; selecting one declaration would make the answer depend
+    /// on HashMap iteration order.
+    Alternatives(Vec<JavaReturnType>),
+}
+
+fn java_return_type_from_source_facts(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    method: &CodeUnit,
+) -> JavaReturnType {
+    let Some(mounted) = session.query_optional_row(|| java.declaration_source_facts(token, file))
+    else {
+        return JavaReturnType::Types(Vec::new());
+    };
+    if !mounted.facts.valid_links(&mounted.source) {
+        return JavaReturnType::Types(Vec::new());
+    }
+    let alternatives = mounted
+        .declaration_units
+        .iter()
+        .filter(|(_, units)| units.iter().any(|unit| unit == method))
+        .map(|(callable, _)| {
+            let return_fact = mounted
+                .facts
+                .callable_returns
+                .iter()
+                .find(|fact| fact.callable == *callable);
+            let Some(type_id) = return_fact.and_then(|fact| fact.ty) else {
+                return JavaReturnType::Types(Vec::new());
+            };
+            java_return_type_from_source_type_fact(
+                analyzer, token, java, session, file, &mounted, *callable, type_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    match alternatives.len() {
+        0 => JavaReturnType::Types(Vec::new()),
+        1 => alternatives
+            .into_iter()
+            .next()
+            .expect("one Java return alternative exists"),
+        _ => JavaReturnType::Alternatives(alternatives),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_return_type_from_source_type_fact(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    mounted: &JavaFileSourceFacts,
+    callable: brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+    type_id: JavaSourceTypeId,
+) -> JavaReturnType {
+    let Some(type_fact) = mounted.facts.types.get(type_id.index()) else {
+        return JavaReturnType::Types(Vec::new());
+    };
+    let JavaTypeSyntaxShape::Named {
+        parameter: Some(parameter),
+        ..
+    } = &type_fact.shape
+    else {
+        return JavaReturnType::Types(java_receiver_types_from_source_type_facts(
+            analyzer, token, java, session, file, mounted, type_id,
+        ));
+    };
+    let Some(parameter_fact) = mounted
+        .facts
+        .type_parameters
+        .iter()
+        .find(|fact| fact.declaration == *parameter)
+    else {
+        return JavaReturnType::Types(Vec::new());
+    };
+    let mut bounds = Vec::new();
+    for bound in &parameter_fact.bounds {
+        for candidate in java_receiver_types_from_source_type_facts(
+            analyzer, token, java, session, file, mounted, *bound,
+        ) {
+            java_push_receiver_type(&mut bounds, candidate);
+        }
+    }
+    let class_owner = mounted
+        .facts
+        .declaration_owners
+        .iter()
+        .find_map(|(declaration, owner)| (*declaration == callable).then_some(*owner));
+    if class_owner == Some(parameter_fact.owner) {
+        return JavaReturnType::OwnerTypeParameter {
+            index: parameter_fact.ordinal as usize,
+            bounds,
+        };
+    }
+    JavaReturnType::Types(bounds)
 }
 
 /// The classes a method's declared return type gives the next member lookup in
@@ -3487,11 +4255,11 @@ fn java_method_return_types(
     receiver: &[JavaReceiverType],
     method_unit: &CodeUnit,
 ) -> Vec<JavaReceiverType> {
-    let Some(method_range) = session.ranges(analyzer, method_unit).first().copied() else {
-        return Vec::new();
-    };
     let method_file = method_unit.source();
     let returned = if method_file == file {
+        let Some(method_range) = session.ranges(analyzer, method_unit).first().copied() else {
+            return Vec::new();
+        };
         java_return_type_of(
             analyzer,
             token,
@@ -3503,47 +4271,100 @@ fn java_method_return_types(
             &method_range,
         )
     } else {
-        let Some(method_source) = session.read_source(method_file) else {
-            return Vec::new();
-        };
-        let Some(tree) = session.parse_java_source(&method_source) else {
-            return Vec::new();
-        };
-        java_return_type_of(
+        java_return_type_from_source_facts(analyzer, token, java, session, method_file, method_unit)
+    };
+    let mut pending_returns = vec![returned];
+    let mut alternatives = Vec::new();
+    while let Some(returned) = pending_returns.pop() {
+        if let JavaReturnType::Alternatives(branches) = returned {
+            pending_returns.extend(branches);
+        } else {
+            alternatives.push(returned);
+        }
+    }
+    let mut projected = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        let Some(types) = java_project_return_type_alternative(
             analyzer,
             token,
             java,
             session,
-            method_file,
-            &method_source,
-            tree.root_node(),
-            &method_range,
-        )
-    };
-    let (index, bounds) = match returned {
-        JavaReturnType::Types(types) => return types,
-        JavaReturnType::OwnerTypeParameter { index, bounds } => (index, bounds),
-    };
-    // Only a receiver typed as the declaring class itself carries the arguments
-    // this method's own type parameters stand for. A member reached through a
-    // supertype would need that supertype's arguments, which the spelling this
-    // walk read never supplied, so it falls back to the parameter's own bounds.
-    let owner = session.parent_of(analyzer, method_unit);
-    let mut types = Vec::new();
-    for candidate in receiver {
-        if owner.as_ref() != Some(&candidate.unit) {
-            continue;
-        }
-        let Some(argument) = candidate.arguments.get(index) else {
-            continue;
+            file,
+            source,
+            root,
+            receiver,
+            method_unit,
+            alternative,
+        ) else {
+            // A missing source alternative is not evidence that a known
+            // alternative is authoritative. Preserve the old conservative
+            // unknown result instead of selecting by traversal order.
+            return Vec::new();
         };
-        for resolved in java_receiver_types_of_spelling(
-            analyzer, token, java, session, file, source, root, argument,
-        ) {
-            java_push_receiver_type(&mut types, resolved);
+        projected.push(types);
+    }
+    let Some(first) = projected.first() else {
+        return Vec::new();
+    };
+    let expected = first.iter().cloned().collect::<HashSet<_>>();
+    if expected.is_empty()
+        || projected.iter().any(|alternative| {
+            let actual = alternative.iter().cloned().collect::<HashSet<_>>();
+            actual != expected
+        })
+    {
+        return Vec::new();
+    }
+    first.clone()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_project_return_type_alternative(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: &[JavaReceiverType],
+    method_unit: &CodeUnit,
+    returned: JavaReturnType,
+) -> Option<Vec<JavaReceiverType>> {
+    let (mut types, owner_parameters) = match returned {
+        JavaReturnType::Types(candidates) if !candidates.is_empty() => {
+            let mut types = Vec::new();
+            for candidate in candidates {
+                java_push_receiver_type(&mut types, candidate);
+            }
+            (types, Vec::new())
+        }
+        JavaReturnType::OwnerTypeParameter { index, bounds } => (Vec::new(), vec![(index, bounds)]),
+        JavaReturnType::Types(_) | JavaReturnType::Alternatives(_) => return None,
+    };
+    for (index, upper) in owner_parameters {
+        let owner = session.parent_of(analyzer, method_unit);
+        let before = types.len();
+        for candidate in receiver {
+            if owner.as_ref() != Some(&candidate.unit) {
+                continue;
+            }
+            let Some(argument) = candidate.arguments.get(index) else {
+                continue;
+            };
+            for resolved in java_receiver_types_of_spelling(
+                analyzer, token, java, session, file, source, root, argument,
+            ) {
+                java_push_receiver_type(&mut types, resolved);
+            }
+        }
+        if types.len() == before {
+            for candidate in upper {
+                java_push_receiver_type(&mut types, candidate);
+            }
         }
     }
-    if types.is_empty() { bounds } else { types }
+    (!types.is_empty()).then_some(types)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3855,28 +4676,72 @@ fn java_local_type_candidate_visible(
     if candidate.source() != file {
         return false;
     }
-    let Some(source) = session.read_source(file) else {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return false;
     };
-    let Some(tree) = session.parse_java_source(&source) else {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let Some(mounted) = session.query_optional_row(|| java.declaration_source_facts(token, file))
+    else {
         return false;
     };
-    session
-        .ranges(analyzer, candidate)
-        .into_iter()
-        .any(|range| {
-            if range.start_byte >= byte {
-                return false;
+    if !mounted.facts.valid_links(&mounted.source) {
+        return false;
+    }
+    for local in &mounted.facts.local_types {
+        let declaration_occurrence = mounted.source.declaration(local.declaration).occurrence;
+        let declaration_range = mounted.source.occurrence(declaration_occurrence).range;
+        let scope_range = mounted.source.occurrence(local.lexical_scope).range;
+        if declaration_range.start_byte < byte
+            && scope_range.start_byte <= byte
+            && byte < scope_range.end_byte
+            && !mounted.declaration_units.contains_key(&local.declaration)
+        {
+            // No declaration-name text is persisted, so a visible local with
+            // no bridge is an unresolved shadowing candidate for every name.
+            return false;
+        }
+    }
+    let mut visible = HashSet::default();
+    for (declaration, units) in &mounted.declaration_units {
+        if !units.iter().any(|unit| unit == candidate) {
+            continue;
+        }
+        let declaration_occurrence = mounted.source.declaration(*declaration).occurrence;
+        let declaration_range = mounted.source.occurrence(declaration_occurrence).range;
+        if declaration_range.start_byte >= byte {
+            continue;
+        }
+        for local in mounted
+            .facts
+            .local_types
+            .iter()
+            .filter(|fact| fact.declaration == *declaration)
+        {
+            let scope_range = mounted.source.occurrence(local.lexical_scope).range;
+            if scope_range.start_byte <= byte && byte < scope_range.end_byte {
+                visible.insert((local.declaration, local.lexical_scope));
             }
-            let Some(declaration) = session.smallest_named_node_covering(
-                tree.root_node(),
-                range.start_byte,
-                range.end_byte,
-            ) else {
-                return false;
-            };
-            java_local_type_scope_contains(declaration, byte)
+        }
+    }
+    let Some(nearest_scope_width) = visible
+        .iter()
+        .map(|(_, scope)| {
+            let range = mounted.source.occurrence(*scope).range;
+            range.end_byte.saturating_sub(range.start_byte)
         })
+        .min()
+    else {
+        return false;
+    };
+    visible.retain(|(_, scope)| {
+        let range = mounted.source.occurrence(*scope).range;
+        range.end_byte.saturating_sub(range.start_byte) == nearest_scope_width
+    });
+    // Duplicate bridge rows for one source declaration are deduplicated by
+    // the identity set. Distinct source declarations at the same nearest
+    // scope are an unresolved lexical collision, so do not choose one.
+    visible.len() == 1
 }
 
 /// Find `normalized` as a nested type of `scope` or of one of its enclosing
@@ -4464,11 +5329,8 @@ fn java_expression_type_text(
                 .fqn(&format!("{}.{}", owner.fq_name(), field))
                 .into_iter()
                 .next()?;
-            let signature = unit
-                .signature()
-                .map(str::to_string)
-                .or_else(|| session.signatures(analyzer, &unit).first().cloned())?;
-            java_field_type_text_from_signature(&signature, field)
+            let metadata = session.signature_metadata(analyzer, &unit);
+            java_field_type_text_from_metadata(&metadata)
         }
         "method_invocation" => {
             if expression
@@ -4561,27 +5423,6 @@ fn java_identifier_type_text_before(
         found = Some(name.to_string());
     }
     found
-}
-
-fn java_field_type_text_from_signature(signature: &str, field: &str) -> Option<String> {
-    let before_initializer = signature.split('=').next().unwrap_or(signature);
-    let field_start = before_initializer.rfind(field)?;
-    let mut type_text = before_initializer[..field_start].trim();
-    for modifier in [
-        "public",
-        "protected",
-        "private",
-        "static",
-        "final",
-        "transient",
-        "volatile",
-    ] {
-        type_text = type_text
-            .strip_prefix(modifier)
-            .unwrap_or(type_text)
-            .trim_start();
-    }
-    (!type_text.is_empty()).then(|| type_text.to_string())
 }
 
 fn java_generic_arg(type_text: &str, index: usize) -> Option<String> {
@@ -4926,7 +5767,20 @@ fn java_member_candidates_in_enclosing_chain(
         }
         walk_incomplete |= crossed_boundary;
         innermost_failure.get_or_insert(outcome);
-        static_context |= java_class_is_static(analyzer, session, &owner);
+        let Some(owner_is_static) = java_class_is_static(analyzer, session, &owner) else {
+            return JavaEnclosingMemberResolution {
+                outcome: diagnostic_outcome(
+                    DefinitionLookupStatus::Unavailable,
+                    "unavailable_java_staticness",
+                    format!(
+                        "canonical staticness metadata for `{}` is absent or conflicting",
+                        owner.fq_name()
+                    ),
+                ),
+                static_import_fallback_allowed: false,
+            };
+        };
+        static_context |= owner_is_static;
     }
     let outcome = innermost_failure.unwrap_or_else(|| {
         no_definition(
@@ -4945,11 +5799,14 @@ fn java_class_is_static(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
-) -> bool {
-    session
-        .signature_metadata(analyzer, owner)
+) -> Option<bool> {
+    let alternatives = session.signature_metadata(analyzer, owner);
+    let metadata = alternatives.first()?;
+    let is_static = metadata.class_like_is_static();
+    alternatives
         .iter()
-        .any(|metadata| metadata.class_like_is_static())
+        .all(|alternative| alternative.class_like_is_static() == is_static)
+        .then_some(is_static)
 }
 
 fn java_member_is_static(
@@ -4957,15 +5814,24 @@ fn java_member_is_static(
     session: &JavaResolutionSession<'_>,
     member: &CodeUnit,
     kind: JavaMemberLookupKind,
-) -> bool {
-    session
-        .signature_metadata(analyzer, member)
+) -> Option<bool> {
+    let alternatives = session.signature_metadata(analyzer, member);
+    let metadata = alternatives.first()?;
+    let is_static = match kind {
+        JavaMemberLookupKind::Field => metadata.field_is_static(),
+        JavaMemberLookupKind::Method => metadata.callable_is_static(),
+        JavaMemberLookupKind::Type => false,
+    };
+    alternatives
         .iter()
-        .any(|metadata| match kind {
-            JavaMemberLookupKind::Field => metadata.field_is_static(),
-            JavaMemberLookupKind::Method => metadata.callable_is_static(),
-            JavaMemberLookupKind::Type => false,
+        .all(|alternative| {
+            (match kind {
+                JavaMemberLookupKind::Field => alternative.field_is_static(),
+                JavaMemberLookupKind::Method => alternative.callable_is_static(),
+                JavaMemberLookupKind::Type => false,
+            }) == is_static
         })
+        .then_some(is_static)
 }
 
 fn java_static_context_member_outcome(
@@ -4978,12 +5844,22 @@ fn java_static_context_member_outcome(
     if outcome.definitions.is_empty() {
         return outcome;
     }
-    let definitions: Vec<_> = outcome
-        .definitions
-        .iter()
-        .filter(|candidate| java_member_is_static(analyzer, session, candidate, kind))
-        .cloned()
-        .collect();
+    let mut definitions = Vec::new();
+    for candidate in &outcome.definitions {
+        let Some(is_static) = java_member_is_static(analyzer, session, candidate, kind) else {
+            return diagnostic_outcome(
+                DefinitionLookupStatus::Unavailable,
+                "unavailable_java_staticness",
+                format!(
+                    "canonical staticness metadata for `{}` is absent or conflicting",
+                    candidate.fq_name()
+                ),
+            );
+        };
+        if is_static {
+            definitions.push(candidate.clone());
+        }
+    }
     if definitions.is_empty() {
         return no_definition(
             "java_static_context",
@@ -5192,12 +6068,24 @@ fn java_member_candidates(
                 level_site,
             );
             if arity.is_some() && !level_applicability.winners.is_empty() {
-                let winners = java_prefer_class_method_candidates(
+                let winners = match java_prefer_class_method_candidates(
                     analyzer,
                     kind,
                     level_applicability.winners.clone(),
                     &declaring_owner_by_candidate,
-                );
+                ) {
+                    Ok(winners) => winners,
+                    Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                        return diagnostic_outcome(
+                            DefinitionLookupStatus::Unavailable,
+                            "unavailable_java_hierarchy_facts",
+                            format!(
+                                "canonical interface metadata for `{}` is absent or conflicting",
+                                owner.fq_name()
+                            ),
+                        );
+                    }
+                };
                 if let Some(state) = member_trace.as_ref() {
                     state.stage_selection(owner, &level_applicability, &winners);
                 }
@@ -5205,12 +6093,24 @@ fn java_member_candidates(
             }
             if !level_candidates.is_empty() {
                 if arity.is_none() {
-                    let candidates = java_prefer_class_method_candidates(
+                    let candidates = match java_prefer_class_method_candidates(
                         analyzer,
                         kind,
                         level_candidates,
                         &declaring_owner_by_candidate,
-                    );
+                    ) {
+                        Ok(candidates) => candidates,
+                        Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                            return diagnostic_outcome(
+                                DefinitionLookupStatus::Unavailable,
+                                "unavailable_java_hierarchy_facts",
+                                format!(
+                                    "canonical interface metadata for `{}` is absent or conflicting",
+                                    owner.fq_name()
+                                ),
+                            );
+                        }
+                    };
                     if let Some(state) = member_trace.as_ref() {
                         state.stage_selection(owner, &level_applicability, &candidates);
                     }
@@ -5255,9 +6155,9 @@ fn java_prefer_class_method_candidates(
     kind: JavaMemberLookupKind,
     candidates: Vec<CodeUnit>,
     declaring_owner_by_candidate: &HashMap<CodeUnit, CodeUnit>,
-) -> Vec<CodeUnit> {
+) -> Result<Vec<CodeUnit>, JavaHierarchyFactError> {
     if kind != JavaMemberLookupKind::Method || candidates.len() < 2 {
-        return candidates;
+        return Ok(candidates);
     }
     let mut owners = candidates
         .iter()
@@ -5270,8 +6170,8 @@ fn java_prefer_class_method_candidates(
         .collect::<Vec<_>>();
     sort_units(&mut owners);
     owners.dedup();
-    let preferred = java_preferred_declaring_owners(analyzer, &owners);
-    candidates
+    let preferred = java_preferred_declaring_owners(analyzer, &owners)?;
+    Ok(candidates
         .into_iter()
         .filter(|candidate| {
             preferred.contains(
@@ -5280,7 +6180,7 @@ fn java_prefer_class_method_candidates(
                     .expect("hierarchy candidate has its declaring owner"),
             )
         })
-        .collect()
+        .collect())
 }
 
 /// Whether `owner`'s supertype closure names a type this workspace does not
@@ -5626,6 +6526,53 @@ fn java_static_import_candidates(
     }
 }
 
+/// Attach exact selected-JDK call evidence to a native external static-import
+/// boundary. The native resolver owns the boundary decision; this helper only
+/// proves the imported owner/member identity and call arity from the same
+/// structured import facts and selected JDK that back ordinary Java calls.
+pub(crate) fn expand_java_external_static_import_callee(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    callee_text: &str,
+    site: &ExternalCalleeSite<'_>,
+) -> Option<ImportedExternalCallee> {
+    let node = site.tree.root_node().named_descendant_for_byte_range(
+        site.callee_start_byte,
+        site.callee_start_byte.saturating_add(1),
+    )?;
+    if node.kind() != "identifier" || site.source.get(node.byte_range())? != callee_text {
+        return None;
+    }
+    let invocation = node.parent().filter(|parent| {
+        parent.kind() == "method_invocation"
+            && parent.child_by_field_name("name") == Some(node)
+            && parent.child_by_field_name("object").is_none()
+    })?;
+    let arity = argument_list_arity(invocation.child_by_field_name("arguments")?);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::Java);
+    let session = JavaResolutionSession::unbounded(&support);
+    let resolution = java_static_import_candidates(
+        analyzer,
+        scope.token(),
+        &session,
+        file,
+        callee_text,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    if resolution.outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
+        || resolution.external_owner.is_none()
+    {
+        return None;
+    }
+    let proof = resolution.evidence.exact_external_call?;
+    let identity = resolution.evidence.external_callee_identity?;
+    // The evidence carries the selected JDK artifact only when it agrees with
+    // the artifact that supplied the exact imported member.
+    Some(ImportedExternalCallee::proven(proof, identity))
+}
+
 fn java_import_boundary_for_type(
     java: &JavaAnalyzer,
     token: QueryToken<'_>,
@@ -5672,9 +6619,425 @@ fn java_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 #[cfg(test)]
+mod canonical_constructor_tests {
+    use super::*;
+    use crate::analyzer::{
+        AnalyzerDefinitionLookup, CodeUnit, CodeUnitIndex, CodeUnitType, JavaAnalyzer, Language,
+        ProjectFile,
+    };
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+    use brokk_bifrost_core::analyzer::model::SignatureMetadata;
+    use brokk_bifrost_jvm::java::graph::resolver::{TargetSpec, java_callable_arity};
+    use brokk_bifrost_jvm::java::graph_support::java_callable_facts;
+
+    fn java_owner(
+        fixture: &BuiltInlineTestProject,
+        file_name: &str,
+        identifier: &str,
+    ) -> (JavaAnalyzer, ProjectFile, CodeUnit) {
+        let java = JavaAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file(file_name);
+        let owner = java
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.identifier() == identifier)
+            .expect("written Java owner");
+        (java, file, owner)
+    }
+
+    #[test]
+    fn constructor_context_uses_constructor_bit_for_same_named_method() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Widget.java",
+                "class Widget { Widget(int size) {} int Widget() { return 0; } }\n",
+            )
+            .build();
+        let (java, _file, owner) = java_owner(&fixture, "Widget.java", "Widget");
+        let candidates = java
+            .direct_children(&owner)
+            .into_iter()
+            .filter(CodeUnit::is_function)
+            .collect::<Vec<_>>();
+        let context = java
+            .constructor_context(&owner, candidates, Some(1))
+            .expect("canonical constructor facts");
+
+        assert_eq!(context.constructors.len(), 1);
+        assert!(
+            java.signature_metadata(&context.constructors[0])
+                .iter()
+                .all(|metadata| metadata.callable_is_constructor())
+        );
+        assert!(!context.owner_shape_accepts);
+    }
+
+    #[test]
+    fn record_constructor_is_explicit_before_canonical_owner_fallback() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("Point.java", "record Point(int x) { Point(int x) {} }\n")
+            .build();
+        let (java, _file, owner) = java_owner(&fixture, "Point.java", "Point");
+        let candidates = java
+            .direct_children(&owner)
+            .into_iter()
+            .filter(CodeUnit::is_function)
+            .collect::<Vec<_>>();
+        let explicit = java
+            .constructor_context(&owner, candidates, Some(1))
+            .expect("record constructor facts");
+        assert_eq!(explicit.constructors.len(), 1);
+        assert!(explicit.owner_shape_accepts);
+
+        let fallback = java
+            .constructor_context(&owner, Vec::new(), Some(1))
+            .expect("record canonical owner shape");
+        assert!(fallback.constructors.is_empty());
+        assert!(fallback.owner_shape_accepts);
+    }
+
+    #[test]
+    fn missing_or_conflicting_callable_facts_are_not_proven_misses() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Worker.java",
+                "class Worker { public static void run() {} public void run() {} }\n",
+            )
+            .build();
+        let (java, _file, owner) = java_owner(&fixture, "Worker.java", "Worker");
+        let member = java
+            .direct_children(&owner)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "run")
+            .expect("same-named methods");
+
+        assert_eq!(java.signature_metadata(&member).len(), 2);
+        assert!(java_callable_facts(&java, &member).is_none());
+        assert!(java_callable_arity(&java, &member).is_none());
+        assert!(TargetSpec::from_target(&java, &member).is_none());
+
+        let analyzer = &java as &dyn crate::analyzer::IAnalyzer;
+        let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
+        let session = JavaResolutionSession::unbounded(&support);
+        // This function-shaped unit is deliberately absent from the index, so
+        // its canonical metadata read is empty. The applicability contract
+        // must retain it as unknown rather than turn missing rows into a miss.
+        let unknown = CodeUnit::new(
+            member.source().clone(),
+            CodeUnitType::Function,
+            owner.fq_name(),
+            "unrecorded",
+        );
+        let applicability = java_candidate_applicability(
+            analyzer,
+            &session,
+            std::slice::from_ref(&unknown),
+            Some(1),
+            None,
+        );
+        assert_eq!(applicability.winners, vec![unknown]);
+        assert_eq!(applicability.verdicts.len(), 1);
+        assert_eq!(
+            applicability.verdicts[0].verdict,
+            ApplicabilityVerdict::Unknown
+        );
+
+        let synthetic_fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Host.java",
+                "class Host { Runnable value = new Runnable() { public void run() {} }; }\n",
+            )
+            .build();
+        let (synthetic_java, _file, synthetic_owner) =
+            java_owner(&synthetic_fixture, "Host.java", "Host");
+        let anonymous = synthetic_java
+            .all_declarations()
+            .find(|unit| unit.source() == synthetic_owner.source() && unit.is_synthetic());
+        // The synthetic class has no source-owned constructor shape. It is an
+        // unavailable read, not evidence that an implicit constructor is absent.
+        let anonymous = anonymous.expect("anonymous class unit");
+        assert!(
+            synthetic_java
+                .constructor_context(&anonymous, Vec::new(), Some(0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn field_type_metadata_requires_complete_agreement() {
+        let complete = vec![
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+        ];
+        assert_eq!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&complete)
+                .as_deref(),
+            Some("Target")
+        );
+
+        let missing = vec![SignatureMetadata::new("value", Vec::new())];
+        assert!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(&missing)
+                .is_none()
+        );
+
+        let conflicting = vec![
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Target")),
+            SignatureMetadata::new("value", Vec::new()).with_return_type_text(Some("Other")),
+        ];
+        assert!(
+            brokk_bifrost_jvm::java::graph::resolver::java_field_type_text_from_metadata(
+                &conflicting
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn foreign_source_return_retains_qualified_generic_owner() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Factory.java",
+                "class Box<T> { class Inner {} } class Factory { Box<String>.Inner make() { return null; } }\n",
+            )
+            .file("Use.java", "class Use {}\n")
+            .build();
+        let (java, file, owner) = java_owner(&fixture, "Factory.java", "Factory");
+        let method = java
+            .direct_children(&owner)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "make")
+            .expect("foreign factory method");
+        let analyzer = &java as &dyn crate::analyzer::IAnalyzer;
+        let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
+        let session = JavaResolutionSession::unbounded(&support);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let JavaReturnType::Types(types) = java_return_type_from_source_facts(
+            analyzer,
+            scope.token(),
+            &java,
+            &session,
+            &file,
+            &method,
+        ) else {
+            panic!("one nominal return type");
+        };
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].unit.identifier(), "Inner");
+    }
+
+    #[test]
+    fn foreign_source_facts_resolve_local_anonymous_return_nominal() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Factory.java",
+                "class Factory { Object make() { class Local { void ping() {} } return new Local() {}; } }\n",
+            )
+            .file("Use.java", "class Use { void use(Factory factory) { factory.make(); } }\n")
+            .build();
+        let (java, file, owner) = java_owner(&fixture, "Factory.java", "Factory");
+        let method = java
+            .direct_children(&owner)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "make")
+            .expect("foreign factory method");
+        let analyzer = &java as &dyn crate::analyzer::IAnalyzer;
+        let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
+        let session = JavaResolutionSession::unbounded(&support);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mounted = java
+            .declaration_source_facts(scope.token(), &file)
+            .expect("foreign Java source facts");
+        let anonymous = mounted
+            .declaration_units
+            .iter()
+            .find_map(|(callable, units)| {
+                units.iter().any(|unit| unit == &method).then(|| {
+                    mounted.facts.anonymous_returns.iter().find(|fact| {
+                        fact.callable == *callable
+                            && matches!(
+                                fact.status,
+                                brokk_bifrost_core::analyzer::java_facts::JavaAnonymousReturnStatus::AllAnonymous
+                            )
+                            && !fact.returns.is_empty()
+                    })
+                })
+            })
+            .flatten()
+            .expect("canonical anonymous return fact");
+        let entry = anonymous.returns.first().expect("anonymous return entry");
+        let types = java_receiver_types_from_source_type_facts(
+            analyzer,
+            scope.token(),
+            &java,
+            &session,
+            &file,
+            mounted.as_ref(),
+            entry.declared_type,
+        );
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].unit.identifier(), "Local");
+    }
+
+    #[test]
+    fn foreign_source_return_alternatives_require_agreement() {
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Factory.java",
+                "class Factory { class Target {} class Other {} Target make() { return null; } Other make() { return null; } }\n",
+            )
+            .file("Use.java", "class Use {}\n")
+            .build();
+        let (java, factory_file, owner) = java_owner(&fixture, "Factory.java", "Factory");
+        let method = java
+            .direct_children(&owner)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "make")
+            .expect("foreign overloaded return method");
+        let analyzer = &java as &dyn crate::analyzer::IAnalyzer;
+        let support = AnalyzerDefinitionLookup::new(analyzer, Language::Java);
+        let session = JavaResolutionSession::unbounded(&support);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let raw = java_return_type_from_source_facts(
+            analyzer,
+            scope.token(),
+            &java,
+            &session,
+            &factory_file,
+            &method,
+        );
+        let JavaReturnType::Alternatives(alternatives) = raw else {
+            panic!("duplicate source declaration bridges must remain alternatives");
+        };
+        assert_eq!(alternatives.len(), 2);
+
+        let use_file = fixture.file("Use.java");
+        let use_source = "class Use {}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java parser language");
+        let tree = parser.parse(use_source, None).expect("parsed use fixture");
+        let projected = java_method_return_types(
+            analyzer,
+            scope.token(),
+            &java,
+            &session,
+            &use_file,
+            use_source,
+            tree.root_node(),
+            &[JavaReceiverType::plain(owner)],
+            &method,
+        );
+        assert!(
+            projected.is_empty(),
+            "conflicting same-key foreign returns cannot establish a precise receiver"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn external_constructor_keeps_the_model_member_identity() {
+        use crate::analyzer::semantic_model::*;
+        use serde_json::json;
+        let source =
+            "import example.Box; class App { Object make(int value) { return new Box(value); } }";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("App.java", source)
+            .build();
+        let workspace = project.workspace_analyzer(crate::AnalyzerConfig::default());
+        let pack = compile_source(SourceFormat::Json, &serde_json::to_vec(&json!({
+            "schema_version": 2, "pack_id": "test.constructor", "version": "1.0.0",
+            "producer": {"name": "contract", "version": "1.0.0"}, "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": [{"name": "jdk", "requirement": ">=17.0.0"}]},
+            "provenance": {"source": "test:inline"}, "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "declarations", "activation": [{"toolchain": {"name": "jdk", "version": ">=17.0.0"}, "targets": ["jvm"], "configurations": []}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": "box", "name": "example.Box", "type_kind": "class", "visibility": "public",
+                    "is_abstract": false, "is_sealed": false,
+                    "locator": {"kind": "artifact", "path": "example/Box.java", "symbol": "example.Box"}
+                }], "members": [{
+                    "id": "box.init", "owner": "box", "name": "<init>", "member_kind": "constructor",
+                    "visibility": "public", "is_static": false, "is_abstract": false, "is_virtual": false,
+                    "callable_family_complete": true,
+                    "signature": {"parameters": [{"name": "value", "type": {"kind": "named", "name": "int"}}]},
+                    "locator": {"kind": "artifact", "path": "example/Box.java", "symbol": "box.init"}
+                }]}
+            }]
+        })).unwrap(), &CompilerOptions::default()).expect("valid contract pack");
+        let catalog =
+            SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "constructor-contract".into(),
+                },
+            )
+            .expect("register pack");
+        let activation = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "java".into(),
+                    ecosystem: "jdk".into(),
+                    package: None,
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "jdk".into(),
+                        version: Some(semver::Version::new(21, 0, 0)),
+                    }),
+                    target: Some("jvm".into()),
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &crate::CancellationToken::new(),
+        );
+        assert!(
+            matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+            "{activation:#?}"
+        );
+        let analyzer = workspace.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let start = source.find("Box(value)").expect("constructor token");
+        let outcomes = resolve_call_target_batch_with_source(
+            analyzer,
+            scope.token(),
+            vec![DefinitionLookupRequest {
+                file: project.file("App.java"),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + 3),
+            }],
+            project.file("App.java"),
+            Arc::from(source),
+            None,
+        );
+        let [outcome] = outcomes.as_slice() else {
+            panic!("one call: {outcomes:#?}");
+        };
+        let proof = outcome
+            .exact_external_call
+            .as_ref()
+            .expect("external constructor evidence");
+        assert_eq!(proof.canonical_callee(), "example.Box.<init>");
+        assert_eq!(proof.parameter_count(), 1);
+        assert!(!proof.has_receiver());
+    }
 
     #[test]
     fn selected_jdk_does_not_turn_an_external_library_call_into_a_jdk_call() {

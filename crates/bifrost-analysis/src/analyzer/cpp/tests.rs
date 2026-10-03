@@ -1255,6 +1255,86 @@ mod header_language_attribution_tests {
         );
     }
 
+    /// #3763: two publishers share `cpp:c`. The ordinary workspace sync owns
+    /// the `.c` files and the C-reading mount owns the headers C compiles.
+    /// When each replaced the whole membership, the first dropped the
+    /// headers and the second put them back, so every warm start advanced
+    /// the `cpp:c` revision twice. A warm start over unchanged files, and an
+    /// update naming unchanged files, must publish no revision in either
+    /// storage language.
+    #[test]
+    fn a_no_op_warm_start_or_update_publishes_no_workspace_revision() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file(
+                "shared.h",
+                "struct Outer { struct Inner { int value; } inner; };\n",
+            )
+            .file(
+                "main.c",
+                "#include \"shared.h\"\nint main(void) { return 0; }\n",
+            )
+            .build();
+        let project = fixture.project_dyn();
+        let store = Arc::new(
+            crate::analyzer::store::AnalyzerStore::open_persistent(
+                &fixture.root().join("warm-start.db"),
+            )
+            .expect("persistent store"),
+        );
+        let start = || {
+            CppAnalyzer::new_with_config_store_context(
+                Arc::clone(&project),
+                AnalyzerConfig::default(),
+                crate::analyzer::tree_sitter_analyzer::revision_image_store_context(
+                    project.as_ref(),
+                    Arc::clone(&store),
+                ),
+                None,
+            )
+            .expect("analyzer over the persistent store")
+        };
+        let revisions = |analyzer: &CppAnalyzer| {
+            let snapshots = analyzer.inner.selected_workspace_snapshots();
+            [
+                "cpp",
+                crate::analyzer::cpp::adapter::CPP_C_STORAGE_LANGUAGE_KEY,
+            ]
+            .map(|lang| {
+                snapshots
+                    .get(lang)
+                    .unwrap_or_else(|| panic!("no {lang} snapshot in {snapshots:?}"))
+                    .revision
+            })
+        };
+
+        let cold = start();
+        let header = fixture.file("shared.h");
+        {
+            let scope = AnalyzerQueryScope::new(&cold);
+            assert!(
+                cold.c_reading_workspace_files(scope.token())
+                    .contains(&header),
+                "the header must be mounted under cpp:c, or the test proves nothing"
+            );
+        }
+        let cold_revisions = revisions(&cold);
+        drop(cold);
+
+        let warm = start();
+        assert_eq!(
+            revisions(&warm),
+            cold_revisions,
+            "a warm start over unchanged files published a revision"
+        );
+
+        let updated = warm.update(&BTreeSet::from([header, fixture.file("main.c")]));
+        assert_eq!(
+            revisions(&updated),
+            cold_revisions,
+            "an update naming unchanged files published a revision"
+        );
+    }
+
     #[test]
     fn a_direct_database_entry_naming_the_header_is_decisive() {
         // The compile database has no entry for the reaching translation

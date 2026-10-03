@@ -2,7 +2,9 @@ use super::JavaGraphSource;
 use crate::java::graph_support::{
     JavaSource, UniqueClassInFile, resolve_java_usage_type_components_in,
 };
+use crate::java::source_facts::JavaFileSourceFacts;
 use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
+use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -11,7 +13,9 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
 };
 use brokk_bifrost_core::hash::HashMap;
 use std::sync::Mutex;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+#[cfg(test)]
+use tree_sitter::Parser;
 
 pub const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
 pub const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_chain_depth";
@@ -153,10 +157,10 @@ fn method_unit_declared_return_type_uncached<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let Some(range) = ctx.java().ranges(method).first().copied() else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
     if method.source() == ctx.file() {
+        let Some(range) = ctx.java().ranges(method).first().copied() else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
         return java_return_type_node_covering(ctx.root(), &range)
             .and_then(|type_node| {
                 java_declared_type_fqn(
@@ -240,10 +244,10 @@ fn method_unit_anonymous_return_type_uncached<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let Some(range) = ctx.java().ranges(method).first().copied() else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
     if method.source() == ctx.file() {
+        let Some(range) = ctx.java().ranges(method).first().copied() else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
         return method_declaration_covering(ctx.root(), &range)
             .map(|declaration| {
                 method_declaration_anonymous_return_type(
@@ -302,70 +306,184 @@ fn build_java_file_return_facts<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let Ok(source) = file.read_to_string() else {
+    let Some(mounted) = ctx.java().declaration_source_facts(token, file) else {
         return JavaFileReturnFacts::default();
     };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .is_err()
-    {
+    if !mounted.facts.valid_links(&mounted.source) {
         return JavaFileReturnFacts::default();
     }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return JavaFileReturnFacts::default();
-    };
+    let mut declared_alternatives: HashMap<
+        FileReturnCacheKey,
+        Vec<ReceiverAnalysisOutcome<String>>,
+    > = HashMap::default();
+    let mut anonymous_alternatives: HashMap<
+        FileReturnCacheKey,
+        Vec<ReceiverAnalysisOutcome<String>>,
+    > = HashMap::default();
+    let mut callable_returns = HashMap::default();
+    for fact in &mounted.facts.callable_returns {
+        callable_returns
+            .entry(fact.callable)
+            .or_insert_with(Vec::new)
+            .push(fact);
+    }
+    let mut anonymous_returns = HashMap::default();
+    for fact in &mounted.facts.anonymous_returns {
+        anonymous_returns
+            .entry(fact.callable)
+            .or_insert_with(Vec::new)
+            .push(fact);
+    }
+    for (declaration, units) in &mounted.declaration_units {
+        for unit in units.iter().filter(|unit| unit.is_function()) {
+            let key = FileReturnCacheKey {
+                fq_name: unit.fq_name(),
+                signature: unit.signature().map(str::to_string),
+            };
+            let declared = callable_returns.get(declaration);
+            if let Some(facts) = declared {
+                for fact in facts {
+                    let declared_type = fact
+                        .ty
+                        .and_then(|type_id| {
+                            java_declared_source_type_fqn(
+                                ctx.java(),
+                                token,
+                                ctx.relational_definitions(),
+                                &mounted,
+                                type_id,
+                                unit,
+                            )
+                        })
+                        .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
+                        .unwrap_or(ReceiverAnalysisOutcome::Unknown);
+                    declared_alternatives
+                        .entry(key.clone())
+                        .or_default()
+                        .push(declared_type);
+                }
+            } else {
+                declared_alternatives
+                    .entry(key.clone())
+                    .or_default()
+                    .push(ReceiverAnalysisOutcome::Unknown);
+            }
+
+            let anonymous = anonymous_returns.get(declaration);
+            if let Some(facts) = anonymous {
+                for fact in facts {
+                    let anonymous_return_type = if fact.status
+                        != brokk_bifrost_core::analyzer::java_facts::JavaAnonymousReturnStatus::AllAnonymous
+                    {
+                        ReceiverAnalysisOutcome::Unknown
+                    } else {
+                        let mut types = Vec::with_capacity(fact.returns.len());
+                        for entry in &fact.returns {
+                            let Some(fqn) = java_declared_source_type_fqn(
+                                ctx.java(),
+                                token,
+                                ctx.relational_definitions(),
+                                &mounted,
+                                entry.declared_type,
+                                unit,
+                            ) else {
+                                types.clear();
+                                break;
+                            };
+                            types.push(fqn);
+                        }
+                        if types.is_empty() {
+                            ReceiverAnalysisOutcome::Unknown
+                        } else {
+                            ReceiverAnalysisOutcome::Precise(types)
+                        }
+                    };
+                    anonymous_alternatives
+                        .entry(key.clone())
+                        .or_default()
+                        .push(anonymous_return_type);
+                }
+            } else {
+                anonymous_alternatives
+                    .entry(key)
+                    .or_default()
+                    .push(ReceiverAnalysisOutcome::Unknown);
+            }
+        }
+    }
+
     let mut facts = JavaFileReturnFacts::default();
-    for unit in ctx
-        .java()
-        .declarations(file)
-        .into_iter()
-        .filter(|unit| unit.is_function())
-    {
-        let key = FileReturnCacheKey {
-            fq_name: unit.fq_name(),
-            signature: unit.signature().map(str::to_string),
-        };
-        let declaration = ctx
-            .java()
-            .ranges(&unit)
-            .first()
-            .copied()
-            .and_then(|range| method_declaration_covering(tree.root_node(), &range));
-        let declared_type = declaration
-            .and_then(|method| method.child_by_field_name("type"))
-            .and_then(|type_node| {
-                java_declared_type_fqn(
-                    ctx.java(),
-                    token,
-                    ctx.relational_definitions(),
-                    file,
-                    &source,
-                    type_node,
-                    &unit,
-                )
-            })
-            .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
-            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
-        let anonymous_return_type = declaration
-            .map(|method| {
-                method_declaration_anonymous_return_type(
-                    ctx.java(),
-                    token,
-                    ctx.relational_definitions(),
-                    file,
-                    &source,
-                    method,
-                    &unit,
-                )
-            })
-            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
-        facts.declared_types.insert(key.clone(), declared_type);
-        facts
-            .anonymous_return_types
-            .insert(key, anonymous_return_type);
+    for (key, alternatives) in declared_alternatives {
+        facts.declared_types.insert(
+            key,
+            merge_same_declaration_receiver_type_outcomes(alternatives),
+        );
+    }
+    for (key, alternatives) in anonymous_alternatives {
+        facts.anonymous_return_types.insert(
+            key,
+            merge_same_declaration_receiver_type_outcomes(alternatives),
+        );
     }
     facts
+}
+
+fn java_declared_source_type_fqn(
+    java: &dyn JavaSource,
+    token: QueryToken<'_>,
+    definitions: &dyn RelationalDefinitionFrontier,
+    mounted: &JavaFileSourceFacts,
+    root: JavaSourceTypeId,
+    declaration: &CodeUnit,
+) -> Option<String> {
+    let source_type_occurrence = mounted
+        .facts
+        .types
+        .get(root.index())
+        .map(|type_fact| type_fact.occurrence)?;
+    let mut current = root;
+    loop {
+        current = match &mounted.facts.types.get(current.index())?.shape {
+            JavaTypeSyntaxShape::Named { name, parameter } => {
+                if parameter.is_some() {
+                    return None;
+                }
+                let components = name.path();
+                match java_local_type_from_source_facts(
+                    java,
+                    mounted,
+                    source_type_occurrence,
+                    declaration,
+                    components,
+                ) {
+                    LexicalTypeResolution::Resolved(unit) => return Some(unit.fq_name()),
+                    LexicalTypeResolution::Blocked => return None,
+                    LexicalTypeResolution::NotFound => {}
+                }
+                return match java_lexical_type_from_declaration(
+                    java,
+                    token,
+                    declaration,
+                    components,
+                ) {
+                    LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
+                    LexicalTypeResolution::NotFound => resolve_java_usage_type_components_in(
+                        java,
+                        token,
+                        definitions,
+                        declaration.source(),
+                        name.path(),
+                    )
+                    .map(|unit| unit.fq_name()),
+                    LexicalTypeResolution::Blocked => None,
+                };
+            }
+            JavaTypeSyntaxShape::Generic { base, .. }
+            | JavaTypeSyntaxShape::Array { element: base, .. }
+            | JavaTypeSyntaxShape::Annotated(base) => *base,
+            JavaTypeSyntaxShape::NonNominal | JavaTypeSyntaxShape::Unknown => return None,
+        };
+    }
 }
 
 fn java_declared_type_fqn(
@@ -544,6 +662,110 @@ fn java_local_type_from_node(
         return LexicalTypeResolution::Resolved(binding);
     }
     LexicalTypeResolution::NotFound
+}
+
+/// Resolve a foreign-file local class from canonical source facts. The source
+/// rows retain both the class declaration and its nearest lexical scope, so a
+/// foreign reader can apply the same declaration-before-use and scope rules as
+/// the active-file AST path without reconstructing a parser tree.
+fn java_local_type_from_source_facts(
+    java: &dyn JavaSource,
+    mounted: &JavaFileSourceFacts,
+    type_occurrence: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId,
+    declaration: &CodeUnit,
+    components: &[String],
+) -> LexicalTypeResolution {
+    let Some(first_component) = components.first() else {
+        return LexicalTypeResolution::NotFound;
+    };
+    let use_byte = mounted.source.occurrence(type_occurrence).range.start_byte;
+    let mut candidates = Vec::new();
+    for local in &mounted.facts.local_types {
+        let declaration_row = mounted.source.declaration(local.declaration);
+        let declaration_range = mounted.source.occurrence(declaration_row.occurrence).range;
+        let scope_range = mounted.source.occurrence(local.lexical_scope).range;
+        if declaration_range.start_byte >= use_byte
+            || scope_range.start_byte > use_byte
+            || use_byte >= scope_range.end_byte
+        {
+            continue;
+        }
+        let Some(units) = mounted.declaration_units.get(&local.declaration) else {
+            // Source rows intentionally do not duplicate declaration-name
+            // text. A visible local declaration with no bridge therefore
+            // cannot be shown unrelated to this spelling; fail closed rather
+            // than falling through to a package or import answer.
+            return LexicalTypeResolution::Blocked;
+        };
+        for unit in units.iter().filter(|unit| {
+            unit.is_class()
+                && unit.identifier() == first_component
+                && unit.source() == declaration.source()
+        }) {
+            let identity = (local.declaration, local.lexical_scope, unit.clone());
+            if !candidates.iter().any(|existing| existing == &identity) {
+                candidates.push(identity);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return LexicalTypeResolution::NotFound;
+    }
+
+    let nearest_scope_width = candidates
+        .iter()
+        .map(|(_, scope, _)| {
+            let range = mounted.source.occurrence(*scope).range;
+            range.end_byte.saturating_sub(range.start_byte)
+        })
+        .min()
+        .expect("non-empty local type candidates have a scope");
+    candidates.retain(|(_, scope, _)| {
+        let range = mounted.source.occurrence(*scope).range;
+        range.end_byte.saturating_sub(range.start_byte) == nearest_scope_width
+    });
+
+    // Repeated bridge rows for one source declaration are harmless, but two
+    // source declarations at the same nearest scope are an unresolved lexical
+    // collision even when their rendered CodeUnit happens to compare equal.
+    let identities = candidates
+        .iter()
+        .map(|(local, scope, _)| (*local, *scope))
+        .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+    if identities.len() != 1 {
+        return LexicalTypeResolution::Blocked;
+    }
+    let units = candidates
+        .into_iter()
+        .map(|(_, _, unit)| unit)
+        .collect::<Vec<_>>();
+    let mut units = units.into_iter();
+    let Some(mut binding) = units.next() else {
+        return LexicalTypeResolution::Blocked;
+    };
+    if units.next().is_some() {
+        return LexicalTypeResolution::Blocked;
+    }
+    for component in &components[1..] {
+        let nested = java
+            .direct_children_in_file(&binding)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.identifier() == component
+                    && candidate.source() == declaration.source()
+            })
+            .collect::<Vec<_>>();
+        let mut nested = nested.into_iter();
+        let Some(next) = nested.next() else {
+            return LexicalTypeResolution::Blocked;
+        };
+        if nested.next().is_some() {
+            return LexicalTypeResolution::Blocked;
+        }
+        binding = next;
+    }
+    LexicalTypeResolution::Resolved(binding)
 }
 
 fn java_local_type_visible_at(
@@ -765,6 +987,39 @@ pub fn merge_receiver_type_outcomes(
     ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, ReceiverAnalysisBudget::default())
 }
 
+/// Merge projections made from duplicate source declaration bridges for one
+/// declaration identity. These alternatives are not overloads: a missing or
+/// disagreeing bridge must poison precision rather than unioning an answer
+/// that depends on map traversal order. The regular merge remains appropriate
+/// for distinct overloads and hierarchy owners.
+fn merge_same_declaration_receiver_type_outcomes(
+    outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
+) -> ReceiverAnalysisOutcome<String> {
+    let mut outcomes = outcomes.into_iter();
+    let Some(first) = outcomes.next() else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let ReceiverAnalysisOutcome::Precise(mut expected) = first else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    expected.sort();
+    expected.dedup();
+    if expected.is_empty() {
+        return ReceiverAnalysisOutcome::Unknown;
+    }
+    for outcome in outcomes {
+        let ReceiverAnalysisOutcome::Precise(mut actual) = outcome else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        actual.sort();
+        actual.dedup();
+        if actual != expected {
+            return ReceiverAnalysisOutcome::Unknown;
+        }
+    }
+    ReceiverAnalysisOutcome::Precise(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +1064,31 @@ class Sample {
                 ("scoped".to_string(), "pkg.Outer.Inner".to_string()),
             ]),
             actual
+        );
+    }
+
+    #[test]
+    fn same_declaration_return_alternatives_require_set_agreement() {
+        assert_eq!(
+            merge_same_declaration_receiver_type_outcomes([
+                ReceiverAnalysisOutcome::Precise(vec!["a.B".to_string(), "a.A".to_string()]),
+                ReceiverAnalysisOutcome::Precise(vec!["a.A".to_string(), "a.B".to_string()]),
+            ]),
+            ReceiverAnalysisOutcome::Precise(vec!["a.A".to_string(), "a.B".to_string()]),
+        );
+        assert_eq!(
+            merge_same_declaration_receiver_type_outcomes([
+                ReceiverAnalysisOutcome::Precise(vec!["a.A".to_string()]),
+                ReceiverAnalysisOutcome::Precise(vec!["a.B".to_string()]),
+            ]),
+            ReceiverAnalysisOutcome::Unknown,
+        );
+        assert_eq!(
+            merge_same_declaration_receiver_type_outcomes([
+                ReceiverAnalysisOutcome::Precise(vec!["a.A".to_string()]),
+                ReceiverAnalysisOutcome::Unknown,
+            ]),
+            ReceiverAnalysisOutcome::Unknown,
         );
     }
 }

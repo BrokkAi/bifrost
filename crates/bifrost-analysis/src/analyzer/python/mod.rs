@@ -18,7 +18,13 @@ mod guard_summary;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+pub mod runtime_artifact;
+pub(crate) mod runtime_binding;
+pub(crate) mod runtime_environment;
+pub(crate) mod runtime_provider;
 mod semantic;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 mod type_flow;
 use crate::analyzer::QueryToken;
@@ -80,6 +86,7 @@ pub(crate) use brokk_bifrost_python::graph_support::{
 };
 pub(crate) use brokk_bifrost_python::imports::resolve_fqn_candidates;
 use brokk_bifrost_python::imports::resolve_imports_batched;
+use brokk_bifrost_python::source_facts::PythonSourceFactProvider;
 use brokk_bifrost_python::test_detection::detect_python_test_assertion_smells;
 use brokk_bifrost_python::usage_index::PythonUsageIndex;
 pub(crate) use brokk_bifrost_python::usage_index::{
@@ -102,6 +109,10 @@ pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>,
+    >,
     // Every source file this file's imports resolve to, keyed on the file itself -- NOT deduped by
     // binding name like `imported_code_units` (a HashMap<String, CodeUnit> would silently drop an
     // import whose binding name collides with another's). `could_import_file` needs the undeduped
@@ -109,12 +120,8 @@ pub struct PythonAnalyzer {
     // on every call (previously uncached, called once per (candidate file, target) pair).
     imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    // `export_index_of` re-parses `file` from source on every call (it walks re-export chains, not
-    // the store-backed `FileState`). `resolve_exported_name`'s re-export BFS calls it once per hop
-    // per importing candidate, so on a workspace where many files resolve through a shared re-export
-    // chain this was previously O(candidates * chain depth) redundant full-file parses -- invisible
-    // while candidate discovery was single-threaded and dominated by slower costs, but the dominant
-    // cost once that walk was fixed and parallelized (#1257).
+    // Re-export resolution memoizes the source-owned import/order projection
+    // once per file and analyzer generation, including unsaved overlays.
     export_index: Cache<ProjectFile, Arc<ExportIndex>>,
     // Uncached, this rebuilt the whole per-file binding map -- including a store lookup per
     // from-import through `resolve_module_code_unit` -- for every single `.bindings.get(name)` the
@@ -156,6 +163,25 @@ pub struct PythonAnalyzer {
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
+    pub(crate) fn install_python_runtime_snapshot(
+        &self,
+        base: &crate::analyzer::store::WorkspaceSnapshotId,
+        published: crate::analyzer::store::WorkspaceSnapshotId,
+    ) -> Result<(), crate::analyzer::store::StoreError> {
+        self.inner.install_python_runtime_snapshot(base, published)
+    }
+
+    pub(crate) fn python_runtime_store_snapshot(
+        &self,
+    ) -> Option<(
+        Arc<crate::analyzer::store::AnalyzerStore>,
+        crate::analyzer::store::WorkspaceSnapshotId,
+    )> {
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let snapshot = snapshots.get("python")?.clone();
+        Some((Arc::clone(self.inner.analyzer_store()), snapshot))
+    }
+
     /// Return one typed memo shared by every nested scope of the active query.
     /// Definition resolution uses this rather than exposing the language
     /// analyzer's complete tree-sitter implementation.
@@ -317,6 +343,12 @@ impl PythonAnalyzer {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            source_facts: build_weighted_cache(
+                memo_budget / 8,
+                |_, value: &Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>| {
+                    u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
+                },
+            ),
             imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
@@ -350,10 +382,11 @@ impl PythonAnalyzer {
         &self,
         nodes: &HashSet<String>,
         targets: &HashSet<String>,
-        build: impl FnOnce() -> crate::analyzer::usages::inverted_edges::UsageEdges,
-    ) -> Arc<crate::analyzer::usages::inverted_edges::UsageEdges> {
+        build: impl FnOnce() -> Option<crate::analyzer::usages::inverted_edges::UsageEdges>,
+    ) -> Option<Arc<crate::analyzer::usages::inverted_edges::UsageEdges>> {
         let key = PythonUsageEdgesKey::new(nodes, targets);
-        self.usage_edges.get_with(key, || Arc::new(build()))
+        self.usage_edges
+            .optionally_get_with(key, || build().map(Arc::new))
     }
 
     #[doc(hidden)]
@@ -369,9 +402,7 @@ impl PythonAnalyzer {
         )
     }
 
-    /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
-    /// re-export BFS, so two threads racing on the same file's first lookup must not both pay the
-    /// full disk-read-and-reparse cost below.
+    /// Coalesce concurrent first lookups of the same source-owned export facts.
     pub fn export_index_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ExportIndex> {
         self.export_index.get_with(file.clone(), || {
             Arc::new(compute_export_index_of(self, token, file))
@@ -439,6 +470,18 @@ impl PythonAnalyzer {
         }
 
         reverse
+    }
+}
+
+impl PythonSourceFactProvider for PythonAnalyzer {
+    fn python_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>> {
+        self.inner
+            .canonical_python_source_facts(file, &self.source_facts, keep_going)
     }
 }
 
@@ -800,49 +843,11 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_project_file_set,
-            ),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
-            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(PoolSafeMemo::new()),
-            module_spellings: Arc::new(PoolSafeMemo::new()),
-            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
-        }
+        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
     }
 
     fn update_all(&self) -> Self {
-        let inner = self.inner.update_all();
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_project_file_set,
-            ),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
-            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(PoolSafeMemo::new()),
-            module_spellings: Arc::new(PoolSafeMemo::new()),
-            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
-        }
+        Self::from_inner(self.inner.update_all(), self.memo_budget)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -1065,6 +1070,10 @@ impl LanguageSupport for PythonSupport {
         Language::Python
     }
 
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
         use brokk_bifrost_python::declarations::{module_code_unit, python_module_name};
         module_code_unit(file, &python_module_name(file))
@@ -1105,6 +1114,36 @@ impl LanguageSupport for PythonSupport {
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider> {
         resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
+    }
+
+    fn refine_resolved_call_targets(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        site: &crate::analyzer::languages::ExternalCalleeSite<'_>,
+        targets: &mut [crate::analyzer::usages::call_relations::CallDispatchTarget],
+    ) {
+        let Some(receiver_class) =
+            crate::analyzer::usages::get_definition::python_bound_receiver_class_for_method_call(
+                analyzer,
+                token,
+                file,
+                site.source,
+                site.tree,
+                site.callee_start_byte,
+            )
+        else {
+            return;
+        };
+        let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+            return;
+        };
+        if type_flow::python_receiver_method_dispatch_may_be_bypassed(python, &receiver_class) {
+            for target in targets {
+                target.proof = crate::analyzer::usages::UsageProof::Unproven;
+            }
+        }
     }
 
     fn saved_default_arguments_available(&self, analyzer: &dyn IAnalyzer) -> Option<bool> {

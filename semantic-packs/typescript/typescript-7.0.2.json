@@ -127,7 +127,6 @@
     }
   },
   "compatibility": {
-    "bifrost": ">=0.10.5, <1.0.0",
     "toolchains": []
   },
   "activation": [

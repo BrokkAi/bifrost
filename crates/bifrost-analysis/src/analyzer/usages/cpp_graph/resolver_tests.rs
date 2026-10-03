@@ -1734,6 +1734,12 @@ ABSL_NAMESPACE_END
         const UNRELATED_DECLARATIONS: usize = 256;
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::create_dir_all(root.join("include")).expect("create alias header directory");
+        fs::write(
+            root.join("include/alias.h"),
+            "namespace perf { using Alias = Exact; }\n",
+        )
+        .expect("write canonical alias fixture");
         let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
         let target_a_file = ProjectFile::new(root.clone(), "include/target_a.h");
         let target_b_file = ProjectFile::new(root.clone(), "include/target_b.h");
@@ -1747,14 +1753,11 @@ ABSL_NAMESPACE_END
             Some("void Exact()".to_string()),
             false,
         );
-        let alias = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "include/alias.h"),
-            CodeUnitType::Field,
-            "perf",
-            "Alias",
-            Some("using Alias = Exact;".to_string()),
-            false,
-        );
+        // Keep the alias mounted in the producer's canonical source arena. The
+        // resolver now classifies aliases from source facts, so a hand-minted
+        // CodeUnit with the same spelling is not a valid stand-in for the
+        // declaration the fixture wrote.
+        let alias_file = ProjectFile::new(root.clone(), "include/alias.h");
         let global = CodeUnit::new(
             ProjectFile::new(root.clone(), "include/global.h"),
             CodeUnitType::Class,
@@ -1767,6 +1770,16 @@ ABSL_NAMESPACE_END
             "perf",
             "Exact",
         );
+
+        let cpp = CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        )));
+        let alias = cpp
+            .declarations(&alias_file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "Alias")
+            .expect("canonical alias declaration");
 
         let mut visible = HashSet::default();
         for index in 0..UNRELATED_DECLARATIONS {
@@ -1788,7 +1801,6 @@ ABSL_NAMESPACE_END
             (consumer.clone(), visible.clone()),
             (alias.source().clone(), visible),
         ]);
-        let cpp = visibility_analyzer(&visible_by_file);
         let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
         let query_token = query_scope.token();
         let visibility = visibility_index(&cpp, query_token, visible_by_file);

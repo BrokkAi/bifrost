@@ -520,6 +520,7 @@ impl RowPredicateOp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RowLiteral {
     String(String),
+    StringList(Vec<String>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(String),
@@ -532,6 +533,7 @@ impl fmt::Display for RowLiteral {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::String(value) => write!(formatter, "\"{value}\""),
+            Self::StringList(value) => write!(formatter, "{value:?}"),
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Boolean(value) => write!(formatter, "{value}"),
             Self::ConstrainedEnum(value) => formatter.write_str(value),

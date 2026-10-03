@@ -241,6 +241,11 @@ pub struct CompiledProcedureSummary {
     /// separately.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ordinary_heap_unchanged: bool,
+    /// Reviewed claim that this procedure neither synchronizes with
+    /// caller-visible memory nor retains caller-visible memory for concurrent
+    /// work. It is independent of ordinary-heap preservation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_concurrency_effects: bool,
     /// The author's explicit claim that every implementation outside the
     /// workspace conforms to this summary (#2371). Serialized only when
     /// claimed, so a summary that does not claim it keeps its content digest.
@@ -995,6 +1000,10 @@ pub fn decode_manifest(
     let manifest: CompiledPackManifest = serde_json::from_slice(bytes)
         .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?;
     require_version(manifest.schema_version)?;
+    manifest
+        .compatibility
+        .validate_for_schema(manifest.schema_version)
+        .map_err(|error| ArtifactError::InvalidDescriptor(error.to_string()))?;
     if canonical_json(&manifest)? != bytes {
         return Err(ArtifactError::NonCanonical);
     }
@@ -1015,11 +1024,9 @@ pub fn decode_manifest(
     )?;
     validate_text(&manifest.language, limits, "manifest language")?;
     validate_text(&manifest.ecosystem, limits, "manifest ecosystem")?;
-    validate_text(
-        &manifest.compatibility.bifrost,
-        limits,
-        "manifest Bifrost compatibility",
-    )?;
+    if let Some(requirement) = &manifest.compatibility.bifrost {
+        validate_text(requirement, limits, "manifest Bifrost compatibility")?;
+    }
     validate_text(&manifest.provenance.source, limits, "manifest provenance")?;
     if let Some(revision) = &manifest.provenance.revision {
         validate_text(revision, limits, "manifest provenance revision")?;
@@ -1030,11 +1037,6 @@ pub fn decode_manifest(
     {
         return Err(ArtifactError::InvalidDescriptor(
             "manifest versions must be semantic versions".to_owned(),
-        ));
-    }
-    if semver::VersionReq::parse(&manifest.compatibility.bifrost).is_err() {
-        return Err(ArtifactError::InvalidDescriptor(
-            "manifest Bifrost compatibility must be a semantic-version requirement".to_owned(),
         ));
     }
     if spdx::Expression::parse(&manifest.license).is_err() {
@@ -1123,37 +1125,7 @@ pub fn decode_shard(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
-    validate_descriptor(descriptor, limits)?;
-    let actual_stored = u64::try_from(bytes.len())
-        .map_err(|_| ArtifactError::LimitExceeded("stored shard byte limit"))?;
-    if descriptor.stored_size != actual_stored {
-        return Err(ArtifactError::SizeMismatch {
-            expected: descriptor.stored_size,
-            actual: actual_stored,
-        });
-    }
-    if stored_digest(bytes) != descriptor.stored_sha256 {
-        return Err(ArtifactError::DigestMismatch("stored"));
-    }
-
-    let raw = match descriptor.encoding {
-        ArtifactEncoding::Raw => bytes.to_vec(),
-        ArtifactEncoding::Deflate => inflate_bounded(bytes, descriptor.raw_size, limits)?,
-    };
-    let actual_raw = u64::try_from(raw.len())
-        .map_err(|_| ArtifactError::LimitExceeded("raw shard byte limit"))?;
-    if descriptor.raw_size != actual_raw {
-        return Err(ArtifactError::SizeMismatch {
-            expected: descriptor.raw_size,
-            actual: actual_raw,
-        });
-    }
-    if content_digest(&raw) != descriptor.content_sha256 {
-        return Err(ArtifactError::DigestMismatch("content"));
-    }
-    let wire: WireCompiledShard = serde_json::from_slice(&raw)
-        .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?;
-    require_version(wire.schema_version)?;
+    let (wire, raw) = read_shard_wire(descriptor, bytes, limits)?;
     if canonical_json(&wire)? != raw {
         return Err(ArtifactError::NonCanonical);
     }
@@ -1205,6 +1177,68 @@ pub fn decode_shard(
     if semantic_digest(&shard)? != descriptor.semantic_sha256 {
         return Err(ArtifactError::DigestMismatch("semantic"));
     }
+    Ok(shard)
+}
+
+// This performs the integrity checks needed on every read, including reads of
+// previously validated bytes. Semantic validation remains in decode_shard.
+fn read_shard_wire(
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<(WireCompiledShard, Vec<u8>), ArtifactError> {
+    validate_descriptor(descriptor, limits)?;
+    let actual_stored = u64::try_from(bytes.len())
+        .map_err(|_| ArtifactError::LimitExceeded("stored shard byte limit"))?;
+    if descriptor.stored_size != actual_stored {
+        return Err(ArtifactError::SizeMismatch {
+            expected: descriptor.stored_size,
+            actual: actual_stored,
+        });
+    }
+    if stored_digest(bytes) != descriptor.stored_sha256 {
+        return Err(ArtifactError::DigestMismatch("stored"));
+    }
+
+    let raw = match descriptor.encoding {
+        ArtifactEncoding::Raw => bytes.to_vec(),
+        ArtifactEncoding::Deflate => {
+            let _scope = crate::profiling::scope("semantic_pack.inflate_shard");
+            inflate_bounded(bytes, descriptor.raw_size, limits)?
+        }
+    };
+    let actual_raw = u64::try_from(raw.len())
+        .map_err(|_| ArtifactError::LimitExceeded("raw shard byte limit"))?;
+    if descriptor.raw_size != actual_raw {
+        return Err(ArtifactError::SizeMismatch {
+            expected: descriptor.raw_size,
+            actual: actual_raw,
+        });
+    }
+    if content_digest(&raw) != descriptor.content_sha256 {
+        return Err(ArtifactError::DigestMismatch("content"));
+    }
+    let wire: WireCompiledShard = {
+        let _scope = crate::profiling::scope("semantic_pack.parse_shard_json");
+        serde_json::from_slice(&raw)
+            .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?
+    };
+    require_version(wire.schema_version)?;
+    Ok((wire, raw))
+}
+
+/// Hydrate bytes with a current catalog validation certificate. The catalog
+/// must bind that certificate to this exact manifest, descriptor, and limits.
+/// Content digests and the manifest envelope are checked on every read.
+pub(super) fn hydrate_certified_shard(
+    manifest: &CompiledPackManifest,
+    descriptor: &CompiledShardDescriptor,
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<CompiledShard, ArtifactError> {
+    let (wire, _raw) = read_shard_wire(descriptor, bytes, limits)?;
+    let shard = compiled_from_wire(wire);
+    validate_shard_envelope(manifest, descriptor, &shard)?;
     Ok(shard)
 }
 
@@ -1308,6 +1342,16 @@ fn decode_present_shard_for_manifest(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
+    let shard = decode_shard(descriptor, bytes, limits)?;
+    validate_shard_envelope(manifest, descriptor, &shard)?;
+    Ok(shard)
+}
+
+fn validate_shard_envelope(
+    manifest: &CompiledPackManifest,
+    descriptor: &CompiledShardDescriptor,
+    shard: &CompiledShard,
+) -> Result<(), ArtifactError> {
     if !manifest
         .shards
         .iter()
@@ -1317,7 +1361,6 @@ fn decode_present_shard_for_manifest(
             "shard descriptor is not present in manifest".to_owned(),
         ));
     }
-    let shard = decode_shard(descriptor, bytes, limits)?;
     if shard.schema_version != manifest.schema_version
         || shard.pack_id != manifest.pack_id
         || shard.pack_version != manifest.version
@@ -1334,7 +1377,7 @@ fn decode_present_shard_for_manifest(
             "shard envelope does not match manifest".to_owned(),
         ));
     }
-    Ok(shard)
+    Ok(())
 }
 
 fn inflate_bounded(
@@ -1902,6 +1945,7 @@ fn authored_procedure_summary_from_compiled(
         },
         completeness: summary.completeness,
         ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
+        no_concurrency_effects: summary.no_concurrency_effects,
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,
@@ -2494,6 +2538,169 @@ mod tests {
         include_bytes!("../../../testdata/semantic-model-packs/declarations-v1.json");
     const PROCEDURE_SUMMARIES: &[u8] =
         include_bytes!("../../../testdata/semantic-model-packs/procedure-summaries-v1.json");
+
+    #[test]
+    fn schema_eight_compiles_without_engine_gate_and_keeps_partial_state() {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        let legacy = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        assert_eq!(legacy.manifest.schema_version, 2);
+        assert!(legacy.manifest.compatibility.bifrost.is_some());
+        decode_manifest(&legacy.manifest_bytes, &DecodeLimits::default()).unwrap();
+
+        authored.schema_version = SEMANTIC_MODEL_SCHEMA_VERSION;
+        authored.compatibility.bifrost = None;
+        authored.completeness = Completeness::Partial;
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let manifest_json: serde_json::Value =
+            serde_json::from_slice(&compiled.manifest_bytes).unwrap();
+        assert_eq!(manifest_json["schema_version"], 8);
+        assert!(manifest_json["compatibility"].get("bifrost").is_none());
+        assert!(manifest_json["compatibility"].get("toolchains").is_some());
+        let decoded = decode_manifest(&compiled.manifest_bytes, &DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.compatibility.bifrost, None);
+        assert_eq!(decoded.completeness, Completeness::Partial);
+
+        let mut forbidden_gate = manifest_json.clone();
+        forbidden_gate["compatibility"]["bifrost"] = serde_json::json!("*");
+        let forbidden_gate_bytes = canonical_json(&forbidden_gate).unwrap();
+        assert!(matches!(
+            decode_manifest(&forbidden_gate_bytes, &DecodeLimits::default()),
+            Err(ArtifactError::InvalidDescriptor(message)) if message.contains("forbids")
+        ));
+
+        let mut null_gate = manifest_json.clone();
+        null_gate["compatibility"]["bifrost"] = serde_json::Value::Null;
+        let null_gate_bytes = canonical_json(&null_gate).unwrap();
+        assert!(matches!(
+            decode_manifest(&null_gate_bytes, &DecodeLimits::default()),
+            Err(ArtifactError::InvalidJson(_))
+        ));
+
+        let mut missing_legacy_gate: serde_json::Value =
+            serde_json::from_slice(&legacy.manifest_bytes).unwrap();
+        missing_legacy_gate["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        let missing_legacy_bytes = canonical_json(&missing_legacy_gate).unwrap();
+        assert!(matches!(
+            decode_manifest(&missing_legacy_bytes, &DecodeLimits::default()),
+            Err(ArtifactError::InvalidDescriptor(message)) if message.contains("requires")
+        ));
+
+        let mut unknown_schema = manifest_json.clone();
+        unknown_schema["schema_version"] = serde_json::json!(9);
+        let unknown_schema_bytes = canonical_json(&unknown_schema).unwrap();
+        assert_eq!(
+            decode_manifest(&unknown_schema_bytes, &DecodeLimits::default()),
+            Err(ArtifactError::UnsupportedVersion(9))
+        );
+
+        let mut missing_legacy = authored.clone();
+        missing_legacy.schema_version = 7;
+        assert!(
+            compile_pack(&missing_legacy, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "compatibility.schema_shape")
+        );
+
+        let mut mixed_schema_eight = authored.clone();
+        mixed_schema_eight.compatibility.bifrost = Some("=0.12.0".to_owned());
+        assert!(
+            compile_pack(&mixed_schema_eight, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "compatibility.schema_shape")
+        );
+
+        let mut unknown_schema = authored;
+        unknown_schema.schema_version = 9;
+        assert!(
+            compile_pack(&unknown_schema, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema.unsupported_version")
+        );
+    }
+
+    #[test]
+    fn authoring_schema_and_rust_compiler_agree_on_engine_gate_shapes() {
+        let schema: serde_json::Value =
+            serde_json::from_str(&crate::analyzer::semantic_model::authoring_json_schema())
+                .unwrap();
+        let validator = jsonschema::draft202012::new(&schema)
+            .expect("semantic-model authoring schema is valid Draft 2020-12");
+        let fixture: serde_json::Value = serde_json::from_slice(DECLARATIONS).unwrap();
+
+        let assert_agreement = |value: &serde_json::Value, accepted: bool| {
+            assert_eq!(validator.is_valid(value), accepted);
+            let bytes = serde_json::to_vec(value).unwrap();
+            assert_eq!(
+                compile_source(SourceFormat::Json, &bytes, &CompilerOptions::default()).is_ok(),
+                accepted
+            );
+        };
+
+        assert_agreement(&fixture, true);
+
+        let mut missing_legacy_gate = fixture.clone();
+        missing_legacy_gate["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        assert_agreement(&missing_legacy_gate, false);
+
+        let mut native = fixture;
+        native["schema_version"] = serde_json::json!(SEMANTIC_MODEL_SCHEMA_VERSION);
+        native["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        native["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("toolchains");
+        assert_agreement(&native, true);
+        let decoded: AuthoredSemanticModelPack = serde_json::from_value(native.clone()).unwrap();
+        assert!(decoded.compatibility.bifrost.is_none());
+        assert!(decoded.compatibility.toolchains.is_empty());
+
+        let mut native_with_gate = native.clone();
+        native_with_gate["compatibility"]["bifrost"] = serde_json::json!("=0.12.0");
+        assert_agreement(&native_with_gate, false);
+
+        let mut native_with_null_gate = native;
+        native_with_null_gate["compatibility"]["bifrost"] = serde_json::Value::Null;
+        assert_agreement(&native_with_null_gate, false);
+    }
+
+    #[test]
+    fn callable_inventory_round_trips_only_in_its_schema() {
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(DECLARATIONS).unwrap();
+        authored.schema_version = CALLABLE_SURFACE_MIN_SCHEMA_VERSION;
+        let AuthoredPayload::DeclarationFacts { types, .. } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        types[0].callable_surface_complete = true;
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(decoded.payload().declaration_facts().unwrap().0[0].callable_surface_complete);
+        authored.schema_version = CALLABLE_SURFACE_MIN_SCHEMA_VERSION - 1;
+        assert!(
+            compile_pack(&authored, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema.callable_surface_version")
+        );
+    }
 
     #[test]
     fn reviewed_result_use_obligation_round_trips_and_rejects_unsupported_claims() {
@@ -3730,6 +3937,114 @@ mod tests {
                 "missing {expected_code} in {diagnostics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn no_concurrency_effects_defaults_omits_and_round_trips_independently() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        authored.schema_version = NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION;
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !summary.no_concurrency_effects)
+        );
+
+        let mut summary = summaries[1].clone();
+        summary.effects.clear();
+        summary.no_concurrency_effects = true;
+        assert!(!summary.ordinary_heap_unchanged);
+        let expected = summary.clone();
+        summaries[1] = summary;
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summaries = decoded.payload().procedure_summaries().unwrap();
+        assert!(summaries[1].no_concurrency_effects);
+        assert!(!summaries[1].ordinary_heap_unchanged);
+        assert_eq!(
+            authored_procedure_summary_from_compiled(&summaries[1]),
+            expected
+        );
+        assert!(
+            String::from_utf8(canonical_json(&summaries[1]).unwrap())
+                .unwrap()
+                .contains("\"no_concurrency_effects\":true")
+        );
+        assert!(
+            !String::from_utf8(canonical_json(&summaries[0]).unwrap())
+                .unwrap()
+                .contains("no_concurrency_effects")
+        );
+    }
+
+    #[test]
+    fn no_concurrency_effects_requires_schema_seven_complete_and_empty_effects() {
+        fn with_claim(
+            mutate: impl FnOnce(&mut AuthoredProcedureSummary),
+        ) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            authored.schema_version = NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION;
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            let summary = &mut summaries[1];
+            summary.effects.clear();
+            summary.no_concurrency_effects = true;
+            mutate(summary);
+            authored
+        }
+
+        let cases = [
+            (
+                with_claim(|summary| summary.completeness = Completeness::Partial),
+                "summary.no_concurrency_effects_on_partial_summary",
+            ),
+            (
+                with_claim(|summary| {
+                    summary.concurrency_effects = vec![AuthoredConcurrencyEffect::LockAcquire {
+                        lock: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                        mode: AuthoredLockMode::Exclusive,
+                        condition: None,
+                    }]
+                }),
+                "summary.no_concurrency_effects_conflict",
+            ),
+        ];
+        for (pack, expected_code) in cases {
+            let diagnostics = compile_pack(&pack, &CompilerOptions::default()).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected_code),
+                "missing {expected_code} in {diagnostics:#?}"
+            );
+        }
+
+        let mut old_schema: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut old_schema.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[1].effects.clear();
+        summaries[1].no_concurrency_effects = true;
+        let diagnostics = compile_pack(&old_schema, &CompilerOptions::default()).unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "summary.no_concurrency_effects_schema_version"
+        }));
     }
 
     #[test]

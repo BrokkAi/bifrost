@@ -30,9 +30,20 @@ pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProv
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
     fn all_files(&self) -> Vec<ProjectFile>;
 
+    /// Source inventory before publication filtering. Missing files must stay
+    /// in readiness/autoload censuses; None means the inventory is unavailable.
+    fn source_files(&self) -> Option<Vec<ProjectFile>>;
+
     /// Workspace-wide `autoload :Const, "path"` edges, keyed by the `$`-joined
     /// constant name. Built by [`crate::imports::build_autoload_constant_files`].
-    fn autoload_constant_files(&self) -> &HashMap<String, HashSet<ProjectFile>>;
+    fn autoload_constant_files(&self) -> Option<&HashMap<String, HashSet<ProjectFile>>>;
+
+    /// Complete canonical load syntax; None means unavailable and must not be
+    /// cached as an empty set or reconstructed from source bytes.
+    fn source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_core::analyzer::ruby_facts::RubyFileSourceInfo>;
 
     /// Whether `Gemfile`/`Gemfile.lock` declare rails or zeitwerk. Built by
     /// [`crate::imports::detect_zeitwerk_autoload_conventions`].

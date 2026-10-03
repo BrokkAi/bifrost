@@ -4,14 +4,18 @@ use schemars::JsonSchema;
 // a declaration that is not in the workspace. One enum, declared where both
 // layers can name it.
 pub use brokk_bifrost_core::analyzer::model::AmbientUseRole;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 /// The schema version every producer writes and every compiled artifact this
 /// build mints. Version three adds [`AmbientUseRole`] to `TypeFact` and
 /// `MemberFact`; version four adds the portable runtime-contract companion;
-/// version five adds reviewed normal-result use obligations.
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 5;
+/// version five adds reviewed normal-result use obligations; version six adds
+/// positive declared callable-surface coverage; version seven adds reviewed
+/// procedure summaries with an explicit no-concurrency-effects claim; version
+/// eight moves engine compatibility to schema admission.
+pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -21,7 +25,11 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 5;
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
-pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5];
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4, 5, 6, 7, 8];
+/// Positive declared callable inventory first appeared in version six.
+pub const CALLABLE_SURFACE_MIN_SCHEMA_VERSION: u32 = 6;
+/// Reviewed no-concurrency-effects summaries first appeared in schema seven.
+pub const NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION: u32 = 7;
 /// Result-use obligations first appeared in version five. Earlier packs have
 /// no such claim, even if a procedure has a result contract or no effects.
 pub const RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION: u32 = 5;
@@ -717,7 +725,7 @@ pub enum RuntimeExceptionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
-    #[schemars(range(min = 2, max = 4))]
+    #[schemars(range(min = 2, max = 8))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -1169,9 +1177,179 @@ pub struct Producer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compatibility {
-    pub bifrost: String,
+    /// Required for legacy schemas 2 through 7. Schema 8 is admitted by the
+    /// reader's supported-schema set and must omit this field.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_null"
+    )]
+    #[schemars(with = "String")]
+    pub bifrost: Option<String>,
     #[serde(default)]
     pub toolchains: Vec<VersionConstraint>,
+}
+
+impl Compatibility {
+    fn engine_requirement(
+        &self,
+        schema_version: u32,
+    ) -> Result<Option<VersionReq>, CompatibilityError> {
+        if !SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&schema_version) {
+            return Err(CompatibilityError::UnsupportedSchema(schema_version));
+        }
+        match (schema_version, self.bifrost.as_deref()) {
+            (2..=7, None) => Err(CompatibilityError::MissingLegacyRequirement),
+            (2..=7, Some(requirement)) if requirement.trim().is_empty() => {
+                Err(CompatibilityError::EmptyLegacyRequirement)
+            }
+            (2..=7, Some(requirement)) => VersionReq::parse(requirement)
+                .map(Some)
+                .map_err(|_| CompatibilityError::InvalidLegacyRequirement),
+            (8, Some(_)) => Err(CompatibilityError::ForbiddenRequirement),
+            (8, None) => Ok(None),
+            _ => unreachable!("supported schema version was checked above"),
+        }
+    }
+
+    /// Validate the compatibility shape promised by a native schema version.
+    pub(crate) fn validate_for_schema(
+        &self,
+        schema_version: u32,
+    ) -> Result<(), CompatibilityError> {
+        self.engine_requirement(schema_version).map(|_| ())
+    }
+
+    /// Whether this compatibility shape admits the engine version. Malformed
+    /// schema shapes are errors and are never interpreted as a wildcard.
+    pub(crate) fn matches_engine(
+        &self,
+        schema_version: u32,
+        engine_version: &Version,
+    ) -> Result<bool, CompatibilityError> {
+        Ok(self
+            .engine_requirement(schema_version)?
+            .is_none_or(|requirement| requirement.matches(engine_version)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatibilityError {
+    UnsupportedSchema(u32),
+    MissingLegacyRequirement,
+    EmptyLegacyRequirement,
+    InvalidLegacyRequirement,
+    ForbiddenRequirement,
+}
+
+impl std::fmt::Display for CompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "unsupported semantic-model schema version {version}"
+                )
+            }
+            Self::MissingLegacyRequirement => {
+                formatter.write_str("legacy schema requires compatibility.bifrost")
+            }
+            Self::EmptyLegacyRequirement => {
+                formatter.write_str("legacy compatibility.bifrost must not be empty")
+            }
+            Self::InvalidLegacyRequirement => formatter
+                .write_str("legacy compatibility.bifrost must be a semantic-version requirement"),
+            Self::ForbiddenRequirement => {
+                formatter.write_str("schema 8 forbids compatibility.bifrost")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompatibilityError {}
+
+fn deserialize_non_null<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::{Compatibility, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS};
+    use semver::Version;
+
+    #[test]
+    fn compatibility_shape_preserves_legacy_gate_and_schema_eight_admission() {
+        let engine = Version::parse("0.12.0").unwrap();
+        let legacy: Compatibility = serde_json::from_value(serde_json::json!({
+            "bifrost": ">=0.12.0, <0.13.0",
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(legacy.validate_for_schema(7).is_ok());
+        assert!(legacy.matches_engine(7, &engine).unwrap());
+        assert!(
+            !legacy
+                .matches_engine(7, &Version::parse("0.13.0").unwrap())
+                .unwrap()
+        );
+
+        let native: Compatibility = serde_json::from_value(serde_json::json!({
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(native.validate_for_schema(8).is_ok());
+        assert!(native.matches_engine(8, &engine).unwrap());
+        let bytes = serde_json::to_value(&native).unwrap();
+        assert!(bytes.get("bifrost").is_none());
+    }
+
+    #[test]
+    fn compatibility_rejects_malformed_or_mixed_schema_shapes() {
+        let engine = Version::parse("0.12.0").unwrap();
+        let missing_legacy: Compatibility = serde_json::from_value(serde_json::json!({
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(missing_legacy.validate_for_schema(2).is_err());
+
+        let empty_legacy: Compatibility = serde_json::from_value(serde_json::json!({
+            "bifrost": "  ",
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(empty_legacy.validate_for_schema(7).is_err());
+
+        let invalid_legacy: Compatibility = serde_json::from_value(serde_json::json!({
+            "bifrost": "latest",
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(invalid_legacy.validate_for_schema(2).is_err());
+
+        let mixed: Compatibility = serde_json::from_value(serde_json::json!({
+            "bifrost": ">=0.0.0",
+            "toolchains": []
+        }))
+        .unwrap();
+        assert!(mixed.validate_for_schema(8).is_err());
+        assert!(mixed.matches_engine(8, &engine).is_err());
+        assert!(missing_legacy.matches_engine(9, &engine).is_err());
+        assert_eq!(
+            SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
+            &[2, 3, 4, 5, 6, 7, 8]
+        );
+
+        assert!(
+            serde_json::from_value::<Compatibility>(serde_json::json!({
+                "bifrost": null,
+                "toolchains": []
+            }))
+            .is_err()
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1302,6 +1480,16 @@ pub struct AuthoredProcedureSummary {
     /// call site; they do not add value-flow edges to `effects`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concurrency_effects: Vec<AuthoredConcurrencyEffect>,
+    /// Reviewed claim that this procedure neither synchronizes with
+    /// caller-visible memory nor retains caller-visible memory for concurrent
+    /// work. This is independent of `ordinary_heap_unchanged`: it says nothing
+    /// about ordinary synchronous reads or writes by the procedure.
+    ///
+    /// Only a complete summary with no `concurrency_effects` may make this
+    /// claim. Omission or `false` leaves the call boundary unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub no_concurrency_effects: bool,
     /// Namespaced effect identifiers the reviewed pack attributes to this exact
     /// procedure identity (#2437), for example `acme.network_io`.
     ///
@@ -2155,6 +2343,13 @@ pub struct TypeFact {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_sealed: bool,
+    /// Every directly declared externally visible callable and direct
+    /// hierarchy edge is represented. This positive inventory claim excludes
+    /// inherited members, fields, effects and overload applicability. False
+    /// means unreviewed, even when the retained declarations look complete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub callable_surface_complete: bool,
     #[serde(default)]
     pub has_explicit_type_terms: bool,
     #[serde(default)]
@@ -2248,6 +2443,13 @@ pub enum HierarchyKind {
     MixinExtend,
 }
 
+/// Evidence emitted only after a producer reads an exact Java final method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonOverridableEvidence {
+    JavaFinalMethod,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemberFact {
@@ -2262,6 +2464,9 @@ pub struct MemberFact {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_virtual: bool,
+    /// Explicit declaration evidence. An omitted/default virtuality flag is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_overridable: Option<NonOverridableEvidence>,
     /// Reviewed role of this exact member in implicit value operations.
     /// The member's own stable `id` is the operation identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2816,9 +3021,9 @@ pub enum Locator {
         path: String,
         symbol: String,
         identity: Box<super::csmi::CsmiPortableSymbolIdentity>,
-        /// Validated noncore facts for the exact imported artifact. Exactly
-        /// one declaration owns this carrier; its digest binds the complete
-        /// native pack that was produced from the interchange document.
+        /// Validated Python profile constraints and noncore facts for the
+        /// exact imported artifact. Exactly one declaration owns this carrier;
+        /// its digest binds the complete native pack from the interchange.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "Option<serde_json::Value>")]
         profile_evidence: Option<Box<PortableProfileEvidence>>,
@@ -2845,6 +3050,8 @@ pub struct PortableCallableShapeEvidence {
 pub struct PortableProfileEvidence {
     pub native_sha256: String,
     pub vocabulary_uses: Vec<super::csmi::CsmiVocabularyUse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_constraints: Vec<super::csmi::CsmiCompatibilityConstraint>,
     pub extension_facts: Vec<super::csmi::CsmiExtensionFact>,
     pub completeness_statements: Vec<super::csmi::CsmiCompletenessStatement>,
     pub provenance_records: Vec<super::csmi::CsmiProvenanceRecord>,

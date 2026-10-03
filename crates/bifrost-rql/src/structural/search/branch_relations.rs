@@ -137,25 +137,45 @@ pub(super) fn branch_relation_expansions(
     } else {
         filter.relations.clone()
     };
-    if !matches!(
+    // These languages answer the structural relations but have no scalar
+    // condition producer.
+    let pilot = matches!(
         seed.language,
-        Language::Java | Language::JavaScript | Language::TypeScript | Language::Python
-    ) {
-        for relation in &selected {
-            report(
-                cache,
-                seed,
+        Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Python
+            | Language::Go
+    );
+    let structural_only = matches!(
+        seed.language,
+        Language::CSharp
+            | Language::Kotlin
+            | Language::Rust
+            | Language::Scala
+            | Language::Php
+            | Language::Ruby
+            | Language::Cpp
+    );
+    let (unsupported, selected): (Vec<_>, Vec<_>) = selected.into_iter().partition(|relation| {
+        !pilot && !(structural_only && *relation != BranchRelationKind::ContradictoryCondition)
+    });
+    for relation in &unsupported {
+        report(
+            cache,
+            seed,
+            relation.label(),
+            "unsupported_language",
+            format!(
+                "{} {} branch relations are not implemented for {}",
+                seed.language.config_label(),
                 relation.label(),
-                "unsupported_language",
-                format!(
-                    "{} {} branch relations are not implemented for {}",
-                    seed.language.config_label(),
-                    relation.label(),
-                    rel_path_string(&seed.file)
-                ),
-                diagnostics,
-            );
-        }
+                rel_path_string(&seed.file)
+            ),
+            diagnostics,
+        );
+    }
+    if selected.is_empty() {
         return Vec::new();
     }
     for relation in selected.iter().copied().filter(|relation| {

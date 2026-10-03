@@ -10,6 +10,7 @@ pub mod graph;
 pub mod graph_support;
 pub mod imports;
 pub mod language;
+pub mod source_facts;
 pub mod structural;
 pub mod supertypes;
 pub mod test_detection;
@@ -125,80 +126,6 @@ pub fn scala_simple_type_name(unit: &CodeUnit) -> String {
         .to_string()
 }
 
-/// The declared return type of a Scala member signature, if it spells one.
-pub fn scala_signature_return_type(signature: &str) -> Option<&str> {
-    let (_, after_colon) = signature.rsplit_once(':')?;
-    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
-    let return_type = after_colon[..end].trim();
-    (!return_type.is_empty()).then_some(return_type)
-}
-
-/// The parameter count a Scala member signature declares, extension methods
-/// counted after their receiver clause.
-pub fn scala_member_signature_arity(signature: &str) -> Option<usize> {
-    if let Some(extension_signature) = signature.strip_prefix("extension ") {
-        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
-        return after_receiver
-            .find('(')
-            .and_then(|open| scala_parenthesized_arity(&after_receiver[open..]))
-            .or(Some(0));
-    }
-    let open = signature.find('(')?;
-    scala_parenthesized_arity(&signature[open..])
-}
-
-/// The contents of the balanced parenthesized group `source` opens with.
-pub fn scala_balanced_parenthesized_prefix(source: &str) -> Option<&str> {
-    let mut chars = source.char_indices();
-    let (_, first) = chars.next()?;
-    if first != '(' {
-        return None;
-    }
-    let mut depth = 1usize;
-    for (idx, ch) in chars {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(&source[1..idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split `value` on the commas that sit outside every bracket group.
-pub fn scala_split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut parts = Vec::new();
-    for (idx, ch) in value.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(value[start..idx].trim());
-                start = idx + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts.into_iter().filter(|part| !part.is_empty())
-}
-
-/// The number of top-level entries in the parenthesized group `source` opens
-/// with.
-pub fn scala_parenthesized_arity(source: &str) -> Option<usize> {
-    let inner = scala_balanced_parenthesized_prefix(source)?;
-    if inner.trim().is_empty() {
-        return Some(0);
-    }
-    Some(scala_split_top_level_commas(inner).count())
-}
 /// Whether `name` is a type the Scala standard prelude puts in scope without
 /// an import.
 ///

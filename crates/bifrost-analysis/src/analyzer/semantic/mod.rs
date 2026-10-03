@@ -86,6 +86,7 @@ macro_rules! impl_program_semantics_provider {
 
 pub(crate) use impl_program_semantics_provider;
 
+pub mod binding_origins;
 pub mod capabilities;
 pub(crate) mod cfg;
 pub mod cfg_algorithms;
@@ -106,6 +107,7 @@ pub mod type_flow;
 pub mod workspace_oracle;
 
 pub use crate::cancellation::CancellationToken;
+pub use binding_origins::*;
 pub use capabilities::*;
 pub use icfg::*;
 pub use ids::*;

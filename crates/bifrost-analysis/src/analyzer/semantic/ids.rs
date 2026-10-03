@@ -188,7 +188,12 @@ impl WorkspaceMountId {
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
+/// Revision 39 adds explicit pointer-dereference memory locations and accesses.
 ///
+/// Revision 38 records module-qualified callable references whose namespace
+/// qualifier participates in lookup without binding as a runtime receiver.
+/// Revision 37 records producer-attested loop sites: the point each new
+/// iteration re-enters and the body entry of one source loop.
 /// Revision 36 lets a point-scoped exceptional-control gap declare retained
 /// control topology for an exception dispatch whose successors are all
 /// retained.
@@ -227,7 +232,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 36;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 39;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1360,10 +1365,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "4771fb06c817fdaa26bc07b963e107751b4c14858af9862f67de5dcc973590f9"
+            "075c7df26dc9530d64d9f2f9e43e4aa6e8d94b230f4d7f3b2033201209635856"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 36);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 39);
     }
 
     fn digest(label: &str) -> StableDigest {

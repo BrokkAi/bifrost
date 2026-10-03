@@ -1,15 +1,17 @@
-; A Java catch body is structurally empty, including comment-only bodies.
+; A Java, JavaScript, TypeScript, C#, PHP, C++ or Kotlin catch body, a Python
+; except body, or a Ruby rescue body is structurally empty, including
+; comment-only bodies and Python pass/ellipsis.
 ; Recovered or unavailable syntax remains unknown. This does not claim that
-; the catch is reachable or that its exception type can be thrown.
+; the handler is reachable or that its exception type can be thrown.
 (policy
   :schema-version 1
   :id "bifrost.correctness.empty-failure-handler"
   :name "Empty failure handler"
-  :message "this catch body contains no failure-handling statements"
+  :message "this failure handler contains no failure-handling statements"
   :severity warning
-  :description "An exact Java catch clause has no non-comment body statements. This is a structural review finding: it does not establish that the catch is reachable or that its exception type can be thrown. Recovered or unavailable syntax is inconclusive. Review whether the exception needs handling or propagation; comments do not count as handling. No automatic fix is supplied."
+  :description "An exact Java, JavaScript, TypeScript, C#, PHP, C++ or Kotlin catch clause, Python except clause, or Ruby rescue clause has no body statements other than comments, empty statements, or Python pass and ellipsis. A C# exception filter selects an exception but does not handle it. Promise rejection callbacks, the Ruby rescue modifier and Scala catch cases are not covered. This is a structural review finding: it does not establish that the handler is reachable or that its exception type can be thrown. Recovered or unavailable syntax is inconclusive. Review whether the exception needs handling or propagation; comments do not count as handling. No automatic fix is supplied."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
-  :tags ["correctness" "java" "exceptions"]
+  :tags ["correctness" "exceptions"]
   :analysis (analysis
     :type assertion
     (bind :name handler
@@ -18,7 +20,7 @@
                         (proof eq exact)
                         (coverage eq exhaustive))
           (failure-handler-state
-            (language java (catch))))))
+            (language java javascript typescript python csharp php cpp kotlin ruby (catch))))))
     (group :name by-handler :by (handler.id)
       (aggregate :name empty-handlers :op count))
     (assert :group by-handler :value empty-handlers :cardinality (exactly 0))))

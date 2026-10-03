@@ -35,14 +35,21 @@ pub(crate) fn resolve_python_type_bounded(
         ));
     };
     let support = PythonDefinitionProvider::new(python, &session);
-    let Some(resolution) = python_type_lookup_resolution_bounded(
+    let resolution = python_type_lookup_resolution_bounded(
         &support,
         token,
         file,
         source,
         tree.root_node(),
         site,
-    ) else {
+    );
+    if support.source_facts_unavailable() {
+        return session.finish(no_type(
+            "python_source_facts_unavailable",
+            "Canonical Python declaration annotations are unavailable",
+        ));
+    }
+    let Some(resolution) = resolution else {
         return session.finish(no_type(
             "python_dynamic_receiver_unsupported",
             format!(

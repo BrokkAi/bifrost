@@ -5,6 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { required, toCamelCase } from "./cli-argument-helpers.mjs";
+
 const EXPORTED_FILES = [
   "plugins/bifrost-agent/bifrost-release.json",
 ];
@@ -74,15 +76,4 @@ function parseArgs(args) {
     parsed[toCamelCase(key.slice(2))] = value;
   }
   return parsed;
-}
-
-function toCamelCase(value) {
-  return value.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
-}
-
-function required(value, name) {
-  if (!value) {
-    throw new Error(`Missing required --${name}`);
-  }
-  return value;
 }

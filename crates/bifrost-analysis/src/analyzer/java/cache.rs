@@ -9,6 +9,10 @@ use std::sync::Arc;
 pub(super) struct JavaMemoCaches {
     budget_bytes: u64,
     pub(super) resolved_imports: Cache<ProjectFile, Arc<HashMap<String, CodeUnit>>>,
+    pub(super) source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
+    >,
     pub(super) package_names: Cache<ProjectFile, Arc<str>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
@@ -33,6 +37,12 @@ impl JavaMemoCaches {
         Self {
             budget_bytes,
             resolved_imports: Self::build_cache(budget_bytes / 4, weight_import_map),
+            source_facts: Self::build_cache(
+                budget_bytes / 8,
+                |_, value: &Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>| {
+                    u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
+                },
+            ),
             package_names: Self::build_cache(budget_bytes / 16, weight_package_name),
             referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),

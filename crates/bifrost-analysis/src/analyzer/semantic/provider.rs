@@ -148,6 +148,17 @@ pub struct SemanticBudget {
     ledger: BudgetLedger<SemanticWork>,
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
+    /// The first charge this ledger refused. Clones share it, so a refusal
+    /// on a staging copy that is then discarded is still recorded; a child
+    /// ledger has its own.
+    first_refusal: Arc<std::sync::OnceLock<SemanticBudgetRefusal>>,
+}
+
+/// One charge a semantic budget refused, and the code that asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticBudgetRefusal {
+    pub exceeded: SemanticBudgetExceeded,
+    pub site: &'static std::panic::Location<'static>,
 }
 
 #[derive(Debug)]
@@ -230,8 +241,9 @@ impl fmt::Display for SemanticBudgetExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "semantic work `{}` attempted {} against limit {}",
+            "semantic work `{}` (`{}`) attempted {} against limit {}",
             self.dimension.public_lane().label(),
+            self.dimension.label(),
             self.attempted,
             self.limit
         )
@@ -261,6 +273,7 @@ impl SemanticBudget {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
             scope: Arc::new(SemanticBudgetScope),
             charged_artifacts: Arc::new(HashSet::new()),
+            first_refusal: Arc::default(),
         })
     }
 
@@ -285,9 +298,44 @@ impl SemanticBudget {
         self.ledger.check(work).map_err(Into::into)
     }
 
-    /// Atomically charge work; a failed charge leaves the budget unchanged.
+    /// Atomically charge work; a failed charge leaves the budget unchanged
+    /// apart from recording the first refusal and its caller.
+    #[track_caller]
     pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        self.ledger.charge(work).map_err(Into::into)
+        let site = std::panic::Location::caller();
+        self.ledger.charge(work).map_err(|exceeded| {
+            let exceeded = SemanticBudgetExceeded::from(exceeded);
+            self.first_refusal
+                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
+            exceeded
+        })
+    }
+
+    /// Record a refusal that a caller enforced against an allowance it carved
+    /// from this ledger's remaining `dimension`, such as a traversal budget,
+    /// so it is attributed like a refused charge. `limit` and `attempted` are
+    /// totals of the dimension, counting this ledger's use.
+    #[track_caller]
+    pub fn record_allowance_refusal(
+        &self,
+        dimension: SemanticBudgetDimension,
+        limit: usize,
+        attempted: usize,
+    ) {
+        let site = std::panic::Location::caller();
+        self.first_refusal.get_or_init(|| SemanticBudgetRefusal {
+            exceeded: SemanticBudgetExceeded {
+                dimension,
+                limit,
+                attempted,
+            },
+            site,
+        });
+    }
+
+    /// The first charge this ledger, or a staging copy of it, refused.
+    pub fn first_refusal(&self) -> Option<SemanticBudgetRefusal> {
+        self.first_refusal.get().copied()
     }
 
     /// Snapshot this budget's logical scope and paid artifact identities.
@@ -327,6 +375,7 @@ impl SemanticBudget {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
             scope: Arc::clone(&parent.scope),
             charged_artifacts: Arc::clone(&parent.charged_artifacts),
+            first_refusal: Arc::default(),
         }
     }
 
@@ -345,6 +394,7 @@ impl SemanticBudget {
         }
     }
 
+    #[track_caller]
     pub fn apply_child_charge(
         &mut self,
         work: SemanticWork,
@@ -399,6 +449,7 @@ impl SemanticBudget {
 
     /// Charge the canonical complete-artifact cache-hit cost atomically.
     #[doc(hidden)]
+    #[track_caller]
     pub fn charge_complete_artifact_hit(
         &mut self,
         artifact: StableDigest,
@@ -1634,8 +1685,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             exceeded.to_string(),
-            "semantic work `rows` attempted 2 against limit 1"
+            "semantic work `rows` (`program_points`) attempted 2 against limit 1"
         );
+        let refusal = budget
+            .first_refusal()
+            .expect("the refused charge is recorded");
+        assert_eq!(refusal.exceeded, exceeded);
+        assert_eq!(refusal.site.file(), file!());
     }
 
     #[test]

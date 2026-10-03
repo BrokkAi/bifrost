@@ -402,3 +402,83 @@ pub fn collect_local_bindings<B: LocalBindingBudget>(
     }
     Ok(collector.finish())
 }
+
+/// Primary extraction shares the same binding interpretation as request-time
+/// lowering, but receives body nodes from the coordinated language driver.
+#[derive(Default)]
+pub(crate) struct PrimaryLocalBindings {
+    timelines: Vec<LocalBindingTimeline>,
+    extents: Vec<(std::ops::Range<usize>, Option<std::ops::Range<usize>>)>,
+}
+
+impl PrimaryLocalBindings {
+    pub(crate) fn enter_scope(
+        &mut self,
+        source: &str,
+        scope: Node<'_>,
+        parent: Option<usize>,
+    ) -> usize {
+        let mut budget = UnboundedLocalBindingBudget;
+        let mut collector = LocalBindingCollector::new(source, &mut budget);
+        let body = scope.child_by_field_name("body").unwrap_or(scope);
+        let parameters = callable_parameters(scope, body);
+        if let Some(parameters) = parameters {
+            collector
+                .collect_parameters(parameters)
+                .unwrap_or_else(|never| match never {});
+        }
+        if matches!(scope.kind(), "lambda" | "block" | "do_block") {
+            if parameters.is_none() {
+                for name in ["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "it"] {
+                    collector
+                        .insert_entry_name(name)
+                        .unwrap_or_else(|never| match never {});
+                }
+            }
+            if let Some(parent) = parent {
+                for name in self.timelines[parent].active_names_at(scope.start_byte()) {
+                    collector
+                        .insert_entry_name(name)
+                        .unwrap_or_else(|never| match never {});
+                }
+            }
+        }
+        let id = self.timelines.len();
+        self.timelines.push(collector.finish().timeline);
+        self.extents.push((
+            body.byte_range(),
+            parameters
+                .filter(|parameters| {
+                    parameters.start_byte() < body.start_byte()
+                        || parameters.end_byte() > body.end_byte()
+                })
+                .map(|parameters| parameters.byte_range()),
+        ));
+        id
+    }
+
+    pub(crate) fn observe(&mut self, source: &str, scope: usize, node: Node<'_>) {
+        let (body, parameters) = &self.extents[scope];
+        let inside = |extent: &std::ops::Range<usize>| {
+            extent.start <= node.start_byte() && node.end_byte() <= extent.end
+        };
+        if !inside(body) && !parameters.as_ref().is_some_and(inside) {
+            return;
+        }
+        let mut budget = UnboundedLocalBindingBudget;
+        let mut collector = LocalBindingCollector {
+            source,
+            timeline: std::mem::take(&mut self.timelines[scope]),
+            has_parameter_defaults: false,
+            budget: &mut budget,
+        };
+        collector
+            .collect_write(node)
+            .unwrap_or_else(|never| match never {});
+        self.timelines[scope] = collector.finish().timeline;
+    }
+
+    pub(crate) fn is_active(&self, scope: usize, name: &str, position: usize) -> bool {
+        self.timelines[scope].is_active_at(name, position)
+    }
+}

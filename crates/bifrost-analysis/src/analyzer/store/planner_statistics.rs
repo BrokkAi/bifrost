@@ -20,6 +20,18 @@ use brokk_bifrost_core::cache_gc::{
 use super::{AnalyzerStore, Result, StoreError};
 
 impl AnalyzerStore {
+    /// Collection refreshes statistics through its own connection. Reload
+    /// that result without sampling the same database a second time.
+    pub(crate) fn reload_planner_statistics(&self) -> Result<()> {
+        self.conn.execute(|conn| -> Result<()> {
+            conn.execute_batch("ANALYZE sqlite_schema;")?;
+            conn.flush_prepared_statement_cache();
+            Ok(())
+        })?;
+        self.recycle_readers_for_new_statistics();
+        Ok(())
+    }
+
     /// Recompute this store's query-planner statistics unconditionally.
     ///
     /// The build and garbage-collection hooks use
@@ -187,6 +199,7 @@ pub mod pinned_plans {
         CLASS_SET_SUMMARY_PROCEDURE_SQL, DEPENDENCIES_SQL, DEPENDENCY_SOURCES_SQL, EXITS_SQL,
         FACTS_SQL, REACHED_SQL, READS_SQL,
     };
+    use super::super::resolution_operation::selected_rust_declaration_authority_sql;
     use super::super::{
         AnalyzerStore, EXACT_PATH_SYMBOL_FQN_SQL, NORMALIZED_PATH_SYMBOL_FQN_SQL,
         REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL, REVERSE_IMPORT_CANDIDATE_BLOBS_SQL,
@@ -200,10 +213,10 @@ pub mod pinned_plans {
         persisted_blob_mutation_cost_fallback_sql, point_anchor_only_definition_candidate_sql,
         point_component_definition_candidate_sql, ranges_bulk_sql, raw_unit_fq_segments_sql,
         read_path_parsed_blob_condition, search_candidate_key_set_sql,
-        search_candidate_name_rows_sql, signature_metadata_for_unit_limited_sql,
-        signature_metadata_value_columns_sql, stored_blob_cascade_costs_sql,
-        structural_fact_manifest_sql, structural_fact_payload_bytes_sql, sync_active_blob_oids,
-        sync_reverse_reference_lookup_keys, workspace_content_package_facts_sql,
+        search_candidate_name_rows_sql, signature_metadata_for_unit_sql,
+        signature_metadata_projection_columns_sql, stored_blob_cascade_costs_sql,
+        structural_fact_manifest_sql, sync_active_blob_oids, sync_reverse_reference_lookup_keys,
+        workspace_content_package_facts_sql,
     };
 
     pub(crate) const OID: &str = "0123456789012345678901234567890123456789";
@@ -284,6 +297,52 @@ pub mod pinned_plans {
         }
     }
 
+    /// Demand-terminal reader statements, also included in the complete registry.
+    ///
+    /// The header readers bind a first or last symbol as its persisted
+    /// identity id, the integer `identity_id` holds, so the pins bind one too:
+    /// a STAT4 build plans from the bound value.
+    pub fn root_terminal_demand_queries() -> Vec<PinnedQuery> {
+        vec![
+            pin(
+                "selected_path_endpoint_header_mounts",
+                super::super::resolution_lexical::PATH_ENDPOINT_HEADER_MOUNTS_SQL,
+                vec![text("forward"), integer(7), integer(1), integer(1)],
+            ),
+            pin(
+                "selected_scoped_path_endpoint_header_mounts",
+                super::super::resolution_lexical::SCOPED_PATH_ENDPOINT_HEADER_MOUNTS_SQL,
+                vec![
+                    text("forward"),
+                    integer(7),
+                    integer(0),
+                    integer(1),
+                    text("[0]"),
+                ],
+            ),
+            pin(
+                "selected_path_terminal_header_mounts",
+                super::super::resolution_lexical::PATH_TERMINAL_HEADER_MOUNTS_SQL,
+                vec![integer(7)],
+            ),
+            pin(
+                "selected_unconditional_candidate_gap_reasons",
+                super::super::resolution_lexical::CANDIDATE_GAP_UNCONDITIONAL_SQL,
+                vec![integer(2)],
+            ),
+            pin(
+                "selected_boundary_candidate_gap_branches",
+                super::super::resolution_lexical::CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL,
+                vec![integer(5)],
+            ),
+            pin(
+                "selected_endpoint_candidate_gap_branches",
+                super::super::resolution_lexical::CANDIDATE_GAP_ENDPOINT_BRANCHES_SQL,
+                vec![integer(1), integer(5), text("[[1,0],[1,2]]"), text("[2]")],
+            ),
+        ]
+    }
+
     /// The one entry named `name`, for the pin test that asserts on its plan.
     ///
     /// This registry is the single source of every pinned SQL expression in
@@ -305,6 +364,7 @@ pub mod pinned_plans {
 
     /// The plan SQLite chooses for one pinned query, as its detail column.
     pub fn explain_pin(conn: &Connection, query: &PinnedQuery) -> Vec<String> {
+        crate::analyzer::store::rust_crates::prepare_pin_context(conn).expect("crate SQL context");
         plan_rows(conn, query)
             .unwrap_or_else(|error| panic!("planning pinned query {}: {error}", query.name))
     }
@@ -316,6 +376,56 @@ pub mod pinned_plans {
     /// does not even prepare, so the dump would report a preparation error
     /// instead of a plan.
     pub fn prepare_pin_context(conn: &Connection) {
+        crate::analyzer::store::resolution_lexical::register_resolution_identity_functions(conn)
+            .expect("resolution identity SQL functions");
+        crate::analyzer::store::rust_crates::prepare_pin_context(conn).expect("crate SQL context");
+        // The authority reader is normally planned against the selected
+        // operation's connection, where this temp table is already installed.
+        // Keep the registry self-contained for ephemeral planner-pin stores,
+        // preserving the production mount table's WITHOUT ROWID key layout.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS selected_resolution_overlay_masks(storage_language TEXT NOT NULL, persisted_relative_path TEXT NOT NULL, intent TEXT NOT NULL DEFAULT 'replacement', masked_file_version_id INTEGER, masked_blob_oid TEXT, masked_projection_digest BLOB, expected_transient_replacement_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(storage_language,persisted_relative_path)) WITHOUT ROWID;
+             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_mounts(
+                mount_ordinal INTEGER PRIMARY KEY,
+                file_version_id INTEGER UNIQUE,
+                blob_id INTEGER,
+                workspace_id TEXT,
+                generation INTEGER,
+                revision INTEGER,
+                blob_oid TEXT,
+                storage_language TEXT,
+                semantic_language TEXT,
+                producer_epoch TEXT,
+                interior_digest BLOB,
+                persisted_relative_path TEXT,
+                UNIQUE(storage_language, persisted_relative_path)
+             ) WITHOUT ROWID, STRICT;
+             CREATE INDEX IF NOT EXISTS temp.selected_resolution_mounts_blob_ordinal
+               ON selected_resolution_mounts(blob_id, mount_ordinal);
+             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_scope_mounts(
+               mount_ordinal INTEGER NOT NULL PRIMARY KEY CHECK(mount_ordinal >= 0)
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_1(
+               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
+               key0 INTEGER NOT NULL CHECK(key0 >= 0),
+               PRIMARY KEY(mount_ordinal, key0)
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_2(
+               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
+               key0 INTEGER NOT NULL CHECK(key0 >= 0),
+               key1 INTEGER NOT NULL CHECK(key1 >= 0),
+               PRIMARY KEY(mount_ordinal, key0, key1)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .expect("selected resolution mount pin table");
+        conn.execute_batch(
+            crate::analyzer::store::resolution_operation::go_context::GO_TRANSIENT_PLACEMENTS_SQL,
+        )
+        .expect("selected Go transient placement pin view");
+        conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL)
+            .expect("selected Rust module placement pin view");
+        conn.execute_batch(crate::analyzer::store::resolution_stage::schema_sql())
+            .expect("selected resolution stage pin tables");
         sync_active_blob_oids(conn, &[]).expect("active blob temp table");
         sync_reverse_reference_lookup_keys(
             conn,
@@ -326,6 +436,166 @@ pub mod pinned_plans {
         .expect("reverse lookup temp tables");
     }
 
+    /// The typed-fact statements that take one blob and one key array, with the
+    /// name each is pinned and planned under (milestone 6 port block 4, lane TF).
+    ///
+    /// The table is the one place the list lives: `pinned_queries` registers it
+    /// and the plan pin below walks the same list, so a statement cannot be added
+    /// to the reader and left unplanned.
+    pub(super) const TYPED_FACT_PINS: &[(&str, &str)] = &[
+        (
+            "resolution_type_frontiers_by_slot",
+            crate::analyzer::store::resolution_prepare::typed_rows::TYPE_FRONTIERS_BY_SLOT_SQL,
+        ),
+        (
+            "resolution_type_frontiers_by_reference",
+            crate::analyzer::store::resolution_prepare::typed_rows::TYPE_FRONTIERS_BY_REFERENCE_SQL,
+        ),
+        (
+            "resolution_type_transfers_by_source",
+            crate::analyzer::store::resolution_prepare::typed_rows::TYPE_TRANSFERS_BY_SOURCE_SQL,
+        ),
+        (
+            "resolution_type_transfers_by_target",
+            crate::analyzer::store::resolution_prepare::typed_rows::TYPE_TRANSFERS_BY_TARGET_SQL,
+        ),
+        (
+            "resolution_intrinsic_seeds_by_slot",
+            crate::analyzer::store::resolution_prepare::typed_rows::INTRINSIC_SEEDS_BY_SLOT_SQL,
+        ),
+        (
+            "resolution_intrinsic_seeds_by_identity",
+            crate::analyzer::store::resolution_prepare::typed_rows::INTRINSIC_SEEDS_BY_IDENTITY_SQL,
+        ),
+        (
+            "resolution_binding_projections_by_reference",
+            crate::analyzer::store::resolution_prepare::typed_rows::BINDING_PROJECTIONS_BY_REFERENCE_SQL,
+        ),
+        (
+            "resolution_binding_projections_by_output",
+            crate::analyzer::store::resolution_prepare::typed_rows::BINDING_PROJECTIONS_BY_OUTPUT_SQL,
+        ),
+        (
+            "resolution_qualified_routes_by_reference",
+            crate::analyzer::store::resolution_prepare::typed_rows::QUALIFIED_ROUTES_BY_REFERENCE_SQL,
+        ),
+        (
+            "resolution_qualified_routes_by_qualifier_slot",
+            crate::analyzer::store::resolution_prepare::typed_rows::QUALIFIED_ROUTES_BY_QUALIFIER_SLOT_SQL,
+        ),
+        (
+            "resolution_qualified_routes_by_lookup",
+            crate::analyzer::store::resolution_prepare::typed_rows::QUALIFIED_ROUTES_BY_LOOKUP_SQL,
+        ),
+        (
+            "resolution_qualified_routes_by_gap_reason",
+            crate::analyzer::store::resolution_prepare::typed_rows::QUALIFIED_ROUTES_BY_GAP_REASON_SQL,
+        ),
+        (
+            "resolution_declaration_types_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::DECLARATION_TYPES_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_declaration_types_by_slot",
+            crate::analyzer::store::resolution_prepare::typed_rows::DECLARATION_TYPES_BY_SLOT_SQL,
+        ),
+        (
+            "resolution_declaration_visibilities_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::DECLARATION_VISIBILITIES_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_member_scopes_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_SCOPES_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_member_scopes_by_head",
+            crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_SCOPES_BY_HEAD_SQL,
+        ),
+        (
+            "resolution_member_owners_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_OWNERS_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_member_owners_by_owner",
+            crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_OWNERS_BY_OWNER_SQL,
+        ),
+        (
+            "resolution_deferred_member_owners_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::DEFERRED_MEMBER_OWNERS_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_deferred_member_owners_by_lookup",
+            crate::analyzer::store::resolution_prepare::typed_rows::DEFERRED_MEMBER_OWNERS_BY_LOOKUP_SQL,
+        ),
+        (
+            "resolution_construction_requirements_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::CONSTRUCTION_REQUIREMENTS_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_supertypes_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::SUPERTYPES_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_supertypes_by_reference",
+            crate::analyzer::store::resolution_prepare::typed_rows::SUPERTYPES_BY_REFERENCE_SQL,
+        ),
+        (
+            "resolution_supertypes_by_frontier",
+            crate::analyzer::store::resolution_prepare::typed_rows::SUPERTYPES_BY_FRONTIER_SQL,
+        ),
+        (
+            "resolution_definition_property_gaps_by_reason",
+            crate::analyzer::store::resolution_prepare::typed_rows::DEFINITION_PROPERTY_GAPS_BY_REASON_SQL,
+        ),
+        (
+            "resolution_definition_property_gaps_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::DEFINITION_PROPERTY_GAPS_BY_DEFINITION_SQL,
+        ),
+        (
+            "resolution_call_obligations_by_callee",
+            crate::analyzer::store::resolution_prepare::typed_rows::CALL_OBLIGATIONS_BY_CALLEE_SQL,
+        ),
+        (
+            "resolution_call_obligations_by_reason",
+            crate::analyzer::store::resolution_prepare::typed_rows::CALL_OBLIGATIONS_BY_REASON_SQL,
+        ),
+        (
+            "resolution_callable_signatures_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::CALLABLE_SIGNATURES_BY_DEFINITION_SQL,
+        ),
+    ];
+
+    /// Scalar ownership and payload seeks bind the blob followed by exact
+    /// integer keys. Provenance uses reason, source site and property kind;
+    /// the other seeks use one rule, call, node or parameter definition key.
+    pub(super) const TYPED_OWNER_PINS: &[(&str, &str, &[i64])] = &[
+        (
+            "resolution_type_transfer_owner_by_rule",
+            crate::analyzer::store::resolution_prepare::typed_rows::TYPE_TRANSFER_OWNER_BY_RULE_SQL,
+            &[1, 0],
+        ),
+        (
+            "resolution_call_obligation_owner_by_call",
+            crate::analyzer::store::resolution_prepare::typed_rows::CALL_OBLIGATION_OWNER_BY_CALL_SQL,
+            &[1, 0],
+        ),
+        (
+            "resolution_property_gap_owner_by_provenance",
+            crate::analyzer::store::resolution_prepare::typed_rows::PROPERTY_GAP_OWNER_BY_PROVENANCE_SQL,
+            &[1, 777777, 77, 3], // blob, reason, source site, property kind
+        ),
+        (
+            "resolution_node_catalog_payload_by_key",
+            crate::analyzer::store::resolution::NODE_CATALOG_PAYLOAD_BY_KEY_SQL,
+            &[1, 0],
+        ),
+        (
+            "resolution_callable_parameter_owner_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::CALLABLE_PARAMETER_OWNER_BY_DEFINITION_SQL,
+            &[1, 0],
+        ),
+    ];
+
     /// Every EXPLAIN QUERY PLAN pin this crate's store module owns, as data.
     ///
     /// This is where each of those statements is written, once. The pin tests
@@ -335,15 +605,528 @@ pub mod pinned_plans {
     /// registry existed the dump carried its own copy of every statement and
     /// could drift from the test that asserts on it.
     pub fn pinned_queries() -> Vec<PinnedQuery> {
-        let mut queries = Vec::new();
+        let mut queries = vec![pin(
+            "jvm_native_source_membership",
+            super::super::jvm_package_context::JVM_NATIVE_SOURCE_MEMBERSHIP_SQL,
+            vec![
+                integer(1),
+                integer(1),
+                text("module3/src/main/"),
+                text("module3/src/main0"),
+            ],
+        )];
+        queries.push(pin(
+            "go_definition_package_anchor",
+            super::super::resolution_operation::native_units::GO_DEFINITION_PACKAGE_ANCHOR,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "jvm_native_import_target_mounts",
+            super::super::resolution_operation::jvm_context::JAVA_IMPORT_TARGET_MOUNTS,
+            vec![text("dep")],
+        ));
+        queries.push(pin(
+            "jvm_native_source_access",
+            super::super::resolution_operation::jvm_context::SOURCE_ACCESS,
+            vec![
+                integer(1),
+                integer(1),
+                text("consumer/src/main/java/use/Caller.java"),
+                integer(2),
+                text("provider/src/main/java/dep/Target.java"),
+            ],
+        ));
+        use super::super::resolution_operation::package_context;
+        for (name, sql, params) in [
+            (
+                "native_package_references",
+                package_context::ORDINARY_REFERENCES,
+                vec![integer(0)],
+            ),
+            (
+                "native_package_members",
+                package_context::ORDINARY_MEMBERS,
+                vec![integer(1), integer(1)],
+            ),
+            (
+                "native_stage_package_references",
+                package_context::STAGED_PACKAGE_REFERENCES,
+                vec![integer(0)],
+            ),
+            (
+                "native_stage_package_members",
+                package_context::STAGED_MEMBERS,
+                vec![integer(1), integer(1)],
+            ),
+        ] {
+            queries.push(pin(name, sql, params));
+        }
+        for arity in [1_u32, 64, 256] {
+            use crate::analyzer::resolution::{SemanticId, SharedNameId};
+            let requests = (0..arity)
+                .map(|index| {
+                    crate::analyzer::store::resolution_stage::lexical::semantic_cells(
+                        if index % 2 == 0 {
+                            SemanticId::operation_local((1_u64 << 53) + 3000 + u64::from(index))
+                        } else {
+                            SemanticId::shared_name(SharedNameId::per_request(3000 + index))
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            queries.push(pin(
+                if arity == 1 {
+                    "stage_rust_reference_contexts".to_owned()
+                } else {
+                    format!("stage_rust_reference_contexts_{arity}")
+                },
+                crate::analyzer::store::resolution_stage::rust_context::REFERENCES_SQL,
+                vec![text(
+                    &serde_json::to_string(&requests).expect("Rust context request pairs"),
+                )],
+            ));
+            queries.push(pin(format!("stage_lexical_prefix_spellings_{arity}"),
+                crate::analyzer::store::resolution_stage::lexical_readers::REFERENCE_LOOKUP_SPELLINGS_SQL,
+                vec![text(&serde_json::to_string(&requests).expect("prefix pin parameters")), Value::Integer(crate::analyzer::store::resolution_prepare::resolution_rows::namespace_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type))],
+            ));
+        }
+        queries.push(pin(
+            "selected_typed_shared_membership",
+            crate::analyzer::store::resolution_typed::shared_membership_sql(
+                1,
+                crate::analyzer::store::resolution::TypedFactRelation::DeferredMemberOwnerLookup,
+            ),
+            vec![integer(0), integer(1)],
+        ));
+        queries.extend([
+            pin(
+                "python_runtime_scope_at_path",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_SCOPE_AT_PATH_SQL,
+                vec![integer(1), text("src/pkg")],
+            ),
+            pin(
+                "python_runtime_unresolved_scopes",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_UNRESOLVED_SCOPES_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "python_runtime_import_candidates",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_IMPORT_CANDIDATES_SQL,
+                vec![
+                    integer(1),
+                    integer(7),
+                    text("pkg.module"),
+                    text(&"a".repeat(64)),
+                    text("python"),
+                    integer(0),
+                    integer(1),
+                ],
+            ),
+            pin(
+                "python_runtime_artifacts_for_environment",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_ARTIFACTS_FOR_ENVIRONMENT_SQL,
+                vec![integer(7), integer(1)],
+            ),
+            pin(
+                "python_runtime_artifact_members",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_ARTIFACT_MEMBERS_SQL,
+                vec![integer(1), integer(9)],
+            ),
+            pin(
+                "python_runtime_scope_frontiers",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_SCOPE_FRONTIERS_SQL,
+                vec![integer(1), integer(7), text("pkg.module")],
+            ),
+            pin(
+                "python_runtime_unnamed_scope_frontiers",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_UNNAMED_SCOPE_FRONTIERS_SQL,
+                vec![integer(1), integer(7)],
+            ),
+            pin(
+                "python_runtime_declared_environment",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL,
+                vec![integer(1), integer(7)],
+            ),
+            pin(
+                "python_runtime_declared_roots",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_DECLARED_ROOTS_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "python_runtime_declared_inputs",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_DECLARED_INPUTS_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "python_runtime_declared_extras",
+                crate::analyzer::store::python_runtime::PYTHON_RUNTIME_DECLARED_EXTRAS_SQL,
+                vec![integer(1)],
+            ),
+        ]);
+        for arity in [0, 1, 64, 256] {
+            queries.push(pin(
+                format!("selected_reference_gap_completions_{arity}"),
+                crate::analyzer::store::resolution_lexical::reference_gap_completions_sql(),
+                vec![
+                    integer(0),
+                    integer(0),
+                    integer(1),
+                    text(&serde_json::to_string(&(1..=arity).collect::<Vec<_>>()).unwrap()),
+                    integer(crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference)),
+                    integer(0),
+                ],
+            ));
+        }
+        queries.push(pin(
+            "frontier_source_ready",
+            crate::analyzer::store::resolution_typed::FRONTIER_SOURCE_READY_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin("stage_lexical_ordinary_completion_suppression",
+            crate::analyzer::store::resolution_stage::lexical_readers::ORDINARY_COMPLETION_SUPPRESSION_SQL,
+            vec![Value::Integer(crate::analyzer::store::resolution_stage::codec::encode_semantic(crate::analyzer::resolution::SemanticId::local(0,0))),
+                Value::Integer(crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference))],
+        ));
+        queries.push(pin(
+            "stage_capsule_membership",
+            crate::analyzer::store::resolution_stage::CAPSULE_MEMBERSHIP_QUERY,
+            vec![Value::Integer(1), Value::Integer(4095)],
+        ));
+        queries.push(pin(
+            "stage_typed_frontiers",
+            crate::analyzer::store::resolution_stage::TYPED_FRONTIER_QUERY,
+            vec![text("[[17,null]]")],
+        ));
+        queries.push(pin(
+            "stage_typed_observations",
+            crate::analyzer::store::resolution_stage::TYPED_OBSERVATION_QUERY,
+            vec![text("[[17,null]]")],
+        ));
+        queries.push(pin(
+            "stage_typed_property_gap_reasons",
+            crate::analyzer::store::resolution_stage::TYPED_PROPERTY_GAP_REASON_QUERY,
+            vec![text("[[17,null]]")],
+        ));
+        // These are the production batch seeks, including both semantic
+        // namespace bindings. The operator context installs the real TEMP DDL.
+        for (family, sql, spaces) in [
+            (
+                "semantics",
+                super::super::resolution_stage::allocation::SEMANTICS_SQL,
+                &[0, 1][..],
+            ),
+            (
+                "nodes",
+                super::super::resolution_stage::allocation::NODES_SQL,
+                &[0][..],
+            ),
+            (
+                "paths",
+                super::super::resolution_stage::allocation::PATHS_SQL,
+                &[0][..],
+            ),
+        ] {
+            for &shared in spaces {
+                for arity in [1, 64, 256] {
+                    let requests = (0..arity)
+                        .map(|key: i64| {
+                            let mut digest = [0_u8; 32];
+                            digest[..8].copy_from_slice(&key.to_le_bytes());
+                            serde_json::json!([
+                                1,
+                                super::super::resolution_lexical::hex_digest(digest),
+                                shared
+                            ])
+                        })
+                        .collect::<Vec<_>>();
+                    queries.push(pin(
+                        format!("stage_allocation_{family}_{shared}_{arity}"),
+                        sql,
+                        vec![text(
+                            &serde_json::to_string(&requests).expect("allocation pin parameters"),
+                        )],
+                    ));
+                }
+            }
+        }
+        queries.extend(root_terminal_demand_queries());
+        queries.extend(
+            crate::analyzer::store::rust_crates::sql_pins()
+                .into_iter()
+                .chain(crate::analyzer::store::resolution_operation::rust_crate_point_sql_pins())
+                .map(|(name, sql, parameters)| pin(name, sql, vec![Value::Null; parameters])),
+        );
+        queries.push(pin(
+            "rust_crate_module_walk",
+            crate::analyzer::store::rust_crates::MODULE_WALK_SQL,
+            vec![text("app/src/lib.rs"), text("[\"test\"]"), text("[]")],
+        ));
+        queries.push(pin(
+            "rust_crate_item_macro_decisions",
+            crate::analyzer::store::rust_crates::ITEM_MACRO_DECISIONS_SQL,
+            vec![text("[]"), text("[]")],
+        ));
+        queries.push(pin(
+            "rust_crate_collect_unbound",
+            crate::analyzer::store::rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL,
+            vec![],
+        ));
+        // The textual-macro module walk, pinned with a real `rel_path` rather
+        // than NULL: these are the statements the index
+        // `rust_crate_containers_rel_path` exists for, and what a plan pin has
+        // to show about them is that the path is sought and not scanned.
+        use crate::analyzer::store::resolution_operation::rust_crate_context as macro_walk;
+        queries.extend([
+            pin(
+                "rust_macro_walk_ancestry",
+                macro_walk::MACRO_WALK_ANCESTRY,
+                vec![text("[\"app/src/lib.rs\",\"app/src/child.rs\"]")],
+            ),
+            pin(
+                "rust_macro_walk_child_module_files",
+                macro_walk::MACRO_WALK_CHILD_MODULE_FILES,
+                vec![text("app/src/lib.rs"), text("child")],
+            ),
+            pin(
+                "rust_macro_included_file",
+                macro_walk::MACRO_INCLUDED_FILE,
+                vec![text("app/src/lib.rs"), text("generated.rs")],
+            ),
+            pin(
+                "rust_macro_include_starts",
+                macro_walk::MACRO_INCLUDE_STARTS,
+                vec![text("app/src/lib.rs")],
+            ),
+        ]);
+        use crate::analyzer::store::resolution_operation::rust_reverse_rows as reverse;
+        queries.extend([
+            pin(
+                "rust_reverse_definition_blob",
+                crate::analyzer::store::selected_definition::SELECTED_DEFINITION_BLOB_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "rust_reverse_definition_semantics",
+                crate::analyzer::store::selected_definition::DEFINITION_SEMANTICS_SQL.as_str(),
+                vec![integer(1)],
+            ),
+            pin(
+                "rust_reverse_base_target_activation",
+                reverse::BASE_TARGET_ACTIVATION_SQL,
+                vec![integer(1), integer(1)],
+            ),
+            pin(
+                "rust_reverse_masked_blob",
+                reverse::MASKED_BLOB_SQL,
+                vec![text("src/lib.rs")],
+            ),
+            pin(
+                "rust_reverse_blob_definition_site",
+                reverse::BLOB_DEFINITION_SITE_SQL,
+                vec![integer(1), integer(1)],
+            ),
+            pin(
+                "rust_reverse_trusted_field_reference",
+                reverse::FIELD_REFERENCE_PROVENANCE_SQL,
+                vec![
+                    text("src/lib.rs"),
+                    integer(7),
+                    integer(super::super::resolution_prepare::resolution_rows::namespace_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Value,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::site_kind_code(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::MemberReference,
+                    )),
+                    integer(super::super::resolution_prepare::resolution_rows::gap_origin_code(
+                        crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                            brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::MalformedSyntax,
+                        ),
+                    )),
+                    integer(i64::from(super::super::source_facts::provenance_code(
+                        brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
+                    ))),
+                ],
+            ),
+            pin(
+                "rust_graph_definitions",
+                crate::analyzer::store::resolution_operation::RUST_GRAPH_DEFINITIONS_SQL,
+                vec![],
+            ),
+            pin(
+                "rust_reverse_caller_roots",
+                reverse::CALLER_ROOTS_SQL,
+                vec![text("src/lib.rs")],
+            ),
+            pin(
+                "rust_reverse_contract_owner",
+                reverse::CONTRACT_OWNER_SQL,
+                vec![integer(0), integer(0)],
+            ),
+            pin(
+                "rust_reverse_reference_lookup_blobs",
+                reverse::REFERENCE_LOOKUP_BLOBS_SQL,
+                vec![digest(0)],
+            ),
+            pin(
+                "rust_reverse_target_activation",
+                reverse::TARGET_ACTIVATION_SQL,
+                vec![integer(0), integer(0)],
+            ),
+            pin(
+                "rust_reverse_definition_site",
+                reverse::DEFINITION_SITE_SQL,
+                vec![integer(0), integer(0)],
+            ),
+            pin(
+                "rust_reverse_root_references",
+                reverse::ROOT_REFERENCES_SQL,
+                vec![digest(0), text("crate"), text("target")],
+            ),
+            pin(
+                "rust_reverse_imports",
+                reverse::IMPORTS_SQL,
+                vec![digest(0), text("crate"), text("X")],
+            ),
+            pin(
+                "rust_reverse_globs",
+                reverse::GLOBS_SQL,
+                vec![digest(0), text("crate")],
+            ),
+            pin(
+                "rust_reverse_module_sources",
+                reverse::MODULE_SOURCES_SQL,
+                vec![integer(1), text("crate")],
+            ),
+            pin(
+                "rust_reverse_locators",
+                reverse::LOCATORS_SQL,
+                vec![integer(1)],
+            ),
+            pin(
+                "rust_reverse_textual_macro_sources",
+                reverse::TEXTUAL_MACRO_SOURCES_SQL,
+                vec![integer(1)],
+            ),
+        ]);
+        queries.extend([
+            pin("rust_reverse_exports", include_str!("rust_reverse_exports.sql"), vec![integer(1), integer(0)]),
+            pin("rust_crate_imports_binder", "SELECT * FROM rust_crate_imports WHERE topology_id = ?1 AND module_path = ?2 AND blob_id = ?3 AND binder_scope = ?4 AND bound_name = ?5", vec![integer(1), text("crate"), integer(1), integer(0), text("X")]),
+            pin("rust_crate_imports_target", "SELECT * FROM rust_crate_imports WHERE target_crate_key = ?1 AND target_module_path = ?2 AND target_name = ?3", vec![digest(0), text("crate"), text("X")]),
+            pin("rust_crate_exports_declaration", "SELECT * FROM rust_crate_exports WHERE declaration_blob_id = ?1 AND declaration_site = ?2", vec![integer(1), integer(0)]),
+            pin("rust_crate_glob_reexport_routes_target", "SELECT * FROM rust_crate_glob_reexport_routes WHERE target_crate_key = ?1 AND target_module_path = ?2", vec![digest(0), text("crate")]),
+            pin("rust_crate_reexport_routes_target", "SELECT * FROM rust_crate_reexport_routes WHERE target_crate_key = ?1 AND target_module_path = ?2 AND target_name = ?3", vec![digest(0), text("crate"), text("X")]),
+            pin("selected_rust_crates", "SELECT * FROM selected_rust_crates WHERE crate_key = ?1", vec![digest(0)]),
+            pin("selected_rust_crate_containers", "SELECT * FROM selected_rust_crate_containers WHERE topology_id = ?1 AND container_path = ?2", vec![integer(1), text("crate")]),
+            pin("rust_crate_exports_reachable", "SELECT * FROM rust_crate_exports_reachable WHERE topology_id = ?1 AND module_path = ?2 AND name = ?3", vec![integer(1), text("crate"), text("X")]),
+        ]);
 
-        let metadata_columns = signature_metadata_value_columns_sql("metadata");
+        // Milestone 6's checkpoint (lane PK). The path read is a primary-key
+        // seek and the two identity reads are seeks on `resolution_identities`'
+        // own keys, so none of them needs an index of its own or an
+        // `INDEXED BY`; what the pins assert is that the JSON array drives the
+        // seek instead of being joined against a scan of the table.
+        use crate::analyzer::store::resolution_prepare::resolution_rows as rows;
+        queries.extend([
+            pin(
+                "resolution_paths_by_key",
+                rows::RESOLUTION_PATHS_BY_KEY_SQL,
+                vec![integer(1), text("[0]")],
+            ),
+            pin(
+                "resolution_identity_recipes",
+                rows::RESOLUTION_IDENTITY_RECIPES_SQL,
+                vec![text(
+                    "[\"0000000000000000000000000000000000000000000000000000000000000000\"]",
+                )],
+            ),
+        ]);
+
+        // Port block 2 (lane CM). The two candidate-match statements name
+        // their index, because the planner has no statistics on a cache that
+        // has not been `ANALYZE`d and would otherwise take the primary-key
+        // prefix and scan the blob (lane LD). The site read is a primary-key
+        // seek and the member-scope read uses the unique index that table
+        // already carries, so neither needs one.
+        queries.extend([
+            pin(
+                "resolution_forward_candidate_match",
+                rows::RESOLUTION_FORWARD_CANDIDATE_MATCH_SQL,
+                vec![
+                    integer(1),
+                    text("[[0,0,1,null,0]]"),
+                    text("[[0,0]]"),
+                    text("[]"),
+                ],
+            ),
+            pin(
+                "resolution_reverse_candidate_match",
+                rows::RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL,
+                vec![
+                    integer(1),
+                    text("[[0,0,1,null,0]]"),
+                    text("[[0,0]]"),
+                    text("[]"),
+                    text("[[0,\"[[0,null,0]]\",0,1,[1]]]"),
+                ],
+            ),
+            pin(
+                "resolution_root_terminal_paths",
+                rows::RESOLUTION_ROOT_TERMINAL_PATHS_SQL,
+                vec![integer(1), integer(1)],
+            ),
+            pin(
+                "resolution_sites_by_key",
+                rows::RESOLUTION_SITES_BY_KEY_SQL,
+                vec![integer(1), text("[0]")],
+            ),
+            pin(
+                "resolution_member_scope_owners_by_node",
+                crate::analyzer::store::resolution_lexical::MEMBER_SCOPE_OWNERS_BY_NODE_SQL,
+                vec![integer(1), text("[0]")],
+            ),
+        ]);
+        for arity in [1, 32, 256] {
+            queries.push(pin(
+                format!("ordinary_reference_sites_by_key_{arity}"),
+                crate::analyzer::store::resolution_lexical::REFERENCE_SITES_BY_KEY_SQL,
+                vec![
+                    integer(1),
+                    text(&serde_json::to_string(&(1..=arity).collect::<Vec<_>>()).unwrap()),
+                ],
+            ));
+        }
+        // Batch typed readers bind a blob and a JSON key array. Scalar
+        // ownership readers carry their exact integer binding shape below.
+        // Both families must seek the stored table or its named index.
+        use crate::analyzer::store::resolution_prepare::typed_rows as typed;
+        for (name, sql) in TYPED_FACT_PINS {
+            queries.push(pin(*name, *sql, vec![integer(1), text("[0]")]));
+        }
+        for (name, sql, keys) in TYPED_OWNER_PINS {
+            queries.push(pin(
+                *name,
+                *sql,
+                keys.iter().copied().map(integer).collect(),
+            ));
+        }
+        queries.push(pin(
+            "resolution_qualified_routes_by_slot_lookup",
+            typed::QUALIFIED_ROUTES_BY_SLOT_LOOKUP_SQL,
+            vec![integer(1), text("[[0,0]]")],
+        ));
+        queries.push(pin(
+            "resolution_qualified_routes_inventory",
+            typed::QUALIFIED_ROUTES_INVENTORY_SQL,
+            vec![integer(1)],
+        ));
+
+        let metadata_columns = signature_metadata_projection_columns_sql("metadata");
         queries.push(pin(
             "signature_metadata_batch_reader",
             format!(
                 "SELECT keys.blob_oid, metadata.unit_key, {metadata_columns}
                  FROM blobs AS keys
-                 JOIN unit_signature_metadata AS metadata ON metadata.blob_id = keys.id
+                 JOIN unit_signature_metadata_values AS metadata ON metadata.blob_id = keys.id
                  WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
                  ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
             ),
@@ -351,7 +1134,7 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "signature_metadata_for_unit_limited",
-            signature_metadata_for_unit_limited_sql(),
+            signature_metadata_for_unit_sql(),
             vec![
                 text(OID),
                 text("java"),
@@ -369,32 +1152,12 @@ pub mod pinned_plans {
             vec![text(OID), text("rust")],
         ));
 
-        for (table, order_by) in [
-            ("structural_fact_nodes", "node_id"),
-            ("structural_fact_roles", "source_node_id, ordinal"),
-            ("structural_fact_occurrence_roles", "node_id, ordinal"),
-        ] {
-            queries.push(pin(
-                format!("structural_fact_hydration_{table}"),
-                format!("SELECT * FROM {table} WHERE blob_id = ?1 ORDER BY {order_by}"),
-                vec![integer(0)],
-            ));
-        }
         // The manifest lookup is the hydration path's only statement that
-        // joins and subqueries instead of seeking one primary key, and the
-        // payload-bytes measurement runs three correlated subqueries on every
-        // persist. Both are therefore the structural-fact statements whose
-        // plans can move with the store's statistics; the three row-family
-        // reads above cannot.
+        // joins and subqueries instead of seeking one primary key.
         queries.push(pin(
             "structural_fact_manifest",
             structural_fact_manifest_sql(),
             vec![text(OID), text("java"), integer(1)],
-        ));
-        queries.push(pin(
-            "structural_fact_payload_bytes",
-            structural_fact_payload_bytes_sql(),
-            vec![integer(0)],
         ));
 
         let langs = vec!["rust".to_string(), "python".to_string()];
@@ -447,6 +1210,148 @@ pub mod pinned_plans {
         ] {
             queries.push(pin(label, sql, vec![text("python"), text("pkg.service")]));
         }
+
+        queries.push(pin(
+            "stage_go_definition_namespaces",
+            super::super::resolution_stage::lexical_readers::GO_DEFINITION_NAMESPACES_SQL,
+            vec![text("[1]")],
+        ));
+
+        queries.push(pin(
+            "go_dot_import_target_mounts",
+            super::super::resolution_operation::go_context::DOT_IMPORT_TARGET_MOUNTS,
+            vec![
+                integer(1),
+                integer(1),
+                text("go"),
+                text("example.test/provider"),
+            ],
+        ));
+
+        for (label, sql) in [
+            (
+                "go_named_import_bindings",
+                super::super::resolution_operation::go_named::ORDINARY_IMPORT_BINDINGS,
+            ),
+            (
+                "go_named_stage_import_bindings",
+                super::super::resolution_operation::go_named::STAGED_IMPORT_BINDINGS,
+            ),
+        ] {
+            queries.push(pin(label, sql, vec![integer(1)]));
+        }
+        queries.push(pin(
+            "go_named_import_package_name",
+            super::super::resolution_operation::go_named::IMPORT_PACKAGE_NAME,
+            vec![
+                integer(1),
+                integer(1),
+                text("go"),
+                text("example.test/provider"),
+            ],
+        ));
+        queries.push(pin(
+            "go_named_import_target_mounts",
+            super::super::resolution_operation::go_named::NAMED_IMPORT_TARGET_MOUNTS,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "java_access_endpoints",
+            super::super::resolution_typed::java_access::ENDPOINTS,
+            vec![],
+        ));
+        queries.push(pin(
+            "go_member_declarations",
+            super::super::resolution_typed::go_members::DECLARATIONS,
+            vec![],
+        ));
+        queries.push(pin(
+            "java_inheritance_declarations",
+            super::super::resolution_typed::java_inheritance::DECLARATIONS,
+            vec![],
+        ));
+        queries.push(pin(
+            "go_caller_source_role",
+            super::super::resolution_operation::go_named::CALLER_SOURCE_ROLE,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "go_caller_package",
+            super::super::resolution_operation::go_same_package::CALLER_PACKAGE,
+            vec![integer(1), integer(1), text("go")],
+        ));
+        queries.push(pin(
+            "go_package_peer_mounts",
+            super::super::resolution_operation::go_same_package::PACKAGE_PEER_MOUNTS,
+            vec![integer(1), integer(1), text("go")],
+        ));
+
+        queries.push(pin(
+            "go_native_selected_context",
+            super::super::go_package_context::SELECT_CONTEXT_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+                digest(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_native_canonical_source",
+            super::super::go_package_context::CANONICAL_SOURCE_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                text("consumer/use.go"),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_native_source_inventory",
+            super::super::go_package_context::SOURCE_INVENTORY_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_native_prior_heads",
+            super::super::go_package_context::PRIOR_HEADS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_native_context_head",
+            super::super::go_package_context::RECHECK_CONTEXT_SQL,
+            vec![integer(1), integer(1), digest(1)],
+        ));
+        queries.push(pin(
+            "go_native_observed_inputs",
+            super::super::go_package_context::OBSERVE_INPUTS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+
+        queries.push(pin(
+            "selected_configuration_bytes",
+            super::super::workspace_inputs::SELECTED_CONFIGURATION_BYTES_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                text("java"),
+                integer(1),
+                text("gradle.properties"),
+                integer(1),
+            ],
+        ));
 
         queries.push(pin(
             "workspace_snapshot_identity",
@@ -766,37 +1671,18 @@ pub mod pinned_plans {
         queries.push(pin(
             "import_statements_per_blob",
             format!(
-                "SELECT {} FROM import_statements
+                "SELECT {} FROM source_import_statements
                  WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                  ORDER BY ordinal",
                 super::super::IMPORT_STATEMENT_COLUMNS
             ),
             vec![text(OID), text("rust")],
         ));
-        for (table, value_columns) in [
-            ("import_path_segments", "segment"),
-            ("import_lexical_prefixes", "prefix"),
-            ("import_lexical_scopes", "start_byte, end_byte"),
-        ] {
-            queries.push(pin(
-                format!("import_child_{table}"),
-                format!(
-                    "SELECT keys.blob_oid, facts.ordinal, {value_columns}
-                     FROM blobs AS keys
-                     JOIN {table} AS facts ON facts.blob_id = keys.id
-                     WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
-                     ORDER BY keys.blob_oid, facts.ordinal"
-                ),
-                vec![text("rust"), text(OID), text(OID)],
-            ));
-        }
-
         queries.push(pin(
             "workspace_content_package_facts",
             workspace_content_package_facts_sql(2),
             vec![text("java"), text(OID), text(OID)],
         ));
-
         for (label, sql) in [
             (
                 "reverse_import_candidate_blobs",
@@ -818,7 +1704,21 @@ pub mod pinned_plans {
             RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL,
             vec![text("rust"), text("semantic")],
         ));
-
+        queries.push(pin(
+            "selected_rust_declaration_authority",
+            selected_rust_declaration_authority_sql(2),
+            vec![integer(0), integer(11), integer(0), integer(17)],
+        ));
+        queries.push(pin(
+            "selected_definition_units",
+            super::super::selected_definition::SELECTED_DEFINITION_UNITS_SQL.as_str(),
+            vec![],
+        ));
+        queries.push(pin(
+            "selected_lexical_definitions",
+            super::super::selected_definition::SELECTED_LEXICAL_DEFINITIONS_SQL,
+            vec![],
+        ));
         queries
     }
 
@@ -904,6 +1804,561 @@ pub(crate) mod tests {
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
     use crate::gitblob::test_repo::{commit_all, init_repo};
 
+    #[test]
+    fn issue_3769_field_exclusion_seeks_exact_source_and_gap_rows() {
+        use rusqlite::{StatementStatus, params, params_from_iter};
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        prepare_pin_context(&conn);
+        let pin = pinned("rust_reverse_trusted_field_reference");
+        conn.execute(
+            "INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) VALUES(0,1,'rust','src/lib.rs')",
+            [],
+        ).unwrap();
+        // Real bound source coordinates amid unrelated blobs and sites. The
+        // occurrence arena is read by position, never through json_each.
+        for blob in 1..=16 {
+            if blob != 1 {
+                conn.execute(
+                    "INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) VALUES(?1,?1,'rust',?2)",
+                    params![blob, format!("src/decoy_{blob}.rs")],
+                ).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO source_occurrence_arenas VALUES(?1,jsonb('[[0,1,1,1,0]]'))",
+                [blob],
+            )
+            .unwrap();
+            for site in 0..128 {
+                conn.execute(
+                    "INSERT INTO resolution_sites(blob_id,site,role,namespace,site_kind,start_byte,end_byte,unqualified) VALUES(?1,?2,0,?3,?4,0,1,0)",
+                    params![blob, site, pin.params[2], pin.params[3]],
+                ).unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_rust_reference_contexts VALUES(?1,?2,?2,0,0,NULL,jsonb('[]'))",
+                    params![blob, site],
+                ).unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_gap_reasons VALUES(?1,?2,?2,?3)",
+                    params![blob, site, pin.params[4]],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO resolution_gaps VALUES(?1,4,?2,0,?2,?2)",
+                    params![blob, site],
+                )
+                .unwrap();
+            }
+        }
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pin);
+            assert!(
+                plan.iter().any(|row| row.contains("SEARCH mount USING")
+                    && row.contains("storage_language=? AND persisted_relative_path=?")),
+                "{state:?}: {plan:?}"
+            );
+            for table in ["site", "context", "arena", "gap", "reason"] {
+                assert!(
+                    plan.iter()
+                        .any(|row| row.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                    "{state:?} {table}: {plan:?}"
+                );
+            }
+            assert!(
+                !plan.iter().any(|row| row.contains("AUTOMATIC")
+                    || row.contains("VIRTUAL TABLE")
+                    || row.contains("TEMP B-TREE")
+                    || row.contains("CO-ROUTINE")),
+                "{state:?}: {plan:?}"
+            );
+            let mut statement = conn.prepare(&pin.sql).unwrap();
+            assert!(
+                statement
+                    .query_row(params_from_iter(&pin.params), |row| {
+                        Ok(row.get::<_, bool>(0)? && row.get::<_, bool>(1)?)
+                    })
+                    .unwrap()
+            );
+            assert_eq!(
+                statement.get_status(StatementStatus::FullscanStep),
+                0,
+                "{state:?}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_gap_completion_seeks_requested_subjects_with_unrelated_blob_gaps() {
+        use crate::analyzer::resolution::LoweringGapOrigin;
+        use crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
+        use rusqlite::StatementStatus;
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            // This is a populated access-plan fixture, not a publication fixture.
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            let qualified = gap_origin_code(LoweringGapOrigin::QualifiedReference);
+            conn.execute(
+                "INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id) VALUES(0,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO temp.selected_resolution_stage_producers(producer_id,host_ordinal,bridge_identity,content_digest) VALUES(1,0,zeroblob(32),zeroblob(32))", []).unwrap();
+            for key in 0..=256_i64 {
+                conn.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(1,?1,0,?2)", rusqlite::params![10000+key,if [2,3].contains(&key) {qualified} else {0}]).unwrap();
+                conn.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES(1,?1,?2,0,?3,?3)",rusqlite::params![if key==0 {0}else{4},key,10000+key]).unwrap();
+            }
+            conn.execute("INSERT INTO temp.selected_resolution_stage_closed_reasons(producer_id,semantic_key) VALUES(1,10001)", []).unwrap();
+            conn.execute("INSERT INTO temp.selected_resolution_stage_qualified_routes(host_ordinal,producer_id,sequence,reference_key,qualifier_slot_key,lookup_key,source_lookup_key,projection_output_slot_key,coarse_gap_reason_key,precedence_ordinal,namespace,projection_kind) VALUES(0,1,0,2,2,2,2,2,10002,0,0,0)", []).unwrap();
+            conn.execute("INSERT INTO resolution_qualified_routes(blob_id,reference,precedence_ordinal,qualifier_slot,lookup,source_lookup,namespace,projection_output_slot,projection_kind,coarse_gap_reason) VALUES(1,3,0,3,1,1,0,3,0,10003)", []).unwrap();
+            let mut baseline = std::collections::BTreeMap::new();
+            for noise in [0_i64, 1024, 8192] {
+                conn.execute(
+                    "DELETE FROM resolution_gaps WHERE blob_id=1 AND subject>=100000",
+                    [],
+                )
+                .unwrap();
+                for key in 0..noise {
+                    conn.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES(1,4,?1,0,?1,10000)",[100000+key]).unwrap();
+                }
+                state.install(&conn);
+                for arity in [0, 1, 64, 256] {
+                    let pin = pinned(&format!("selected_reference_gap_completions_{arity}"));
+                    for hit in [false, true] {
+                        let keys = if hit {
+                            (1..=arity).collect::<Vec<_>>()
+                        } else {
+                            (50000..50000 + arity).collect::<Vec<_>>()
+                        };
+                        let keys = serde_json::to_string(&keys).unwrap();
+                        let bindings = rusqlite::named_params! {":host":0,":mount_base":0,":blob":1,":keys":keys,":qualified_origin":qualified,":local_base":0};
+                        let plan = conn
+                            .prepare(&format!("EXPLAIN QUERY PLAN {}", pin.sql))
+                            .unwrap()
+                            .query_map(bindings, |row| row.get::<_, String>(3))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let mut statement = conn.prepare(&pin.sql).unwrap();
+                        let actual = statement
+                            .query_map(bindings, |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            })
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let expected = std::iter::once((0, 0, 10000))
+                            .chain(
+                                (4..=arity)
+                                    .filter(|_| hit)
+                                    .map(|key| (4, i64::from(key), 10000 + i64::from(key))),
+                            )
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            actual, expected,
+                            "{state:?} arity={arity} hit={hit} noise={noise}"
+                        );
+                        let steps = statement.get_status(StatementStatus::VmStep);
+                        let first = *baseline.entry((arity, hit)).or_insert(steps);
+                        eprintln!(
+                            "reference gaps {state:?} arity={arity} hit={hit} noise={noise} vm={steps} plan={plan:?}"
+                        );
+                        assert!(
+                            steps <= first + first / 4 + 128,
+                            "unrelated gaps changed work: {state:?} arity={arity} hit={hit} noise={noise} first={first} steps={steps} plan={plan:?}"
+                        );
+                        assert!(
+                            plan.iter()
+                                .filter(|p| p.contains("SEARCH fact")
+                                    && p.contains("blob_id=? AND covers=? AND subject=?"))
+                                .count()
+                                >= 2,
+                            "{state:?}: {plan:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_unsupported_reason_access_compares_ordered_seeks() {
+        use crate::analyzer::store::resolution_prepare::authority_rows;
+        use rusqlite::StatementStatus;
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for size in [16, 256, 1024] {
+                conn.execute("DELETE FROM resolution_gap_reasons", [])
+                    .unwrap();
+                for key in 0..size {
+                    for origin in [0, 1] {
+                        conn.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(1,?1,?2,?3)",rusqlite::params![key*2+origin,key,origin]).unwrap();
+                    }
+                }
+                state.install(&conn);
+                for (name, sql) in [
+                    (
+                        "in",
+                        "SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin IN (?3,?4,?5) ORDER BY reason",
+                    ),
+                    ("ordered_union", authority_rows::UNSUPPORTED_GAP_REASONS_SQL),
+                ] {
+                    for key in [size - 1, size] {
+                        let plan = conn
+                            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                            .unwrap()
+                            .query_map([1, key, 0, 1, 2], |row| row.get::<_, String>(3))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let mut statement = conn.prepare(sql).unwrap();
+                        let rows = statement
+                            .query_map([1, key, 0, 1, 2], |row| row.get::<_, i64>(0))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let vm = statement.get_status(StatementStatus::VmStep);
+                        assert_eq!(
+                            rows,
+                            if key < size {
+                                vec![key * 2, key * 2 + 1]
+                            } else {
+                                vec![]
+                            }
+                        );
+                        eprintln!(
+                            "B1 unsupported state={state} shape={name} size={size} key={key} rows={rows:?} vm={vm} plan={plan:?}"
+                        );
+                        if name == "ordered_union" {
+                            assert!(vm < 100, "ordered origin seeks remain bounded: {vm}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_lookup_access_is_bounded_by_requested_keys() {
+        use crate::analyzer::store::resolution_prepare::authority_rows;
+        use rusqlite::StatementStatus;
+        let mut failures = Vec::new();
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO resolution_sites(blob_id,site,role,namespace) VALUES(1,0,0,0); INSERT INTO resolution_node_catalog(blob_id,local_key,identity_digest,source_scope) VALUES(1,10,zeroblob(32),0)").unwrap();
+            let mut observed = std::collections::BTreeMap::<(&str, bool), Vec<i32>>::new();
+            for size in [16, 256, 1024] {
+                conn.execute("DELETE FROM resolution_paths", []).unwrap();
+                for key in 1..=size {
+                    for shared in [false, true] {
+                        conn.execute("INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_local,end_lead_identity,end_lead_scoped,body) VALUES(1,?1,0,0,12,?2,?3,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",rusqlite::params![key*2+i64::from(shared),(!shared).then_some(key),shared.then_some(key)]).unwrap();
+                    }
+                    conn.execute("INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_scoped,body) VALUES(1,?1,?2,0,?3,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",rusqlite::params![10000+key,20000+key,30000+key]).unwrap();
+                }
+                for (path, start, end) in [(50000, 11, 10), (50001, 12, 11)] {
+                    conn.execute("INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_scoped,body) VALUES(1,?1,?2,0,?3,0,jsonb('[[],null,[],null,[],null,[],null,[],[],[]]'))",rusqlite::params![path,start,end]).unwrap();
+                }
+                state.install(&conn);
+                for (name, sql, scope) in [
+                    ("local", authority_rows::LOOKUP_REFERENCE_LOCAL_SQL, None),
+                    ("shared", authority_rows::LOOKUP_REFERENCE_SHARED_SQL, None),
+                    (
+                        "scoped_local",
+                        authority_rows::SCOPED_LOOKUP_REFERENCE_LOCAL_SQL,
+                        Some(0),
+                    ),
+                    (
+                        "scoped_shared",
+                        authority_rows::SCOPED_LOOKUP_REFERENCE_SHARED_SQL,
+                        Some(0),
+                    ),
+                ] {
+                    for key in [size, size + 1] {
+                        let plan = conn
+                            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                            .unwrap()
+                            .query_map(rusqlite::params![1, key, scope], |row| {
+                                row.get::<_, String>(3)
+                            })
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let mut statement = conn.prepare(sql).unwrap();
+                        let rows = statement
+                            .query_map(rusqlite::params![1, key, scope], |row| row.get::<_, i64>(0))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        let vm = statement.get_status(StatementStatus::VmStep);
+                        assert_eq!(rows, if key <= size { vec![0] } else { vec![] });
+                        observed.entry((name, key <= size)).or_default().push(vm);
+                        eprintln!(
+                            "B1 lookup state={state} kind={name} size={size} hit={} rows={rows:?} vm={vm} plan={plan:?}",
+                            key <= size
+                        );
+                    }
+                }
+            }
+            for (key, steps) in observed {
+                if steps.iter().max().unwrap() - steps.iter().min().unwrap() > 64 {
+                    failures.push(format!("state={state} {key:?} {steps:?}"));
+                }
+            }
+        }
+        eprintln!("B1 lookup unbounded work: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "existing lookup and reverse indexes must bound the final shape: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_root_terminal_access_is_keyed_amid_unrelated_terminals() {
+        use crate::analyzer::store::resolution_prepare::authority_rows;
+        use rusqlite::StatementStatus;
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO resolution_sites(blob_id,site,role,namespace) VALUES(1,0,0,0)").unwrap();
+            for size in [16, 256, 1024] {
+                conn.execute("DELETE FROM resolution_paths", []).unwrap();
+                for key in 1..=size {
+                    for shared in [false, true] {
+                        let terminal = if shared { -key } else { key };
+                        let body =
+                            format!("[[],null,[],null,[0,0,{terminal}],null,[],null,[],[],[]]");
+                        let fixed = format!("[0,0,{terminal}]");
+                        conn.execute("INSERT INTO resolution_paths(blob_id,path,start_node,start_lead_scoped,end_node,end_lead_local,end_lead_scoped,root_terminal,body,end_fixed_key,end_open_tail) VALUES(1,?1,0,0,-1,0,0,?2,jsonb(?3),?4,0)", rusqlite::params![key*2+i64::from(shared), shared.then_some(key), body, fixed]).unwrap();
+                    }
+                }
+                state.install(&conn);
+                for (name, sql) in [
+                    ("local", authority_rows::ROOT_DEMAND_LOCAL_SQL),
+                    ("shared", authority_rows::ROOT_DEMAND_SHARED_SQL),
+                ] {
+                    for forced in [false, true] {
+                        let index = if name == "local" {
+                            "resolution_paths_root_local_terminal"
+                        } else {
+                            "resolution_paths_root_terminal"
+                        };
+                        let sql = if forced {
+                            sql.replace(
+                                "FROM resolution_paths p JOIN",
+                                &format!("FROM resolution_paths p INDEXED BY {index} JOIN"),
+                            )
+                        } else {
+                            sql.to_owned()
+                        };
+                        for key in [size, size + 1] {
+                            let plan = conn
+                                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                                .unwrap()
+                                .query_map([1, key], |row| row.get::<_, String>(3))
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let mut statement = conn.prepare(&sql).unwrap();
+                            let rows = statement
+                                .query_map([1, key], |row| {
+                                    Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                                })
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let vm = statement.get_status(StatementStatus::VmStep);
+                            assert_eq!(
+                                rows,
+                                if key <= size {
+                                    vec![(0, false)]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            eprintln!(
+                                "B1 root terminal state={state} kind={name} forced={forced} size={size} key={key} rows={rows:?} vm={vm} plan={plan:?}"
+                            );
+                            if forced {
+                                assert!(
+                                    vm < 200,
+                                    "terminal seek must not scale with unrelated paths: {vm}"
+                                );
+                            }
+                        }
+                    }
+                }
+                let bytes = conn.prepare("SELECT name,sum(pgsize),sum(payload) FROM dbstat WHERE name IN ('resolution_paths_root_terminal','resolution_paths_root_local_terminal','resolution_sites_reference_range') GROUP BY name ORDER BY name").unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                eprintln!("B1 root/index bytes state={state} size={size}: {bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_reference_range_access_compares_covering_and_forced_seeks() {
+        use crate::analyzer::store::resolution_prepare::authority_rows;
+        use rusqlite::StatementStatus;
+        for state in PlannerStatisticsState::BOTH {
+            for covering in [false, true] {
+                let store = AnalyzerStore::open_ephemeral().unwrap();
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+                conn.execute_batch("DROP INDEX resolution_sites_reference_range")
+                    .unwrap();
+                conn.execute_batch(if covering {
+                    "CREATE INDEX resolution_sites_reference_range ON resolution_sites(blob_id,start_byte,end_byte,role,site,namespace)"
+                } else {
+                    "CREATE INDEX resolution_sites_reference_range ON resolution_sites(blob_id,start_byte,end_byte,role,site)"
+                }).unwrap();
+                for size in [16, 256, 1024] {
+                    conn.execute("DELETE FROM resolution_sites", []).unwrap();
+                    for key in 0..size {
+                        conn.execute("INSERT INTO resolution_sites(blob_id,site,role,namespace,site_kind,start_byte,end_byte,unqualified) VALUES(1,?1,0,0,0,?1,?1+1,1)", [key]).unwrap();
+                    }
+                    state.install(&conn);
+                    for forced in [false, true] {
+                        let sql = if forced {
+                            authority_rows::SEMANTIC_SITES_2_SQL.replace("FROM resolution_sites WHERE", "FROM resolution_sites INDEXED BY resolution_sites_reference_range WHERE")
+                        } else {
+                            authority_rows::SEMANTIC_SITES_2_SQL.to_owned()
+                        };
+                        for key in [size - 1, size + 1] {
+                            let parameters = [1, key, key + 1, 0];
+                            let plan = conn
+                                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                                .unwrap()
+                                .query_map(parameters, |row| row.get::<_, String>(3))
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let mut statement = conn.prepare(&sql).unwrap();
+                            let rows = statement
+                                .query_map(parameters, |row| {
+                                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                                })
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap();
+                            let steps = statement.get_status(StatementStatus::VmStep);
+                            assert_eq!(rows.len(), usize::from(key < size));
+                            eprintln!(
+                                "B1 range access state={state} covering={covering} forced={forced} size={size} key={key} rows={rows:?} vm={steps} plan={plan:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_authority_queries_bind_and_seek_in_both_statistics_states() {
+        use crate::analyzer::store::resolution_prepare::{
+            authority_rows, rust_authority, typed_rows,
+        };
+        use rusqlite::types::Value;
+        let mut failures = Vec::new();
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open planner store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let mut queries = authority_rows::PINNED_SQL
+                .iter()
+                .map(|(name, sql)| ((*name).to_owned(), (*sql).to_owned()))
+                .collect::<Vec<_>>();
+            queries.extend([
+                (
+                    "rust_reference_contexts".into(),
+                    rust_authority::REFERENCES_SQL.into(),
+                ),
+                (
+                    "rust_declaration_authorities".into(),
+                    rust_authority::DECLARATIONS_SQL.into(),
+                ),
+                (
+                    "typed_frontier_completion".into(),
+                    typed_rows::frontier_completion_sql(),
+                ),
+                (
+                    "typed_gap_reason_provenance".into(),
+                    typed_rows::GAP_REASON_PROVENANCE_SQL.into(),
+                ),
+            ]);
+            for (name, sql) in queries {
+                let mut statement = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                let mut parameters = vec![Value::Integer(0); statement.parameter_count()];
+                for index in 1..=parameters.len() {
+                    if sql.contains(&format!("json_each(?{index})")) {
+                        parameters[index - 1] =
+                            Value::Text(if index == 1 { "[[0,0]]" } else { "[0]" }.into());
+                    }
+                }
+                if sql.contains("?3 IS NULL") {
+                    parameters[2] = Value::Null;
+                }
+                if sql.contains("identity_digest=?2") {
+                    parameters[1] = Value::Blob(vec![0; 32]);
+                }
+                let plan = statement
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                eprintln!("B1 plan {state} {name}: {plan:?}");
+                if plan.iter().any(|row| row.contains("SCAN resolution_")) {
+                    failures.push(format!("{state} {name}: {plan:?}"));
+                }
+                let required = match name.as_str() {
+                    "semantic_sites_2_sql" => Some("resolution_sites_reference_range"),
+                    "semantic_sites_3_sql" => Some("source_declarations_name_range"),
+                    "unsupported_gap_reasons_sql" => Some("resolution_gap_reasons_site"),
+                    "qualified_route_reference_sites_sql" => {
+                        Some("resolution_qualified_routes_source_lookup")
+                    }
+                    "root_demand_local_sql" => Some("resolution_paths_root_local_terminal"),
+                    "root_demand_shared_sql" => Some("resolution_paths_root_terminal"),
+                    "lookup_reference_local_sql" | "scoped_lookup_reference_local_sql" => {
+                        Some("resolution_paths_end_lookup_local")
+                    }
+                    "lookup_reference_shared_sql" | "scoped_lookup_reference_shared_sql" => {
+                        Some("resolution_paths_end_lookup_identity")
+                    }
+                    _ => None,
+                };
+                if let Some(required) = required
+                    && !plan.iter().any(|row| row.contains(required))
+                {
+                    failures.push(format!("{state} {name} must use {required}: {plan:?}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "authority plan failures: {failures:#?}"
+        );
+    }
+
     /// Dump the plan of every pinned query against a real repository store.
     ///
     /// Point `BIFROST_3016_STORE_PATH` at a `bifrost_cache.v*.db` file and run
@@ -974,6 +2429,427 @@ pub(crate) mod tests {
         }
     }
 
+    /// Batch typed-fact readers and scalar ownership readers must seek
+    /// stored resolution tables under both statistics states. Array readers
+    /// may scan json_each or its subquery; no reader may scan a resolution
+    /// table once per request.
+    #[test]
+    fn every_typed_fact_read_is_driven_by_its_key_array() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let names = super::pinned_plans::TYPED_FACT_PINS
+                .iter()
+                .map(|(name, _)| *name)
+                .chain(
+                    super::pinned_plans::TYPED_OWNER_PINS
+                        .iter()
+                        .map(|(name, _, _)| *name),
+                )
+                .chain([
+                    "resolution_qualified_routes_by_slot_lookup",
+                    "resolution_qualified_routes_inventory",
+                ]);
+            for name in names {
+                let plan = explain_pin(&conn, &pinned(name));
+                let scanned = plan
+                    .iter()
+                    .filter(|row| row.contains("SCAN resolution_"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    scanned.is_empty(),
+                    "{state} {name} must seek every resolution table it opens, not scan it: \
+                     scans {scanned:?}, whole plan {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// Milestone 6's checkpoint reads rows by key, in both statistics states.
+    ///
+    /// The three statements the checkpoint adds each pass the keys the caller
+    /// already holds as one JSON array. What has to hold is that the array is
+    /// the outer loop and the table is sought: a plan that scanned
+    /// `resolution_paths` or `resolution_identities` once per call would be
+    /// the whole port's cost, not its saving. Lane LD measured the byte-range
+    /// pin flipping between the two statistics states, so both are checked.
+    #[test]
+    fn the_checkpoint_row_reads_are_driven_by_their_key_arrays() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for (name, required, forbidden) in [
+                (
+                    "resolution_paths_by_key",
+                    "SEARCH resolution_paths USING PRIMARY KEY (blob_id=? AND path=?)",
+                    "SCAN resolution_paths",
+                ),
+                (
+                    "resolution_identity_recipes",
+                    "SEARCH resolution_identities USING INTEGER PRIMARY KEY (rowid=?)",
+                    "SCAN resolution_identities",
+                ),
+                // Port block 2 (lane CM): every arm of the two candidate-match
+                // statements seeks its own index, and the JSON array of
+                // requests is what drives it.
+                (
+                    "resolution_forward_candidate_match",
+                    "SEARCH p USING INDEX resolution_paths_forward (blob_id=? AND start_node=?",
+                    "SCAN p",
+                ),
+                (
+                    "resolution_reverse_candidate_match",
+                    "SEARCH p USING INDEX resolution_paths_reverse (blob_id=? AND end_node=?",
+                    "SCAN p",
+                ),
+                (
+                    "resolution_reverse_candidate_match",
+                    "SEARCH p USING INDEX resolution_paths_reverse_root_prefix (blob_id=? AND end_fixed_key",
+                    "SCAN p",
+                ),
+                (
+                    "resolution_root_terminal_paths",
+                    "SEARCH resolution_paths USING COVERING INDEX resolution_paths_root_terminal \
+                     (blob_id=? AND root_terminal=?)",
+                    "SCAN resolution_paths",
+                ),
+                (
+                    "resolution_sites_by_key",
+                    "SEARCH resolution_sites USING PRIMARY KEY (blob_id=? AND site=?)",
+                    "SCAN resolution_sites",
+                ),
+                (
+                    "resolution_member_scope_owners_by_node",
+                    "(blob_id=? AND scope_head_node_key=?)",
+                    "SCAN main.resolution_member_scope_properties",
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                assert!(
+                    plan.iter().any(|row| row.contains(required)),
+                    "{state} {name} must {required}: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|row| row.contains(forbidden)),
+                    "{state} {name} must not {forbidden}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The scoped endpoint-header read is driven by its mount scope.
+    ///
+    /// The point of binding the scope into the statement is that SQLite reads
+    /// one primary-key row and one index range per scoped mount instead of
+    /// scanning the direction's header rows and discarding all but the
+    /// caller's crate in Rust. That is a property of the plan, not of the
+    /// text, and it has to hold with and without `sqlite_stat1`: the whole
+    /// reason plans are pinned here is that the same statement can be planned
+    /// two ways.
+    ///
+    /// Two scopes drive it now. `root` is the root read's own mount array and
+    /// `scope` is `temp.selected_resolution_scope_mounts`, the mounts the
+    /// request may bind into at all, so the plan reads one primary-key row of
+    /// each per array entry before it touches a header row. A mount the crate
+    /// closure excludes drops out at the second seek and is never turned into
+    /// an interior.
+    #[test]
+    fn the_scoped_endpoint_header_read_is_driven_by_its_mount_scope() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(
+                &conn,
+                &pinned("selected_scoped_path_endpoint_header_mounts"),
+            );
+            for required in [
+                "SCAN root VIRTUAL TABLE",
+                "SEARCH scope USING PRIMARY KEY (mount_ordinal=?)",
+                "SEARCH m USING PRIMARY KEY (mount_ordinal=?)",
+                "INDEX resolution_path_endpoint_headers_keyed (blob_id=? AND direction=?)",
+                "INDEX resolution_path_endpoint_headers_unkeyed (blob_id=? AND direction=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(required)),
+                    "{state} scoped endpoint header read must {required}: {plan:?}"
+                );
+            }
+            for forbidden in ["SCAN h", "SCAN m", "SCAN scope"] {
+                assert!(
+                    !plan.iter().any(|row| row.contains(forbidden)),
+                    "{state} scoped endpoint header read must not {forbidden}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The whole-selection endpoint-header read seeks the header shape its
+    /// probe can match, so headers of other shapes cost it nothing.
+    ///
+    /// Its zero-fixed-symbol arm used to carry the wildcard in the same OR,
+    /// which left `direction` as the only term the search index could seek:
+    /// every execution walked the direction's whole header range, 3,461 times
+    /// over twenty tract call sites for 527 ms. The noise here is headers of
+    /// shapes no non-wildcard probe admits, in unmounted blobs, as most of
+    /// tract's reverse headers are; each probe's VM work must not grow with
+    /// them. The wildcard probe admits every header of its direction, so only
+    /// its answer is checked.
+    #[test]
+    fn the_unscoped_endpoint_header_read_seeks_its_probe_shape() {
+        use rusqlite::StatementStatus;
+        let sql = super::super::resolution_lexical::PATH_ENDPOINT_HEADER_MOUNTS_SQL;
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            // This is a populated access-plan fixture, not a publication fixture.
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            conn.execute_batch(
+                "INSERT INTO temp.selected_resolution_mounts(mount_ordinal, blob_id)
+                   VALUES (0, 1), (1, 2), (2, 3);
+                 INSERT INTO temp.selected_resolution_scope_mounts(mount_ordinal)
+                   VALUES (0), (1), (2);
+                 INSERT INTO resolution_path_endpoint_headers(
+                   blob_id, direction, identity_id, symbol_fixed_count, open_tail)
+                   VALUES (1, 'forward', 7, 2, 1),
+                          (2, 'reverse', NULL, 0, 1),
+                          (3, 'reverse', NULL, 4, 0);",
+            )
+            .unwrap();
+            let mut baseline = HashMap::new();
+            for noise in [0_i64, 1024, 8192] {
+                conn.execute(
+                    "DELETE FROM resolution_path_endpoint_headers WHERE blob_id >= 1000",
+                    [],
+                )
+                .unwrap();
+                for key in 0..noise {
+                    conn.execute(
+                        "INSERT INTO resolution_path_endpoint_headers(
+                           blob_id, direction, identity_id, symbol_fixed_count, open_tail)
+                           VALUES (?1, 'forward', ?2, 2, 1), (?1, 'reverse', NULL, ?3, ?4)",
+                        rusqlite::params![1000 + key, 100_000 + key, 3 + key % 5, key % 2],
+                    )
+                    .unwrap();
+                }
+                state.install(&conn);
+                // (direction, first symbol, fixed symbols, open tail), answer, wildcard.
+                type Probe = (&'static str, Option<i64>, i64, i64);
+                let probes: [(Probe, &[i64], bool); 6] = [
+                    (("forward", Some(7), 2, 0), &[0], false),
+                    (("forward", Some(7), 1, 1), &[0], false),
+                    (("forward", Some(99), 2, 0), &[], false),
+                    (("reverse", None, 4, 0), &[1], false),
+                    (("reverse", None, 0, 0), &[1], false),
+                    (("forward", None, 0, 1), &[0], true),
+                ];
+                for (probe, expected, wildcard) in probes {
+                    let bindings = rusqlite::params![probe.0, probe.1, probe.2, probe.3];
+                    let plan = conn
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .unwrap()
+                        .query_map(bindings, |row| row.get::<_, String>(3))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    let mut statement = conn.prepare(sql).unwrap();
+                    let mut actual = statement
+                        .query_map(bindings, |row| row.get::<_, i64>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "{state} probe={probe:?} noise={noise}");
+                    if !wildcard {
+                        let steps = statement.get_status(StatementStatus::VmStep);
+                        let first = *baseline.entry(probe).or_insert(steps);
+                        assert!(
+                            steps <= first + first / 4 + 128,
+                            "headers of other shapes changed the work of {probe:?}: {state} \
+                             noise={noise} first={first} steps={steps} plan={plan:?}"
+                        );
+                    }
+                    // The keyed arm may plan as one range or as a multi-index OR
+                    // over its three fixed-count terms; both seek the identity.
+                    for required in [
+                        "resolution_path_endpoint_headers_search (direction=? AND identity_id=?",
+                        "resolution_path_endpoint_headers_search (direction=? AND identity_id=? AND symbol_fixed_count=?)",
+                    ] {
+                        assert!(
+                            plan.iter().any(|row| row.contains(required)),
+                            "{state} unscoped endpoint header read must seek {required}: {plan:?}"
+                        );
+                    }
+                    let direction_only = plan
+                        .iter()
+                        .filter(|row| {
+                            row.contains("resolution_path_endpoint_headers_search (direction=?)")
+                        })
+                        .count();
+                    assert!(
+                        direction_only <= 1,
+                        "{state} only the wildcard arm may read a whole direction: {plan:?}"
+                    );
+                    for forbidden in ["SCAN h", "SCAN m", "SCAN scope"] {
+                        assert!(
+                            !plan.iter().any(|row| row.contains(forbidden)),
+                            "{state} unscoped endpoint header read must not {forbidden}: {plan:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both candidate gap-header reads are driven by the request's mount
+    /// scope, and the unconditional one is covered by its index.
+    ///
+    /// The unconditional read used to bind `(direction, coverage_scope)` only,
+    /// which made the header relation the outer loop: one execution walked
+    /// every gap header the workspace held for that direction (122,728 rows on
+    /// tract), seeked the table for a column it then discarded, and sorted the
+    /// result in a temp b-tree. Both reads now drive from
+    /// `temp.selected_resolution_scope_mounts` into `resolution_gaps` through
+    /// a narrow partial index that leads on `covers`, so each is one covering
+    /// seek per in-scope mount and a direction the workspace has no row of
+    /// costs one trivial probe per mount rather than a descent through that
+    /// blob's other gaps. That is a property of the plan, not of the text, and
+    /// it has to hold with and without `sqlite_stat1`.
+    /// A shared typed request reaches each member mount through its blob.
+    /// The unique path index binds only the language here, and a plan through
+    /// it walks every mount for every membership row (#3761).
+    #[test]
+    fn the_shared_typed_membership_reaches_mounts_by_blob() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("selected_typed_shared_membership"));
+            assert!(
+                plan.iter().any(|row| row.contains(
+                    "SEARCH m USING INDEX selected_resolution_mounts_blob_ordinal (blob_id=?)"
+                )),
+                "{state} must reach the mount by its blob: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.contains("SCAN m")),
+                "{state} must not scan the mounts: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_candidate_gap_header_reads_are_driven_by_their_mount_scope() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for (name, header_search) in [
+                (
+                    "selected_unconditional_candidate_gap_reasons",
+                    "SEARCH h USING COVERING INDEX resolution_gaps_fragment_wide (covers=? AND blob_id=?)",
+                ),
+                (
+                    "selected_boundary_candidate_gap_branches",
+                    "SEARCH h USING COVERING INDEX resolution_gaps_root_branches (covers=? AND blob_id=?)",
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                for required in [
+                    "SCAN scope",
+                    "SEARCH m USING PRIMARY KEY (mount_ordinal=?)",
+                    header_search,
+                ] {
+                    assert!(
+                        plan.iter().any(|row| row.contains(required)),
+                        "{state} {name} must {required}: {plan:?}"
+                    );
+                }
+                for forbidden in ["SCAN h", "SCAN m", "TEMP B-TREE"] {
+                    assert!(
+                        !plan.iter().any(|row| row.contains(forbidden)),
+                        "{state} {name} must not {forbidden}: {plan:?}"
+                    );
+                }
+            }
+            // The per-endpoint branch read is keyed, not scoped: its caller
+            // holds the blob and the endpoint nodes, so it seeks the primary
+            // key for each node of one JSON array and never scans the table.
+            let name = "selected_endpoint_candidate_gap_branches";
+            let plan = explain_pin(&conn, &pinned(name));
+            assert!(
+                plan.iter().any(|row| row
+                    .contains("SEARCH h USING PRIMARY KEY (blob_id=? AND covers=? AND subject=?)")),
+                "{state} {name} must seek its endpoint keys: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|row| row.contains(
+                    "SEARCH h USING PRIMARY KEY (blob_id=? AND covers=? AND subject=? AND lookup=?)"
+                )),
+                "{state} {name} must seek exact lookup keys: {plan:?}"
+            );
+            for forbidden in ["SCAN h", "TEMP B-TREE"] {
+                assert!(
+                    !plan.iter().any(|row| row.contains(forbidden)),
+                    "{state} {name} must not {forbidden}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_definition_units_seek_the_complete_requested_keys() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("selected_definition_units"));
+            for seek in [
+                "SEARCH crosswalk USING PRIMARY KEY (blob_id=? AND definition_semantic_key=?)",
+                "SEARCH units USING PRIMARY KEY (blob_id=? AND unit_key=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(seek)),
+                    "{state}: {seek}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.first().is_some_and(|row| row.contains("SCAN request")),
+                "{state}: requested coordinates drive hydration: {plan:?}"
+            );
+        }
+    }
+
     /// Every registered pinned query prepares and plans in both statistics
     /// states.
     ///
@@ -1000,13 +2876,83 @@ pub(crate) mod tests {
             }
             for query in pinned_queries() {
                 let plan = explain_pin(&conn, &query);
+                if plan.is_empty() {
+                    // SQLite emits no QUERY PLAN rows for a VALUES insert
+                    // without a lookup. Still require executable VM bytecode
+                    // for the exact registered statement and bindings.
+                    let mut statement = conn.prepare(&format!("EXPLAIN {}", query.sql)).unwrap();
+                    let mut bytecode = statement
+                        .query(rusqlite::params_from_iter(query.params.iter()))
+                        .unwrap();
+                    assert!(
+                        bytecode.next().unwrap().is_some(),
+                        "pinned query {} has neither a query plan nor bytecode {state}",
+                        query.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// No production statement opens a resolution table outside tier 1.
+    ///
+    /// Tier 2 is computed on demand, so a statement that reads one of its
+    /// families is reading rows the writer no longer produces. The check is
+    /// structural: SQLite's own bytecode names every b-tree a statement
+    /// opens through its root page, and `sqlite_schema` maps that root page
+    /// back to a table. No source text is scanned, so a statement assembled
+    /// at runtime is covered exactly as a literal one is.
+    #[test]
+    fn no_pinned_statement_opens_a_resolution_table_outside_tier_one() {
+        let store = AnalyzerStore::open_ephemeral().expect("open store");
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .expect("workspace selection views");
+        prepare_pin_context(&conn);
+        let mut opened_any = false;
+        for query in pinned_queries() {
+            let mut statement = conn
+                .prepare(&format!("EXPLAIN {}", query.sql))
+                .unwrap_or_else(|error| {
+                    panic!("pinned query {} does not prepare: {error}", query.name)
+                });
+            let roots = statement
+                .query_map(rusqlite::params_from_iter(query.params.iter()), |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+                })
+                .expect("explain pinned query bytecode")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect pinned query bytecode")
+                .into_iter()
+                .filter(|(opcode, _)| opcode == "OpenRead")
+                .map(|(_, root)| root)
+                .collect::<std::collections::BTreeSet<_>>();
+            drop(statement);
+            for root in roots {
+                let table = conn
+                    .query_row(
+                        "SELECT COALESCE(tbl_name, name) FROM sqlite_schema WHERE rootpage = ?1",
+                        [root],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                let Some(table) = table else { continue };
+                if !table.starts_with("resolution_") {
+                    continue;
+                }
+                opened_any = true;
                 assert!(
-                    !plan.is_empty(),
-                    "pinned query {} planned to nothing {state}",
+                    super::super::resolution::PERSISTED_RESOLUTION_TABLES.contains(&table.as_str()),
+                    "pinned query {} opens {table}, which tier 1 does not persist",
                     query.name
                 );
             }
         }
+        assert!(
+            opened_any,
+            "the registry must contain at least one resolution reader for this pin to mean anything"
+        );
     }
 
     #[test]
@@ -1533,5 +3479,194 @@ pub(crate) mod tests {
             [OID],
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use rusqlite::Connection;
+
+    use super::super::ReaderPool;
+
+    #[test]
+    fn statistics_refresh_retires_idle_and_checked_out_readers() {
+        use super::super::SelectedReader;
+
+        let pool = ReaderPool::new(None);
+        let open = |statistics_epoch| SelectedReader {
+            conn: Connection::open_in_memory().unwrap(),
+            selection: None,
+            resolution_selection: None,
+            statistics_epoch,
+            query_planner_stability_before_resolution: None,
+        };
+        let (old_epoch, empty) = pool.acquire();
+        assert!(empty.is_none());
+        let (second_epoch, empty) = pool.acquire();
+        assert!(empty.is_none());
+        let (opening_epoch, empty) = pool.acquire();
+        assert!(empty.is_none());
+        pool.checkin(open(old_epoch));
+        pool.checkin(open(second_epoch));
+        let (_, borrowed) = pool.acquire();
+        assert_eq!(pool.recycle(), 1);
+        assert_eq!(pool.idle_len(), 0);
+        pool.checkin(borrowed.unwrap());
+        assert_eq!(pool.idle_len(), 0);
+        // An open racing the refresh keeps its old stamp and releases its permit.
+        pool.checkin(open(opening_epoch));
+        assert_eq!(pool.idle_len(), 0);
+        let (new_epoch, empty) = pool.acquire();
+        assert!(empty.is_none());
+        assert_ne!(old_epoch, new_epoch);
+        pool.checkin(open(new_epoch));
+        assert_eq!(pool.idle_len(), 1);
+    }
+
+    #[test]
+    fn refresh_recycles_all_store_reader_classes_and_populates_statistics() {
+        let store = super::AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE planner_fixture(k INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+                 CREATE INDEX planner_fixture_value ON planner_fixture(value);
+                 WITH RECURSIVE inputs(k) AS (
+                   VALUES(1) UNION ALL SELECT k + 1 FROM inputs WHERE k < 2000
+                 ) INSERT INTO planner_fixture SELECT k, k % 3 FROM inputs;",
+            )
+            .unwrap();
+        });
+        for pool in [
+            &store.readers,
+            &store.active_readers,
+            &store.streaming_readers,
+        ] {
+            let reader = store
+                .read_conn_from_pool(pool, crate::cache_db::open_readonly_temp_connection)
+                .unwrap();
+            let count: i64 = reader
+                .query_row("SELECT count(*) FROM planner_fixture", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2000);
+            drop(reader);
+            assert_eq!(pool.idle_len(), 1);
+        }
+        let borrowed = store.read_conn().unwrap();
+        assert!(store.refresh_planner_statistics().unwrap().stat1_rows > 0);
+        drop(borrowed);
+        for pool in [
+            &store.readers,
+            &store.active_readers,
+            &store.streaming_readers,
+        ] {
+            assert_eq!(pool.idle_len(), 0);
+        }
+        let reader = store.read_conn().unwrap();
+        let plan: String = reader
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT k FROM planner_fixture WHERE value = ?1",
+                [1],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("planner_fixture_value"), "{plan}");
+        drop(reader);
+        store.conn.execute(|conn| {
+            conn.execute(
+                "UPDATE sqlite_stat1 SET stat = '9000 3000' WHERE idx = 'planner_fixture_value'",
+                [],
+            )
+            .unwrap();
+        });
+        store.reload_planner_statistics().unwrap();
+        assert_eq!(store.readers.idle_len(), 0);
+        let retained: String = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT stat FROM sqlite_stat1 WHERE idx = 'planner_fixture_value'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "9000 3000", "reload must not resample statistics");
+    }
+}
+
+#[cfg(test)]
+mod rust_crate_row_plans {
+    use super::pinned_plans::{explain_pin, pinned};
+    use crate::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    #[test]
+    fn rust_crate_reverse_and_selected_queries_use_indexes() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0);
+             INSERT INTO rust_crate_topologies VALUES(1, zeroblob(32), zeroblob(32),
+                 'test', 'lib', 'sample', '2021', 'std', jsonb('[\"test\"]'), 1, zeroblob(32), 'complete');
+             INSERT INTO rust_crate_containers VALUES(1, 'crate', 'module', 'root');
+             INSERT INTO rust_crate_container_sources SELECT 1, 'crate', id, 0, 'src/lib.rs', 'declared', NULL, NULL FROM blobs;
+             INSERT INTO rust_crate_exports SELECT 1, 'crate', 'type', 'X', 'declaration',
+                 'public', NULL, id, 0 FROM blobs;
+             INSERT INTO rust_crate_imports VALUES(1, 'crate', 'type', 'X', 1, 0, 0,
+                 zeroblob(32), 'crate', 'X');
+             INSERT INTO rust_crate_reexport_routes VALUES(1, 'crate', 'X', zeroblob(32),
+                 'crate', 'X', 'public', NULL);
+             INSERT INTO rust_crate_glob_reexport_routes VALUES(1, 'crate', zeroblob(32), 'crate', 'public', NULL);",
+        ).unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspace_revisions VALUES(printf('%064d', 0), 'rust', 0, 1);
+             INSERT INTO workspace_file_versions(workspace_id, lang, generation, rel_path,
+                 blob_oid, projection_digest, valid_from)
+             VALUES(printf('%064d', 0), 'rust', 0, 'src/lib.rs',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', printf('%064d', 0), 1);
+             INSERT INTO rust_crate_versions VALUES(printf('%064d', 0), 'rust', 0,
+                 zeroblob(32), 1, NULL, NULL, 1);
+             INSERT INTO selected_workspace_revisions VALUES(printf('%064d', 0), 'rust', 0, 1);",
+        )
+        .unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for (name, index) in [
+                ("rust_reverse_exports", "rust_crate_exports_declaration"),
+                ("rust_crate_imports_target", "rust_crate_imports_target"),
+                (
+                    "rust_crate_glob_reexport_routes_target",
+                    "rust_crate_glob_reexport_routes_target",
+                ),
+                ("rust_crate_imports_binder", "blob_id=? AND binder_scope=?"),
+                (
+                    "rust_crate_exports_declaration",
+                    "rust_crate_exports_declaration",
+                ),
+                (
+                    "rust_crate_reexport_routes_target",
+                    "rust_crate_reexport_routes_target",
+                ),
+                ("selected_rust_crates", "rust_crate_topologies_crate_key"),
+                (
+                    "selected_rust_crate_containers",
+                    "SEARCH modules USING PRIMARY KEY",
+                ),
+                (
+                    "rust_crate_exports_reachable",
+                    "rust_crate_reexport_routes_target",
+                ),
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                assert!(
+                    plan.iter().any(|row| row.contains(index)),
+                    "{state:?} {name}: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                    "{state:?} {name}: {plan:?}"
+                );
+            }
+        }
     }
 }

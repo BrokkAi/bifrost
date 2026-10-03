@@ -61,8 +61,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer_pack::summary_id;
-use super::{FOUNDRY_BIFROST_REQUIREMENT, FOUNDRY_PRODUCER_VERSION};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -511,7 +511,8 @@ impl PackIdentity {
         members: Vec<MemberFact>,
     ) -> AuthoredSemanticModelPack {
         AuthoredSemanticModelPack {
-            schema_version: 2,
+            schema_version:
+                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
             pack_id: self.pack_id.clone(),
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {
@@ -521,7 +522,7 @@ impl PackIdentity {
             language: "java".to_owned(),
             ecosystem: self.ecosystem.clone(),
             compatibility: Compatibility {
-                bifrost: FOUNDRY_BIFROST_REQUIREMENT.to_owned(),
+                bifrost: None,
                 toolchains: self.toolchains.clone(),
             },
             provenance: Provenance {

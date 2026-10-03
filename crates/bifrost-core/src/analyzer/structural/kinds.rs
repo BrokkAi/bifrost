@@ -15,6 +15,7 @@ use std::fmt;
 
 macro_rules! normalized_kinds {
     ($($variant:ident => $label:literal: $description:literal,)+) => {
+        #[repr(u8)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum NormalizedKind {
@@ -51,6 +52,18 @@ macro_rules! normalized_kinds {
                 match self {
                     $(NormalizedKind::$variant => $description,)+
                 }
+            }
+        }
+
+        impl crate::analyzer::structural::code::VocabularyCode for NormalizedKind {
+            /// The declaration ordinal. `#[repr(u8)]` on the enum makes the
+            /// cast the ordinal itself.
+            fn code(self) -> u8 {
+                self as u8
+            }
+
+            fn from_code(code: u8) -> Option<NormalizedKind> {
+                ALL_KINDS.get(code as usize).copied()
             }
         }
     };
@@ -147,6 +160,7 @@ impl fmt::Display for NormalizedKind {
 /// constrain depends on its kind — see [`Role::valid_for`].
 macro_rules! roles {
     ($($variant:ident => $label:literal: $shape:ident, $description:literal,)+) => {
+        #[repr(u8)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Role {
             $($variant,)+
@@ -195,6 +209,18 @@ macro_rules! roles {
                 match self {
                     $(Role::$variant => $description,)+
                 }
+            }
+        }
+
+        impl crate::analyzer::structural::code::VocabularyCode for Role {
+            /// The declaration ordinal. `#[repr(u8)]` on the enum makes the
+            /// cast the ordinal itself.
+            fn code(self) -> u8 {
+                self as u8
+            }
+
+            fn from_code(code: u8) -> Option<Role> {
+                ALL_ROLES.get(code as usize).copied()
             }
         }
     };

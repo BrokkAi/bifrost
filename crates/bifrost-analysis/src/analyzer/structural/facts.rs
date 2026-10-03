@@ -7,18 +7,53 @@
 //! `left`, ...) point at either another fact or, when the target expression is
 //! not itself normalized, at a raw source span.
 
-pub use brokk_bifrost_core::analyzer::structural::facts::{RoleTarget, Span};
+pub use brokk_bifrost_core::analyzer::structural::facts::Span;
+
+use brokk_bifrost_core::analyzer::source_facts::SourceFactRows;
+use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
 
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use crate::analyzer::Range;
 use crate::analyzer::semantic::ContentIdentity;
-use crate::compact_graph::CompactRows;
+use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CallSiteFacts,
 };
+use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
 use std::fmt;
+
+#[derive(Debug, Clone)]
+pub struct RoleTarget {
+    pub role: Role,
+    pub spread: bool,
+    pub keyword: Option<Span>,
+    pub node: Option<u32>,
+    pub span: Span,
+    pub name: Option<Span>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedNode {
+    pub kind: NormalizedKind,
+    pub boolean_value: Option<bool>,
+    pub construct: Option<String>,
+    pub range: Range,
+    pub parent: Option<u32>,
+    pub name: Option<Span>,
+    pub subtree_end: u32,
+    pub call_site: Option<CallSiteFacts>,
+}
+
+impl NormalizedNode {
+    pub fn span(&self) -> Span {
+        Span {
+            start_byte: self.range.start_byte,
+            end_byte: self.range.end_byte,
+        }
+    }
+}
 
 /// Semantic contract for persisted structural facts.
 ///
@@ -84,7 +119,17 @@ use std::fmt;
 /// carries an occurrence role -- binder, import alias, import target, type
 /// operand, path segment, receiver, declaration name or value reference --
 /// where only member positions did before (#2962).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 21;
+/// Version 24 adds Java formal and spread parameter facts and their annotation
+/// role edges (#3714). Old arenas cannot supply these source identities.
+/// Version 25 stops classifying Kotlin reads inside `for` and `catch` bodies,
+/// parameter default values and `for` iterables as binders (#3551).
+/// Version 26 classifies C# binders and adds C# block and implicit lambda
+/// parameter facts (#3546).
+/// Version 27 classifies Go binders and adds Go block, case and switch
+/// scope facts (#3547).
+/// Version 28 classifies C and C++ binders and adds their block, switch and
+/// range-`for` scope facts (#3544, #3545).
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 28;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -112,7 +157,8 @@ pub(crate) struct PersistedSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedStructuralNode {
     pub(crate) node_id: u32,
-    pub(crate) kind: String,
+    /// `NormalizedKind::code()`, decoded in `from_persisted_rows`.
+    pub(crate) kind: u8,
     pub(crate) boolean_value: Option<bool>,
     pub(crate) construct: Option<String>,
     pub(crate) span: PersistedSpan,
@@ -124,8 +170,8 @@ pub(crate) struct PersistedStructuralNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedCallSite {
-    pub(crate) call_kind: Option<String>,
-    pub(crate) coverage: String,
+    pub(crate) call_kind: Option<u8>,
+    pub(crate) coverage: u8,
     pub(crate) continues_callee_groups: bool,
 }
 
@@ -133,7 +179,8 @@ pub(crate) struct PersistedCallSite {
 pub(crate) struct PersistedStructuralRole {
     pub(crate) source_node_id: u32,
     pub(crate) ordinal: u32,
-    pub(crate) role: String,
+    /// `Role::code()`, decoded in `from_persisted_rows`.
+    pub(crate) role: u8,
     pub(crate) spread: bool,
     pub(crate) keyword: Option<PersistedSpan>,
     pub(crate) node: Option<u32>,
@@ -145,7 +192,8 @@ pub(crate) struct PersistedStructuralRole {
 pub(crate) struct PersistedOccurrenceRole {
     pub(crate) node_id: u32,
     pub(crate) ordinal: u32,
-    pub(crate) role: String,
+    /// `OccurrenceRole::code()`, decoded in `from_persisted_rows`.
+    pub(crate) role: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +204,7 @@ pub(crate) struct PersistedStructuralFacts {
     pub(crate) occurrence_roles: Vec<PersistedOccurrenceRole>,
 }
 
+#[cfg(test)]
 fn persist_span(span: Span) -> Result<PersistedSpan, StructuralFactsPersistenceError> {
     Ok(PersistedSpan {
         start: u32::try_from(span.start_byte).map_err(|_| {
@@ -194,45 +243,60 @@ fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
     line_starts.partition_point(|&start| start <= byte)
 }
 
-/// One normalized node occurrence.
-#[derive(Debug, Clone)]
-pub struct NormalizedNode {
-    pub kind: NormalizedKind,
-    /// Exact language-neutral value for a boolean-literal fact. `None` for
-    /// every other kind and for adapters that do not support this axis.
-    pub boolean_value: Option<bool>,
-    /// Grammar-backed source construct used by semantic generator rules.
-    pub construct: Option<String>,
-    pub range: Range,
-    /// Nearest enclosing normalized node, forming the containment chain used
-    /// by `inside` / `not_inside` / `has`.
-    pub parent: Option<u32>,
-    /// The fact's source-backed semantic name span (declared identifier for
-    /// declarations, the callee name for calls, field name for field accesses,
-    /// ...). A semantic name may be outside the fact's match range when the
-    /// language supplies an owner name for syntax without its own spelling,
-    /// such as a Kotlin constructor.
-    pub name: Option<Span>,
-    /// One-past-the-end fact id for this fact's normalized subtree. Facts are
-    /// stored in pre-order, so descendants are exactly
-    /// `(self_id + 1)..subtree_end`.
-    pub subtree_end: u32,
-    /// What the language spec's grammar says about this call site (#1478):
-    /// refined call kind, argument-shape coverage, and whether the site
-    /// continues its callee's argument-list sequence. Always `None` for a
-    /// node that is not a [`NormalizedKind::Call`], and `None` for a call
-    /// whose adapter does not refine call sites — the derivation layer then
-    /// keeps the receiver-derived baseline rather than guessing.
-    pub call_site: Option<CallSiteFacts>,
-}
-
-impl NormalizedNode {
-    pub fn span(&self) -> Span {
-        Span {
-            start_byte: self.range.start_byte,
-            end_byte: self.range.end_byte,
-        }
+fn materialize_rows(
+    source_facts: &SourceFactRows,
+    rows: &StructuralFactRows,
+) -> (Vec<NormalizedNode>, CompactRows<RoleTarget>) {
+    let nodes = rows
+        .nodes()
+        .iter()
+        .map(|node| NormalizedNode {
+            kind: node.kind,
+            boolean_value: node.boolean_value,
+            construct: node.construct.clone(),
+            range: source_facts.occurrence(node.occurrence).range,
+            parent: node.parent,
+            name: node
+                .name
+                .map(|name| source_facts.occurrence(name).range)
+                .map(|range| Span {
+                    start_byte: range.start_byte,
+                    end_byte: range.end_byte,
+                }),
+            subtree_end: node.subtree_end,
+            call_site: node.call_site,
+        })
+        .collect::<Vec<_>>();
+    let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), rows.role_count());
+    for node_id in 0..nodes.len() as u32 {
+        roles.push_row(rows.roles(node_id).iter().map(|role| {
+            let range = source_facts.occurrence(role.occurrence).range;
+            RoleTarget {
+                role: role.role,
+                spread: role.spread,
+                keyword: role.keyword.map(|keyword| {
+                    let range = source_facts.occurrence(keyword).range;
+                    Span {
+                        start_byte: range.start_byte,
+                        end_byte: range.end_byte,
+                    }
+                }),
+                node: role.node,
+                span: Span {
+                    start_byte: range.start_byte,
+                    end_byte: range.end_byte,
+                },
+                name: role.name.map(|name| {
+                    let range = source_facts.occurrence(name).range;
+                    Span {
+                        start_byte: range.start_byte,
+                        end_byte: range.end_byte,
+                    }
+                }),
+            }
+        }));
     }
+    (nodes, roles.finish())
 }
 
 /// All normalized facts for one file. `source` is a private copy so spans stay
@@ -244,11 +308,7 @@ pub struct FileFacts {
     source_identity: ContentIdentity,
     line_starts: Vec<usize>,
     nodes: Vec<NormalizedNode>,
-    /// Role edges grouped by source fact and retained in source order.
     roles: CompactRows<RoleTarget>,
-    /// Occurrence-role classifications keyed by the classified node itself,
-    /// not by the fact that emitted them (#1473). Almost every row holds one
-    /// role; the compact-rows shape keeps the "no role" case free.
     occurrence_roles: CompactRows<OccurrenceRole>,
 }
 
@@ -262,13 +322,9 @@ impl FileFacts {
     ) -> Self {
         assert_eq!(roles.rows(), nodes.len());
         assert_eq!(occurrence_roles.rows(), nodes.len());
-        assert!(
-            nodes
-                .iter()
-                .all(|node| node.boolean_value.is_none()
-                    || node.kind == NormalizedKind::BooleanLiteral),
-            "only normalized boolean-literal facts may carry boolean values"
-        );
+        assert!(nodes.iter().all(
+            |node| node.boolean_value.is_none() || node.kind == NormalizedKind::BooleanLiteral
+        ));
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             source,
@@ -280,6 +336,17 @@ impl FileFacts {
         }
     }
 
+    pub(crate) fn from_source_and_rows(
+        source: String,
+        source_facts: SourceFactRows,
+        rows: StructuralFactRows,
+    ) -> Self {
+        let line_starts = compute_line_starts(&source);
+        let (nodes, roles) = materialize_rows(&source_facts, &rows);
+        let (_, _, occurrence_roles) = rows.into_parts();
+        Self::new(source, line_starts, nodes, roles, occurrence_roles)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -288,6 +355,7 @@ impl FileFacts {
         self.source_identity
     }
 
+    #[cfg(test)]
     pub(crate) fn persisted_rows(
         &self,
     ) -> Result<PersistedStructuralFacts, StructuralFactsPersistenceError> {
@@ -305,7 +373,7 @@ impl FileFacts {
                             "structural node count exceeds u32",
                         )
                     })?,
-                    kind: node.kind.label().to_string(),
+                    kind: node.kind.code(),
                     boolean_value: node.boolean_value,
                     construct: node.construct.clone(),
                     span: persist_span(node.span())?,
@@ -313,8 +381,8 @@ impl FileFacts {
                     name: node.name.map(persist_span).transpose()?,
                     subtree_end: node.subtree_end,
                     call_site: node.call_site.map(|facts| PersistedCallSite {
-                        call_kind: facts.call_kind.map(|kind| kind.label().to_string()),
-                        coverage: facts.coverage.label().to_string(),
+                        call_kind: facts.call_kind.map(|kind| kind.code()),
+                        coverage: facts.coverage.code(),
                         continues_callee_groups: facts.continues_callee_groups,
                     }),
                 })
@@ -331,7 +399,7 @@ impl FileFacts {
                     ordinal: u32::try_from(ordinal).map_err(|_| {
                         StructuralFactsPersistenceError::invalid("structural role row exceeds u32")
                     })?,
-                    role: target.role.label().to_string(),
+                    role: target.role.code(),
                     spread: target.spread,
                     keyword: target.keyword.map(persist_span).transpose()?,
                     node: target.node,
@@ -340,7 +408,7 @@ impl FileFacts {
                 });
             }
         }
-        let mut occurrence_roles = Vec::with_capacity(self.occurrence_roles.len());
+        let mut occurrence_roles = Vec::with_capacity(self.occurrence_role_count());
         for node_id in 0..self.nodes.len() {
             let node_id = u32::try_from(node_id).map_err(|_| {
                 StructuralFactsPersistenceError::invalid("structural node count exceeds u32")
@@ -353,7 +421,7 @@ impl FileFacts {
                             "structural occurrence-role row exceeds u32",
                         )
                     })?,
-                    role: role.label().to_string(),
+                    role: role.code(),
                 });
             }
         }
@@ -382,7 +450,7 @@ impl FileFacts {
             StructuralFactsPersistenceError::invalid("structural facts node count exceeds u32")
         })?;
         let line_starts = compute_line_starts(&source);
-        let mut nodes = Vec::with_capacity(persisted.nodes.len());
+        let mut nodes: Vec<NormalizedNode> = Vec::with_capacity(persisted.nodes.len());
         for (id, node) in persisted.nodes.into_iter().enumerate() {
             let id = id as u32;
             if node.node_id != id {
@@ -408,6 +476,27 @@ impl FileFacts {
                 .name
                 .map(|name| hydrate_span(name, &source))
                 .transpose()?;
+            if let Some(name) = name
+                && (name.start_byte < span.start_byte || name.end_byte > span.end_byte)
+            {
+                // A constructor can use its enclosing class's written name.
+                // Follow the recorded ancestry; unrelated source text is not a name.
+                let mut ancestor = node.parent;
+                let mut inherited_name = false;
+                while let Some(parent) = ancestor {
+                    let parent = &nodes[parent as usize];
+                    if parent.name == Some(name) {
+                        inherited_name = true;
+                        break;
+                    }
+                    ancestor = parent.parent;
+                }
+                if !inherited_name {
+                    return Err(StructuralFactsPersistenceError::invalid(format!(
+                        "structural node {id} name is outside its node span and is not an ancestor name"
+                    )));
+                }
+            }
             let call_site = node
                 .call_site
                 .map(|facts| {
@@ -415,14 +504,14 @@ impl FileFacts {
                         call_kind: facts
                             .call_kind
                             .map(|kind| {
-                                CallKind::from_label(&kind).ok_or_else(|| {
+                                CallKind::from_code(kind).ok_or_else(|| {
                                     StructuralFactsPersistenceError::invalid(format!(
                                         "unknown structural call kind {kind}"
                                     ))
                                 })
                             })
                             .transpose()?,
-                        coverage: CallShapeCoverage::from_label(&facts.coverage).ok_or_else(
+                        coverage: CallShapeCoverage::from_code(facts.coverage).ok_or_else(
                             || {
                                 StructuralFactsPersistenceError::invalid(format!(
                                     "unknown structural call coverage {}",
@@ -434,9 +523,9 @@ impl FileFacts {
                     })
                 })
                 .transpose()?;
-            let kind = NormalizedKind::from_label(&node.kind).ok_or_else(|| {
+            let kind = NormalizedKind::from_code(node.kind).ok_or_else(|| {
                 StructuralFactsPersistenceError::invalid(format!(
-                    "unknown structural kind {}",
+                    "unknown structural kind code {}",
                     node.kind
                 ))
             })?;
@@ -497,9 +586,9 @@ impl FileFacts {
                     )));
                 }
                 roles.push(RoleTarget {
-                    role: Role::from_label(&target.role).ok_or_else(|| {
+                    role: Role::from_code(target.role).ok_or_else(|| {
                         StructuralFactsPersistenceError::invalid(format!(
-                            "unknown structural role {}",
+                            "unknown structural role code {}",
                             target.role
                         ))
                     })?,
@@ -549,9 +638,9 @@ impl FileFacts {
                     )));
                 }
                 ordinal += 1;
-                occurrence_roles.push(OccurrenceRole::from_label(&row.role).ok_or_else(|| {
+                occurrence_roles.push(OccurrenceRole::from_code(row.role).ok_or_else(|| {
                     StructuralFactsPersistenceError::invalid(format!(
-                        "unknown structural occurrence role {}",
+                        "unknown structural occurrence role code {}",
                         row.role
                     ))
                 })?);
@@ -654,14 +743,15 @@ impl FileFacts {
                 (self.nodes.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
             )
+            .saturating_add(self.roles.estimated_bytes())
+            .saturating_add(self.occurrence_roles.estimated_bytes())
             .saturating_add(
                 self.nodes
                     .iter()
-                    .map(|node| node.construct.as_ref().map_or(0, String::capacity) as u64)
+                    .filter_map(|node| node.construct.as_ref())
+                    .map(|construct| construct.capacity() as u64)
                     .sum::<u64>(),
             )
-            .saturating_add(self.roles.estimated_bytes())
-            .saturating_add(self.occurrence_roles.estimated_bytes())
     }
 
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
@@ -672,9 +762,7 @@ impl FileFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FileFacts, NormalizedNode, PersistedSpan, RoleTarget, STRUCTURAL_FACTS_VERSION, Span,
-    };
+    use super::{FileFacts, NormalizedNode, PersistedSpan, RoleTarget, Span};
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
@@ -682,6 +770,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::structural::callable::{
         CallKind, CallShapeCoverage, CallSiteFacts,
     };
+    use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
 
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
@@ -820,26 +909,34 @@ mod tests {
         nodes.push(node());
         let mut roles = CompactRowsBuilder::with_capacity(1, 1);
         roles.push_row([role_target(Role::Callee, 0)]);
-        let facts = FileFacts::new(
-            source,
-            line_starts,
-            nodes,
-            roles.finish(),
-            empty_occurrence_rows(1),
-        );
+        let roles = roles.finish();
+        let occurrence_roles = empty_occurrence_rows(1);
+        let facts = FileFacts::new(source, line_starts, nodes, roles, occurrence_roles);
 
-        let length_based = facts.source.len() as u64
+        let source_length_based = facts.source.len() as u64
             + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
             + facts.roles.estimated_bytes()
-            + facts.occurrence_roles.estimated_bytes();
+            + facts.occurrence_roles.estimated_bytes()
+            + facts
+                .nodes
+                .iter()
+                .filter_map(|node| node.construct.as_ref())
+                .map(|construct| construct.capacity() as u64)
+                .sum::<u64>();
         let capacity_based = facts.source.capacity() as u64
             + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
             + facts.roles.estimated_bytes()
-            + facts.occurrence_roles.estimated_bytes();
+            + facts.occurrence_roles.estimated_bytes()
+            + facts
+                .nodes
+                .iter()
+                .filter_map(|node| node.construct.as_ref())
+                .map(|construct| construct.capacity() as u64)
+                .sum::<u64>();
 
-        assert!(capacity_based > length_based);
+        assert!(capacity_based > source_length_based);
         assert_eq!(facts.estimated_bytes(), capacity_based);
         assert_eq!(facts.role_count(), 1);
         assert_eq!(facts.roles(0).len(), 1);
@@ -881,13 +978,15 @@ mod tests {
 
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
-        assert_eq!(STRUCTURAL_FACTS_VERSION, 21);
         let original = relational_fixture();
         let rows = original.persisted_rows().unwrap();
         assert_eq!(rows.source_bytes, original.source().len() as u32);
-        assert_eq!(rows.nodes[0].kind, "call");
-        assert_eq!(rows.roles[1].role, "kwargs");
-        assert_eq!(rows.occurrence_roles[0].role, "value_reference");
+        assert_eq!(rows.nodes[0].kind, NormalizedKind::Call.code());
+        assert_eq!(rows.roles[1].role, Role::Kwarg.code());
+        assert_eq!(
+            rows.occurrence_roles[0].role,
+            OccurrenceRole::ValueReference.code()
+        );
 
         let decoded = FileFacts::from_persisted_rows(original.source().to_owned(), rows).unwrap();
 
@@ -977,12 +1076,12 @@ mod tests {
         );
 
         let mut rows = fixture.persisted_rows().unwrap();
-        rows.nodes[0].kind = "not_a_kind".to_owned();
+        rows.nodes[0].kind = u8::MAX;
         assert!(
             FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
                 .unwrap_err()
                 .to_string()
-                .contains("unknown structural kind")
+                .contains("unknown structural kind code")
         );
 
         let mut rows = fixture.persisted_rows().unwrap();

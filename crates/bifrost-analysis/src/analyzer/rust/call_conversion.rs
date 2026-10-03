@@ -14,15 +14,12 @@ use crate::analyzer::usages::call_conversion::{
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::usages::get_definition::{
-    AnalyzerRustDefinitionProvider, rust_is_type_definition, rust_resolve_type_node_fqn,
+    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
-use crate::analyzer::usages::rust_graph::RustDefinitionProvider;
 use crate::analyzer::{
-    AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, QueryScope, RustAnalyzer,
-    resolve_analyzer,
+    AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer,
 };
 use brokk_bifrost_rust::declarations::rust_node_text;
-use brokk_bifrost_rust::graph::ast::type_parameter_trait_bounds;
 use brokk_bifrost_rust::lexical_scope::{rust_lexical_scope_index, visible_import_binder_in_tree};
 use brokk_bifrost_rust::ownership::{
     rust_dereference_operand, rust_node_is_in_unsafe_context, rust_reference_expression_value,
@@ -66,9 +63,7 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
         supported_type_context(formal)?;
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
             .ok_or(ConversionUnknown::UnsupportedLanguage)?;
-        let scope = AnalyzerQueryScope::new(rust);
-        let token = scope.token();
-        let support = AnalyzerRustDefinitionProvider::new(rust, true);
+        let _scope = AnalyzerQueryScope::new(rust);
 
         let actual_context = RustTypeContext {
             analyzer,
@@ -83,15 +78,16 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
             root: node_root(formal),
         };
 
-        let source_type = actual_context.expression_type(actual, &support, token, 0)?;
+        let source_type = actual_context.expression_type(actual, 0)?;
         let target_node = formal
             .child_by_field_name("type")
             .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-        let target_type = formal_context.type_from_node(target_node, &support, token, 0)?;
+        let target_type = formal_context.type_from_node(target_node, 0)?;
         let kind = conversion_kind(&source_type, &target_type)
             .ok_or(ConversionUnknown::UnsupportedConversion)?;
 
         Ok(ArgumentTypeConversion {
+            hierarchy: None,
             source: ResolvedConversionType::Rust(source_type),
             target: ResolvedConversionType::Rust(target_type),
             kind,
@@ -110,8 +106,6 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     fn type_from_node(
         &self,
         node: Node<'tree>,
-        support: &AnalyzerRustDefinitionProvider<'_>,
-        token: crate::analyzer::QueryToken<'_>,
         depth: usize,
     ) -> Result<RustConversionType, ConversionUnknown> {
         if depth >= MAX_TYPE_DEPTH || node.has_error() || node.is_missing() {
@@ -128,14 +122,14 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     .ok_or(ConversionUnknown::UnresolvedTargetType)?;
                 Ok(RustConversionType::Reference {
                     mutable: rust_reference_is_mutable(node),
-                    referent: Box::new(self.type_from_node(referent, support, token, depth + 1)?),
+                    referent: Box::new(self.type_from_node(referent, depth + 1)?),
                 })
             }
             "array_type" => {
                 let element = node
                     .child_by_field_name("element")
                     .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-                let element = self.type_from_node(element, support, token, depth + 1)?;
+                let element = self.type_from_node(element, depth + 1)?;
                 match node.child_by_field_name("length") {
                     Some(length_node) => {
                         let (length, suffix) =
@@ -163,7 +157,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     if child.is_extra() {
                         continue;
                     }
-                    elements.push(self.type_from_node(child, support, token, depth + 1)?);
+                    elements.push(self.type_from_node(child, depth + 1)?);
                 }
                 Ok(RustConversionType::Tuple(elements))
             }
@@ -177,7 +171,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             | "scoped_identifier"
             | "self"
             | "crate"
-            | "super" => self.nominal_type(node, support, token),
+            | "super" => self.nominal_type(node),
             _ => Err(ConversionUnknown::UnsupportedConversion),
         }
     }
@@ -194,42 +188,37 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 .bindings
                 .values()
                 .any(|binding| binding.kind == ImportKind::Glob)
-            || type_parameter_trait_bounds(node, spelling, self.source).is_some()
         {
             return Err(ConversionUnknown::UnsupportedConversion);
         }
         Ok(RustConversionType::Primitive(primitive))
     }
 
-    fn nominal_type(
-        &self,
-        node: Node<'tree>,
-        support: &AnalyzerRustDefinitionProvider<'_>,
-        token: crate::analyzer::QueryToken<'_>,
-    ) -> Result<RustConversionType, ConversionUnknown> {
+    fn nominal_type(&self, node: Node<'tree>) -> Result<RustConversionType, ConversionUnknown> {
         let name_node = node.child_by_field_name("name").unwrap_or(node);
         let name = rust_node_text(name_node, self.source).trim();
         if name.is_empty() {
             return Err(ConversionUnknown::UnresolvedTargetType);
         }
-        if type_parameter_trait_bounds(node, name, self.source).is_some() {
-            return Err(ConversionUnknown::GenericSubstitution);
-        }
-        let fqn = rust_resolve_type_node_fqn(
+        let mut outcomes = resolve_definition_batch_with_source(
             self.analyzer,
-            token,
-            support,
-            self.file,
-            self.source,
-            node,
-            Some(node.start_byte()),
-        )
-        .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-        let mut candidates = support
-            .fqn(&fqn)
-            .into_iter()
-            .filter(|unit| rust_is_type_definition(self.analyzer, unit))
-            .collect::<Vec<_>>();
+            vec![DefinitionLookupRequest {
+                file: self.file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(name_node.start_byte()),
+                end_byte: Some(name_node.end_byte()),
+            }],
+            self.file.clone(),
+            std::sync::Arc::from(self.source),
+        );
+        let outcome = outcomes
+            .pop()
+            .expect("one native type request has one outcome");
+        if outcome.status != DefinitionLookupStatus::Resolved || !outcome.diagnostics.is_empty() {
+            return Err(ConversionUnknown::UnresolvedTargetType);
+        }
+        let mut candidates = outcome.definitions;
         candidates.sort_by_key(|unit| unit.declaration_id());
         candidates.dedup_by(|left, right| left.declaration_id() == right.declaration_id());
         let [unit] = candidates.as_slice() else {
@@ -269,8 +258,6 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     fn expression_type(
         &self,
         mut node: Node<'tree>,
-        support: &AnalyzerRustDefinitionProvider<'_>,
-        token: crate::analyzer::QueryToken<'_>,
         depth: usize,
     ) -> Result<RustConversionType, ConversionUnknown> {
         if depth >= MAX_TYPE_DEPTH
@@ -321,13 +308,13 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 let type_node = declaration
                     .child_by_field_name("type")
                     .ok_or(ConversionUnknown::UnresolvedSourceType)?;
-                self.type_from_node(type_node, support, token, depth + 1)
+                self.type_from_node(type_node, depth + 1)
                     .map_err(source_type_error)
             }
             "reference_expression" => {
                 let value = rust_reference_expression_value(node)
                     .ok_or(ConversionUnknown::UnsupportedExpression)?;
-                let referent = self.expression_type(value, support, token, depth + 1)?;
+                let referent = self.expression_type(value, depth + 1)?;
                 Ok(RustConversionType::Reference {
                     mutable: rust_reference_is_mutable(node),
                     referent: Box::new(referent),
@@ -336,7 +323,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             "unary_expression" => {
                 let operand = rust_dereference_operand(node)
                     .ok_or(ConversionUnknown::UnsupportedExpression)?;
-                match self.expression_type(operand, support, token, depth + 1)? {
+                match self.expression_type(operand, depth + 1)? {
                     RustConversionType::Reference { referent, .. } => Ok(*referent),
                     _ => Err(ConversionUnknown::UnsupportedExpression),
                 }
@@ -480,6 +467,11 @@ fn has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
 fn supported_type_context(node: Node<'_>) -> Result<(), ConversionUnknown> {
     let mut current = Some(node);
     while let Some(scope) = current {
+        if scope.child_by_field_name("type_parameters").is_some()
+            || has_named_child_kind(scope, "where_clause")
+        {
+            return Err(ConversionUnknown::GenericSubstitution);
+        }
         if matches!(scope.kind(), "macro_invocation" | "macro_definition") {
             return Err(ConversionUnknown::UnsupportedExpression);
         }

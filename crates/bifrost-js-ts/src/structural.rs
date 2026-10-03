@@ -397,13 +397,16 @@ const JS_TS_DECLARATION_HEADS: &[&str] = &[
 /// `shorthand_property_identifier_pattern` inside `object_pattern` versus
 /// `shorthand_property_identifier` inside `object` — so this never has to guess
 /// from source text.
-fn js_ts_is_binding_pattern(node: Node<'_>) -> bool {
+fn js_ts_is_binding_pattern<'tree>(
+    node: Node<'tree>,
+    parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> bool {
     let mut current = node;
     // At least one destructuring node must sit between the token and the
     // binding form; otherwise `const x = source` would bind its right-hand
     // side as eagerly as its left.
     let mut through_pattern = false;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = parent_of(current) {
         match parent.kind() {
             "object_pattern"
             | "array_pattern"
@@ -433,7 +436,10 @@ fn js_ts_is_binding_pattern(node: Node<'_>) -> bool {
 }
 
 /// Classify one JavaScript/TypeScript identifier token by its AST position.
-fn js_ts_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+fn js_ts_occurrence_role<'tree>(
+    node: Node<'tree>,
+    parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<OccurrenceRole> {
     let node_kind = node.kind();
     if !matches!(
         node_kind,
@@ -454,13 +460,13 @@ fn js_ts_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     }
 
     let mut anchor = node;
-    let mut parent = anchor.parent()?;
+    let mut parent = parent_of(anchor)?;
     while parent.kind() == "nested_identifier" {
         if field_name_in_parent(parent, anchor) != Some("property") {
             return Some(OccurrenceRole::PathSegment);
         }
         anchor = parent;
-        parent = anchor.parent()?;
+        parent = parent_of(anchor)?;
     }
 
     let field = field_name_in_parent(parent, anchor);
@@ -492,7 +498,7 @@ fn js_ts_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             OccurrenceRole::MemberPosition
         }
         _ if node_kind == "type_identifier" => OccurrenceRole::TypeOperand,
-        _ if js_ts_is_binding_pattern(anchor) => OccurrenceRole::Binder,
+        _ if js_ts_is_binding_pattern(anchor, parent_of) => OccurrenceRole::Binder,
         _ => OccurrenceRole::ValueReference,
     };
     Some(role)
@@ -586,48 +592,16 @@ fn js_ts_var_scope_is_exact(declarator: Node<'_>) -> bool {
             .is_some_and(|owner| JS_TS_FUNCTION_KINDS.contains(&owner.kind()))
 }
 
-impl StructuralSpec for JsTsStructuralSpec {
-    fn language(&self) -> Language {
-        self.language
-    }
-
-    fn supports_boolean_literal_value(&self) -> bool {
-        true
-    }
-
-    fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
-        match self.language {
-            Language::JavaScript => JS_KIND_TABLE,
-            Language::TypeScript => TS_KIND_TABLE,
-            _ => unreachable!("JS/TS structural spec only supports JavaScript and TypeScript"),
-        }
-    }
-
-    fn refine_kind(
+impl JsTsStructuralSpec {
+    pub(crate) fn should_extract_with_parent<'tree>(
         &self,
-        node: Node<'_>,
+        node: Node<'tree>,
         kind: NormalizedKind,
-        _enclosing: Option<NormalizedKind>,
-        source: &str,
-        _context: &CallSiteContext,
-    ) -> NormalizedKind {
-        if kind == NormalizedKind::Method
-            && node.kind() == "method_definition"
-            && node
-                .child_by_field_name("name")
-                .and_then(|name| node_text(name, source))
-                == Some("constructor")
-        {
-            NormalizedKind::Constructor
-        } else {
-            kind
-        }
-    }
-
-    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+    ) -> bool {
         if kind == NormalizedKind::JsxSpreadAttribute
             && !(node.kind() == "jsx_expression"
-                && node.parent().is_some_and(|parent| {
+                && parent_of(node).is_some_and(|parent| {
                     matches!(
                         parent.kind(),
                         "jsx_opening_element" | "jsx_self_closing_element"
@@ -642,104 +616,14 @@ impl StructuralSpec for JsTsStructuralSpec {
             || node.child_by_field_name("value").is_some()
     }
 
-    fn supports_role(&self, role: Role) -> bool {
-        role != Role::Kwarg
-    }
-
-    fn supports_kind(&self, kind: NormalizedKind) -> bool {
-        kind == NormalizedKind::Constructor
-            || self
-                .kind_table()
-                .iter()
-                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
-    }
-
-    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &JS_TS_OCCURRENCE_ROLE_SUPPORT
-    }
-
-    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
-    }
-
-    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
-        &JS_TS_MATERIALIZATION_SUPPORT
-    }
-
-    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
-        &DEEP_REFERENCE_EDGE_SUPPORT
-    }
-
-    fn identity_route_support(&self) -> &IdentityRouteSupport {
-        // `export { x }` resolves through the local binding (including an
-        // imported one) to the origin declaration, and since #1648 an import
-        // specifier and an `export ... from` specifier resolve to the target
-        // module's declaration as well, so the import, alias and re-export
-        // relations all have a producer (the gap the #1475 ExecPlan Decision
-        // Log, M3, recorded is closed). `export * from` still names no token,
-        // and so contributes no row rather than an unclaimed relation.
-        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
-            .supported_relation(RouteHopKind::Export)
-            .supported_relation(RouteHopKind::Import)
-            .supported_relation(RouteHopKind::Alias)
-            .supported_relation(RouteHopKind::ReExport)
-            .supported_relation(RouteHopKind::NestedOwner);
-        &SUPPORT
-    }
-
-    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
-        js_ts_binding_activation(binder, scope)
-    }
-
-    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
-        if !matches!(
-            token.kind(),
-            "identifier" | "property_identifier" | "type_identifier"
-        ) {
-            return None;
-        }
-        qualified_chain_root(token, JS_TS_PATH_CHAIN)
-    }
-
-    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
-        linear_chain_tokens(root, JS_TS_PATH_CHAIN, &[])
-    }
-
-    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
-        spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
-    }
-
-    fn indirection_relation(
+    pub(crate) fn extract_with_parent<'tree>(
         &self,
-        token: Node<'_>,
-        _source: &str,
-        _surface: &CuratedExportSurface,
-    ) -> Option<RouteHopKind> {
-        if let Some(export) = nearest_ancestor(token, |kind| kind == "export_statement") {
-            return Some(if export.child_by_field_name("source").is_some() {
-                RouteHopKind::ReExport
-            } else {
-                RouteHopKind::Export
-            });
-        }
-        nearest_ancestor(token, |kind| kind == "import_statement").map(|_| RouteHopKind::Import)
-    }
-
-    /// The only scope segments this adapter classifies come from
-    /// `nested_identifier`, which is a namespace qualifier in both grammars.
-    fn occurrence_namespace(
-        &self,
-        role: OccurrenceRole,
-        declares: Option<NormalizedKind>,
-    ) -> Option<Namespace> {
-        match role {
-            OccurrenceRole::PathSegment => Some(Namespace::Module),
-            _ => default_occurrence_namespace(role, declares),
-        }
-    }
-
-    fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
-        if let Some(role) = js_ts_occurrence_role(node) {
+        node: Node<'tree>,
+        kind: NormalizedKind,
+        sink: &mut RoleSink<'_>,
+        parent_of: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+    ) {
+        if let Some(role) = js_ts_occurrence_role(node, parent_of) {
             sink.occurrence_role(node, role);
         }
         match kind {
@@ -899,6 +783,145 @@ impl StructuralSpec for JsTsStructuralSpec {
     }
 }
 
+impl StructuralSpec for JsTsStructuralSpec {
+    fn language(&self) -> Language {
+        self.language
+    }
+
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
+    fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
+        match self.language {
+            Language::JavaScript => JS_KIND_TABLE,
+            Language::TypeScript => TS_KIND_TABLE,
+            _ => unreachable!("JS/TS structural spec only supports JavaScript and TypeScript"),
+        }
+    }
+
+    fn refine_kind(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _enclosing: Option<NormalizedKind>,
+        source: &str,
+        _context: &CallSiteContext,
+    ) -> NormalizedKind {
+        if kind == NormalizedKind::Method
+            && node.kind() == "method_definition"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(name, source))
+                == Some("constructor")
+        {
+            NormalizedKind::Constructor
+        } else {
+            kind
+        }
+    }
+
+    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        self.should_extract_with_parent(node, kind, |node| node.parent())
+    }
+
+    fn supports_role(&self, role: Role) -> bool {
+        role != Role::Kwarg
+    }
+
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        kind == NormalizedKind::Constructor
+            || self
+                .kind_table()
+                .iter()
+                .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &JS_TS_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &JS_TS_MATERIALIZATION_SUPPORT
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // `export { x }` resolves through the local binding (including an
+        // imported one) to the origin declaration, so the export relation has
+        // a producer. `export * from` names no token and contributes no row.
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Export)
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::Alias)
+            .supported_relation(RouteHopKind::ReExport)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        js_ts_binding_activation(binder, scope)
+    }
+
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if !matches!(
+            token.kind(),
+            "identifier" | "property_identifier" | "type_identifier"
+        ) {
+            return None;
+        }
+        qualified_chain_root(token, JS_TS_PATH_CHAIN)
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        linear_chain_tokens(root, JS_TS_PATH_CHAIN, &[])
+    }
+
+    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
+        spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
+    }
+
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
+        if let Some(export) = nearest_ancestor(token, |kind| kind == "export_statement") {
+            return Some(if export.child_by_field_name("source").is_some() {
+                RouteHopKind::ReExport
+            } else {
+                RouteHopKind::Export
+            });
+        }
+        nearest_ancestor(token, |kind| kind == "import_statement").map(|_| RouteHopKind::Import)
+    }
+
+    /// The only scope segments this adapter classifies come from
+    /// `nested_identifier`, which is a namespace qualifier in both grammars.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        declares: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        match role {
+            OccurrenceRole::PathSegment => Some(Namespace::Module),
+            _ => default_occurrence_namespace(role, declares),
+        }
+    }
+
+    fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        self.extract_with_parent(node, kind, sink, |node| node.parent());
+    }
+}
+
 fn js_ts_assignment_operator(assignment: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = assignment.walk();
     assignment.children(&mut cursor).find(|child| {
@@ -942,8 +965,8 @@ fn attach_collection_elements(sink: &mut RoleSink<'_>, literal: Node<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
     use brokk_bifrost_core::analyzer::structural::spec::RoleSink;
-    use brokk_bifrost_core::hash::HashMap;
 
     #[test]
     fn typescript_parameter_extracts_name_and_decorator_role() {
@@ -954,12 +977,9 @@ mod tests {
             .expect("TypeScript grammar");
         let tree = parser.parse(source, None).expect("TypeScript tree");
 
-        let mut fact_by_ts_node = HashMap::default();
         let mut parameter = None;
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            let fact_id = fact_by_ts_node.len() as u32;
-            fact_by_ts_node.insert(node.id(), fact_id);
             if node.kind() == "required_parameter" {
                 parameter = Some(node);
             }
@@ -968,34 +988,28 @@ mod tests {
         }
         let parameter = parameter.expect("decorated required parameter");
 
-        let mut roles = Vec::new();
-        let mut occurrence_roles = Vec::new();
+        let mut source_facts = PrimarySourceFactCollector::new(source);
         let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
-        let mut sink = RoleSink::new(
-            &fact_by_ts_node,
-            &mut roles,
-            &mut occurrence_roles,
-            32,
-            None,
-            &parents,
-        );
+        let mut sink = RoleSink::new(&mut source_facts, 32, None, &parents);
         TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
-        let (name, stop) = sink.into_parts();
+        let (name, roles, _occurrence_roles, stop) = sink.into_parts();
 
         assert_eq!(stop, None);
-        assert_eq!(
-            name,
-            Some(Span {
-                start_byte: 33,
-                end_byte: 38
-            })
-        );
+        let name_range = source_facts.occurrence(name.expect("parameter name")).range;
+        assert_eq!((name_range.start_byte, name_range.end_byte), (33, 38));
         let decorator = roles
             .iter()
             .find(|target| target.role == Role::Decorator)
             .expect("parameter decorator role");
-        assert_eq!(decorator.span.text(source), "@Query");
-        assert_eq!(decorator.name.map(|span| span.text(source)), Some("Query"));
+        let decorator_range = source_facts.occurrence(decorator.occurrence).range;
+        assert_eq!(
+            &source[decorator_range.start_byte..decorator_range.end_byte],
+            "@Query"
+        );
+        let name_range = source_facts
+            .occurrence(decorator.name.expect("decorator name"))
+            .range;
+        assert_eq!(&source[name_range.start_byte..name_range.end_byte], "Query");
     }
 
     #[test]
@@ -1007,12 +1021,9 @@ mod tests {
             .expect("TSX grammar");
         let tree = parser.parse(source, None).expect("TSX tree");
 
-        let mut fact_by_ts_node = HashMap::default();
         let mut parameter = None;
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            let fact_id = fact_by_ts_node.len() as u32;
-            fact_by_ts_node.insert(node.id(), fact_id);
             if node.kind() == "required_parameter" {
                 parameter = Some(node);
             }
@@ -1021,33 +1032,27 @@ mod tests {
         }
         let parameter = parameter.expect("decorated required parameter");
 
-        let mut roles = Vec::new();
-        let mut occurrence_roles = Vec::new();
+        let mut source_facts = PrimarySourceFactCollector::new(source);
         let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
-        let mut sink = RoleSink::new(
-            &fact_by_ts_node,
-            &mut roles,
-            &mut occurrence_roles,
-            32,
-            None,
-            &parents,
-        );
+        let mut sink = RoleSink::new(&mut source_facts, 32, None, &parents);
         TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
-        let (name, stop) = sink.into_parts();
+        let (name, roles, _occurrence_roles, stop) = sink.into_parts();
 
         assert_eq!(stop, None);
-        assert_eq!(
-            name,
-            Some(Span {
-                start_byte: 33,
-                end_byte: 38
-            })
-        );
+        let name_range = source_facts.occurrence(name.expect("parameter name")).range;
+        assert_eq!((name_range.start_byte, name_range.end_byte), (33, 38));
         let decorator = roles
             .iter()
             .find(|target| target.role == Role::Decorator)
             .expect("parameter decorator role");
-        assert_eq!(decorator.span.text(source), "@Query");
-        assert_eq!(decorator.name.map(|span| span.text(source)), Some("Query"));
+        let decorator_range = source_facts.occurrence(decorator.occurrence).range;
+        assert_eq!(
+            &source[decorator_range.start_byte..decorator_range.end_byte],
+            "@Query"
+        );
+        let name_range = source_facts
+            .occurrence(decorator.name.expect("decorator name"))
+            .range;
+        assert_eq!(&source[name_range.start_byte..name_range.end_byte], "Query");
     }
 }

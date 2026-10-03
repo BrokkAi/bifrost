@@ -9,11 +9,13 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, Language};
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::path_utils::path_suffix_key;
-use regex::Regex;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use tree_sitter::Node;
+
+use crate::source_facts::CppFileSourceFacts;
 
 /// Workspace-wide resolution table for `#include` targets: every analyzable file
 /// keyed both by its full workspace-relative path and by its bare file name.
@@ -24,6 +26,41 @@ use std::sync::OnceLock;
 pub struct IncludeTargetIndex {
     by_rel_path: HashMap<PathBuf, Vec<ProjectFile>>,
     by_file_name: HashMap<String, Vec<ProjectFile>>,
+}
+
+/// The include paths published by the primary C++ source collector.
+///
+/// A missing source-facts mount is deliberately different from an empty
+/// include list. Consumers use `None` to preserve the unavailable-facts
+/// boundary rather than reparsing the source text at query time.
+pub fn canonical_include_paths(facts: &CppFileSourceFacts) -> Vec<String> {
+    facts
+        .facts
+        .includes
+        .iter()
+        .map(|include| include.path.clone())
+        .collect()
+}
+
+/// Render canonical include facts for legacy APIs that still expose complete
+/// directive spellings. The path itself comes from the AST-owned fact; this
+/// function does not parse source text.
+pub fn canonical_include_statements(facts: &CppFileSourceFacts) -> Vec<String> {
+    facts
+        .facts
+        .includes
+        .iter()
+        .map(|include| canonical_include_statement(&include.path, include.quoted))
+        .collect()
+}
+
+/// Render one canonical include fact as a directive spelling.
+pub fn canonical_include_statement(path: &str, quoted: bool) -> String {
+    if quoted {
+        format!("#include \"{path}\"")
+    } else {
+        format!("#include <{path}>")
+    }
 }
 
 impl IncludeTargetIndex {
@@ -291,21 +328,18 @@ pub fn resolve_direct_include_targets_with_index(
 fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Option<PathBuf> {
     let canonical_root = project_root
         .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .normalize();
     let canonical_include = include_path
         .canonicalize()
-        .unwrap_or_else(|_| include_path.to_path_buf());
-    canonical_include
-        .strip_prefix(&canonical_root)
-        .map(Path::to_path_buf)
-        .or_else(|_| {
-            include_path
-                .strip_prefix(project_root)
-                .map(Path::to_path_buf)
-        })
-        .ok()
-        .or_else(|| lexical_project_relative_include_path(&canonical_root, &canonical_include))
-        .or_else(|| lexical_project_relative_include_path(project_root, include_path))
+        .unwrap_or_else(|_| include_path.to_path_buf())
+        .normalize();
+    strip_path_prefix(&canonical_include, &canonical_root).or_else(|| {
+        strip_path_prefix(
+            &include_path.to_path_buf().normalize(),
+            &project_root.to_path_buf().normalize(),
+        )
+    })
 }
 
 /// The claim edges `sources` contribute: for each source file, the workspace
@@ -454,31 +488,60 @@ pub fn include_paths(parsed: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The capitalized identifiers a C++ source mentions, used to decide which of a
-/// declaration's `#include` lines are relevant to it.
+/// Return the literal path and delimiter kind from one parsed `#include`.
 ///
-/// Deliberately lexical, and the only place in this crate that is: the input is
-/// a rendered source excerpt whose enclosing translation unit is not available
-/// to parse, and the output feeds a *filter* over already-resolved includes, so
-/// an over-broad token set costs recall on the filter rather than inventing a
-/// declaration. Every fleet language has this same shape
-/// (`brokk_bifrost_python::graph_support::extract_type_identifiers` is the
-/// closest sibling).
-pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
-    static IDENT_RE: OnceLock<Regex> = OnceLock::new();
-    let regex =
-        IDENT_RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_:<>]*").expect("valid regex"));
-    regex
-        .find_iter(source)
-        .map(|m| m.as_str())
-        .filter(|token| {
-            token
+/// The path is read from the grammar's `path` child, so malformed directives
+/// and arbitrary source text never become include facts. Only the fixed
+/// delimiters represented by tree-sitter's literal node kinds are removed.
+pub fn include_path_from_node<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, bool)> {
+    if node.kind() != "preproc_include" {
+        return None;
+    }
+    let path = node.child_by_field_name("path")?;
+    let text = source.get(path.byte_range())?;
+    match path.kind() {
+        "string_literal" => Some((
+            text.strip_prefix('"')?
+                .strip_suffix('"')
+                .filter(|path| !path.is_empty())?,
+            true,
+        )),
+        "system_lib_string" => Some((
+            text.strip_prefix('<')?
+                .strip_suffix('>')
+                .filter(|path| !path.is_empty())?,
+            false,
+        )),
+        _ => None,
+    }
+}
+
+/// Collect capitalized identifier nodes from one live C++ syntax subtree.
+///
+/// This is intentionally an AST operation: the caller supplies the exact
+/// prepared declaration node and its matching source snapshot. The uppercase
+/// filter preserves the existing relevance policy while avoiding lexical
+/// reinterpretation of comments, literals, operators, and malformed text.
+pub fn extract_type_identifiers(node: Node<'_>, source: &str) -> BTreeSet<String> {
+    let mut identifiers = BTreeSet::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "identifier" | "type_identifier" | "namespace_identifier"
+        ) && let Some(text) = source.get(current.byte_range())
+            && text
                 .chars()
                 .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-        })
-        .map(|token| token.trim_matches(':').to_string())
-        .collect()
+                .is_some_and(|character| character.is_ascii_uppercase())
+        {
+            identifiers.insert(text.to_owned());
+        }
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    identifiers
 }
 
 /// Whether the structural receiver queries apply to `file`.
@@ -492,42 +555,24 @@ pub fn receiver_query_supported(file: &ProjectFile) -> bool {
         != Some("c")
 }
 
-fn lexical_project_relative_include_path(
-    project_root: &Path,
-    include_path: &Path,
-) -> Option<PathBuf> {
-    let root = slash_path(project_root);
-    let include = slash_path(include_path);
-    strip_slash_prefix(&include, &root).map(PathBuf::from)
-}
-
-fn slash_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    raw.replace('\\', "/").trim_end_matches('/').to_string()
-}
-
 #[cfg(windows)]
-fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
-    if path.eq_ignore_ascii_case(root) {
-        return Some("");
+fn strip_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let path_component = path_components.next()?;
+        if !path_component
+            .as_os_str()
+            .eq_ignore_ascii_case(root_component.as_os_str())
+        {
+            return None;
+        }
     }
-    if path.len() > root.len()
-        && path.as_bytes().get(root.len()) == Some(&b'/')
-        && path[..root.len()].eq_ignore_ascii_case(root)
-    {
-        return Some(&path[root.len() + 1..]);
-    }
-    None
+    Some(path_components.as_path().to_path_buf())
 }
 
 #[cfg(not(windows))]
-fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
-    if path == root {
-        return Some("");
-    }
-    path.strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix('/'))
+fn strip_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
 #[cfg(test)]

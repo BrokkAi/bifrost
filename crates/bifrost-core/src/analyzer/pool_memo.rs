@@ -255,20 +255,40 @@ impl<T> PoolSafeMemo<T> {
 
     /// Build the value on [`dedicated_build_pool`], off the global rayon pool.
     ///
-    /// Use for a whole-workspace index whose build is long enough that a
-    /// request must not be billed for it: the C# compilation and
+    /// Use from a background warm. While this build runs, a global-pool worker
+    /// that reaches the same memo waits for it instead of duplicating it
+    /// serially: the duplicate is a second whole-workspace build, billed to
+    /// whichever request's parallel fan-out touched the index first (#1757).
+    /// It is also the path for whole-workspace indexes whose build is long
+    /// enough that a request must not be billed for it: the C# compilation and
     /// test-classification indexes, and the Rust and Go type hierarchies
-    /// (#1772). While this build runs, a global-pool worker that reaches the
-    /// same memo waits for it instead of duplicating it serially: the
-    /// duplicate is a second whole-workspace build, billed to whichever
-    /// request's parallel fan-out touched the index first (#1757).
+    /// (#1772).
     /// Returns an already-built or concurrently built value unchanged.
     pub fn get_or_build_on_dedicated_pool(&self, build: impl FnOnce() -> T + Send) -> Arc<T>
     where
         T: Send,
     {
+        match self.get_or_try_build_on_dedicated_pool(|| Ok::<T, std::convert::Infallible>(build()))
+        {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Fallible dedicated-pool construction. Failed builds publish no value;
+    /// dropping the builder claim wakes followers so they can retry. The
+    /// dedicated-pool parking and re-entrant escape rules remain identical to
+    /// the infallible entry point.
+    pub fn get_or_try_build_on_dedicated_pool<E>(
+        &self,
+        build: impl FnOnce() -> Result<T, E> + Send,
+    ) -> Result<Arc<T>, E>
+    where
+        T: Send,
+        E: Send,
+    {
         if let Some(value) = self.wait_or_claim_build(BuildClaim::PoolIndependent) {
-            return value;
+            return Ok(value);
         }
         let _guard = BuildingGuard {
             memo: self,
@@ -289,21 +309,25 @@ impl<T> PoolSafeMemo<T> {
             // OS thread so the global worker truly parks instead of stealing
             // another request that can wait on itself.
             std::thread::scope(|scope| {
+                // Re-raise the builder's own payload. `expect` here would
+                // replace the build's message and location with this line's,
+                // which is the same loss of the real failure that #2359 fixed
+                // in the language build fan-out (issue #2771).
                 scope
                     .spawn(|| dedicated_build_pool().install(build))
                     .join()
-                    .expect("dedicated index build thread panicked")
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             })
         } else {
             dedicated_build_pool().install(build)
-        });
+        }?);
 
         let mut state = self.state.lock().expect("pool memo poisoned");
         if let Some(existing) = state.value.as_ref() {
-            return Arc::clone(existing);
+            return Ok(Arc::clone(existing));
         }
         state.value = Some(Arc::clone(&built));
-        built
+        Ok(built)
     }
 
     /// Build the value once on [`dedicated_build_pool`] while work remains permitted.
@@ -763,6 +787,59 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "cancelled");
         assert!(memo.get().is_none());
+    }
+
+    #[test]
+    fn failed_dedicated_build_wakes_follower_for_retry() {
+        let memo = Arc::new(PoolSafeMemo::<usize>::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let leader_memo = Arc::clone(&memo);
+        let leader = thread::spawn(move || {
+            leader_memo.get_or_try_build_on_dedicated_pool(move || {
+                started_tx.send(()).expect("announce dedicated build");
+                resume_rx.recv().expect("release failed build");
+                Err("unavailable")
+            })
+        });
+        started_rx.recv().expect("dedicated build starts");
+        assert!(!memo.is_ready());
+
+        let follower_memo = Arc::clone(&memo);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let follower = thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("caller pool");
+            let value = pool
+                .install(|| follower_memo.get_or_try_build_on_dedicated_pool(|| Ok::<_, &str>(7)));
+            finished_tx.send(()).expect("announce follower completion");
+            value
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "follower must wait for the in-flight dedicated build"
+        );
+        resume_tx.send(()).expect("release failed leader");
+        assert_eq!(
+            leader.join().expect("leader joined").unwrap_err(),
+            "unavailable"
+        );
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("failed leader must wake its follower");
+        let value = follower
+            .join()
+            .expect("follower joined")
+            .expect("retry succeeds");
+        assert_eq!(*value, 7);
+        assert!(Arc::ptr_eq(
+            &value,
+            &memo.get().expect("only success is cached")
+        ));
     }
 
     #[test]

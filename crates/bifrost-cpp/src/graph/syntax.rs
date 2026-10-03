@@ -3,6 +3,7 @@ use crate::graph::resolver::{
     cpp_name_component_nodes, cpp_type_name_components, is_globally_qualified_cpp_name,
     is_nested_type_node, qualified_owner_components,
 };
+use brokk_bifrost_core::analyzer::cpp_facts::CppDeclaredFieldTypeFact;
 use brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed;
 use std::ops::{ControlFlow, Range};
 use tree_sitter::{Node, Parser};
@@ -54,6 +55,8 @@ pub fn is_cpp_recovered_callable_declaration_reference(node: Node<'_>) -> bool {
 pub struct MacroReplacementField {
     pub name: String,
     pub declaration: String,
+    pub field_type: Option<CppDeclaredFieldTypeFact>,
+    pub names_function_type: bool,
 }
 
 /// The structured content of one object-like field-list macro replacement:
@@ -167,9 +170,13 @@ pub fn object_macro_replacement(replacement: &str) -> ObjectMacroReplacement {
         else {
             continue;
         };
+        let (field_type, names_function_type) =
+            crate::source_facts::capture_field_type(declaration, &name, &synthetic);
         recovered.fields.push(MacroReplacementField {
             name,
             declaration: declaration_text,
+            field_type,
+            names_function_type,
         });
     }
     if !malformed_regions_are_composition(tree.root_node(), &composed_terminators) {
@@ -228,6 +235,8 @@ pub struct RecoveredAggregateField {
     pub name: String,
     pub declaration: String,
     pub range: Range<usize>,
+    pub field_type: Option<CppDeclaredFieldTypeFact>,
+    pub names_function_type: bool,
 }
 
 /// Recover the direct members of an aggregate body region the ordinary parse
@@ -299,12 +308,16 @@ pub fn recovered_aggregate_fields(
         else {
             continue;
         };
+        let (field_type, names_function_type) =
+            crate::source_facts::capture_field_type(declaration, &name, &synthetic);
         let start = span.start + declaration.start_byte() - PREFIX.len();
         let end = span.start + declaration.end_byte() - PREFIX.len();
         fields.push(RecoveredAggregateField {
             name,
             declaration: declaration_text,
             range: start..end,
+            field_type,
+            names_function_type,
         });
     }
     fields
@@ -890,10 +903,24 @@ mod tests {
                 MacroReplacementField {
                     name: "public_value".to_string(),
                     declaration: "int public_value;".to_string(),
+                    field_type: Some(CppDeclaredFieldTypeFact {
+                        type_text: "int".to_string(),
+                        indirection: 0,
+                        binds_indirectly: false,
+                        template_arguments: None,
+                    }),
+                    names_function_type: false,
                 },
                 MacroReplacementField {
                     name: "private_value".to_string(),
                     declaration: "unsigned private_value;".to_string(),
+                    field_type: Some(CppDeclaredFieldTypeFact {
+                        type_text: "unsigned".to_string(),
+                        indirection: 0,
+                        binds_indirectly: false,
+                        template_arguments: None,
+                    }),
+                    names_function_type: false,
                 },
             ]
         );
@@ -968,6 +995,13 @@ mod tests {
             vec![MacroReplacementField {
                 name: "flags".to_string(),
                 declaration: "unsigned int flags;".to_string(),
+                field_type: Some(CppDeclaredFieldTypeFact {
+                    type_text: "unsigned int".to_string(),
+                    indirection: 0,
+                    binds_indirectly: false,
+                    template_arguments: None,
+                }),
+                names_function_type: false,
             }]
         );
     }

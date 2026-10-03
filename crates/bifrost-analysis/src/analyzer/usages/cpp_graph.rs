@@ -61,7 +61,6 @@ pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
     is_declarator_node as cpp_is_declarator_node, is_globally_qualified_cpp_name,
     normalize_type_text as normalize_cpp_type_text,
     recovered_c_new_expression_argument_at as cpp_recovered_c_new_expression_argument_at,
-    signature_arity as cpp_signature_arity,
 };
 pub use shared::CppAuthoritativeUsageBatch;
 

@@ -7,11 +7,12 @@ use crate::analyzer::common::{
     is_valid_rename_identifier, language_for_file, source_identifier_for_target,
 };
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, byte_offset_for_character_column,
-    resolve_definition_batch_with_source,
+    DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus,
+    byte_offset_for_character_column, resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
-    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHitSurface,
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, QueryResult, UsageFinder, UsageHit,
+    UsageProof, UsageQueryCompletion,
 };
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
@@ -60,6 +61,105 @@ pub struct RenameResult {
     pub target: CodeUnit,
     pub old_name: String,
     pub files: Vec<RenameFileEdits>,
+}
+
+/// One language-owned authority for edit discovery and capture validation.
+/// Target selection and identifier validation happen before this boundary.
+pub(crate) trait RenameProvider: Send + Sync {
+    fn rename(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        project: &dyn Project,
+        target: &CodeUnit,
+        new_name: &str,
+    ) -> Result<RenameResult, RenameFailure>;
+}
+
+fn rename_usage_hits(query: QueryResult) -> Result<Vec<UsageHit>, RenameFailure> {
+    if query.completion != UsageQueryCompletion::Complete
+        || query.candidate_files_truncated
+        || query.source_bytes_truncated
+    {
+        return Err(RenameFailure {
+            kind: if query.completion == UsageQueryCompletion::Cancelled {
+                "cancelled"
+            } else if query.candidate_files_truncated
+                || query.completion == UsageQueryCompletion::CandidateFilesBudgetExhausted
+            {
+                "too_many_files"
+            } else {
+                "incomplete_analysis"
+            },
+            message: format!(
+                "rename requires complete usage execution: completion={:?}, candidate_files_truncated={}, source_bytes_truncated={}, result={:?}",
+                query.completion,
+                query.candidate_files_truncated,
+                query.source_bytes_truncated,
+                query.result,
+            ),
+        });
+    }
+    let hits = match query.result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            if unproven_by_overload.values().any(|hits| !hits.is_empty())
+                || unproven_total_by_overload.values().any(|total| *total != 0)
+            {
+                return Err(RenameFailure {
+                    kind: "ambiguous",
+                    message: format!(
+                        "rename cannot omit uncertain references: hits_by_overload={hits_by_overload:?}, unproven_by_overload={unproven_by_overload:?}, unproven_total_by_overload={unproven_total_by_overload:?}",
+                    ),
+                });
+            }
+            hits_by_overload
+                .into_values()
+                .flatten()
+                .filter(UsageHit::is_lsp_reference_site)
+                .collect::<Vec<_>>()
+        }
+        result @ FuzzyResult::Ambiguous { .. } => {
+            return Err(RenameFailure {
+                kind: "ambiguous",
+                message: format!(
+                    "rename target resolved to ambiguous usage candidates: {result:?}"
+                ),
+            });
+        }
+        result @ FuzzyResult::Incomplete { .. } => {
+            return Err(RenameFailure {
+                kind: "incomplete_analysis",
+                message: format!("rename requires complete reference enumeration: {result:?}"),
+            });
+        }
+        result @ FuzzyResult::Failure { .. } => {
+            return Err(RenameFailure {
+                kind: "not_found",
+                message: format!("rename usages could not be resolved: {result:?}"),
+            });
+        }
+        result @ FuzzyResult::TooManyCallsites { .. } => {
+            return Err(RenameFailure {
+                kind: "too_many_callsites",
+                message: format!(
+                    "rename target has too many call sites to edit safely: {result:?}"
+                ),
+            });
+        }
+    };
+    if hits
+        .iter()
+        .any(|hit| hit.proof != UsageProof::Proven || hit.confidence < RENAME_CONFIDENCE_THRESHOLD)
+    {
+        return Err(RenameFailure {
+            kind: "low_confidence",
+            message: format!("rename requires proven high-confidence references: {hits:?}"),
+        });
+    }
+    Ok(hits)
 }
 
 pub fn prepare_rename(
@@ -122,54 +222,20 @@ pub fn rename_symbol(
         });
     }
 
+    if let Some(provider) =
+        crate::analyzer::languages::language_support(language_for_file(target.source()))
+            .and_then(|support| support.rename_provider())
+    {
+        return provider.rename(analyzer, project, &target, new_name);
+    }
+
     let query = UsageFinder::new().query(
         analyzer,
         std::slice::from_ref(&target),
         DEFAULT_MAX_FILES,
         DEFAULT_MAX_USAGES,
     );
-    if query.candidate_files_truncated {
-        return Err(RenameFailure {
-            kind: "too_many_files",
-            message: "rename candidate files exceeded the enumeration limit".to_string(),
-        });
-    }
-    let hits = match query.result {
-        FuzzyResult::Success {
-            hits_by_overload, ..
-        } => hits_by_overload
-            .into_values()
-            .flat_map(|hits| hits.into_iter())
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::LspReferences))
-            .collect::<Vec<_>>(),
-        FuzzyResult::Ambiguous { .. } => {
-            return Err(RenameFailure {
-                kind: "ambiguous",
-                message: "rename target resolved to ambiguous usage candidates".to_string(),
-            });
-        }
-        FuzzyResult::Failure { .. } => {
-            return Err(RenameFailure {
-                kind: "not_found",
-                message: "rename usages could not be resolved".to_string(),
-            });
-        }
-        FuzzyResult::TooManyCallsites { .. } => {
-            return Err(RenameFailure {
-                kind: "too_many_callsites",
-                message: "rename target has too many call sites to edit safely".to_string(),
-            });
-        }
-    };
-    if hits
-        .iter()
-        .any(|hit| hit.confidence < RENAME_CONFIDENCE_THRESHOLD)
-    {
-        return Err(RenameFailure {
-            kind: "low_confidence",
-            message: "rename would include at least one low-confidence usage".to_string(),
-        });
-    }
+    let hits = rename_usage_hits(query)?;
 
     let mut cache = FileContentCache::default();
     let mut edits_by_file: HashMap<ProjectFile, Vec<EditCandidate>> = HashMap::new();
@@ -226,11 +292,12 @@ pub fn rename_symbol(
     }
     files.sort_by(|left, right| left.file.rel_path().cmp(right.file.rel_path()));
 
-    Ok(RenameResult {
+    let result = RenameResult {
         target,
         old_name,
         files,
-    })
+    };
+    Ok(result)
 }
 
 pub(crate) fn line_column_for_byte_offset(
@@ -350,17 +417,18 @@ fn resolve_rename_target(
         cursor.file.clone(),
         Arc::from(cursor.content),
     );
-    let Some(outcome) = outcomes.pop() else {
-        return Err(RenameFailure {
-            kind: "not_found",
-            message: "no definition resolved at rename location".to_string(),
-        });
-    };
+    let outcome = outcomes
+        .pop()
+        .expect("a one-request definition batch answers with one outcome");
     if outcome.status != DefinitionLookupStatus::Resolved {
-        return Err(RenameFailure {
-            kind: "not_found",
-            message: "no definition resolved at rename location".to_string(),
-        });
+        return Err(unresolved_definition_failure(&outcome));
+    }
+    // A local, parameter or other lexical binding resolves to exactly one
+    // lexical definition and no workspace `CodeUnit`. Rename edits only
+    // workspace declarations, so this is an unsupported target, not an
+    // ambiguity: the definition answer at the same location is one binding.
+    if let Some(lexical) = &outcome.lexical_definition {
+        return Err(lexical_binding_failure(lexical));
     }
     if outcome.definitions.len() != 1 {
         return Err(RenameFailure {
@@ -380,6 +448,54 @@ fn resolve_rename_target(
         });
     }
     Ok(target)
+}
+
+/// The rename failure for a location that resolves to one lexical binding.
+fn lexical_binding_failure(
+    lexical: &crate::analyzer::lexical_definitions::LexicalDefinition,
+) -> RenameFailure {
+    RenameFailure {
+        kind: "unsupported",
+        message: format!(
+            "`{}` resolves to a {}; rename does not support lexical bindings yet",
+            lexical.identifier,
+            lexical.kind.label()
+        ),
+    }
+}
+
+/// The rename failure for a definition lookup that did not resolve.
+///
+/// The definition status contract says an exhausted budget, a cancellation and
+/// an incomplete answer are not proven absence, so every one of them has to
+/// arrive at the caller as itself. Collapsing them into `not_found` both lost
+/// the reason and earned the caller the "move to an identifier token and
+/// retry" advice that only a genuine miss deserves, which turned a budget
+/// exhaustion into an invitation to hunt for a better token.
+///
+/// The failure therefore carries the status as its kind, in the same shape
+/// `rename_usage_hits` already uses for cancelled and incomplete usage
+/// execution, and the message carries the lookup's own diagnostics so the
+/// reason survives the hand-off. `Ambiguous` is included by the same rule
+/// rather than by exception: an ambiguous location has no unique authority to
+/// rename, and `DefinitionLookupStatus::carries_definitions` already refuses
+/// to let it stand in for one.
+fn unresolved_definition_failure(outcome: &DefinitionLookupOutcome) -> RenameFailure {
+    debug_assert_ne!(
+        outcome.status,
+        DefinitionLookupStatus::Resolved,
+        "a resolved lookup is not a rename failure"
+    );
+    RenameFailure {
+        kind: outcome.status.as_str(),
+        message: format!(
+            "rename requires one resolved definition at the rename location: status={}, \
+             definitions={:?}, diagnostics={:?}",
+            outcome.status.as_str(),
+            outcome.definitions,
+            outcome.diagnostics,
+        ),
+    }
 }
 
 fn declaration_target_at_span(
@@ -625,6 +741,158 @@ struct EditCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use std::collections::BTreeSet;
+
+    fn usage_query(result: FuzzyResult, completion: UsageQueryCompletion) -> QueryResult {
+        QueryResult {
+            completion,
+            candidate_files: Default::default(),
+            candidate_files_truncated: false,
+            source_bytes_truncated: false,
+            scanned_source_bytes: 0,
+            candidate_files_sample: None,
+            result,
+            proof_authority: Default::default(),
+            graph_failure: None,
+        }
+    }
+
+    #[test]
+    fn rename_requires_complete_execution_and_proven_reference_inventory() {
+        let file = ProjectFile::new(std::env::temp_dir(), "target.rs");
+        let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+        let proven = UsageHit::new(file.clone(), 0, 0, 6, target.clone(), 1.0, "target");
+        let mut uncertain = UsageHit::new(file, 1, 10, 16, target.clone(), 1.0, "target");
+        uncertain.proof = UsageProof::Unproven;
+        for (candidates, total) in [
+            (BTreeSet::from([uncertain.clone()]), 1),
+            (BTreeSet::from([uncertain.clone().into_import()]), 0),
+            (BTreeSet::new(), 1),
+        ] {
+            let result = FuzzyResult::Success {
+                hits_by_overload: [(target.clone(), BTreeSet::from([proven.clone()]))]
+                    .into_iter()
+                    .collect(),
+                unproven_by_overload: [(target.clone(), candidates)].into_iter().collect(),
+                unproven_total_by_overload: [(target.clone(), total)].into_iter().collect(),
+            };
+            let failure =
+                rename_usage_hits(usage_query(result, UsageQueryCompletion::Complete)).unwrap_err();
+            assert_eq!(failure.kind, "ambiguous");
+            assert!(failure.message.contains("unproven_total_by_overload"));
+        }
+        // Confidence alone does not certify a proof, even if a producer places
+        // an uncertain hit in the nominally proven bucket.
+        let result = FuzzyResult::success(target.clone(), BTreeSet::from([uncertain]));
+        assert_eq!(
+            rename_usage_hits(usage_query(result, UsageQueryCompletion::Complete))
+                .unwrap_err()
+                .kind,
+            "low_confidence"
+        );
+        let result = FuzzyResult::success(target, BTreeSet::from([proven.clone()]));
+        assert_eq!(
+            rename_usage_hits(usage_query(result, UsageQueryCompletion::Complete)).unwrap(),
+            vec![proven]
+        );
+        assert!(
+            rename_usage_hits(usage_query(
+                FuzzyResult::empty_success(),
+                UsageQueryCompletion::Complete
+            ))
+            .unwrap()
+            .is_empty()
+        );
+        for (completion, kind) in [
+            (UsageQueryCompletion::Cancelled, "cancelled"),
+            (
+                UsageQueryCompletion::CandidateFilesBudgetExhausted,
+                "too_many_files",
+            ),
+            (
+                UsageQueryCompletion::SourceBytesBudgetExhausted,
+                "incomplete_analysis",
+            ),
+        ] {
+            assert_eq!(
+                rename_usage_hits(usage_query(FuzzyResult::empty_success(), completion))
+                    .unwrap_err()
+                    .kind,
+                kind
+            );
+        }
+    }
+
+    fn unresolved_outcome(status: DefinitionLookupStatus) -> DefinitionLookupOutcome {
+        DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
+            status,
+            reference: None,
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: vec![
+                crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic {
+                    claim: None,
+                    kind: "receiver_budget_exhausted".to_string(),
+                    message: "bounded resolution stopped at its scope-node budget".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// Every inconclusive definition status reaches the caller as itself.
+    ///
+    /// Exhaustion, cancellation and incompleteness are not proven absence, so
+    /// none of them may arrive as `not_found`: that is the one kind the
+    /// navigation surface answers with "move to an identifier token and
+    /// retry", advice that is wrong for every status here.
+    #[test]
+    fn an_unresolved_definition_keeps_its_status_and_diagnostics() {
+        for (status, kind) in [
+            (
+                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+                "exceeded_budget",
+            ),
+            (DefinitionLookupStatus::Cancelled, "cancelled"),
+            (DefinitionLookupStatus::Unavailable, "unavailable"),
+            (DefinitionLookupStatus::Incomplete, "incomplete"),
+            (DefinitionLookupStatus::Ambiguous, "ambiguous"),
+            (DefinitionLookupStatus::NoDefinition, "no_definition"),
+            (
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "unresolvable_import_boundary",
+            ),
+            (DefinitionLookupStatus::NotFound, "not_found"),
+        ] {
+            let failure = unresolved_definition_failure(&unresolved_outcome(status));
+
+            assert_eq!(failure.kind, kind, "status {status:?}");
+            assert!(
+                failure.message.contains(kind),
+                "status {status:?} must name itself: {}",
+                failure.message
+            );
+            assert!(
+                failure
+                    .message
+                    .contains("bounded resolution stopped at its scope-node budget"),
+                "status {status:?} must carry its diagnostics: {}",
+                failure.message
+            );
+        }
+    }
+
+    /// An ambiguous location has no unique authority, so it is a refusal and
+    /// never an edit, and it is not reported as an absence either.
+    #[test]
+    fn an_ambiguous_definition_refuses_the_rename_without_claiming_absence() {
+        let failure =
+            unresolved_definition_failure(&unresolved_outcome(DefinitionLookupStatus::Ambiguous));
+
+        assert_eq!(failure.kind, "ambiguous");
+        assert_ne!(failure.kind, "not_found");
+    }
 
     fn edit(start: u32, end: u32) -> EditCandidate {
         EditCandidate {

@@ -23,7 +23,9 @@ use tree_sitter::Node;
 
 use super::PythonAnalyzer;
 use super::lexical_scope::python_lexical_scope_inventory_bounded;
-use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
+use crate::analyzer::lexical_definitions::{
+    FormalVariadicKind, PythonMethodBinding, formal_parameter_slots_for_owner,
+};
 use crate::analyzer::semantic::type_flow::{
     CallGuardOutcome, ClassBodyMemberBinding, ClassHierarchy, ClassIdentity, ClassSeed,
     DynamicFieldWrite, ExternalClassCache, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
@@ -40,7 +42,8 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
-    SemanticModelOverlay, SemanticModelSymbolKind, semantic_model_callable_family_id,
+    SemanticModelOverlay, SemanticModelSurfaceGap, SemanticModelSymbolKind,
+    semantic_model_callable_family_id,
 };
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::get_definition::{
@@ -53,7 +56,7 @@ use crate::analyzer::usages::get_type::{
 use crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, Language, ProjectFile, QueryScope,
+    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, QueryScope,
     TypeHierarchyProvider, WorkspaceAnalyzer, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
@@ -432,6 +435,32 @@ fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName>
         .child_by_field_name("attribute")?
         .utf8_text(source.as_bytes())
         .ok()?;
+    if matches!(
+        attribute,
+        "get"
+            | "items"
+            | "keys"
+            | "values"
+            | "copy"
+            | "fromkeys"
+            | "__contains__"
+            | "__getitem__"
+            | "__len__"
+            | "__iter__"
+            | "__reversed__"
+            | "__or__"
+            | "__ror__"
+            | "__eq__"
+            | "__ne__"
+            | "__lt__"
+            | "__le__"
+            | "__gt__"
+            | "__ge__"
+            | "__repr__"
+            | "__str__"
+    ) {
+        return None;
+    }
     if attribute == "__setattr__" {
         let Some(arguments) = node.child_by_field_name("arguments") else {
             return Some(DynamicMemberName::Any);
@@ -911,6 +940,37 @@ fn python_typing_marker_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &st
     )
 }
 
+/// Whether this exact base expression is the unshadowed builtin `object`.
+/// Python supplies its default `__getattribute__`; that inherited method is
+/// not evidence of a user hook, even when the active pack omits `object`.
+fn python_default_object_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &str) -> bool {
+    if raw != "object" {
+        return false;
+    }
+    let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
+        return false;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, owner) else {
+        return false;
+    };
+    let Some(bases) = class.child_by_field_name("superclasses") else {
+        return false;
+    };
+    let mut cursor = bases.walk();
+    let Some(base) = bases
+        .named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .map(python_base_origin_node)
+        .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(raw))
+    else {
+        return false;
+    };
+    base.kind() == "identifier"
+        && base.utf8_text(prepared.source().as_bytes()) == Ok("object")
+        && import_bound_external_symbol(python, owner.source(), &prepared, base).is_none()
+        && indexed_builtin_is_unshadowed(python, base, &prepared) == Some(true)
+}
+
 /// The active model's class for one canonical dotted name.
 ///
 /// The name index admits aliases and simple-name postings, so a match is a
@@ -1008,6 +1068,98 @@ fn exact_external_base(
     python
         .indexed_source_matches(owner.source(), prepared.source())
         .then_some(identity)
+}
+
+/// Whether Python attribute lookup may bypass a method already found on this
+/// receiver class. A custom `__getattribute__` can replace any lookup. An
+/// external hierarchy edge that does not resolve to one modeled declaration
+/// remains risky; a partial member surface alone does not, because an override
+/// is an explicit declaration in the modeled class body or its ancestors.
+pub(crate) fn python_receiver_method_dispatch_may_be_bypassed(
+    python: &PythonAnalyzer,
+    receiver_class: &CodeUnit,
+) -> bool {
+    let workspace_ancestors = python.get_ancestors(receiver_class);
+    if std::iter::once(receiver_class)
+        .chain(workspace_ancestors.iter())
+        .any(|owner| {
+            python
+                .direct_children(owner)
+                .iter()
+                .any(|child| child.terminal_name() == "__getattribute__")
+        })
+    {
+        return true;
+    }
+
+    let overlay = python
+        .active_semantic_model_snapshot()
+        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned());
+    let mut external_cache = ExternalClassCache::default();
+    let mut checked_external = HashSet::<Box<str>>::default();
+    for owner in std::iter::once(receiver_class).chain(workspace_ancestors.iter()) {
+        let direct = python.get_direct_ancestors(owner);
+        for raw in python.inner.raw_supertypes_of(owner) {
+            if direct
+                .iter()
+                .any(|ancestor| ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw)
+            {
+                continue;
+            }
+            match exact_external_base(python, owner, overlay.as_deref(), &raw, &mut external_cache)
+            {
+                Some(ClassIdentity::External { symbol_id, .. }) => {
+                    if checked_external.insert(symbol_id.clone())
+                        && external_class_may_override_getattribute(overlay.as_deref(), &symbol_id)
+                    {
+                        return true;
+                    }
+                }
+                Some(ClassIdentity::Workspace(_)) => {
+                    unreachable!("external base resolution returns external classes")
+                }
+                None if python_default_object_base(python, owner, &raw) => {}
+                None if python_typing_marker_base(python, owner, &raw) => {}
+                None => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Whether a modeled external base or one of its modeled ancestors declares
+/// an instance lookup hook. Partial member surfaces do not hide an explicit
+/// method declaration; unresolved or ambiguous hierarchy edges still do.
+fn external_class_may_override_getattribute(
+    overlay: Option<&SemanticModelOverlay>,
+    symbol_id: &str,
+) -> bool {
+    let Some(overlay) = overlay else {
+        return true;
+    };
+    let matched = overlay.symbols_with_id(symbol_id);
+    let [owner] = matched.records.as_slice() else {
+        return true;
+    };
+    if owner.qualified_name == "builtins.object" {
+        return false;
+    }
+    let surface = overlay.owner_surface(owner);
+    if surface
+        .gaps
+        .iter()
+        .any(|gap| !matches!(gap, SemanticModelSurfaceGap::PartialType { .. }))
+    {
+        return true;
+    }
+    surface.closure.iter().any(|ancestor| {
+        ancestor.qualified_name != "builtins.object"
+            && overlay
+                .members_of(&ancestor.id)
+                .records
+                .iter()
+                .any(|member| member.name == "__getattribute__")
+    })
 }
 
 /// Flatten the classes a guard names into one node per class.
@@ -1759,6 +1911,10 @@ fn resolve_indexed_class_at_span(
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
     }
     match outcome.status {
+        TypeLookupStatus::Unavailable => return ClassSeed::Unknown(UnknownReason::UncertainFlow),
+        TypeLookupStatus::Incomplete | TypeLookupStatus::Cancelled => {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
         // The interactive receiver-resolution budget bounds analyzer-side
         // semantic work (scope and definition walks), not the dataflow
         // solver, so its exhaustion is a semantic-budget fact.
@@ -2147,10 +2303,15 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // keeps, so an append behind `if False:` or one a later `__path__`
         // assignment replaces no longer carries them either, and the
         // membership guard it hangs under has to be module-level, so a guard
-        // inside an enclosing dead branch no longer carries them.
+        // inside an enclosing dead branch no longer carries them. Resolved
+        // method returns lose certainty only for actual instance hooks or
+        // unresolved modeled ancestry; partial member surfaces alone are safe
+        // when no modeled __getattribute__ hook exists.
+        // Variadic formals retain their tuple or dict container class instead
+        // of taking the class of an element collected from a caller.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-v57",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-v60",
         )
         .expect("adapter name is non-empty")
     }
@@ -2597,6 +2758,17 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(slot) = layout.slots.get(index) else {
             return ClassSeed::NotApplicable;
         };
+        if let Some(variadic) = slot.variadic {
+            let name = match variadic {
+                FormalVariadicKind::Positional => "builtins.tuple",
+                FormalVariadicKind::Keyword => "builtins.dict",
+                FormalVariadicKind::Both => {
+                    return ClassSeed::Unknown(UnknownReason::VariadicParameter);
+                }
+            };
+            let mut cache = ExternalClassCache::default();
+            return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
+        }
         let declaration = callable
             .named_descendant_for_byte_range(
                 slot.declaration_range.start_byte,

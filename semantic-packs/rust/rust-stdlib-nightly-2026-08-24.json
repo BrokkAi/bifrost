@@ -18,7 +18,6 @@
     "container": null
   },
   "compatibility": {
-    "bifrost": ">=0.10.5, <1.0.0",
     "toolchains": [
       {"name": "rust", "requirement": "=1.100.0-nightly"}
     ]

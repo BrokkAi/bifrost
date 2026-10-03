@@ -413,11 +413,36 @@ pub(super) fn inbound_reference_expansions(
                 exhausted_roots: Vec::new(),
             });
         }
+        if let FuzzyResult::Incomplete {
+            diagnostics: reasons,
+            ..
+        } = &query.result
+            && report
+        {
+            diagnostics.push(CodeQueryDiagnostic {
+                exhausted_roots: Vec::new(),
+                code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: crate::analyzer::common::language_for_file(declaration.unit.source())
+                    .config_label(),
+                message: format!(
+                    "references_of analysis is incomplete for {}: {reasons:?}",
+                    declaration.unit.fq_name()
+                ),
+            });
+        }
         match query.result {
             FuzzyResult::Success {
                 hits_by_overload,
                 unproven_by_overload,
                 unproven_total_by_overload,
+            }
+            | FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                ..
             } => {
                 hits.extend(hits_by_overload.into_values().flatten().map(|hit| {
                     reference_hit_for_target(
@@ -617,6 +642,11 @@ pub(super) fn inbound_reference_expansions(
 fn fuzzy_result_examination_count(result: &FuzzyResult) -> usize {
     match result {
         FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        }
+        | FuzzyResult::Incomplete {
             hits_by_overload,
             unproven_total_by_overload,
             ..
@@ -895,6 +925,23 @@ pub(super) fn scan_outbound_reference_hits(
         );
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (Vec::new(), true);
+        }
+        if let FuzzyResult::Incomplete {
+            diagnostics: reasons,
+            ..
+        } = &result.result
+        {
+            diagnostics.push(CodeQueryDiagnostic {
+                exhausted_roots: Vec::new(),
+                code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: language.config_label(),
+                message: format!(
+                    "uses analysis is incomplete for {}: {reasons:?}",
+                    target.fq_name()
+                ),
+            });
         }
         let (target_hits, target_truncated) =
             reference_hits_for_target(analyzer, result.result, target);

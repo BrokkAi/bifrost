@@ -261,7 +261,7 @@ fn rust_dependency_production_request(
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: dependency
                 .evidence
                 .toolchain

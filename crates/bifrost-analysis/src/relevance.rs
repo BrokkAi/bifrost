@@ -8,7 +8,8 @@ use crate::analyzer::usages::workspace_graph::{
 };
 use crate::analyzer::usages::workspace_graph_cache::{
     WorkspaceUsageGraphCacheAcquisition, WorkspaceUsageGraphCacheBuildOutcome,
-    WorkspaceUsageGraphCacheKey, WorkspaceUsageGraphKind,
+    WorkspaceUsageGraphCacheKey, WorkspaceUsageGraphCacheLifecycle, WorkspaceUsageGraphKind,
+    WorkspaceUsageGraphProducer,
 };
 #[cfg(test)]
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
@@ -30,6 +31,19 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "selected_exact_relevance.rs"]
+mod selected_exact_relevance;
+#[cfg(any(test, feature = "test-support"))]
+pub use selected_exact_relevance::{
+    SelectedExactRelevanceTelemetry, SelectedExactUsageGraphLifecycle,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use selected_exact_relevance::{
+    most_relevant_project_files_with_selected_exact_graph_and_cancellation,
+    rank_exact_workspace_usage_graph_with_cancellation,
+};
 
 const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
@@ -134,12 +148,25 @@ struct UsageReferenceWeights {
 
 pub(crate) enum MostRelevantProjectFilesOutcome {
     Complete(Vec<ProjectFile>),
+    /// The usage graph contributed sound positive evidence but could not prove
+    /// that its inventory was complete. History and imports still fill the
+    /// remaining slots before this outcome is returned.
+    UsageGraphIncomplete(Vec<ProjectFile>),
     /// Ranked without the commit-history leg, which this repository could not
     /// supply within the request. The files are a real ranking from the local
     /// import graph, so the caller returns them and reports the response as
     /// incomplete rather than failing.
     HistoryUnavailable(Vec<ProjectFile>),
+    /// Both independent quality shortfalls occurred in the same ranking.
+    UsageGraphIncompleteAndHistoryUnavailable(Vec<ProjectFile>),
     Cancelled,
+}
+
+enum UsageGraphAcquisition<T> {
+    Complete(T, Option<WorkspaceUsageGraphCacheLifecycle>),
+    Incomplete(T),
+    Cancelled,
+    Stale,
 }
 
 pub(crate) enum Cancellable<T> {
@@ -178,9 +205,9 @@ impl UsageReferenceWeights {
 
 /// Rank files related to `seeds` by git co-change, then by import PageRank.
 ///
-/// The returned status describes the history leg only: the import leg is local
-/// and always runs. `HistoryUnavailable` or `Cancelled` therefore still yields a
-/// usable ranking, just one the caller must report as incomplete.
+/// The returned status describes the history leg. When history is unavailable,
+/// the local import leg still fills the ranking. Cancellation instead stops the
+/// import leg and returns no ranked prefix for publication.
 pub(crate) fn most_relevant_project_files_with_half_life(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
@@ -189,6 +216,9 @@ pub(crate) fn most_relevant_project_files_with_half_life(
     cancellation: &CancellationToken,
 ) -> (Vec<ProjectFile>, HistoryRankingStatus) {
     let _scope = profiling::scope("relevance::most_relevant_project_files");
+    if cancellation.is_cancelled() {
+        return (Vec::new(), HistoryRankingStatus::Cancelled);
+    }
     if top_k == 0 {
         return (Vec::new(), HistoryRankingStatus::Complete);
     }
@@ -208,23 +238,55 @@ pub(crate) fn most_relevant_project_files_with_half_life(
             related_files_by_git(analyzer, &seed_weights, top_k, half_life, cancellation)
                 .unwrap_or_else(|_| (Vec::new(), HistoryRankingStatus::HistoryUnavailable));
         for candidate in candidates {
+            if cancellation.is_cancelled() {
+                return (Vec::new(), HistoryRankingStatus::Cancelled);
+            }
             if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-                return (results, history_status);
+                return if cancellation.is_cancelled() {
+                    (Vec::new(), HistoryRankingStatus::Cancelled)
+                } else {
+                    (results, history_status)
+                };
             }
         }
         history_status
     };
+    if history_status == HistoryRankingStatus::Cancelled || cancellation.is_cancelled() {
+        return (Vec::new(), HistoryRankingStatus::Cancelled);
+    }
 
     {
         let _scope = profiling::scope("relevance::imports");
-        for candidate in related_files_by_imports(analyzer, &seed_weights, top_k, false) {
-            if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-                return (results, history_status);
+        match related_files_by_imports_with_cancellation(
+            analyzer,
+            &seed_weights,
+            top_k,
+            false,
+            cancellation,
+        ) {
+            Cancellable::Complete(candidates) | Cancellable::Incomplete(candidates) => {
+                for candidate in candidates {
+                    if cancellation.is_cancelled() {
+                        return (Vec::new(), HistoryRankingStatus::Cancelled);
+                    }
+                    if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+                        return if cancellation.is_cancelled() {
+                            (Vec::new(), HistoryRankingStatus::Cancelled)
+                        } else {
+                            (results, history_status)
+                        };
+                    }
+                }
             }
+            Cancellable::Cancelled => return (Vec::new(), HistoryRankingStatus::Cancelled),
         }
     }
 
-    (results, history_status)
+    if cancellation.is_cancelled() {
+        (Vec::new(), HistoryRankingStatus::Cancelled)
+    } else {
+        (results, history_status)
+    }
 }
 
 /// Rank files by Git co-change only.
@@ -534,18 +596,6 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
             HistoryRankingStatus::Cancelled => MostRelevantProjectFilesOutcome::Cancelled,
         };
     }
-    if top_k == 0 {
-        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
-    }
-
-    let seed_weights = seed_weight_map(seeds);
-    if seed_weights.is_empty() {
-        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
-    }
-    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
-    let mut results = Vec::new();
-    let mut seen = HashSet::default();
-
     let graph_kind = match ranking_mode {
         MostRelevantFilesRankingMode::UsageGraph => WorkspaceUsageGraphKind::File,
         MostRelevantFilesRankingMode::UsageGraphExact => WorkspaceUsageGraphKind::Exact,
@@ -553,43 +603,115 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
             unreachable!("handled above")
         }
     };
-    let usage_candidates = match related_files_by_usage(
+    match most_relevant_project_files_with_usage_candidates(
         analyzer,
-        token,
-        &seed_weights,
+        seeds,
         top_k,
-        graph_kind,
+        half_life,
         cancellation,
+        |seed_weights, k| {
+            Ok::<_, std::convert::Infallible>(related_files_by_usage(
+                analyzer,
+                token,
+                seed_weights,
+                k,
+                graph_kind,
+                cancellation,
+            ))
+        },
     ) {
-        Cancellable::Complete(candidates) | Cancellable::Incomplete(candidates) => candidates,
-        Cancellable::Cancelled => return MostRelevantProjectFilesOutcome::Cancelled,
+        Ok(outcome) => outcome,
+        Err(unreachable) => match unreachable {},
+    }
+}
+
+fn most_relevant_project_files_with_usage_candidates<E>(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    half_life: Option<f64>,
+    cancellation: &CancellationToken,
+    rank_usage: impl FnOnce(
+        &HashMap<ProjectFile, f64>,
+        usize,
+    ) -> Result<Cancellable<Vec<FileRelevance>>, E>,
+) -> Result<MostRelevantProjectFilesOutcome, E> {
+    if cancellation.is_cancelled() {
+        return Ok(MostRelevantProjectFilesOutcome::Cancelled);
+    }
+    if top_k == 0 {
+        return Ok(MostRelevantProjectFilesOutcome::Complete(Vec::new()));
+    }
+
+    let seed_weights = seed_weight_map(seeds);
+    if cancellation.is_cancelled() {
+        return Ok(MostRelevantProjectFilesOutcome::Cancelled);
+    }
+    if seed_weights.is_empty() {
+        return Ok(MostRelevantProjectFilesOutcome::Complete(Vec::new()));
+    }
+    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
+    let mut results = Vec::new();
+    let mut seen = HashSet::default();
+    let (usage_candidates, usage_graph_incomplete) = match rank_usage(&seed_weights, top_k)? {
+        Cancellable::Complete(candidates) => (candidates, false),
+        Cancellable::Incomplete(candidates) => (candidates, true),
+        Cancellable::Cancelled => return Ok(MostRelevantProjectFilesOutcome::Cancelled),
     };
     for candidate in usage_candidates {
+        if cancellation.is_cancelled() {
+            return Ok(MostRelevantProjectFilesOutcome::Cancelled);
+        }
         if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-            return MostRelevantProjectFilesOutcome::Complete(results);
+            return Ok(if cancellation.is_cancelled() {
+                MostRelevantProjectFilesOutcome::Cancelled
+            } else if usage_graph_incomplete {
+                MostRelevantProjectFilesOutcome::UsageGraphIncomplete(results)
+            } else {
+                MostRelevantProjectFilesOutcome::Complete(results)
+            });
         }
     }
 
     if cancellation.is_cancelled() {
-        return MostRelevantProjectFilesOutcome::Cancelled;
+        return Ok(MostRelevantProjectFilesOutcome::Cancelled);
     }
     let (history_files, history_status) =
         most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life, cancellation);
     for candidate in history_files {
         if cancellation.is_cancelled() {
-            return MostRelevantProjectFilesOutcome::Cancelled;
+            return Ok(MostRelevantProjectFilesOutcome::Cancelled);
         }
         if append_candidate(&mut results, &mut seen, &excluded, candidate, top_k) {
             break;
         }
     }
-    match history_status {
-        _ if cancellation.is_cancelled() => MostRelevantProjectFilesOutcome::Cancelled,
-        HistoryRankingStatus::Complete => MostRelevantProjectFilesOutcome::Complete(results),
-        HistoryRankingStatus::HistoryUnavailable => {
+    Ok(if cancellation.is_cancelled() {
+        MostRelevantProjectFilesOutcome::Cancelled
+    } else {
+        usage_graph_history_outcome(results, usage_graph_incomplete, history_status)
+    })
+}
+
+fn usage_graph_history_outcome(
+    results: Vec<ProjectFile>,
+    usage_graph_incomplete: bool,
+    history_status: HistoryRankingStatus,
+) -> MostRelevantProjectFilesOutcome {
+    match (usage_graph_incomplete, history_status) {
+        (_, HistoryRankingStatus::Cancelled) => MostRelevantProjectFilesOutcome::Cancelled,
+        (false, HistoryRankingStatus::Complete) => {
+            MostRelevantProjectFilesOutcome::Complete(results)
+        }
+        (true, HistoryRankingStatus::Complete) => {
+            MostRelevantProjectFilesOutcome::UsageGraphIncomplete(results)
+        }
+        (false, HistoryRankingStatus::HistoryUnavailable) => {
             MostRelevantProjectFilesOutcome::HistoryUnavailable(results)
         }
-        HistoryRankingStatus::Cancelled => MostRelevantProjectFilesOutcome::Cancelled,
+        (true, HistoryRankingStatus::HistoryUnavailable) => {
+            MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(results)
+        }
     }
 }
 
@@ -729,20 +851,57 @@ fn acquire_usage_ranking_graph_with_cancellation(
     graph_kind: WorkspaceUsageGraphKind,
     cancellation: &CancellationToken,
 ) -> Cancellable<Arc<UsageRankingGraph>> {
-    let Some(cache) = analyzer
+    let acquisition = acquire_usage_ranking_graph_from_builder(
+        analyzer,
+        selected_ecosystems,
+        graph_kind,
+        WorkspaceUsageGraphProducer::Production,
+        cancellation,
+        || {
+            Ok::<_, std::convert::Infallible>(
+                match build_usage_ranking_graph_uncached(
+                    analyzer,
+                    token,
+                    seed_weights,
+                    selected_ecosystems,
+                    graph_kind,
+                    cancellation,
+                ) {
+                    Cancellable::Complete(graph) => {
+                        WorkspaceUsageGraphCacheBuildOutcome::Complete(graph)
+                    }
+                    Cancellable::Incomplete(graph) => {
+                        WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph)
+                    }
+                    Cancellable::Cancelled => WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
+                },
+            )
+        },
+    );
+    match acquisition {
+        Ok(UsageGraphAcquisition::Complete(graph, lifecycle)) => {
+            let _ = lifecycle;
+            Cancellable::Complete(graph)
+        }
+        Ok(UsageGraphAcquisition::Incomplete(graph)) => Cancellable::Incomplete(graph),
+        Ok(UsageGraphAcquisition::Cancelled | UsageGraphAcquisition::Stale) => {
+            Cancellable::Cancelled
+        }
+        Err(unreachable) => match unreachable {},
+    }
+}
+
+fn acquire_usage_ranking_graph_from_builder<E>(
+    analyzer: &dyn IAnalyzer,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    graph_kind: WorkspaceUsageGraphKind,
+    producer: WorkspaceUsageGraphProducer,
+    cancellation: &CancellationToken,
+    mut build: impl FnMut() -> Result<WorkspaceUsageGraphCacheBuildOutcome, E>,
+) -> Result<UsageGraphAcquisition<Arc<UsageRankingGraph>>, E> {
+    let cache = analyzer
         .snapshot_caches()
-        .map(|caches| caches.usage_graphs())
-    else {
-        return build_usage_ranking_graph_uncached(
-            analyzer,
-            token,
-            seed_weights,
-            selected_ecosystems,
-            graph_kind,
-            cancellation,
-        )
-        .map(Arc::new);
-    };
+        .map(|caches| caches.usage_graphs());
 
     // The graph spans exactly the ecosystems its seeds belong to, so it is
     // keyed by the content identity of the languages in those ecosystems
@@ -755,6 +914,7 @@ fn acquire_usage_ranking_graph_with_cancellation(
                     .scope(|language| selected_ecosystems.contains(&UsageEcosystem::of(language)))
             })
     };
+    let workspace_content = ecosystem_content(analyzer);
     if analyzer.read_ledger_attached() {
         // The graph spans whole languages; nothing narrower than the ecosystem
         // scope's content identity bounds what it answered.
@@ -765,79 +925,80 @@ fn acquire_usage_ranking_graph_with_cancellation(
             .collect::<Vec<_>>();
         analyzer.record_read(analyzer.workspace_scope_read_key(&languages));
     }
-    let Some(workspace_content) = ecosystem_content(analyzer) else {
-        cache.record_missing_content_identity(graph_kind, selected_ecosystems.iter().copied());
-        return build_usage_ranking_graph_uncached(
-            analyzer,
-            token,
-            seed_weights,
-            selected_ecosystems,
-            graph_kind,
-            cancellation,
-        )
-        .map(Arc::new);
-    };
-    for _ in 0..2 {
-        let key = WorkspaceUsageGraphCacheKey::new(
+    if workspace_content.is_none()
+        && let Some(cache) = cache
+    {
+        cache.record_missing_content_identity_with_producer(
+            producer,
             graph_kind,
             selected_ecosystems.iter().copied(),
-            workspace_content,
         );
-        let acquisition = cache.acquire(
-            key,
-            cancellation,
-            || match build_usage_ranking_graph_uncached(
-                analyzer,
-                token,
-                seed_weights,
-                selected_ecosystems,
-                graph_kind,
-                cancellation,
-            ) {
-                Cancellable::Complete(graph) => {
-                    WorkspaceUsageGraphCacheBuildOutcome::Complete(graph)
-                }
-                Cancellable::Incomplete(graph) => {
-                    WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph)
-                }
-                Cancellable::Cancelled => WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
-            },
-            || ecosystem_content(analyzer) == Some(workspace_content),
-        );
-        match acquisition {
-            WorkspaceUsageGraphCacheAcquisition::Ready {
-                graph,
-                lifecycle,
-                wait,
-            } => {
-                if profiling::enabled() {
-                    let (retained, invalidated) = cache.verdicts().totals();
-                    profiling::note(format!(
-                        "usage-graph cache={lifecycle:?} waits={} wait_ms={:.1} retained={retained} rebuilt={invalidated}",
-                        wait.waits,
-                        wait.wait_ns as f64 / 1_000_000.0
-                    ));
-                }
-                return Cancellable::Complete(graph);
-            }
-            WorkspaceUsageGraphCacheAcquisition::Incomplete(graph) => {
-                return Cancellable::Incomplete(graph);
-            }
-            WorkspaceUsageGraphCacheAcquisition::Cancelled => return Cancellable::Cancelled,
-            WorkspaceUsageGraphCacheAcquisition::Stale => continue,
-        }
     }
-    Cancellable::Cancelled
-}
 
-impl<T> Cancellable<T> {
-    fn map<U>(self, map: impl FnOnce(T) -> U) -> Cancellable<U> {
-        match self {
-            Self::Complete(value) => Cancellable::Complete(map(value)),
-            Self::Incomplete(value) => Cancellable::Incomplete(map(value)),
-            Self::Cancelled => Cancellable::Cancelled,
+    for _ in 0..2 {
+        if cancellation.is_cancelled() {
+            return Ok(UsageGraphAcquisition::Cancelled);
+        }
+        let acquisition = if let (Some(cache), Some(workspace_content)) = (cache, workspace_content)
+        {
+            let key = WorkspaceUsageGraphCacheKey::new_with_producer(
+                producer,
+                graph_kind,
+                selected_ecosystems.iter().copied(),
+                workspace_content,
+            );
+            let acquisition = cache.acquire_fallible(key, cancellation, &mut build, || {
+                ecosystem_content(analyzer) == Some(workspace_content)
+            })?;
+            match acquisition {
+                WorkspaceUsageGraphCacheAcquisition::Ready {
+                    graph,
+                    lifecycle,
+                    wait,
+                } => {
+                    if profiling::enabled() {
+                        let (retained, invalidated) = cache.verdicts().totals();
+                        profiling::note(format!(
+                            "usage-graph cache={lifecycle:?} producer={producer:?} waits={} wait_ms={:.1} retained={retained} rebuilt={invalidated}",
+                            wait.waits,
+                            wait.wait_ns as f64 / 1_000_000.0
+                        ));
+                    }
+                    UsageGraphAcquisition::Complete(graph, Some(lifecycle))
+                }
+                WorkspaceUsageGraphCacheAcquisition::Incomplete(graph) => {
+                    UsageGraphAcquisition::Incomplete(graph)
+                }
+                WorkspaceUsageGraphCacheAcquisition::Cancelled => UsageGraphAcquisition::Cancelled,
+                WorkspaceUsageGraphCacheAcquisition::Stale => UsageGraphAcquisition::Stale,
+            }
+        } else {
+            let build_result = build();
+            if cancellation.is_cancelled() {
+                return Ok(UsageGraphAcquisition::Cancelled);
+            }
+            let build_outcome = build_result?;
+            match build_outcome {
+                WorkspaceUsageGraphCacheBuildOutcome::Complete(graph) => {
+                    UsageGraphAcquisition::Complete(Arc::new(graph), None)
+                }
+                WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph) => {
+                    UsageGraphAcquisition::Incomplete(Arc::new(graph))
+                }
+                WorkspaceUsageGraphCacheBuildOutcome::Cancelled => UsageGraphAcquisition::Cancelled,
+                #[cfg(any(test, feature = "test-support"))]
+                WorkspaceUsageGraphCacheBuildOutcome::Stale => UsageGraphAcquisition::Stale,
+            }
+        };
+        match acquisition {
+            UsageGraphAcquisition::Stale => continue,
+            _other if cancellation.is_cancelled() => {
+                return Ok(UsageGraphAcquisition::Cancelled);
+            }
+            other => return Ok(other),
         }
     }
+    Ok(UsageGraphAcquisition::Stale)
 }
 
 fn build_usage_ranking_graph_uncached(
@@ -866,20 +1027,43 @@ fn build_usage_ranking_graph_uncached(
             WorkspaceFileUsageGraphBuildOutcome::Cancelled => Cancellable::Cancelled,
         };
     }
-    let Some(catalog) = ({
+    let catalog = {
         let _scope = profiling::scope("relevance::usage_graph_catalog");
         WorkspaceUsageCatalog::build_with_cancellation(analyzer, cancellation)
-    }) else {
-        return Cancellable::Cancelled;
+    };
+    let (catalog, catalog_unavailable) = match catalog {
+        Some(catalog) => (catalog, false),
+        None if cancellation.is_cancelled() => return Cancellable::Cancelled,
+        None => {
+            // The declaration authority can be unavailable independently of
+            // cancellation. Carry that state through the selected ecosystem
+            // readiness checks so the result is incomplete and never cached.
+            let Some(catalog) = WorkspaceUsageCatalog::from_declarations(Vec::new(), cancellation)
+            else {
+                return Cancellable::Cancelled;
+            };
+            (catalog, true)
+        }
     };
     let catalog_ecosystems = catalog.ecosystems_for_files(seed_weights.keys());
     debug_assert!(catalog_ecosystems.is_subset(selected_ecosystems));
-    build_usage_ranking_graph_for_ecosystems_with_cancellation(
+    // Missing authority can erase the catalog. Retain requested ecosystems so
+    // their readiness checks run before an empty graph can be cached.
+    let graph = build_usage_ranking_graph_for_ecosystems_with_cancellation(
         analyzer,
         catalog,
-        &catalog_ecosystems,
+        selected_ecosystems,
         cancellation,
-    )
+    );
+    if !catalog_unavailable {
+        return graph;
+    }
+    match graph {
+        Cancellable::Complete(graph) | Cancellable::Incomplete(graph) => {
+            Cancellable::Incomplete(graph)
+        }
+        Cancellable::Cancelled => Cancellable::Cancelled,
+    }
 }
 
 fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
@@ -899,7 +1083,28 @@ fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
     };
     let graph = match graph_outcome {
         WorkspaceUsageGraphBuildOutcome::Complete(graph) => graph,
+        WorkspaceUsageGraphBuildOutcome::Incomplete(graph) => {
+            return Cancellable::Incomplete(UsageRankingGraph::from_exact(graph));
+        }
         WorkspaceUsageGraphBuildOutcome::Cancelled => return Cancellable::Cancelled,
+        WorkspaceUsageGraphBuildOutcome::Stale => {
+            analyzer.record_query_failure(crate::analyzer::store::StoreError::new(
+                "native ranking graph lost selected generation authority",
+            ));
+            return Cancellable::Cancelled;
+        }
+        WorkspaceUsageGraphBuildOutcome::Unavailable(reason) => {
+            analyzer.record_query_failure(crate::analyzer::store::StoreError::new(format!(
+                "native ranking graph inputs unavailable: {reason}",
+            )));
+            return Cancellable::Cancelled;
+        }
+        WorkspaceUsageGraphBuildOutcome::Failed(error) => {
+            // The public acquisition boundary has no failure-bearing value.
+            // Retain the structured failure in its request and publish no graph.
+            analyzer.record_query_failure(error);
+            return Cancellable::Cancelled;
+        }
     };
     Cancellable::Complete(UsageRankingGraph::from_exact(graph))
 }
@@ -1181,48 +1386,106 @@ impl ImportGraphBuilder {
         self.edges.insert((source, target));
     }
 
-    fn finish(mut self) -> CompactDirectedGraph<ProjectFile> {
+    fn finish_with_cancellation(
+        mut self,
+        cancellation: &CancellationToken,
+    ) -> Option<CompactDirectedGraph<ProjectFile>> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let mut ordered = self.nodes.into_iter().enumerate().collect::<Vec<_>>();
         ordered.sort_by(|(_, left), (_, right)| left.cmp(right));
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let mut remap = vec![0_u32; ordered.len()];
         let mut nodes = Vec::with_capacity(ordered.len());
         for (new, (old, file)) in ordered.into_iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             remap[old] = new as u32;
             nodes.push(file);
         }
-        let edges = self
-            .edges
-            .drain()
-            .map(|(source, target)| (remap[source as usize], remap[target as usize]))
-            .collect();
-        CompactDirectedGraph::new(nodes, edges)
+        let mut edges = Vec::with_capacity(self.edges.len());
+        for (source, target) in self.edges.drain() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            edges.push((remap[source as usize], remap[target as usize]));
+        }
+        if cancellation.is_cancelled() {
+            None
+        } else {
+            Some(CompactDirectedGraph::new(nodes, edges))
+        }
     }
 }
 
+#[cfg(test)]
 fn related_files_by_imports(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
     reversed: bool,
 ) -> Vec<FileRelevance> {
+    match related_files_by_imports_with_cancellation(
+        analyzer,
+        seed_weights,
+        k,
+        reversed,
+        &CancellationToken::default(),
+    ) {
+        Cancellable::Complete(files) | Cancellable::Incomplete(files) => files,
+        Cancellable::Cancelled => {
+            unreachable!("default cancellation token cannot cancel import ranking")
+        }
+    }
+}
+
+fn related_files_by_imports_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    reversed: bool,
+    cancellation: &CancellationToken,
+) -> Cancellable<Vec<FileRelevance>> {
     let _scope = profiling::scope("relevance::related_files_by_imports");
+    if cancellation.is_cancelled() {
+        return Cancellable::Cancelled;
+    }
     if k == 0 {
-        return Vec::new();
+        return if cancellation.is_cancelled() {
+            Cancellable::Cancelled
+        } else {
+            Cancellable::Complete(Vec::new())
+        };
     }
 
-    let positive_seeds: HashMap<_, _> = seed_weights
-        .iter()
-        .filter(|(_, weight)| **weight > 0.0)
-        .map(|(file, weight)| (file.clone(), *weight))
-        .collect();
+    let mut positive_seeds = HashMap::default();
+    for (file, weight) in seed_weights.iter().filter(|(_, weight)| **weight > 0.0) {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
+        positive_seeds.insert(file.clone(), *weight);
+    }
     if positive_seeds.is_empty() {
-        return Vec::new();
+        return if cancellation.is_cancelled() {
+            Cancellable::Cancelled
+        } else {
+            Cancellable::Complete(Vec::new())
+        };
     }
 
-    let graph = {
+    let Some(graph) = ({
         let _scope = profiling::scope("relevance::build_import_graph");
-        build_import_graph(analyzer, &positive_seeds)
+        build_import_graph_with_cancellation(analyzer, &positive_seeds, cancellation)
+    }) else {
+        return Cancellable::Cancelled;
     };
+    if cancellation.is_cancelled() {
+        return Cancellable::Cancelled;
+    }
     if profiling::enabled() {
         profiling::note(format!(
             "compact-import-graph nodes={} edges={}",
@@ -1231,48 +1494,78 @@ fn related_files_by_imports(
         ));
     }
     if graph.nodes().is_empty() {
-        return Vec::new();
+        return if cancellation.is_cancelled() {
+            Cancellable::Cancelled
+        } else {
+            Cancellable::Complete(Vec::new())
+        };
     }
 
-    let total_seed_weight: f64 = positive_seeds.values().sum();
+    let mut total_seed_weight = 0.0;
+    for weight in positive_seeds.values() {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
+        total_seed_weight += weight;
+    }
     if total_seed_weight <= 0.0 {
-        return Vec::new();
+        return if cancellation.is_cancelled() {
+            Cancellable::Cancelled
+        } else {
+            Cancellable::Complete(Vec::new())
+        };
     }
 
     let mut teleport = vec![0.0; graph.nodes().len()];
     for (file, weight) in &positive_seeds {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
         if let Some(index) = graph.node_id(file) {
             teleport[index as usize] = *weight / total_seed_weight;
         }
     }
 
-    let rank = weighted_page_rank(
+    let Some(rank) = weighted_page_rank_with_cancellation(
         &CompactImportAdjacency {
             graph: &graph,
             reversed,
         },
         &teleport,
-    );
+        cancellation,
+    ) else {
+        return Cancellable::Cancelled;
+    };
 
-    let seed_files: HashSet<_> = positive_seeds.keys().cloned().collect();
-    let mut ranked = graph
-        .nodes()
-        .iter()
-        .cloned()
-        .enumerate()
-        .filter_map(|(index, file)| {
-            if seed_files.contains(&file) || rank[index] <= 0.0 {
-                return None;
-            }
-            Some(FileRelevance {
+    let mut seed_files = HashSet::default();
+    for file in positive_seeds.keys() {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
+        seed_files.insert(file.clone());
+    }
+    let mut ranked = Vec::new();
+    for (index, file) in graph.nodes().iter().cloned().enumerate() {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
+        if !seed_files.contains(&file) && rank[index] > 0.0 {
+            ranked.push(FileRelevance {
                 file,
                 score: rank[index],
-            })
-        })
-        .collect::<Vec<_>>();
+            });
+        }
+    }
     ranked.sort_by(compare_file_relevance);
+    if cancellation.is_cancelled() {
+        return Cancellable::Cancelled;
+    }
     ranked.truncate(k);
-    ranked
+    if cancellation.is_cancelled() {
+        Cancellable::Cancelled
+    } else {
+        Cancellable::Complete(ranked)
+    }
 }
 
 struct CompactImportAdjacency<'a> {
@@ -1357,6 +1650,7 @@ impl<const N: usize> WeightedAdjacency for [Vec<(usize, f64)>; N] {
 /// which is the ordinary global-centrality form of PageRank. Dangling mass is
 /// redistributed through the same teleport vector so personalized rank remains
 /// anchored to its seeds.
+#[cfg(test)]
 fn weighted_page_rank<G>(outgoing: &G, teleport: &[f64]) -> Vec<f64>
 where
     G: WeightedAdjacency + ?Sized,
@@ -1472,11 +1766,15 @@ where
     Some(rank)
 }
 
-fn build_import_graph(
+fn build_import_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
-) -> CompactDirectedGraph<ProjectFile> {
+    cancellation: &CancellationToken,
+) -> Option<CompactDirectedGraph<ProjectFile>> {
     let _scope = profiling::scope("relevance::build_import_graph");
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let mut graph = ImportGraphBuilder::default();
     let mut import_cache = HashMap::default();
     let mut reverse_cache = HashMap::default();
@@ -1489,10 +1787,16 @@ fn build_import_graph(
     let mut depth = 0usize;
 
     for seed in seed_weights.keys() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         graph.insert_node(seed.clone());
     }
 
     for _ in 0..IMPORT_DEPTH {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if frontier.is_empty() {
             break;
         }
@@ -1501,6 +1805,9 @@ fn build_import_graph(
 
         let mut next = VecDeque::new();
         while let Some(file) = frontier.pop_front() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             expanded_nodes += 1;
             if profiling::enabled() {
                 profiling::note(format!(
@@ -1516,7 +1823,7 @@ fn build_import_graph(
                 ));
             }
             let import_started = Instant::now();
-            let imported = imported_files_for(analyzer, &file, &mut import_cache);
+            let imported = imported_files_for(analyzer, &file, &mut import_cache, cancellation)?;
             let import_elapsed_ms = import_started.elapsed().as_secs_f64() * 1000.0;
             import_lookup_ms += import_elapsed_ms;
             if profiling::enabled() && (import_elapsed_ms >= 100.0 || imported.len() >= 100) {
@@ -1528,6 +1835,9 @@ fn build_import_graph(
                 ));
             }
             for target in imported {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
                 if graph.insert_node(target.clone()) {
                     next.push_back(target.clone());
                 }
@@ -1542,7 +1852,8 @@ fn build_import_graph(
                 ));
             }
             let reverse_started = Instant::now();
-            let referencing = referencing_files_for(analyzer, &file, &mut reverse_cache);
+            let referencing =
+                referencing_files_for(analyzer, &file, &mut reverse_cache, cancellation)?;
             let reverse_elapsed_ms = reverse_started.elapsed().as_secs_f64() * 1000.0;
             reverse_lookup_ms += reverse_elapsed_ms;
             if profiling::enabled() && (reverse_elapsed_ms >= 100.0 || referencing.len() >= 100) {
@@ -1554,6 +1865,9 @@ fn build_import_graph(
                 ));
             }
             for source in referencing {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
                 if graph.insert_node(source.clone()) {
                     next.push_back(source.clone());
                 }
@@ -1576,64 +1890,88 @@ fn build_import_graph(
         frontier = next;
     }
 
-    graph.finish()
+    graph.finish_with_cancellation(cancellation)
 }
 
 fn imported_files_for(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     cache: &mut HashMap<ProjectFile, BTreeSet<ProjectFile>>,
-) -> BTreeSet<ProjectFile> {
+    cancellation: &CancellationToken,
+) -> Option<BTreeSet<ProjectFile>> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
     if let Some(cached) = cache.get(file) {
-        return cached.clone();
+        let resolved = cached.clone();
+        return (!cancellation.is_cancelled()).then_some(resolved);
     }
 
     let mut resolved = BTreeSet::new();
     if let Some(provider) = analyzer.import_analysis_provider() {
         let imported_units = provider.imported_code_units_of(file);
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if !imported_units.is_empty() {
-            resolved.extend(
-                imported_units
-                    .iter()
-                    .map(|code_unit| code_unit.source().clone()),
-            );
+            for code_unit in imported_units.iter() {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                resolved.insert(code_unit.source().clone());
+            }
         }
     }
 
     if resolved.is_empty() {
         for import in analyzer.import_statements(file) {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             let before = resolved.len();
-            let definitions: Vec<_> = analyzer.definitions(&import).collect();
-            add_definitions_to_files(definitions.iter(), &mut resolved);
+            if !add_definitions_to_files(analyzer.definitions(&import), &mut resolved, cancellation)
+            {
+                return None;
+            }
             if resolved.len() == before {
                 let matches = analyzer.search_definitions(&import, true);
-                add_definitions_to_files(matches.iter(), &mut resolved);
+                if !add_definitions_to_files(matches, &mut resolved, cancellation) {
+                    return None;
+                }
             }
         }
     }
 
     cache.insert(file.clone(), resolved.clone());
-    resolved
+    (!cancellation.is_cancelled()).then_some(resolved)
 }
 
-fn add_definitions_to_files<'a>(
-    definitions: impl IntoIterator<Item = &'a CodeUnit>,
+fn add_definitions_to_files(
+    definitions: impl IntoIterator<Item = CodeUnit>,
     out: &mut BTreeSet<ProjectFile>,
-) {
-    out.extend(
-        definitions
-            .into_iter()
-            .map(|code_unit| code_unit.source().clone()),
-    );
+    cancellation: &CancellationToken,
+) -> bool {
+    for definition in definitions {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        out.insert(definition.source().clone());
+    }
+    !cancellation.is_cancelled()
 }
 
 fn referencing_files_for(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     cache: &mut HashMap<ProjectFile, BTreeSet<ProjectFile>>,
-) -> BTreeSet<ProjectFile> {
+    cancellation: &CancellationToken,
+) -> Option<BTreeSet<ProjectFile>> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
     if let Some(cached) = cache.get(file) {
-        return cached.clone();
+        let resolved = cached.clone();
+        return (!cancellation.is_cancelled()).then_some(resolved);
     }
 
     let resolved: BTreeSet<ProjectFile> = analyzer
@@ -1647,8 +1985,11 @@ fn referencing_files_for(
             crate::analyzer::read_ledger::file_set_digest(&resolved),
         ));
     }
+    if cancellation.is_cancelled() {
+        return None;
+    }
     cache.insert(file.clone(), resolved.clone());
-    resolved
+    (!cancellation.is_cancelled()).then_some(resolved)
 }
 
 /// Shared Git-relevance contract for bifrost and Brokk.
@@ -3001,8 +3342,8 @@ mod tests {
     };
     use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
-        AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
-        RustAnalyzer, TestProject,
+        AnalyzerDelegate, GoAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, OverlayProject,
+        Project, ProjectFile, PythonAnalyzer, RustAnalyzer, TestProject,
     };
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::hash::HashMap;
@@ -3026,6 +3367,92 @@ mod tests {
         K: Eq + std::hash::Hash,
     {
         entries.into_iter().collect()
+    }
+
+    #[test]
+    fn go_exact_ranking_reports_unreprojected_module_overlay_and_recovers() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/relevance\n\ngo 1.24\n")
+            .file("target/target.go", "package target\n\nfunc Target() {}\n")
+            .file(
+                "main.go",
+                r#"package main
+
+import "example.com/relevance/target"
+
+func run() {
+	target.Target()
+}
+"#,
+            )
+            .build();
+        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+        let analyzer = GoAnalyzer::new(overlay.clone() as Arc<dyn Project>);
+        let seed_weights = hash_map([(project.file("main.go"), 1.0)]);
+        let selected_ecosystems = std::collections::BTreeSet::from([super::UsageEcosystem::Go]);
+        let build = |analyzer: &GoAnalyzer| {
+            let scope = AnalyzerQueryScope::new(analyzer);
+            super::build_usage_ranking_graph_uncached(
+                analyzer,
+                scope.token(),
+                &seed_weights,
+                &selected_ecosystems,
+                super::WorkspaceUsageGraphKind::Exact,
+                &crate::CancellationToken::default(),
+            )
+        };
+
+        let initial = build(&analyzer);
+        let super::Cancellable::Complete(initial) = initial else {
+            panic!("initial Go ranking graph must be complete");
+        };
+        assert!(
+            !initial.nodes.is_empty(),
+            "initial Go ranking graph must retain roots"
+        );
+
+        let module = project.file("go.mod");
+        assert!(overlay.set(
+            module.abs_path(),
+            "module example.com/renamed\n\ngo 1.24\n".to_owned(),
+        ));
+        assert!(matches!(
+            build(&analyzer),
+            super::Cancellable::Incomplete(_)
+        ));
+
+        assert!(overlay.clear(&module.abs_path()));
+        let recovered = build(&analyzer);
+        let super::Cancellable::Complete(recovered) = recovered else {
+            panic!("clearing the module overlay must recover Go ranking");
+        };
+        assert!(
+            !recovered.nodes.is_empty(),
+            "recovered Go ranking graph must retain roots"
+        );
+    }
+
+    #[test]
+    fn usage_graph_and_history_incompleteness_are_both_preserved() {
+        assert!(matches!(
+            super::usage_graph_history_outcome(
+                Vec::new(),
+                true,
+                super::HistoryRankingStatus::HistoryUnavailable,
+            ),
+            super::MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(
+                files
+            ) if files.is_empty()
+        ));
+        assert!(matches!(
+            super::usage_graph_history_outcome(
+                Vec::new(),
+                true,
+                super::HistoryRankingStatus::Complete,
+            ),
+            super::MostRelevantProjectFilesOutcome::UsageGraphIncomplete(files)
+                if files.is_empty()
+        ));
     }
 
     #[test]
@@ -3138,6 +3565,12 @@ mod tests {
             super::MostRelevantProjectFilesOutcome::Complete(files) => files,
             super::MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => {
                 panic!("history should be available here, ranked {files:?}")
+            }
+            super::MostRelevantProjectFilesOutcome::UsageGraphIncomplete(files)
+            | super::MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(
+                files,
+            ) => {
+                panic!("the cascade does not use a usage graph, ranked {files:?}")
             }
             super::MostRelevantProjectFilesOutcome::Cancelled => {
                 panic!("an uncancelled token cannot cancel the cascade")
@@ -3279,6 +3712,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(top_two.contains(&b));
         assert!(top_two.contains(&c));
+    }
+
+    #[test]
+    fn import_ranking_cancellation_after_structured_lookup_publishes_no_prefix_and_retries() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let seed = write_file(
+            root,
+            "test/Seed.java",
+            "package test; import test.Target; public class Seed { Target target; }",
+        );
+        let target = write_file(
+            root,
+            "test/Target.java",
+            "package test; public class Target {}",
+        );
+        let analyzer = java_analyzer(root);
+        let seed_weights = hash_map([(seed, 1.0)]);
+        // Entry, seed, graph-frontier, and provider-boundary checks reach the
+        // structured imported-code-unit lookup before cancellation wins.
+        let cancellation = crate::CancellationToken::cancel_after_checks_for_test(8);
+
+        let cancelled = super::related_files_by_imports_with_cancellation(
+            &analyzer,
+            &seed_weights,
+            10,
+            false,
+            &cancellation,
+        );
+
+        assert!(matches!(cancelled, super::Cancellable::Cancelled));
+        let retry = related_files_by_imports(&analyzer, &seed_weights, 10, false);
+        assert!(retry.iter().any(|candidate| candidate.file == target));
     }
 
     #[test]
@@ -3462,6 +3928,15 @@ mod tests {
             root,
             "src/caller.rs",
             "use crate::target::target;\npub fn seed() { target(); }\n",
+        );
+        // Native Rust resolution places a file through its Cargo target, so a
+        // manifest-less tree has no crate root to place these modules in and
+        // the selected workspace context is honestly unavailable. The fixture
+        // is about seed ecosystem pruning, not about manifest discovery.
+        write_file(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"pruning\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
         );
         write_file(root, "src/lib.rs", "pub mod caller;\npub mod target;\n");
         let rust_target = write_file(

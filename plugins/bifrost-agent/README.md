@@ -82,6 +82,32 @@ location. `BIFROST_BINARY_PATH` is the explicit local development override
 that bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
 stdio MCP traffic stays on stdin/stdout.
 
+Before a default MCP or LSP launch, the launcher asks the selected Bifrost
+binary for its `pack-engine-profile` and prepares the newest eligible public
+rules release together with its exact pinned semantic-pack
+release from [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs), the home
+of open semantic packs and policies. Verified manifests, artifacts, and the extracted selection are cached
+under `BIFROST_LAUNCHER_CACHE_DIR/open-pack-releases` (or the platform cache
+directory when no launcher cache override is set). A warm verified cache is
+reused offline; disabling automatic installation also restricts packs to the
+verified cache. Set `BIFROST_OPEN_PACKS_OFFLINE=1` to require offline lookup or
+`BIFROST_OPEN_PACKS_REFRESH=1` to require fresh release discovery.
+
+Manifest schema 2 selects by required schema versions and semantic capabilities;
+engine versions describe provenance. It requires verified integrity and behavior
+that has not failed, retaining pending or limited behavior in the selection
+receipt. Historical schema 1 releases retain their engine bounds and original
+qualification rules.
+
+When an older binary does not support `pack-engine-profile`, or no eligible
+compatible set is available, the launcher reports a diagnostic on stderr and
+continues with the engine's embedded packs. Invalid release metadata, an
+invalid profile, or corrupt cached content stops launch so that verification
+failures cannot silently change the selected packs. A successfully prepared
+open selection supplies `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE`,
+`BIFROST_OPEN_POLICY_PACK_ROOT`, and `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to the
+engine, replacing embedded registration for those explicit pack roots.
+
 The launcher also has commands that do not require a workspace. `doctor`
 reports the preferred and selected versions, source, and exact or compatibility
 mode without modifying the cache or downloading anything. Compatibility checks execute each selected
@@ -148,7 +174,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.12.0
+pi install npm:@brokk/bifrost-agent@0.13.0
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -485,6 +511,6 @@ where available, so users can install or remove Bifrost without hand-editing
 MCP configuration. Amp uses its direct server-map configuration because it has
 no matching host plugin manifest here.
 
-The MCP process created by this plugin is independent from the VS Code language
-server process. They may point at the same `bifrost` binary, but each host
-starts its own stdio process.
+The MCP process created by this plugin is independent from the standalone
+language server used by the [VS Code extension](https://github.com/BrokkAi/bifrost-lsp).
+Each host starts its own stdio process and checks its own engine pack profile.

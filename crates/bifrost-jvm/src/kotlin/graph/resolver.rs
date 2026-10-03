@@ -845,27 +845,17 @@ fn declared_type_of_uncached(
     token: QueryToken<'_>,
     graph: &KotlinGraphSource<'_>,
 ) -> Option<String> {
-    // An enum entry writes no type: it is an instance of its own enum.
-    if unit.is_field()
-        && let Some(parent) = graph.index.parent_of(unit)
-        && parent.is_class()
-        && graph.index.signature_metadata(unit).is_empty()
-    {
-        return Some(parent.fq_name());
+    let metadata = graph.index.signature_metadata(unit);
+    let name = metadata
+        .iter()
+        .find_map(|entry| entry.return_type_identity()?.nominal_name())?;
+    if name.is_absolute() {
+        return type_unit(graph, &name.path().join(".")).map(|owner| owner.fq_name());
     }
-    let components = graph
-        .index
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|entry| {
-            entry
-                .return_type_identity()?
-                .nominal_name()
-                .map(|name| name.path().to_vec())
-        })?;
+    let components = name.path();
     let byte = graph.index.ranges(unit).into_iter().min()?.start_byte;
     KotlinNameResolver::for_declaration(graph, token, unit)
-        .resolve_type_components(&components, byte)
+        .resolve_type_components(components, byte)
 }
 
 /// The workspace type declaration named `fqn`, if there is one.

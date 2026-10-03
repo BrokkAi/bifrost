@@ -54,9 +54,12 @@ use crate::analyzer::usages::applicability::{
 };
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
+use crate::analyzer::{
+    BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata, StructuredTypeIdentity,
+};
+use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_jvm::kotlin::declarations::kotlin_package_name;
+use brokk_bifrost_jvm::kotlin::declarations::{kotlin_identifier_text, kotlin_package_name};
 use brokk_bifrost_jvm::kotlin::syntax::{
     kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
     kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
@@ -297,7 +300,12 @@ fn kotlin_identifier_reference_outcome(
     };
 
     if parent.kind() == "value_argument" && kotlin_named_argument_label(parent, node) {
-        return kotlin_named_argument_outcome(ctx, token, parent, name);
+        return kotlin_named_argument_outcome(
+            ctx,
+            token,
+            parent,
+            kotlin_identifier_text(node, ctx.source),
+        );
     }
     if let Some(call) = kotlin_call_with_callee(node) {
         return kotlin_bare_call_outcome(ctx, token, node, name, Some(kotlin_call_arity(call)));
@@ -331,11 +339,10 @@ struct KotlinCtx<'a> {
     site: &'a ResolvedReferenceSite,
     overlay: Option<Arc<SemanticModelOverlay>>,
     /// Parsed syntax of the files this request has had to look inside, keyed by
-    /// file. Resolving a reference regularly needs a fact that lives in another
-    /// file's *syntax* rather than in its index — whether a nested object is a
-    /// `companion_object`, what a parameter is called, what type a property
-    /// declares — and re-reading and re-parsing the same file for each of those
-    /// questions would be quadratic in a chained expression.
+    /// file. The remaining declaration-side fact that needs syntax is an
+    /// initializer expression for an untyped property; re-reading and
+    /// re-parsing the same file for each occurrence would be quadratic in a
+    /// chained expression.
     file_syntax: RefCell<HashMap<ProjectFile, Option<Rc<KotlinFileSyntax>>>>,
     /// Package name and imports per file. A declaration's own file decides what
     /// its spelled types mean, so resolving the return type of a function in
@@ -468,9 +475,13 @@ impl<'a> KotlinCtx<'a> {
     /// analyzer, lookup, and work accounting.
     fn declaring_ctx<'declaring>(
         &'declaring self,
-        file: &'declaring ProjectFile,
+        token: QueryToken<'_>,
+        unit: &'declaring CodeUnit,
         source: &'declaring str,
     ) -> KotlinCtx<'declaring> {
+        let file = unit.source();
+        let mut file_facts = HashMap::default();
+        file_facts.insert(file.clone(), self.indexed_file_facts(token, unit));
         KotlinCtx {
             analyzer: self.analyzer,
             support: self.support,
@@ -480,7 +491,7 @@ impl<'a> KotlinCtx<'a> {
             site: self.site,
             overlay: self.overlay.clone(),
             file_syntax: RefCell::new(HashMap::default()),
-            file_facts: RefCell::new(HashMap::default()),
+            file_facts: RefCell::new(file_facts),
         }
     }
 
@@ -488,8 +499,7 @@ impl<'a> KotlinCtx<'a> {
     ///
     /// The package comes from the declaration's own identity, the imports from
     /// the import index, and the enclosing owners from the declaration ranges —
-    /// so unlike [`Self::scope_in`], nothing here reads or parses the declaring
-    /// file. That is what makes the published-facts path of
+    /// so nothing here reads or parses the declaring file. The published-facts path of
     /// [`Self::declared_type_of`] a genuine saving rather than a reordering: the
     /// spelled type still has to be resolved in the file that wrote it, and this
     /// is how that file's scope is obtained without opening it.
@@ -503,10 +513,8 @@ impl<'a> KotlinCtx<'a> {
 
     /// The package and imports of `unit`'s file, taken from the index.
     ///
-    /// Seeds the same cache [`Self::file_facts`] reads, because the two produce
-    /// the same answer: a Kotlin `CodeUnit` records the package of the file that
-    /// declared it, which is exactly what parsing that file's package header
-    /// would report.
+    /// A Kotlin `CodeUnit` records the package of its declaring file. The
+    /// initializer context inherits these facts without parsing its header.
     fn indexed_file_facts(&self, token: QueryToken<'_>, unit: &CodeUnit) -> Rc<KotlinFileFacts> {
         let file = unit.source();
         if let Some(cached) = self.file_facts.borrow().get(file) {
@@ -514,25 +522,6 @@ impl<'a> KotlinCtx<'a> {
         }
         let facts = Rc::new(KotlinFileFacts {
             package_name: unit.package_name().to_string(),
-            imports: self.imports_of(token, file),
-        });
-        self.file_facts
-            .borrow_mut()
-            .insert(file.clone(), Rc::clone(&facts));
-        facts
-    }
-
-    /// The package and imports of `file`.
-    fn file_facts(&self, token: QueryToken<'_>, file: &ProjectFile) -> Rc<KotlinFileFacts> {
-        if let Some(cached) = self.file_facts.borrow().get(file) {
-            return Rc::clone(cached);
-        }
-        let package_name = self
-            .file_syntax(file)
-            .map(|syntax| kotlin_package_name(syntax.tree.root_node(), &syntax.source))
-            .unwrap_or_default();
-        let facts = Rc::new(KotlinFileFacts {
-            package_name,
             imports: self.imports_of(token, file),
         });
         self.file_facts
@@ -551,11 +540,7 @@ impl<'a> KotlinCtx<'a> {
         // resolver takes, so it is charged before it happens rather than after.
         let syntax = self
             .session
-            .query_optional(|| {
-                self.analyzer
-                    .indexed_source(file)
-                    .or_else(|| self.analyzer.project().read_source(file).ok())
-            })
+            .query_optional(|| self.analyzer.indexed_source(file))
             .and_then(|source| {
                 let tree = parse_kotlin_tree(&source)?;
                 Some(Rc::new(KotlinFileSyntax { source, tree }))
@@ -570,10 +555,8 @@ impl<'a> KotlinCtx<'a> {
     ///
     /// Declaration ranges are recorded against the file's own bytes, so the
     /// smallest named node covering the range is the declaration itself. This
-    /// is how a resolver asks a *structural* question about a declaration in
-    /// another file — is this object a companion, what is this parameter
-    /// called, what type does this property declare — without inventing a
-    /// second, text-based model of Kotlin.
+    /// is how a resolver reaches the initializer AST for an untyped property
+    /// in another file without inventing a second, text-based model of Kotlin.
     fn declaration_syntax(&self, unit: &CodeUnit) -> Option<(Rc<KotlinFileSyntax>, Range)> {
         let range = self.ranges(unit).into_iter().min()?;
         let syntax = self.file_syntax(unit.source())?;
@@ -585,16 +568,15 @@ impl<'a> KotlinCtx<'a> {
     }
 
     /// The names visible at `byte` of the requesting file.
-    fn scope_at(&self, token: QueryToken<'_>, byte: usize) -> KotlinScope {
-        self.scope_in(token, self.file, byte)
-    }
-
-    /// The names visible at `byte` of `file`: that file's package and imports,
-    /// plus the declarations enclosing the position and the scopes they inherit.
-    fn scope_in(&self, token: QueryToken<'_>, file: &ProjectFile, byte: usize) -> KotlinScope {
+    fn scope_at(&self, _token: QueryToken<'_>, byte: usize) -> KotlinScope {
         KotlinScope {
-            facts: self.file_facts(token, file),
-            owners: self.scope_owners_at(file, byte),
+            facts: Rc::clone(
+                self.file_facts
+                    .borrow()
+                    .get(self.file)
+                    .expect("query and initializer contexts own their file scope"),
+            ),
+            owners: self.scope_owners_at(self.file, byte),
         }
     }
 
@@ -828,10 +810,9 @@ impl<'a> KotlinCtx<'a> {
                 if !names.contains(&owner) {
                     names.push(owner);
                 }
-                let Some(range) = self.ranges(unit).into_iter().min() else {
+                let Some(scope) = self.declaration_scope(token, unit) else {
                     continue;
                 };
-                let scope = self.scope_in(token, unit.source(), range.start_byte);
                 for spelled in self.raw_supertypes(unit) {
                     let Some(fqn) = self.resolve_name(&spelled, &scope).resolved() else {
                         continue;
@@ -933,6 +914,7 @@ impl<'a> KotlinCtx<'a> {
         let mut reference = self.site.clone();
         reference.text = target;
         DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Resolved,
             reference: Some(reference),
             definitions: Vec::new(),
@@ -1017,40 +999,25 @@ impl<'a> KotlinCtx<'a> {
 
     /// Whether `unit` declares a parameter spelled `label`.
     ///
-    /// The parameter's name is read from the declaring file's syntax at the byte
-    /// range the indexer recorded for it, so a parameter written
-    /// `vararg names: List<String> = emptyList()` yields `names` structurally
-    /// rather than by picking the label apart.
+    /// The producer records the binding name separately from the rendered
+    /// parameter label, so a parameter written `vararg names: List<String> =
+    /// emptyList()` is matched without reading the declaring file.
     fn declares_parameter(&self, unit: &CodeUnit, label: &str) -> bool {
-        let Some(syntax) = self.file_syntax(unit.source()) else {
+        if language_for_target(unit) != Language::Kotlin {
             return false;
-        };
+        }
         self.signature_metadata(unit)
             .iter()
-            .flat_map(|entry| entry.parameters().to_vec())
-            .any(|parameter| {
-                kotlin_declaration_node(
-                    syntax.tree.root_node(),
-                    &Range {
-                        start_byte: parameter.start_byte(),
-                        end_byte: parameter.end_byte(),
-                        start_line: 0,
-                        end_line: 0,
-                    },
-                )
-                .and_then(|node| first_named_child_of_kind(node, "simple_identifier"))
-                .and_then(|name| name.utf8_text(syntax.source.as_bytes()).ok())
-                .is_some_and(|name| name == label)
-            })
+            .flat_map(SignatureMetadata::parameters)
+            .any(|parameter| parameter.name().is_some_and(|name| name == label))
     }
 
     /// The companion objects declared directly inside `owner_fqn`.
     ///
     /// Kotlin lets a class's own body, and its subclasses, name companion
     /// members without qualification, so a companion is a scope in its own
-    /// right. Companion-ness is read from the declaration's syntax
-    /// (`companion_object` versus `object_declaration`) because the two are
-    /// indistinguishable in the index: both are nested classes.
+    /// right. The producer's companion marker distinguishes a companion from
+    /// an ordinary nested object even though both are indexed as classes.
     fn companion_objects(&self, owner_fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_direct_children(owner_fqn)
@@ -1127,87 +1094,66 @@ impl<'a> KotlinCtx<'a> {
     /// The type a declaration carries: a property's or parameter's written
     /// type, an enum entry's own enum, or a function's declared return type.
     ///
-    /// Read from the declaring file's syntax and resolved in *that* file's
-    /// scope, because a spelled type means whatever the file that wrote it says
-    /// it means.
+    /// Kotlin declaration metadata is authoritative for these facts. The
+    /// declaring file is read only when an untyped property has an initializer
+    /// that can prove the type of its value.
     fn declared_type_of(
         &self,
         token: QueryToken<'_>,
         unit: &CodeUnit,
         depth: usize,
     ) -> Option<CodeUnit> {
-        // The index publishes what a Kotlin declaration wrote (issue #1345), so
-        // the case that matters — a written type, which is what a receiver chain
-        // needs at every link — costs a lookup rather than a parse of the
-        // declaring file. The syntax path below stays for what the index cannot
-        // publish: an unwritten type inferred from an initializer, an enum
-        // entry's own enum, and a declaration parse recovery dropped entirely.
-        if let Some(resolved) = self.published_declared_type_of(token, unit) {
+        if language_for_target(unit) != Language::Kotlin {
+            return None;
+        }
+
+        let metadata = self.signature_metadata(unit);
+        if metadata.is_empty() {
+            return None;
+        }
+        let has_metadata_type = metadata.iter().any(|entry| {
+            entry.return_type_identity().is_some() || entry.return_type_text().is_some()
+        });
+        if let Some(resolved) = metadata
+            .iter()
+            .find_map(|entry| self.resolve_metadata_type(token, unit, entry.return_type_identity()))
+        {
             return Some(resolved);
         }
+        // An unresolved written type remains unresolved. Only an untyped
+        // property's initializer can supply expression-based type evidence.
+        if has_metadata_type || !unit.is_field() {
+            return None;
+        }
 
+        self.property_initializer_type(token, unit, depth)
+    }
+
+    /// Infer an untyped property's value type from its initializer.
+    ///
+    /// This is the one declaration-side fact the signature metadata does not
+    /// publish: Kotlin infers a property's type from its expression body. The
+    /// expression is still read structurally through the tree-sitter AST.
+    fn property_initializer_type(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+        depth: usize,
+    ) -> Option<CodeUnit> {
+        if !unit.is_field() {
+            return None;
+        }
         let (syntax, range) = self.declaration_syntax(unit)?;
         let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
-        // An enum entry has no written type: it is an instance of its own enum.
-        if node.kind() == "enum_entry" {
-            return self.parent_of(unit).filter(CodeUnit::is_class);
-        }
-
-        let declaring = self.declaring_ctx(unit.source(), &syntax.source);
-        let type_node = match node.kind() {
-            "property_declaration" => named_children(node)
-                .into_iter()
-                .find(|child| child.kind() == "variable_declaration")
-                .and_then(|variable| {
-                    named_children(variable)
-                        .into_iter()
-                        .find_map(|child| kotlin_type_node_spelling(&declaring, child))
-                }),
-            "function_declaration" => kotlin_declared_return_type_spelling(&declaring, node),
-            _ => named_children(node)
-                .into_iter()
-                .find_map(|child| kotlin_type_node_spelling(&declaring, child)),
-        };
-        if let Some(spelled) = type_node {
-            let scope = declaring.scope_in(token, unit.source(), range.start_byte);
-            if let Some(resolved) = declaring.resolve_type_unit(&spelled, &scope) {
-                return Some(resolved);
-            }
-        }
         if node.kind() != "property_declaration" {
             return None;
         }
-        // A property with no written type is only typed when its initializer
-        // proves one.
+        let declaring = self.declaring_ctx(token, unit, &syntax.source);
         let initializer = named_children(node)
             .into_iter()
             .rev()
             .find(|child| kotlin_is_expression_kind(child.kind()))?;
         kotlin_expression_type(&declaring, token, initializer, depth + 1)
-    }
-
-    /// The type `unit` declares, read from the published index rather than from
-    /// the declaring file's syntax.
-    ///
-    /// Restricted to Kotlin declarations. In a JVM realm a member lookup can
-    /// return a Java or Scala unit, and several of those languages publish a
-    /// return type of their own — resolving one of *those* spellings through
-    /// Kotlin's name ladder would answer a Kotlin question with another
-    /// language's syntax.
-    fn published_declared_type_of(
-        &self,
-        token: QueryToken<'_>,
-        unit: &CodeUnit,
-    ) -> Option<CodeUnit> {
-        if language_for_target(unit) != Language::Kotlin {
-            return None;
-        }
-        let spelled = self
-            .signature_metadata(unit)
-            .into_iter()
-            .find_map(|entry| entry.return_type_text().map(str::to_string))?;
-        let scope = self.declaration_scope(token, unit)?;
-        self.resolve_type_unit(&spelled, &scope)
     }
 
     /// The type an extension function extends, or `None` when the callable is
@@ -1218,32 +1164,45 @@ impl<'a> KotlinCtx<'a> {
         // several declaring files to decide which applied. The published
         // receiver (issue #1345) answers both halves of that question from the
         // index: which candidates are extensions at all, and what each extends.
-        if language_for_target(unit) == Language::Kotlin {
-            let metadata = self.signature_metadata(unit);
-            if let Some(spelled) = metadata
-                .iter()
-                .find_map(|entry| entry.extension_receiver_type())
-            {
-                let spelled = spelled.to_string();
-                let scope = self.declaration_scope(token, unit)?;
-                return self.resolve_type_unit(&spelled, &scope);
-            }
-            if !metadata.is_empty() {
-                // Every indexed Kotlin callable and property carries metadata,
-                // so metadata that records no receiver is positive evidence that
-                // the declaration is not an extension — not a gap to go and
-                // re-read the file about.
-                return None;
-            }
+        if language_for_target(unit) != Language::Kotlin {
+            return None;
         }
+        self.signature_metadata(unit).iter().find_map(|entry| {
+            self.resolve_metadata_type(token, unit, entry.extension_receiver_type_identity())
+        })
+    }
 
-        let (syntax, range) = self.declaration_syntax(unit)?;
-        let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
-        let receiver = node.child_by_field_name("receiver")?;
-        let declaring = self.declaring_ctx(unit.source(), &syntax.source);
-        let spelled = kotlin_type_node_spelling(&declaring, receiver)?;
-        let scope = declaring.scope_in(token, unit.source(), range.start_byte);
-        declaring.resolve_type_unit(&spelled, &scope)
+    /// Resolve a producer-published nominal type in the scope of its declaring
+    /// file. A missing nominal identity records unsupported syntax, and does
+    /// not authorize parsing the rendered type label.
+    fn resolve_metadata_type(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+        identity: Option<&StructuredTypeIdentity>,
+    ) -> Option<CodeUnit> {
+        let identity = identity?;
+        let name = identity.nominal_name_with(|| self.session.observe_cancellation())?;
+        let spelled = name.path().join(".");
+        if name.is_absolute() {
+            // Enum entries publish their owner's absolute type. Preserve the
+            // exact parent when duplicate source copies share that type name.
+            if let Some(parent) = self.parent_of(unit)
+                && parent.is_class()
+                && parent
+                    .fq()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment_interner().resolve(*segment).0)
+                    .eq(name.path().iter().map(String::as_str))
+            {
+                return Some(parent);
+            }
+            let mut types = self.types_named(&spelled);
+            return (types.len() == 1).then(|| types.remove(0));
+        }
+        let scope = self.declaration_scope(token, unit)?;
+        self.resolve_type_unit(&spelled, &scope)
     }
 
     /// Whether `subtype` is `supertype` or inherits from it.
@@ -3137,19 +3096,6 @@ fn kotlin_binding_name<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str
     first_named_child_of_kind(binding, "simple_identifier")?
         .utf8_text(source.as_bytes())
         .ok()
-}
-
-/// The return type a function declaration writes, if it wrote one.
-///
-/// The grammar gives the return type no field, but it is the only bare type
-/// node among a `function_declaration`'s children: the parameters live inside
-/// `function_value_parameters` and the receiver behind the `receiver` field.
-fn kotlin_declared_return_type_spelling(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<String> {
-    let receiver = node.child_by_field_name("receiver").map(|node| node.id());
-    named_children(node)
-        .into_iter()
-        .filter(|child| Some(child.id()) != receiver)
-        .find_map(|child| kotlin_type_node_spelling(ctx, child))
 }
 
 /// The dotted name a type node spells, or `None` for a shape that names no

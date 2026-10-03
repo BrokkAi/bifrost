@@ -73,7 +73,11 @@ struct AttemptKey {
 }
 
 static ATTEMPTED_REQUESTS: OnceLock<Mutex<HashSet<AttemptKey>>> = OnceLock::new();
-static RELEASE_CHECKSUM: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+/// The release checksum sidecar this process resolved, or the error that
+/// resolving it produced. See [`ReleaseChecksumMemoTransport`].
+type ReleaseChecksumMemo = Mutex<Option<Result<Vec<u8>, DownloadError>>>;
+
+static RELEASE_CHECKSUM: ReleaseChecksumMemo = Mutex::new(None);
 
 /// The request and immutable release identity that key one negative-cache
 /// entry. `path` is absent only when this host has no machine-local cache root.
@@ -158,8 +162,11 @@ pub fn acquire_semantic_pack(
         return Ok(());
     }
 
-    acquire_with_transport(catalog, request, &UreqTransport::new())
-        .map_err(|error| error.to_string())
+    let transport = ReleaseChecksumMemoTransport {
+        inner: &UreqTransport::new(),
+        memo: &RELEASE_CHECKSUM,
+    };
+    acquire_with_transport(catalog, request, &transport).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -383,28 +390,6 @@ impl UreqTransport {
 
 impl HttpTransport for UreqTransport {
     fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
-        if url == release_asset_url(CHECKSUM_NAME) {
-            // Every acquisition in this process targets the same release.
-            // Resolve its identity once, but retry errors and refresh it when
-            // the next process starts. Absence still requires a catalog proof.
-            let mut checksum = RELEASE_CHECKSUM
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .expect("release checksum mutex poisoned");
-            if let Some(bytes) = checksum.as_ref() {
-                return Ok(bytes.clone());
-            }
-            let bytes = self.fetch_asset(url, max_bytes)?;
-            parse_checksum_sidecar(&bytes, ARCHIVE_NAME)?;
-            *checksum = Some(bytes.clone());
-            return Ok(bytes);
-        }
-        self.fetch_asset(url, max_bytes)
-    }
-}
-
-impl UreqTransport {
-    fn fetch_asset(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
         let mut response = self
             .agent
             .get(url)
@@ -417,6 +402,39 @@ impl UreqTransport {
             .limit(max_bytes)
             .read_to_vec()
             .map_err(|error| DownloadError::new(format!("read {url}: {error}")))
+    }
+}
+
+/// Resolves the release checksum at most once per `memo`, which production
+/// keeps for the whole process.
+///
+/// Every acquisition in a process targets the same release, so its identity
+/// is resolved once. A failure is remembered too: an unpublished release
+/// answers 404 to every dependency, and refetching it cost about 11 s per warm
+/// start on an npm workspace (#3748). The next process fetches again. A
+/// remembered failure is only a failed acquisition; it records no absence,
+/// because absence still requires a catalog proof.
+struct ReleaseChecksumMemoTransport<'a> {
+    inner: &'a dyn HttpTransport,
+    memo: &'a ReleaseChecksumMemo,
+}
+
+impl HttpTransport for ReleaseChecksumMemoTransport<'_> {
+    fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
+        if url != release_asset_url(CHECKSUM_NAME) {
+            return self.inner.fetch(url, max_bytes);
+        }
+        // Holding the lock across the fetch makes concurrent acquisitions
+        // wait for one request instead of each sending their own.
+        self.memo
+            .lock()
+            .expect("release checksum mutex poisoned")
+            .get_or_insert_with(|| {
+                let bytes = self.inner.fetch(url, max_bytes)?;
+                parse_checksum_sidecar(&bytes, ARCHIVE_NAME)?;
+                Ok(bytes)
+            })
+            .clone()
     }
 }
 
@@ -1146,7 +1164,7 @@ mod tests {
                 container: None,
             },
             compatibility: Compatibility {
-                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: format!("={version}"),
@@ -1248,7 +1266,7 @@ mod tests {
                 container: None,
             },
             compatibility: Compatibility {
-                bifrost: format!("={RELEASE_VERSION}"),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "python".to_owned(),
                     requirement: "=3.12.0".to_owned(),
@@ -2206,6 +2224,85 @@ mod tests {
             AcquisitionReceiptLookup::ReceiptMiss,
             "failed verification must not create an absence receipt"
         );
+    }
+
+    #[test]
+    fn failed_release_checksum_fetch_is_remembered_without_recording_absence() {
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let negative_cache_root = tempdir().unwrap();
+        let checksum_url = release_asset_url(CHECKSUM_NAME);
+        // An unpublished release: the fake has no checksum response.
+        let unpublished = FakeTransport::new(HashMap::new());
+        let memo = ReleaseChecksumMemo::new(None);
+        let transport = ReleaseChecksumMemoTransport {
+            inner: &unpublished,
+            memo: &memo,
+        };
+        let first_key = test_key();
+        let second_key = GeneratedProductionKey::new(
+            "1".repeat(64),
+            "test-producer".to_owned(),
+            "1.0.0".to_owned(),
+            SEMANTIC_MODEL_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let errors = [&first_key, &second_key].map(|key| {
+            acquire_with_negative_cache(
+                &catalog,
+                &AcquisitionRequest::GeneratedProduction(key),
+                &transport,
+                Some(negative_cache_root.path()),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(
+            unpublished.requests.lock().unwrap().as_slice(),
+            std::slice::from_ref(&checksum_url),
+            "a second dependency must reuse the remembered failure"
+        );
+        assert_eq!(errors[0], errors[1]);
+        for (key, error) in [&first_key, &second_key].into_iter().zip(&errors) {
+            assert_ne!(
+                *error,
+                unsatisfied_error(&AcquisitionRequest::GeneratedProduction(key)),
+                "a failed checksum fetch is not proven absence"
+            );
+        }
+
+        // The next process starts with an empty memo and fetches again.
+        let digest = "a".repeat(64);
+        let published = FakeTransport::new(HashMap::from([(
+            checksum_url.clone(),
+            format!("{digest}  {ARCHIVE_NAME}\n").into_bytes(),
+        )]));
+        let next_memo = ReleaseChecksumMemo::new(None);
+        let next_process = ReleaseChecksumMemoTransport {
+            inner: &published,
+            memo: &next_memo,
+        };
+        let checksum = next_process
+            .fetch(&checksum_url, MAX_CHECKSUM_BYTES)
+            .unwrap();
+        assert_eq!(
+            parse_checksum_sidecar(&checksum, ARCHIVE_NAME).unwrap(),
+            digest
+        );
+        assert_eq!(published.requests.lock().unwrap().len(), 1);
+
+        // Neither failure recorded absence: no machine-local negative-cache
+        // entry and no catalog receipt for the release that is now published.
+        assert!(!negative_cache_root.path().join(NEGATIVE_CACHE_DIR).exists());
+        for key in [&first_key, &second_key] {
+            assert_eq!(
+                catalog
+                    .acquisition_receipt_lookup(
+                        &receipt_request(&AcquisitionRequest::GeneratedProduction(key)),
+                        &receipt_release(&digest),
+                    )
+                    .unwrap(),
+                AcquisitionReceiptLookup::ReceiptMiss,
+            );
+        }
     }
 
     #[test]

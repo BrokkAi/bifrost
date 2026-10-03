@@ -1,11 +1,12 @@
-; An exact Java loop body cannot reach its own repeat edge.
+; An exact Java, JavaScript, TypeScript, Python, C#, Kotlin, Go, Rust or PHP conditional loop body
+; cannot reach its own repeat edge.
 (policy
   :schema-version 1
   :id "bifrost.correctness.loop-body-never-repeats"
   :name "Loop body never repeats"
   :message "this loop body cannot reach its next iteration"
   :severity warning
-  :description "The exact Java loop body is reachable, but every modeled continuation leaves before its own repeat edge. An intentional do-while(false) is excluded. Review the loop structure and early exits before changing code; no automatic rewrite is supplied."
+  :description "The exact Java, JavaScript, TypeScript, Python, C#, Kotlin, Go, Rust or PHP while, for or do loop body is reachable, but every modeled continuation leaves before its own repeat edge. Iteration loops (Java enhanced for, C# foreach, JavaScript for-in and for-of, Python for, Kotlin for, Go for-range, Rust for, PHP foreach) are not assessed, because a single pass over the first element is a common deliberate idiom. An intentional do-while(false) is excluded. Review the loop structure and early exits before changing code; no automatic rewrite is supplied."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "loop" "code-smell"]
   :analysis (analysis
@@ -13,7 +14,7 @@
     (bind :name loop
       :query (rql :schema-version 1
         (filter :where ((verdict eq proven))
-          (language java
+          (language java javascript typescript python csharp kotlin go rust php
             (loop-relations
               (procedure-of
                 (callable)))))))

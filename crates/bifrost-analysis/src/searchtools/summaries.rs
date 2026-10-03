@@ -164,11 +164,17 @@ pub struct MostRelevantFilesResult {
 pub enum MostRelevantFilesIncompleteReason {
     Cancelled,
     TimeBudget,
+    /// The exact usage graph contained sound positive evidence but could not
+    /// certify that its edge inventory was complete.
+    UsageGraphIncomplete,
     /// Ranking ran without the git co-change leg because this repository cannot
     /// supply recent history as local work. A partial clone (`--filter=blob:none`)
     /// is the case that motivated the distinction: walking its history makes Git
     /// refetch absent objects one round trip at a time (issue #1373).
     HistoryUnavailable,
+    /// The usage graph was incomplete and recent commit history was also
+    /// unavailable; neither independent quality shortfall is hidden.
+    UsageGraphIncompleteAndHistoryUnavailable,
 }
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
@@ -1098,6 +1104,85 @@ pub fn most_relevant_files_with_cancellation(
     params: MostRelevantFilesParams,
     cancellation: &crate::CancellationToken,
 ) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_ranker(
+        analyzer,
+        params,
+        cancellation,
+        |token, seeds, top_k, half_life, ranking_mode, cancellation| {
+            Ok(
+                most_relevant_project_files_with_ranking_mode_and_cancellation(
+                    analyzer,
+                    token,
+                    seeds,
+                    top_k,
+                    half_life,
+                    ranking_mode,
+                    cancellation,
+                ),
+            )
+        },
+    )
+}
+
+/// Test-support facade for the full `most_relevant_files` operation with a
+/// selected Java producer at the exact usage-graph cache-miss seam.
+#[cfg(any(test, feature = "test-support"))]
+pub fn most_relevant_files_with_selected_exact_graph_builder<F, E>(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &crate::CancellationToken,
+    telemetry: &mut crate::relevance::SelectedExactRelevanceTelemetry,
+    mut build_graph: F,
+) -> Result<MostRelevantFilesResult, String>
+where
+    F: FnMut(
+        &crate::CancellationToken,
+    ) -> Result<
+        crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageRankingBuildOutcome,
+        E,
+    >,
+    E: std::fmt::Display,
+{
+    *telemetry = crate::relevance::SelectedExactRelevanceTelemetry::default();
+    let mut build_graph = |cancellation: &crate::CancellationToken| {
+        build_graph(cancellation).map_err(|error| error.to_string())
+    };
+    most_relevant_files_with_ranker(
+        analyzer,
+        params,
+        cancellation,
+        |_token, seeds, top_k, half_life, ranking_mode, cancellation| {
+            if ranking_mode != MostRelevantFilesRankingMode::UsageGraphExact {
+                return Err(format!(
+                    "selected Java relevance requires ranking_mode=usage_graph_exact, got {ranking_mode:?}"
+                ));
+            }
+            crate::relevance::most_relevant_project_files_with_selected_exact_graph_and_cancellation(
+                analyzer,
+                seeds,
+                top_k,
+                half_life,
+                cancellation,
+                telemetry,
+                &mut build_graph,
+            )
+        },
+    )
+}
+
+fn most_relevant_files_with_ranker(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &crate::CancellationToken,
+    mut rank_project_files: impl FnMut(
+        QueryToken<'_>,
+        &[(ProjectFile, f64)],
+        usize,
+        Option<f64>,
+        MostRelevantFilesRankingMode,
+        &crate::CancellationToken,
+    ) -> Result<MostRelevantProjectFilesOutcome, String>,
+) -> Result<MostRelevantFilesResult, String> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let _scope = profiling::scope("searchtools::most_relevant_files");
@@ -1159,21 +1244,26 @@ pub fn most_relevant_files_with_cancellation(
         });
     }
 
-    let (files, complete, ranking_mode_used, incomplete_reason) = {
+    let (mut files, mut complete, ranking_mode_used, mut incomplete_reason) = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let (ranked, complete, ranking_mode_used, incomplete_reason) =
-            match most_relevant_project_files_with_ranking_mode_and_cancellation(
-                analyzer,
+        let (ranked, mut complete, ranking_mode_used, mut incomplete_reason) =
+            match rank_project_files(
                 token,
                 &seeds,
                 requested_limit,
                 recency_half_life,
                 ranking_mode,
                 cancellation,
-            ) {
+            )? {
                 MostRelevantProjectFilesOutcome::Complete(files) => {
                     (files, true, ranking_mode, None)
                 }
+                MostRelevantProjectFilesOutcome::UsageGraphIncomplete(files) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete),
+                ),
                 // The import leg still ranked these files; only the commit-history
                 // leg was missing, so the ranking is served with the shortfall
                 // named rather than discarded.
@@ -1183,20 +1273,34 @@ pub fn most_relevant_files_with_cancellation(
                     ranking_mode,
                     Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
                 ),
-                // Issue #1304: a cancelled or over-budget usage-graph build is
-                // reported by serving the deterministic history/import ranking
-                // instead, not by failing the request. The same cancelled token
-                // is passed on, so the fallback stays bounded rather than
-                // starting the work the budget just stopped.
+                MostRelevantProjectFilesOutcome::UsageGraphIncompleteAndHistoryUnavailable(
+                    files,
+                ) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(
+                        MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
+                    ),
+                ),
+                // Issue #1304: a producer-local cancellation may use the
+                // deterministic history/import fallback while the shared
+                // request token remains live. Shared-token cancellation skips
+                // that fallback and publishes no ranked prefix.
                 MostRelevantProjectFilesOutcome::Cancelled => {
                     let reason = most_relevant_files_incomplete_reason(cancellation);
-                    let (files, _) = most_relevant_project_files_with_half_life(
-                        analyzer,
-                        &seeds,
-                        params.limit,
-                        recency_half_life,
-                        cancellation,
-                    );
+                    let files = if cancellation.is_cancelled() {
+                        Vec::new()
+                    } else {
+                        most_relevant_project_files_with_half_life(
+                            analyzer,
+                            &seeds,
+                            params.limit,
+                            recency_half_life,
+                            cancellation,
+                        )
+                        .0
+                    };
                     (
                         files,
                         false,
@@ -1205,22 +1309,35 @@ pub fn most_relevant_files_with_cancellation(
                     )
                 }
             };
-        (
-            ranked
-                .into_iter()
-                // The one shared classifier, so a ranked file carries exactly
-                // the verdict `classify_test_files` would give it. Bounded by
-                // `limit` entries.
-                .map(|file| MostRelevantFile {
-                    test: super::scan_usages::classify_resolved_test_file(analyzer, &file).kind,
-                    path: rel_path_string(&file),
-                })
-                .collect(),
-            complete,
-            ranking_mode_used,
-            incomplete_reason,
-        )
+        let mut files = Vec::with_capacity(ranked.len());
+        for file in ranked {
+            if cancellation.is_cancelled() {
+                files.clear();
+                complete = false;
+                incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+                break;
+            }
+            // The one shared classifier, so a ranked file carries exactly the
+            // verdict `classify_test_files` would give it. Bounded by `limit`
+            // entries.
+            files.push(MostRelevantFile {
+                test: super::scan_usages::classify_resolved_test_file(analyzer, &file).kind,
+                path: rel_path_string(&file),
+            });
+        }
+        if cancellation.is_cancelled() {
+            files.clear();
+            complete = false;
+            incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+        }
+        (files, complete, ranking_mode_used, incomplete_reason)
     };
+
+    if cancellation.is_cancelled() {
+        files.clear();
+        complete = false;
+        incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+    }
 
     Ok(MostRelevantFilesResult {
         files,
@@ -1718,5 +1835,393 @@ mod issue_1304_tests {
             most_relevant_files_incomplete_reason(&cancelled),
             MostRelevantFilesIncompleteReason::Cancelled
         );
+    }
+}
+
+#[cfg(test)]
+mod selected_java_outer_relevance_tests {
+    use super::*;
+    use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
+    use crate::analyzer::usages::workspace_graph::{
+        SelectedWorkspaceUsageRankingBuildOutcome, SelectedWorkspaceUsageRankingGraph,
+        UsageEcosystem, WorkspaceUsageEdge, WorkspaceUsageRankingGraph, WorkspaceUsageRankingNode,
+    };
+    use crate::analyzer::{AnalyzerConfig, IAnalyzer, Language, ProjectFile};
+    use crate::inline_project::InlineTestProject;
+    use crate::relevance::{SelectedExactRelevanceTelemetry, SelectedExactUsageGraphLifecycle};
+
+    fn exact_params(seed_file_paths: Vec<String>, limit: usize) -> MostRelevantFilesParams {
+        MostRelevantFilesParams {
+            seed_file_paths,
+            seed_weights: None,
+            recency_half_life: Some(DEFAULT_RECENCY_HALF_LIFE),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
+            limit,
+        }
+    }
+
+    fn selected_graph(
+        analyzer: &dyn IAnalyzer,
+        files: &[ProjectFile],
+        edges: &[(usize, usize)],
+    ) -> SelectedWorkspaceUsageRankingGraph {
+        let mut node_indices_by_file = HashMap::default();
+        let nodes = files
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, file)| {
+                node_indices_by_file.insert(file.clone(), vec![index]);
+                WorkspaceUsageRankingNode {
+                    primary_file: file.clone(),
+                    seed_files: vec![file],
+                    incomplete: false,
+                    contains_tests: None,
+                }
+            })
+            .collect();
+        let graph = WorkspaceUsageRankingGraph {
+            nodes,
+            edges: edges
+                .iter()
+                .map(|&(from, to)| WorkspaceUsageEdge {
+                    from,
+                    to,
+                    counts: UsageReferenceCounts {
+                        calls: 1,
+                        ..UsageReferenceCounts::default()
+                    },
+                })
+                .collect(),
+            node_indices_by_file,
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        };
+        SelectedWorkspaceUsageRankingGraph::from_ranking_graph_for_test(
+            graph,
+            analyzer.project().analysis_generation(),
+        )
+    }
+
+    #[test]
+    fn full_selected_operation_preserves_paths_classification_and_complete_warm_hits() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/main/java/p/Seed.java", "package p; class Seed {}\n")
+            .file("other/Seed.java", "class OtherSeed {}\n")
+            .file(
+                "src/test/java/p/TargetHelper.java",
+                "package p; class TargetHelper {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/main/java/p/Seed.java");
+        let target = project.file("src/test/java/p/TargetHelper.java");
+        let params = || {
+            exact_params(
+                vec![
+                    " src/main/java/p/Seed.java ".to_string(),
+                    "Seed.java".to_string(),
+                    "missing/Absent.java".to_string(),
+                ],
+                1,
+            )
+        };
+
+        // Populate the incumbent exact entry first. The selected call must
+        // still build because producer identity is part of the cache key.
+        most_relevant_files_with_cancellation(
+            analyzer,
+            exact_params(vec!["src/main/java/p/Seed.java".to_string()], 1),
+            &crate::CancellationToken::default(),
+        )
+        .expect("incumbent exact ranking should finish");
+
+        let mut first_telemetry = SelectedExactRelevanceTelemetry::default();
+        let first = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut first_telemetry,
+            |_| {
+                Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Complete(
+                    selected_graph(analyzer, &[seed.clone(), target.clone()], &[(0, 1)]),
+                ))
+            },
+        )
+        .expect("selected exact ranking should finish");
+
+        assert_eq!(1, first_telemetry.build_attempts);
+        assert_eq!(Some(true), first_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            first_telemetry.lifecycle
+        );
+        assert_eq!(vec!["src/test/java/p/TargetHelper.java"], paths(&first));
+        assert_eq!(1, first.not_found.len());
+        assert_eq!(1, first.ambiguous_paths.len());
+        let classification = crate::searchtools::classify_test_files(
+            analyzer,
+            crate::searchtools::ClassifyTestFilesParams {
+                file_paths: vec!["src/test/java/p/TargetHelper.java".to_string()],
+            },
+        );
+        assert_eq!(
+            classification.classifications["src/test/java/p/TargetHelper.java"].kind,
+            first.files[0].test
+        );
+
+        let mut warm_telemetry = SelectedExactRelevanceTelemetry::default();
+        let warm = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut warm_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("a selected complete cache hit must not rebuild")
+            },
+        )
+        .expect("warm selected exact ranking should hit");
+        assert_eq!(0, warm_telemetry.build_attempts);
+        assert_eq!(Some(true), warm_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Hit,
+            warm_telemetry.lifecycle
+        );
+        assert_eq!(paths(&first), paths(&warm));
+
+        let mut duplicate_telemetry = SelectedExactRelevanceTelemetry::default();
+        let duplicate = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            exact_params(
+                vec![
+                    "src/main/java/p/Seed.java".to_string(),
+                    " src/main/java/p/Seed.java ".to_string(),
+                ],
+                1,
+            ),
+            &crate::CancellationToken::default(),
+            &mut duplicate_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("duplicate seed short-circuit must not acquire a graph")
+            },
+        )
+        .expect("duplicate seeds are a structured result");
+        assert_eq!(vec!["src/main/java/p/Seed.java"], duplicate.duplicates);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::NotRequested,
+            duplicate_telemetry.lifecycle
+        );
+    }
+
+    #[test]
+    fn incomplete_selected_graph_rebuilds_and_keeps_import_fill_without_duplicates() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "src/main/java/p/Seed.java",
+                "package p; import q.ImportTarget; class Seed { ImportTarget target; }\n",
+            )
+            .file(
+                "src/main/java/p/GraphTarget.java",
+                "package p; class GraphTarget {}\n",
+            )
+            .file(
+                "src/main/java/q/ImportTarget.java",
+                "package q; public class ImportTarget {}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/main/java/p/Seed.java");
+        let graph_target = project.file("src/main/java/p/GraphTarget.java");
+
+        for _ in 0..2 {
+            let mut telemetry = SelectedExactRelevanceTelemetry::default();
+            let result = most_relevant_files_with_selected_exact_graph_builder(
+                analyzer,
+                exact_params(vec!["src/main/java/p/Seed.java".to_string()], 2),
+                &crate::CancellationToken::default(),
+                &mut telemetry,
+                |_| {
+                    Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Incomplete(
+                        selected_graph(analyzer, &[seed.clone(), graph_target.clone()], &[(0, 1)]),
+                    ))
+                },
+            )
+            .expect("incomplete selected graph should still rank sound positives");
+
+            assert_eq!(1, telemetry.build_attempts);
+            assert_eq!(Some(false), telemetry.graph_complete);
+            assert_eq!(
+                SelectedExactUsageGraphLifecycle::Incomplete,
+                telemetry.lifecycle
+            );
+            assert!(!result.complete);
+            assert_eq!(
+                Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete),
+                result.incomplete_reason
+            );
+            let ranked = paths(&result);
+            assert_eq!(2, ranked.len());
+            assert!(ranked.contains(&"src/main/java/p/GraphTarget.java"));
+            assert!(ranked.contains(&"src/main/java/q/ImportTarget.java"));
+            assert!(!ranked.contains(&"src/main/java/p/Seed.java"));
+        }
+    }
+
+    #[test]
+    fn selected_cancel_stale_and_error_do_not_publish_and_retry() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Seed.java", "class Seed {}\n")
+            .file("src/Target.java", "class Target {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let seed = project.file("src/Seed.java");
+        let target = project.file("src/Target.java");
+        let params = || exact_params(vec!["src/Seed.java".to_string()], 1);
+
+        let mut error_telemetry = SelectedExactRelevanceTelemetry::default();
+        let error = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut error_telemetry,
+            |_| Err::<SelectedWorkspaceUsageRankingBuildOutcome, _>("build failed"),
+        );
+        assert_eq!("build failed", error.unwrap_err());
+        assert_eq!(1, error_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Error,
+            error_telemetry.lifecycle
+        );
+
+        let mut stale_attempt = 0;
+        let mut retry_telemetry = SelectedExactRelevanceTelemetry::default();
+        let retry = most_relevant_files_with_selected_exact_graph_builder(
+            analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut retry_telemetry,
+            |_| {
+                stale_attempt += 1;
+                Ok::<_, String>(if stale_attempt == 1 {
+                    SelectedWorkspaceUsageRankingBuildOutcome::Stale
+                } else {
+                    SelectedWorkspaceUsageRankingBuildOutcome::Complete(selected_graph(
+                        analyzer,
+                        &[seed.clone(), target.clone()],
+                        &[(0, 1)],
+                    ))
+                })
+            },
+        )
+        .expect("a fresh selected build should retry stale evidence");
+        assert_eq!(vec!["src/Target.java"], paths(&retry));
+        assert_eq!(2, retry_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            retry_telemetry.lifecycle
+        );
+
+        let second_project = InlineTestProject::with_language(Language::Java)
+            .file("src/Seed.java", "class Seed {}\n")
+            .file("src/Target.java", "class Target {}\n")
+            .build();
+        let second_workspace = second_project.workspace_analyzer(AnalyzerConfig::default());
+        let second_analyzer = second_workspace.analyzer();
+        let second_seed = second_project.file("src/Seed.java");
+        let second_target = second_project.file("src/Target.java");
+
+        let simultaneous_cancellation = crate::CancellationToken::default();
+        let mut simultaneous_telemetry = SelectedExactRelevanceTelemetry::default();
+        let simultaneous = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &simultaneous_cancellation,
+            &mut simultaneous_telemetry,
+            |_| {
+                simultaneous_cancellation.cancel();
+                Err::<SelectedWorkspaceUsageRankingBuildOutcome, _>("error raced cancellation")
+            },
+        )
+        .expect("cancellation must outrank a simultaneous selected build error");
+        assert!(simultaneous.files.is_empty());
+        assert!(!simultaneous.complete);
+        assert_eq!(
+            Some(MostRelevantFilesIncompleteReason::Cancelled),
+            simultaneous.incomplete_reason
+        );
+        assert_eq!(1, simultaneous_telemetry.build_attempts);
+        assert_eq!(None, simultaneous_telemetry.graph_complete);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Cancelled,
+            simultaneous_telemetry.lifecycle
+        );
+
+        let mut cancelled_telemetry = SelectedExactRelevanceTelemetry::default();
+        let cancelled = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut cancelled_telemetry,
+            |_| Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Cancelled),
+        )
+        .expect("builder cancellation is a structured incomplete result");
+        assert!(!cancelled.complete);
+        assert_eq!(
+            Some(MostRelevantFilesIncompleteReason::Cancelled),
+            cancelled.incomplete_reason
+        );
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Cancelled,
+            cancelled_telemetry.lifecycle
+        );
+
+        let mut after_cancel_telemetry = SelectedExactRelevanceTelemetry::default();
+        let after_cancel = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &crate::CancellationToken::default(),
+            &mut after_cancel_telemetry,
+            |_| {
+                Ok::<_, String>(SelectedWorkspaceUsageRankingBuildOutcome::Complete(
+                    selected_graph(
+                        second_analyzer,
+                        &[second_seed.clone(), second_target.clone()],
+                        &[(0, 1)],
+                    ),
+                ))
+            },
+        )
+        .expect("cancelled selected build must leave the cache retryable");
+        assert_eq!(vec!["src/Target.java"], paths(&after_cancel));
+        assert_eq!(1, after_cancel_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::Built,
+            after_cancel_telemetry.lifecycle
+        );
+
+        let cancellation = crate::CancellationToken::default();
+        cancellation.cancel();
+        let mut entry_telemetry = SelectedExactRelevanceTelemetry::default();
+        let entry = most_relevant_files_with_selected_exact_graph_builder(
+            second_analyzer,
+            params(),
+            &cancellation,
+            &mut entry_telemetry,
+            |_| -> Result<SelectedWorkspaceUsageRankingBuildOutcome, String> {
+                panic!("pre-cancelled outer request must not build")
+            },
+        );
+        assert!(entry.unwrap_err().contains("cancelled"));
+        assert_eq!(0, entry_telemetry.build_attempts);
+        assert_eq!(
+            SelectedExactUsageGraphLifecycle::NotRequested,
+            entry_telemetry.lifecycle
+        );
+    }
+
+    fn paths(result: &MostRelevantFilesResult) -> Vec<&str> {
+        result.files.iter().map(|file| file.path.as_str()).collect()
     }
 }

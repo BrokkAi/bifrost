@@ -11,7 +11,7 @@ use crate::analyzer::semantic_model::{
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use brokk_bifrost_rust::declarations::{rust_node_text, rust_package_name};
-use brokk_bifrost_rust::graph::ast::{
+use brokk_bifrost_rust::graph_support::{
     rust_path_is_leading_absolute, rust_path_segments, rust_reference_namespace,
 };
 use brokk_bifrost_rust::imports::{
@@ -118,9 +118,9 @@ pub(crate) fn resolve_generated_functions<'a>(
     overlay: &'a SemanticModelOverlay,
     file: &ProjectFile,
     reference: &ResolvedReferenceSite,
-) -> Vec<&'a SemanticModelSymbol> {
+) -> Result<Vec<&'a SemanticModelSymbol>, brokk_bifrost_rust::graph_support::RustCargoRouteError> {
     if !overlay.has_rust_generated_functions() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let anchors = overlay.symbols_at_authored_path(&crate::path_utils::rel_path_string(file))
         .records.into_iter().filter(|symbol| {
@@ -128,41 +128,41 @@ pub(crate) fn resolve_generated_functions<'a>(
                 SemanticModelLocation::Authored(anchor) if anchor.range.start_byte == reference.focus_start_byte && anchor.range.end_byte == reference.focus_end_byte)
         }).collect::<Vec<_>>();
     if !anchors.is_empty() {
-        return anchors;
+        return Ok(anchors);
     }
     let Some(source) = analyzer.indexed_source(file) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let context = DeclarationNameRangeContext::new(file, source.to_string());
     let Some(root) = context.root_node() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(node) =
         root.named_descendant_for_byte_range(reference.focus_start_byte, reference.focus_end_byte)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if rust_reference_namespace(node) != RustReferenceNamespace::Value {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let node = reference_path(node);
     let Some(path) = rust_path_segments(node) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(last) = path.last() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if last.start_byte() != reference.focus_start_byte
         || last.end_byte() != reference.focus_end_byte
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // Member calls and macro input tokens do not denote a free function path.
     if node
         .parent()
         .is_some_and(|parent| matches!(parent.kind(), "field_expression" | "token_tree"))
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let segments = path
         .iter()
@@ -194,7 +194,7 @@ pub(crate) fn resolve_generated_functions<'a>(
             continue;
         }
         imported = true;
-        let mut imported_path = projected.import.path;
+        let mut imported_path = projected.import.path().to_vec();
         imported_path.extend_from_slice(&segments[1..]);
         if let Some(route) =
             resolve_rust_module_segments_with_crate(owner_module, &crate_module, &imported_path)
@@ -216,7 +216,7 @@ pub(crate) fn resolve_generated_functions<'a>(
         }
     }
     let rust = resolve_analyzer::<RustAnalyzer>(analyzer);
-    let cargo = rust.map(RustAnalyzer::cargo_routes);
+    let cargo = rust.map(RustAnalyzer::cargo_routes).transpose()?;
     let mut matches = Vec::new();
     for route in routes {
         for symbol in overlay.symbols_named(&route).records {
@@ -256,5 +256,5 @@ pub(crate) fn resolve_generated_functions<'a>(
             }
         }
     }
-    matches
+    Ok(matches)
 }

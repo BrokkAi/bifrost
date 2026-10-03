@@ -6,10 +6,11 @@
 //! Zeitwerk convention/visibility cells, and the reverse import index -- stay on `RubyAnalyzer` in
 //! `brokk-bifrost-analysis`; only the decisions that fill them live here.
 
-use crate::declarations::{extract_name_segments, parse_ruby_tree, ruby_node_text as node_text};
+use crate::declarations::ruby_node_text as node_text;
 use crate::graph_support::RubySource;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::ruby_facts::{RubyLoadInfo, RubyLoadKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -18,25 +19,57 @@ use tree_sitter::Node;
 
 pub const ZEITWERK_AUTOLOAD_EXCLUDED_APP_DIRS: &[&str] = &["assets", "javascript", "views"];
 
-/// Parses a `require`/`require_relative`/`load`/`autoload` call into an
-/// [`ImportInfo`]. The required path string is stored in `identifier`; the kind
-/// is recoverable from `raw_snippet`.
-pub fn parse_ruby_require_call(node: Node<'_>, source: &str) -> Option<ImportInfo> {
-    let raw_snippet = node_text(node, source).trim().to_string();
+pub(crate) struct RubyLoadSyntax<'tree> {
+    pub import: ImportInfo,
+    pub kind: RubyLoadKind,
+    pub has_receiver: bool,
+    pub constant: Option<String>,
+    pub target: Node<'tree>,
+}
+
+/// Interpret one load-call node while its primary AST is live.
+pub(crate) fn parse_ruby_load_syntax<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<RubyLoadSyntax<'tree>> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    let kind = match node_text(method, source).trim() {
+        "require" => RubyLoadKind::Require,
+        "require_relative" => RubyLoadKind::RequireRelative,
+        "load" => RubyLoadKind::Load,
+        "autoload" => RubyLoadKind::Autoload,
+        _ => return None,
+    };
     let arguments = node.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
-    let path = arguments
+    let (argument, path) = arguments
         .named_children(&mut cursor)
-        .find_map(|arg| string_literal_value(arg, source))?;
-
-    Some(ImportInfo {
-        raw_snippet,
-        is_wildcard: false,
-        is_global: false,
-        identifier: Some(path),
-        alias: None,
-        path: None,
-        binder_span: None,
+        .find_map(|arg| string_literal_value(arg, source).map(|path| (arg, path)))?;
+    let constant = if kind == RubyLoadKind::Autoload {
+        arguments
+            .named_child(0)
+            .and_then(|node| symbol_name(node, source))
+    } else {
+        None
+    };
+    let target = crate::syntax::single_static_string_content_node(argument).unwrap_or(argument);
+    Some(RubyLoadSyntax {
+        import: ImportInfo {
+            raw_snippet: node_text(node, source).trim().to_owned(),
+            is_wildcard: false,
+            is_global: false,
+            identifier: Some(path),
+            alias: None,
+            path: None,
+            binder_span: None,
+        },
+        kind,
+        has_receiver: node.child_by_field_name("receiver").is_some(),
+        constant,
+        target,
     })
 }
 
@@ -45,9 +78,9 @@ fn string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() != "string" {
         return None;
     }
-    let text = node_text(node, source).trim();
-    let trimmed = text.trim_matches(['"', '\'']);
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    let content = crate::syntax::single_static_string_content_node(node)?;
+    let path = node_text(content, source);
+    (!path.is_empty()).then(|| path.to_owned())
 }
 
 fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -64,19 +97,21 @@ fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
 /// `require_relative` is resolved relative to the requiring file's directory.
 /// Bare `require` is resolved as a project-root-relative load path only when a
 /// matching project file exists.
-pub fn resolve_required_file(file: &ProjectFile, import: &ImportInfo) -> Option<ProjectFile> {
-    let raw_path = import.identifier.as_deref()?;
-    if import.raw_snippet.starts_with("autoload") {
-        return resolve_project_required_file(file, Path::new(raw_path));
+pub fn resolve_required_file(file: &ProjectFile, load: &RubyLoadInfo) -> Option<ProjectFile> {
+    let raw_path = load.import.identifier.as_deref()?;
+    if load.has_receiver {
+        return None;
     }
-    if import.raw_snippet.starts_with("require_relative") {
-        let base = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
-        return resolve_relative_required_file(file, &base.join(raw_path));
+    match load.kind {
+        RubyLoadKind::RequireRelative => {
+            let base = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
+            resolve_relative_required_file(file, &base.join(raw_path))
+        }
+        RubyLoadKind::Require | RubyLoadKind::Autoload => {
+            resolve_project_required_file(file, Path::new(raw_path))
+        }
+        RubyLoadKind::Load => None,
     }
-    if import.raw_snippet.starts_with("require") {
-        return resolve_project_required_file(file, Path::new(raw_path));
-    }
-    None
 }
 
 fn resolve_relative_required_file(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
@@ -133,75 +168,6 @@ fn normalize_relative(path: &Path) -> Option<PathBuf> {
         }
     }
     (!out.as_os_str().is_empty()).then_some(out)
-}
-
-pub fn collect_ruby_autoload_edges(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    index: &mut HashMap<String, HashSet<ProjectFile>>,
-) {
-    enum Exit {
-        Lexical(usize),
-    }
-
-    let mut stack = vec![(root, false)];
-    let mut lexical_stack: Vec<String> = Vec::new();
-    let mut exits: Vec<Exit> = Vec::new();
-    while let Some((node, exiting)) = stack.pop() {
-        if exiting {
-            if let Some(Exit::Lexical(len)) = exits.pop() {
-                lexical_stack.truncate(len);
-            }
-            continue;
-        }
-
-        let mut pushed_exit = false;
-        if matches!(node.kind(), "class" | "module")
-            && let Some(name) = node.child_by_field_name("name")
-        {
-            let previous_len = lexical_stack.len();
-            let mut segments = lexical_stack.clone();
-            segments.extend(extract_name_segments(name, source));
-            if !segments.is_empty() {
-                lexical_stack = segments;
-                exits.push(Exit::Lexical(previous_len));
-                stack.push((node, true));
-                pushed_exit = true;
-            }
-        }
-
-        if node.kind() == "call"
-            && let Some((constant, path)) = parse_ruby_autoload_call(node, source)
-        {
-            let mut segments = lexical_stack.clone();
-            segments.push(constant);
-            let key = segments.join("$");
-            let files = index.entry(key).or_default();
-            files.insert(file.clone());
-            let import = ImportInfo {
-                raw_snippet: node_text(node, source).trim().to_string(),
-                is_wildcard: false,
-                is_global: false,
-                identifier: Some(path),
-                alias: None,
-                path: None,
-                binder_span: None,
-            };
-            if let Some(required) = resolve_required_file(file, &import) {
-                files.insert(required);
-            }
-        }
-
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, false));
-        }
-        if !pushed_exit {
-            continue;
-        }
-    }
 }
 
 pub fn parse_ruby_autoload_call(node: Node<'_>, source: &str) -> Option<(String, String)> {
@@ -322,10 +288,22 @@ pub fn ruby_required_files(
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Vec<ProjectFile> {
-    ruby.import_info_of(token, file)
-        .iter()
-        .filter_map(|import| resolve_required_file(file, import))
-        .collect()
+    ruby_required_files_checked(ruby, token, file).unwrap_or_default()
+}
+
+pub fn ruby_required_files_checked(
+    ruby: &dyn RubySource,
+    _token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Option<Vec<ProjectFile>> {
+    Some(
+        ruby.source_facts(file)?
+            .loads
+            .iter()
+            .filter(|load| load.generic)
+            .filter_map(|load| resolve_required_file(file, load))
+            .collect(),
+    )
 }
 
 /// Whether a supported load directive cannot be closed over project files.
@@ -339,35 +317,45 @@ pub fn ruby_has_unresolved_load_directive(
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> bool {
-    ruby.import_info_of(token, file)
-        .iter()
-        .any(|import| resolve_required_file(file, import).is_none())
+    let _ = token;
+    ruby.source_facts(file).is_none_or(|facts| {
+        facts
+            .loads
+            .iter()
+            .filter(|load| load.generic)
+            .any(|load| resolve_required_file(file, load).is_none())
+    })
 }
 
 pub fn ruby_autoload_visible_files_for_constant(
     ruby: &dyn RubySource,
     constant: &str,
-) -> HashSet<ProjectFile> {
-    ruby.autoload_constant_files()
-        .get(constant)
-        .cloned()
-        .unwrap_or_default()
+) -> Option<HashSet<ProjectFile>> {
+    Some(
+        ruby.autoload_constant_files()?
+            .get(constant)
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 pub fn build_autoload_constant_files(
     ruby: &dyn RubySource,
-) -> HashMap<String, HashSet<ProjectFile>> {
+) -> Option<HashMap<String, HashSet<ProjectFile>>> {
     let mut index: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
-    for file in ruby.all_files() {
-        let Ok(source) = ruby.project().read_source(&file) else {
-            continue;
-        };
-        let Some(tree) = parse_ruby_tree(&source) else {
-            continue;
-        };
-        collect_ruby_autoload_edges(&file, &source, tree.root_node(), &mut index);
+    for file in ruby.source_files()? {
+        for load in ruby.source_facts(&file)?.loads {
+            let Some(constant) = &load.autoload_constant else {
+                continue;
+            };
+            let files = index.entry(constant.join("$")).or_default();
+            files.insert(file.clone());
+            if let Some(required) = resolve_required_file(&file, &load) {
+                files.insert(required);
+            }
+        }
     }
-    index
+    Some(index)
 }
 
 pub fn detect_zeitwerk_autoload_conventions(ruby: &dyn RubySource) -> bool {
@@ -475,11 +463,16 @@ pub fn ruby_transitive_referencing_files_of(
 }
 
 pub fn ruby_imported_files_from_infos(
+    ruby: &dyn RubySource,
     file: &ProjectFile,
     imports: &[ImportInfo],
-) -> HashSet<ProjectFile> {
-    imports
-        .iter()
-        .filter_map(|import| resolve_required_file(file, import))
-        .collect()
+) -> Option<HashSet<ProjectFile>> {
+    let loads = ruby.source_facts(file)?.loads;
+    Some(
+        loads
+            .iter()
+            .filter(|load| load.generic && imports.contains(&load.import))
+            .filter_map(|load| resolve_required_file(file, load))
+            .collect(),
+    )
 }

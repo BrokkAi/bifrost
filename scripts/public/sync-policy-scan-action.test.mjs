@@ -60,6 +60,9 @@ function git(args, cwd) {
       GIT_AUTHOR_EMAIL: "test@example.com",
       GIT_COMMITTER_NAME: "Test",
       GIT_COMMITTER_EMAIL: "test@example.com",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "commit.gpgsign",
+      GIT_CONFIG_VALUE_0: "false",
     },
   });
 }
@@ -82,7 +85,7 @@ function withFixture(body, { action = ACTION, readme = README } = {}) {
     git(["init", "-q", "-b", "main", seed]);
     fs.writeFileSync(path.join(seed, "README.md"), "seed\n");
     git(["add", "-A"], seed);
-    git(["commit", "-q", "-m", "seed"], seed);
+    git(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"], seed);
     git(["remote", "add", "origin", bare], seed);
     git(["push", "-q", "origin", "main"], seed);
 
@@ -93,7 +96,14 @@ function withFixture(body, { action = ACTION, readme = README } = {}) {
 }
 
 function sync(checkout, bare, tag, { githubOutput } = {}) {
-  const env = { ...process.env, RELEASE_TAG: tag, POLICY_SCAN_ALIAS_URL: bare };
+  const env = {
+    ...process.env,
+    RELEASE_TAG: tag,
+    POLICY_SCAN_ALIAS_URL: bare,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "commit.gpgsign",
+    GIT_CONFIG_VALUE_0: "false",
+  };
   if (githubOutput) {
     fs.writeFileSync(githubOutput, "");
     env.GITHUB_OUTPUT = githubOutput;
@@ -256,9 +266,26 @@ test("the analyzer cache separates runner architectures, versions, and exact bui
   );
   assert.match(
     action,
-    /key: bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.value \}\}/u,
+    /key: bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.value \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.workspace-key \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.cache-nonce \}\}/u,
   );
-  assert.doesNotMatch(action, /restore-keys:/u);
+  assert.match(
+    action,
+    /restore-keys:\s*\|\s+bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.value \}\}-\$\{\{ steps\.analyzer-cache-identity\.outputs\.workspace-key \}\}-/u,
+  );
+  assert.match(action, /cache_path="\$\{relative_repo\}\/\.bifrost\/cache"/u);
+  assert.match(action, /cache_path="\.bifrost\/cache"/u);
+  assert.match(action, /working-directory resolves outside GITHUB_WORKSPACE/u);
+  assert.match(action, /export BIFROST_CACHE_DIR="\$\{MANAGED_CACHE_ROOT\}"/u);
+  assert.doesNotMatch(action, /policy-action\//u);
+  assert.match(action, /name: Save analyzer cache\n\s+if: always\(\).*eligible == 'true'/u);
+  assert.doesNotMatch(action, /cache-hit != 'true'/u);
+});
+
+test("the action defaults to incremental evidence and exposes the full evaluation override", () => {
+  const action = fs.readFileSync(".github/actions/policy-scan/action.yml", "utf8");
+  assert.match(action, /full-evaluation:[\s\S]*?default: 'false'/u);
+  assert.match(action, /FULL_EVALUATION: \$\{\{ inputs\.full-evaluation \}\}/u);
+  assert.match(action, /if \[ "\$\{FULL_EVALUATION:-false\}" = true \]; then args\+=\(--no-incremental\); fi/u);
 });
 
 function gateScript() {
@@ -484,7 +511,8 @@ test('managed cache follows the scan through nested roots and ignores inherited 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy action '));
   try {
     const nested = path.join(dir, 'nested root');
-    fs.mkdirSync(nested);
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: dir });
     const binary = path.join(dir, 'fake bifrost');
     const capture = path.join(dir, 'capture');
     const output = path.join(dir, 'output');
@@ -507,7 +535,8 @@ exit 2
     assert.match(outputs['workspace-key'], /^[0-9a-f]{64}$/);
     assert.ok(fs.statSync(outputs['cache-root']).isDirectory());
     const relocated = path.join(dir, 'another checkout');
-    fs.mkdirSync(relocated);
+    fs.mkdirSync(path.join(relocated, 'nested root'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: relocated });
     const readOutputs = () => Object.fromEntries(fs.readFileSync(output, 'utf8').trim().split('\n').map(line => {
       const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)];
     }));
@@ -515,12 +544,19 @@ exit 2
     const repeated = readOutputs();
     assert.equal(repeated['cache-path'], outputs['cache-path'], 'cache archive input must survive checkout relocation');
     assert.notEqual(repeated['cache-root'], outputs['cache-root']);
+    fs.mkdirSync(path.join(dir, 'another root'));
     runActionScript('Resolve analyzer cache identity', { ...env, WORKDIR: 'another root' }, dir);
     assert.notEqual(readOutputs()['workspace-key'], outputs['workspace-key']);
-    assert.notEqual(readOutputs()['cache-path'], outputs['cache-path']);
+    assert.equal(readOutputs()['cache-path'], '.bifrost/cache');
     runActionScript('Resolve analyzer cache identity', { ...env, FAKE_IDENTITY: 'b'.repeat(40) }, dir);
     assert.notEqual(readOutputs().value, outputs.value);
-    assert.notEqual(readOutputs()['cache-path'], outputs['cache-path']);
+    assert.equal(readOutputs()['cache-path'], '.bifrost/cache');
+    const escape = spawnSync('bash', ['-c', actionScript('Resolve analyzer cache identity')], {
+      encoding: 'utf8', cwd: dir,
+      env: { ...process.env, ...env, WORKDIR: '..' },
+    });
+    assert.equal(escape.status, 1);
+    assert.match(escape.stdout, /working-directory resolves outside/u);
     const invalid = spawnSync('bash', ['-c', actionScript('Resolve analyzer cache identity')], {
       encoding: 'utf8', cwd: dir, env: { ...process.env, ...env, FAKE_IDENTITY: 'invalid' },
     });
@@ -531,19 +567,21 @@ exit 2
     const scanEnv = {
       ...env, SARIF_FILE: 'report.sarif', FAIL_ON: 'warning', POLICY_PACKS: '',
       POLICY_IDS: 'rule.one', POLICY_CATEGORIES: '', POLICY_FILES: '', DIFF_BASE: 'abc123',
-      POLICY_TIMINGS: 'true', MANAGED_CACHE: 'true', MANAGED_CACHE_ROOT: outputs['cache-root'],
+      POLICY_TIMINGS: 'true', FULL_EVALUATION: 'false', MANAGED_CACHE: 'true', MANAGED_CACHE_ROOT: outputs['cache-root'],
     };
     runActionScript('Run policies', scanEnv, dir);
     const args = fs.readFileSync(capture, 'utf8').split('\n');
-    assert.deepEqual(args.slice(0, 3), [fs.realpathSync(nested), outputs['cache-root'], `${outputs['cache-root']}/analyzer`]);
+    assert.deepEqual(args.slice(0, 3), [fs.realpathSync(nested), '', outputs['cache-root']]);
     assert.ok(args.includes('--policy-timings'));
     assert.match(fs.readFileSync(path.join(nested, 'report.sarif.stderr.log'), 'utf8'), /fake analyzer diagnostic/);
     assert.ok(args.includes('--diff-base'));
+    assert.ok(!args.includes('--no-incremental'));
     assert.match(fs.readFileSync(output, 'utf8'), /exit-code=2\nstderr-capture-code=0\nsarif-file=nested root\/report.sarif\nhas-sarif=true/u);
-    runActionScript('Run policies', { ...scanEnv, MANAGED_CACHE: 'false', POLICY_TIMINGS: 'false' }, dir);
+    runActionScript('Run policies', { ...scanEnv, FULL_EVALUATION: 'true', MANAGED_CACHE: 'false', POLICY_TIMINGS: 'false' }, dir);
     const unmanaged = fs.readFileSync(capture, 'utf8').split('\n');
     assert.deepEqual(unmanaged.slice(1, 3), ['inherited root', 'inherited exact']);
     assert.ok(!unmanaged.includes('--policy-timings'));
+    assert.ok(unmanaged.includes('--no-incremental'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -571,12 +609,81 @@ test('scan evidence includes policy incompleteness and is retained before gating
     const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
     assert.ok(action.indexOf('name: Retain SARIF report') < action.indexOf('name: Gate on the exit code'));
     assert.match(action, /name: Retain SARIF report and diagnostics\n\s+if: always\(\)/);
-    assert.match(action, /name: Save analyzer cache\n\s+if: always\(\).*cache-hit != 'true'.*has-sarif == 'true'/);
+    assert.match(action, /name: Qualify analyzer cache snapshot\n\s+id: analyzer-cache-qualification/u);
+    assert.match(action, /name: Save analyzer cache\n\s+if: always\(\).*eligible == 'true'/);
     assert.match(action, /path: \$\{\{ steps\.analyzer-cache-identity\.outputs\.cache-path \}\}/);
-    assert.match(action, /key: \$\{\{ steps\.analyzer-cache\.outputs\.cache-primary-key \}\}/);
+    assert.match(action, /key: bifrost-policy-cache-[^\n]*cache-nonce \}\}/u);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('only complete successful policy reports qualify for an immutable cache snapshot', () => {
+  const qualification = actionScript('Qualify analyzer cache snapshot');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-cache-qualification.'));
+  const reportPath = path.join(dir, 'report.sarif');
+  const outputPath = path.join(dir, 'output');
+  const qualify = ({ code = '0', executionSuccessful = true, rawReport, diffBase = '' } = {}) => {
+    fs.writeFileSync(outputPath, '');
+    if (rawReport !== undefined) {
+      fs.writeFileSync(reportPath, rawReport);
+    } else {
+      const report = sarifReport({ executionSuccessful });
+      report.runs[0].properties['bifrost.policyRuns'] = [{ completion: { type: 'complete' } }];
+      report.runs[0].properties['bifrost.reportDiagnostics'] = [];
+      report.runs[0].properties['bifrost.reportDiagnosticsTruncated'] = false;
+      report.runs[0].properties['bifrost.execution'] = { termination: null };
+      report.runs[0].invocations[0].exitCode = Number(code);
+      report.runs[0].invocations[0].toolExecutionNotifications = [];
+      fs.writeFileSync(reportPath, JSON.stringify(report));
+    }
+    runActionScript('Qualify analyzer cache snapshot', {
+      CODE: code,
+      STDERR_CAPTURE_CODE: '0',
+      SARIF_PATH: reportPath,
+      GITHUB_OUTPUT: outputPath,
+      DIFF_BASE: diffBase,
+    }, dir);
+    return fs.readFileSync(outputPath, 'utf8');
+  };
+  try {
+    assert.match(qualify(), /eligible=true/u);
+    assert.match(qualify({ code: '1' }), /eligible=true/u);
+    assert.match(qualify({ code: '2' }), /^eligible=false\n$/u);
+    assert.match(qualify({ executionSuccessful: false }), /^eligible=false\n$/u);
+    assert.match(qualify({ rawReport: 'not json' }), /^eligible=false\n$/u);
+    const withReport = (mutate, { diffBase = '' } = {}) => {
+      const report = sarifReport();
+      report.runs[0].properties['bifrost.policyRuns'] = [{ completion: { type: 'complete' } }];
+      report.runs[0].properties['bifrost.reportDiagnostics'] = [];
+      report.runs[0].properties['bifrost.reportDiagnosticsTruncated'] = false;
+      report.runs[0].properties['bifrost.execution'] = { termination: null };
+      report.runs[0].invocations[0].exitCode = 0;
+      report.runs[0].invocations[0].toolExecutionNotifications = [];
+      mutate(report);
+      return qualify({ rawReport: JSON.stringify(report), diffBase });
+    };
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.policyRuns'][0].completion.type = 'inconclusive'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.policyRuns'][0].completion.type = 'proven_subset'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.policyRuns'][0].completion.type = 'proven_by_summary'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.policyRuns'][0].completion.type = 'unsupported'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.policyRuns'][0].completion.type = 'failed'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].invocations[0].toolExecutionNotifications.push({ descriptor: { id: 'BIFROST_POLICY_UNSUPPORTED' } }); }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.reportDiagnostics'].push({ severity: 'error' }); }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.execution'].termination = 'deadline_exceeded'; }), /^eligible=false\n$/u);
+    assert.match(withReport(report => { report.runs[0].properties['bifrost.diffBaseline'] = { degraded: true }; }, { diffBase: 'abc123' }), /^eligible=false\n$/u);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const action = fs.readFileSync('.github/actions/policy-scan/action.yml', 'utf8');
+  assert.match(qualification, /case "\$\{CODE:-\}" in 0\|1/u);
+  assert.match(qualification, /\.executionSuccessful == true/u);
+  assert.match(qualification, /\.completion\.type == "complete"/u);
+  assert.match(qualification, /reportDiagnosticsTruncated/u);
+  assert.match(qualification, /diffBaseline/u);
+  assert.match(action, /steps\.analyzer-cache-qualification\.outputs\.eligible == 'true'/u);
+  assert.match(action, /github\.run_attempt/u);
+  assert.match(action, /cache_nonce="\$\(date \+%s\)-\$\{RANDOM\}-\$\$"/u);
 });
 
 test('a supplied semantic-pack executable bypasses Cargo and preserves arguments', () => {

@@ -28,6 +28,7 @@ pub mod complete_value_cache;
 pub mod git_file;
 pub mod gitblob;
 pub mod hash;
+pub mod panic_report;
 pub mod path_normalization;
 pub mod path_utils;
 pub mod profiling;

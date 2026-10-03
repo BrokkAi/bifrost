@@ -2030,6 +2030,33 @@ fn procedure_infeasible_points(procedure: &ProcedureSemantics) -> Box<[ProgramPo
 }
 
 impl ValueFlowPlan {
+    /// Keep element values from defining the class of language-known rest
+    /// parameter containers in a class-set projection. General value-flow
+    /// plans retain these argument-to-formal transfers unchanged.
+    pub(crate) fn without_call_value_inputs_to(
+        mut self,
+        container_parameters: &HashSet<ProcedurePortHandle>,
+    ) -> Self {
+        let container_parameter_ids = container_parameters
+            .iter()
+            .filter_map(|parameter| {
+                self.carrier_ids
+                    .get(&ValueFlowCarrier::Port(parameter.clone()))
+                    .copied()
+            })
+            .collect::<HashSet<_>>();
+        if container_parameter_ids.is_empty() {
+            return self;
+        }
+        let mut call_rules = self.call_rules.into_vec();
+        call_rules.retain(|rule| {
+            rule.kind != CallFlowRuleKind::Call || !container_parameter_ids.contains(&rule.target)
+        });
+        self.call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
+        self.call_rules = call_rules.into_boxed_slice();
+        self
+    }
+
     /// Retain only sources and transfer rules that can contribute to `demands`.
     ///
     /// This is a solve-plan slice, not a discovery slice. All carriers, sinks,
@@ -4030,6 +4057,7 @@ impl ValueFlowPlan {
                     call,
                     model.transfers(),
                     SummaryProofRequirement::Derived,
+                    None,
                 )
             })
     }
@@ -4173,9 +4201,14 @@ impl ValueFlowPlan {
         let SummaryBoundaryKind::Dispatch(kind) = boundary.kind() else {
             return false;
         };
-        if let Some(summary) = self.external_summary_for_boundary(kind) {
+        if let Some((summary, actual_to_formal)) = self.external_summary_for_boundary(kind) {
             let authored_complete = summary.completeness().is_complete()
-                && self.model_is_fully_bindable(call, summary.transfers(), requirement);
+                && self.model_is_fully_bindable(
+                    call,
+                    summary.transfers(),
+                    requirement,
+                    actual_to_formal,
+                );
             return match requirement {
                 SummaryProofRequirement::Derived => {
                     matches!(boundary.proof(), Some(ProofStatus::Proven)) && authored_complete
@@ -4197,7 +4230,12 @@ impl ValueFlowPlan {
         // A curated model is a Bifrost-authored fallback, not an external pack
         // summary, so it always answers to the derived requirement.
         self.curated_model_for_call(call).is_some_and(|model| {
-            self.model_is_fully_bindable(call, model.transfers(), SummaryProofRequirement::Derived)
+            self.model_is_fully_bindable(
+                call,
+                model.transfers(),
+                SummaryProofRequirement::Derived,
+                None,
+            )
         })
     }
 
@@ -4285,7 +4323,9 @@ impl ValueFlowPlan {
         if self.has_binding_for_call(call) {
             return None;
         }
-        let summary = self.external_summaries.summary_for(target)?;
+        let (summary, actual_to_formal) = self
+            .external_summaries
+            .summary_and_actual_to_formal_for(target)?;
         let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
             // An inferred summary is derived from a body Bifrost read, so it is
             // not an authored claim and has no authored identity to record.
@@ -4306,6 +4346,7 @@ impl ValueFlowPlan {
                 call,
                 summary.transfers(),
                 SummaryProofRequirement::AcceptAuthoredComplete,
+                actual_to_formal,
             )
         {
             return None;
@@ -4361,6 +4402,7 @@ impl ValueFlowPlan {
         call: &CallSiteHandle,
         transfers: &[SummaryTransfer],
         requirement: SummaryProofRequirement,
+        actual_to_formal: Option<&[u32]>,
     ) -> bool {
         transfers.iter().all(|transfer| {
             let evidence = transfer.evidence();
@@ -4374,15 +4416,25 @@ impl ValueFlowPlan {
                 SummaryProofRequirement::AcceptAuthoredComplete => evidence.is_complete(),
             };
             evidence_ok
-                && match self.summary_input_binding(call, transfer.input()) {
+                && match self.summary_input_binding(call, transfer.input(), actual_to_formal) {
                     SummaryInputBinding::Carrier(_) => {
-                        self.summary_port_carrier(call, transfer.exit().port())
+                        self.summary_port_carrier(
+                            call,
+                            transfer.exit().port(),
+                            actual_to_formal,
+                        )
                             .is_some()
                             // A live exit value without a carrier makes the
                             // transfer's output unobservable over this plan's
                             // carriers, which is vacuous rather than a
                             // missing-model gap (#3406).
-                            || self.summary_port_value(call, transfer.exit().port()).is_some()
+                            || self
+                                .summary_port_value(
+                                    call,
+                                    transfer.exit().port(),
+                                    actual_to_formal,
+                                )
+                                .is_some()
                     }
                     SummaryInputBinding::VacuousConstant
                     | SummaryInputBinding::CarrierlessValue => true,
@@ -4783,12 +4835,12 @@ impl ValueFlowPlan {
     pub(crate) fn external_summary_for_boundary(
         &self,
         boundary: &DispatchBoundaryKind,
-    ) -> Option<&SemanticProcedureSummary> {
+    ) -> Option<(&SemanticProcedureSummary, Option<&[u32]>)> {
         if matches!(boundary, DispatchBoundaryKind::Deferred { .. }) {
             return None;
         }
         self.external_summaries
-            .summary_for(boundary.target_locator()?)
+            .summary_and_actual_to_formal_for(boundary.target_locator()?)
     }
 
     pub(crate) fn curated_model_for_call(
@@ -4805,6 +4857,7 @@ impl ValueFlowPlan {
         &self,
         call: &CallSiteHandle,
         port: &SummaryPort,
+        actual_to_formal: Option<&[u32]>,
     ) -> Option<ValueFlowCarrierId> {
         if matches!(port, SummaryPort::Capture(_) | SummaryPort::Heap(_)) {
             return self
@@ -4815,7 +4868,7 @@ impl ValueFlowPlan {
                 .ok()
                 .map(|index| self.summary_location_bindings[index].carrier);
         }
-        let value = self.summary_port_value(call, port)?;
+        let value = self.summary_port_value(call, port, actual_to_formal)?;
         self.carrier_id(&ValueFlowCarrier::Value(value))
     }
 
@@ -4826,11 +4879,16 @@ impl ValueFlowPlan {
         &self,
         call: &CallSiteHandle,
         port: &SummaryPort,
+        actual_to_formal: Option<&[u32]>,
     ) -> Option<crate::analyzer::semantic::ValueHandle> {
         let row = call.procedure().semantics().call_site(call.id())?;
         let value = match port {
             SummaryPort::Receiver => row.receiver?,
-            SummaryPort::Parameter(index) => row.arguments.get(*index as usize)?.value,
+            SummaryPort::Parameter(formal) => {
+                row.arguments
+                    .get(actual_argument_index_for_formal(*formal, actual_to_formal)?)?
+                    .value
+            }
             SummaryPort::NormalReturn => row.result?,
             SummaryPort::IndexedNormalReturn(index) => row.normal_result(*index as usize)?,
             SummaryPort::ExceptionalReturn => row.thrown?,
@@ -4843,24 +4901,29 @@ impl ValueFlowPlan {
         &self,
         call: &CallSiteHandle,
         port: &SummaryPort,
+        actual_to_formal: Option<&[u32]>,
     ) -> SummaryInputBinding {
-        if let Some(carrier) = self.summary_port_carrier(call, port) {
+        if let Some(carrier) = self.summary_port_carrier(call, port, actual_to_formal) {
             return SummaryInputBinding::Carrier(carrier);
         }
         let Some(row) = call.procedure().semantics().call_site(call.id()) else {
             return SummaryInputBinding::Unbound;
         };
         let value_kind = match port {
-            SummaryPort::Parameter(index) => row
-                .arguments
-                .get(*index as usize)
-                .and_then(|argument| call.procedure().semantics().value(argument.value))
-                .map(|value| &value.kind),
+            SummaryPort::Parameter(formal) => {
+                actual_argument_index_for_formal(*formal, actual_to_formal)
+                    .and_then(|actual| row.arguments.get(actual))
+                    .and_then(|argument| call.procedure().semantics().value(argument.value))
+                    .map(|value| &value.kind)
+            }
             _ => None,
         };
         if carrierless_summary_input_is_vacuous(port, value_kind) {
             SummaryInputBinding::VacuousConstant
-        } else if self.summary_port_value(call, port).is_some() {
+        } else if self
+            .summary_port_value(call, port, actual_to_formal)
+            .is_some()
+        {
             SummaryInputBinding::CarrierlessValue
         } else {
             SummaryInputBinding::Unbound
@@ -4875,7 +4938,7 @@ impl ValueFlowPlan {
         input: ValueFlowCarrierId,
         mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
     ) -> BoundaryTransferApplication {
-        if let Some(summary) =
+        if let Some((summary, actual_to_formal)) =
             boundary.and_then(|boundary| self.external_summary_for_boundary(boundary))
         {
             return self.visit_modeled_transfers(
@@ -4884,6 +4947,7 @@ impl ValueFlowPlan {
                 input,
                 summary.transfers(),
                 summary.effects(),
+                actual_to_formal,
                 summary.completeness().is_complete(),
                 visitor,
             );
@@ -4895,6 +4959,7 @@ impl ValueFlowPlan {
                 input,
                 model.transfers(),
                 model.effects(),
+                None,
                 true,
                 visitor,
             );
@@ -5006,6 +5071,7 @@ impl ValueFlowPlan {
         input: ValueFlowCarrierId,
         transfers: &'a [SummaryTransfer],
         effects: &'a [SummaryEffect],
+        actual_to_formal: Option<&[u32]>,
         mut complete: bool,
         mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
     ) -> BoundaryTransferApplication {
@@ -5038,9 +5104,10 @@ impl ValueFlowPlan {
             .iter()
             .filter(|transfer| transfer.exit().kind() == exit)
         {
-            match self.summary_input_binding(call, transfer.input()) {
+            match self.summary_input_binding(call, transfer.input(), actual_to_formal) {
                 SummaryInputBinding::Carrier(source) => {
-                    match self.summary_port_carrier(call, transfer.exit().port()) {
+                    match self.summary_port_carrier(call, transfer.exit().port(), actual_to_formal)
+                    {
                         Some(target) => {
                             complete &= summary_evidence_is_proven_complete(transfer.evidence());
                             carrier_bound.push((source, target, transfer));
@@ -5475,6 +5542,18 @@ impl ValueFlowPlan {
     ) -> impl Iterator<Item = (ValueFlowSinkId, ValueFlowCarrierId)> {
         self.sinks_at(point, phase)
             .map(|sink| (sink.id, sink.carrier))
+    }
+}
+
+fn actual_argument_index_for_formal(
+    formal: u32,
+    actual_to_formal: Option<&[u32]>,
+) -> Option<usize> {
+    match actual_to_formal {
+        Some(mapping) => mapping
+            .iter()
+            .position(|mapped_formal| *mapped_formal == formal),
+        None => usize::try_from(formal).ok(),
     }
 }
 
@@ -5985,6 +6064,43 @@ func run(input string) string {
             merge_call_rule_completeness(&candidate_completeness, EvidenceCompleteness::Complete,),
             candidate_completeness
         );
+    }
+
+    #[test]
+    fn summary_parameter_ports_invert_the_proven_actual_to_formal_mapping() {
+        let reordered = [1, 0];
+        let identity = [0, 1];
+        assert_eq!(
+            actual_argument_index_for_formal(0, Some(&reordered)),
+            Some(1)
+        );
+        assert_eq!(
+            actual_argument_index_for_formal(1, Some(&reordered)),
+            Some(0)
+        );
+        let three_way = [2, 0, 1];
+        assert_eq!(
+            actual_argument_index_for_formal(0, Some(&three_way)),
+            Some(1)
+        );
+        assert_eq!(
+            actual_argument_index_for_formal(1, Some(&three_way)),
+            Some(2)
+        );
+        assert_eq!(
+            actual_argument_index_for_formal(2, Some(&three_way)),
+            Some(0)
+        );
+        assert_eq!(
+            actual_argument_index_for_formal(0, Some(&identity)),
+            Some(0)
+        );
+        assert_eq!(
+            actual_argument_index_for_formal(1, Some(&identity)),
+            Some(1)
+        );
+        assert_eq!(actual_argument_index_for_formal(0, None), Some(0));
+        assert_eq!(actual_argument_index_for_formal(2, Some(&reordered)), None);
     }
 
     #[test]

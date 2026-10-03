@@ -142,7 +142,7 @@ fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
 /// scope's walk. The `block`/`do_block` wrapper directly under a `lambda` is
 /// the lambda's own body, not a nested scope, matching the semantic
 /// lowering's `callable_shape`.
-fn is_nested_scope_root(node: Node<'_>) -> bool {
+pub(crate) fn is_nested_scope_root(node: Node<'_>) -> bool {
     match node.kind() {
         "method" | "singleton_method" | "class" | "module" | "singleton_class" | "lambda" => true,
         "block" | "do_block" => node.parent().is_none_or(|parent| parent.kind() != "lambda"),
@@ -157,7 +157,7 @@ fn is_nested_scope_root(node: Node<'_>) -> bool {
 /// (parameter lists, assignment targets, pattern binders, method name fields)
 /// keeps its `Identifier` kind, preserving the honest status quo for
 /// constructs this pass does not understand.
-fn is_value_read_position(node: Node<'_>) -> bool {
+pub(crate) fn is_value_read_position(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -782,7 +782,29 @@ mod tests {
 
     fn bare_call_starts(source: &str) -> HashSet<usize> {
         let tree = parse(source);
-        bare_call_identifier_starts(tree.root_node(), source)
+        let file =
+            brokk_bifrost_core::analyzer::ProjectFile::new(std::env::temp_dir(), "primary.rb");
+        let parsed = crate::adapter::parse_ruby_file(&file, source, &tree);
+        let facts = parsed.source_facts.expect("Ruby primary facts");
+        let starts: HashSet<_> = facts
+            .structural
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == NormalizedKind::Call)
+            .filter_map(|node| {
+                let range = facts.occurrences.occurrence(node.occurrence).range;
+                tree.root_node()
+                    .descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .filter(|node| node.kind() == "identifier")
+                    .map(|_| range.start_byte)
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            bare_call_identifier_starts(tree.root_node(), source),
+            "primary and legacy binding classifications differ"
+        );
+        starts
     }
 
     /// Every token this adapter classifies, in source order, as

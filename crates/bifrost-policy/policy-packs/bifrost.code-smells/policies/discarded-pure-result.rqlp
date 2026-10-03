@@ -7,7 +7,7 @@
   :name "Discarded pure transformation result"
   :message "the result of this reviewed pure String transformation is discarded"
   :severity warning
-  :description "The exact JDK 21 String.trim() return value is unused by an expression statement or for-loop initializer/update. Expression lambdas remain incomplete until their functional return contract is proven. This diagnostic requires a reviewed pure-transformation obligation, exact result-use syntax, a selected JDK source artifact, and complete dispatch coverage. Calls with missing model or artifact evidence remain incomplete."
+  :description "The exact JDK 21 String.trim() return value is unused by an expression statement or for-loop initializer/update. An expression lambda also discards the result when its resolved functional method returns void; a value-returning target retains it. Unresolved or conflicting functional contracts remain incomplete. Classifying a deferred body does not prove that it executes. This diagnostic requires a reviewed pure-transformation obligation, proved result use, a selected JDK source artifact, and complete dispatch coverage. Calls with missing model or artifact evidence remain incomplete."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "java" "result-use"]
   :analysis (analysis

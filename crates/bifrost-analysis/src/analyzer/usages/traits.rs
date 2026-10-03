@@ -3,7 +3,7 @@
 // crate can accept one. Its co-residents below all name `IAnalyzer` and stay.
 pub(crate) use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 
-use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::model::{FuzzyResult, UsageProofAuthority};
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
@@ -38,6 +38,18 @@ pub trait UsageAnalyzer: Send + Sync {
 
 /// Graph-backed usage strategy that can distinguish fallback-safe gaps from terminal failures.
 pub(crate) trait GraphUsageAnalyzer: Send + Sync {
+    /// Whether this strategy's proof tiers are authoritative. The engine stamps
+    /// the answer with it so a consumer that may publish only proven evidence
+    /// can tell a certified native inventory from a legacy language resolver's
+    /// long-standing answer, without naming a language itself.
+    ///
+    /// The default is [`UsageProofAuthority::Legacy`]: a strategy that does not
+    /// certify an inventory must not have its unproven candidates read as gaps
+    /// in one.
+    fn proof_authority(&self) -> UsageProofAuthority {
+        UsageProofAuthority::Legacy
+    }
+
     /// Prepare language-specific candidate and resolver state before generic
     /// file-count and source-byte admission. Most languages need no preparation.
     fn prepare_usage_query(

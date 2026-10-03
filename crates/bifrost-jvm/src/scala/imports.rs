@@ -63,6 +63,49 @@ pub fn scala_import_infos_from_node_with_prefixes(
     source: &str,
     lexical_prefixes: &[String],
 ) -> Vec<ImportInfo> {
+    scala_import_syntax(node, source, lexical_prefixes)
+        .into_iter()
+        .map(|syntax| syntax.0)
+        .collect()
+}
+
+pub(crate) fn scala_source_imports_from_node(
+    node: Node<'_>,
+    source: &str,
+    lexical_prefixes: &[String],
+    collector: &mut brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector<'_>,
+) -> Vec<brokk_bifrost_core::analyzer::parsed_file::SourceImportFact> {
+    let declaration = collector.intern_node(node);
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_scala_lexical_scope(parent.kind()) {
+            scopes.push(collector.intern_node(parent));
+        }
+        current = parent.parent();
+    }
+    scopes.reverse();
+    scala_import_syntax(node, source, lexical_prefixes)
+        .into_iter()
+        .map(|(info, target, alias)| {
+            let target = target.map(|target| collector.intern_node(target));
+            let alias = alias.map(|alias| collector.intern_node(alias));
+            brokk_bifrost_core::analyzer::parsed_file::SourceImportFact::from_import(
+                info,
+                declaration,
+                target,
+                alias,
+                scopes.clone(),
+            )
+        })
+        .collect()
+}
+
+fn scala_import_syntax<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    lexical_prefixes: &[String],
+) -> Vec<(ImportInfo, Option<Node<'tree>>, Option<Node<'tree>>)> {
     if node.kind() != "import_declaration" {
         return Vec::new();
     }
@@ -127,21 +170,25 @@ pub fn scala_import_infos_from_node_with_prefixes(
         .last()
         .copied()
         .map(brokk_bifrost_core::analyzer::common::node_span);
-    vec![ImportInfo {
-        raw_snippet: render_scala_import(&base_path, false, None),
-        is_wildcard: false,
-        is_global: false,
-        identifier,
-        alias: None,
-        path: Some(StructuredImportPath {
-            segments: base_path,
-            kind: None,
-            lexical_prefixes: lexical_prefixes.to_vec(),
-            lexical_scopes,
-            declaration_start_byte: node.start_byte(),
-        }),
-        binder_span,
-    }]
+    vec![(
+        ImportInfo {
+            raw_snippet: render_scala_import(&base_path, false, None),
+            is_wildcard: false,
+            is_global: false,
+            identifier,
+            alias: None,
+            path: Some(StructuredImportPath {
+                segments: base_path,
+                kind: None,
+                lexical_prefixes: lexical_prefixes.to_vec(),
+                lexical_scopes,
+                declaration_start_byte: node.start_byte(),
+            }),
+            binder_span,
+        },
+        base_path_nodes.last().copied(),
+        None,
+    )]
 }
 
 pub fn scala_export_info_from_node(node: Node<'_>, source: &str) -> Option<ScalaExportInfo> {
@@ -228,30 +275,34 @@ fn scala_export_selector(node: Node<'_>, source: &str) -> Option<ScalaExportSele
     }
 }
 
-fn scala_import_selector_info(
-    selector: Node<'_>,
+fn scala_import_selector_info<'tree>(
+    selector: Node<'tree>,
     base_path: &[String],
     lexical_prefixes: &[String],
     lexical_scopes: &[StructuredImportScope],
     declaration_start_byte: usize,
     source: &str,
-) -> Option<ImportInfo> {
+) -> Option<(ImportInfo, Option<Node<'tree>>, Option<Node<'tree>>)> {
     if selector.kind() == "namespace_wildcard" {
-        return Some(ImportInfo {
-            raw_snippet: render_scala_import(base_path, true, None),
-            is_wildcard: true,
-            is_global: false,
-            identifier: None,
-            alias: None,
-            path: Some(StructuredImportPath {
-                segments: base_path.to_vec(),
-                kind: None,
-                lexical_prefixes: lexical_prefixes.to_vec(),
-                lexical_scopes: lexical_scopes.to_vec(),
-                declaration_start_byte,
-            }),
-            binder_span: None,
-        });
+        return Some((
+            ImportInfo {
+                raw_snippet: render_scala_import(base_path, true, None),
+                is_wildcard: true,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: Some(StructuredImportPath {
+                    segments: base_path.to_vec(),
+                    kind: None,
+                    lexical_prefixes: lexical_prefixes.to_vec(),
+                    lexical_scopes: lexical_scopes.to_vec(),
+                    declaration_start_byte,
+                }),
+                binder_span: None,
+            },
+            None,
+            None,
+        ));
     }
 
     // The bound name is spelled by the rename's alias token, or by the plain
@@ -278,21 +329,27 @@ fn scala_import_selector_info(
     };
     let mut path = base_path.to_vec();
     path.push(name.clone());
-    Some(ImportInfo {
-        raw_snippet: render_scala_import(&path, false, alias.as_deref()),
-        is_wildcard: false,
-        is_global: false,
-        identifier: Some(alias.clone().unwrap_or(name)),
-        alias,
-        path: Some(StructuredImportPath {
-            segments: path,
-            kind: None,
-            lexical_prefixes: lexical_prefixes.to_vec(),
-            lexical_scopes: lexical_scopes.to_vec(),
-            declaration_start_byte,
-        }),
-        binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(binder_node)),
-    })
+    let target = selector.child_by_field_name("name").unwrap_or(selector);
+    let alias_node = selector.child_by_field_name("alias");
+    Some((
+        ImportInfo {
+            raw_snippet: render_scala_import(&path, false, alias.as_deref()),
+            is_wildcard: false,
+            is_global: false,
+            identifier: Some(alias.clone().unwrap_or(name)),
+            alias,
+            path: Some(StructuredImportPath {
+                segments: path,
+                kind: None,
+                lexical_prefixes: lexical_prefixes.to_vec(),
+                lexical_scopes: lexical_scopes.to_vec(),
+                declaration_start_byte,
+            }),
+            binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(binder_node)),
+        },
+        Some(target),
+        alias_node,
+    ))
 }
 
 pub fn scala_lexical_scope_path(node: Node<'_>) -> Vec<StructuredImportScope> {
@@ -341,7 +398,7 @@ pub fn scala_lexical_scope_path_at(root: Node<'_>, byte: usize) -> Vec<Structure
     scala_lexical_scope_path(node)
 }
 
-fn is_scala_lexical_scope(kind: &str) -> bool {
+pub(crate) fn is_scala_lexical_scope(kind: &str) -> bool {
     matches!(
         kind,
         "package_clause"

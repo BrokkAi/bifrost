@@ -267,7 +267,8 @@ impl MemoryAccessChains {
             let base = match row.kind {
                 MemoryLocationKind::Index { .. } => return true,
                 MemoryLocationKind::Field { base, .. }
-                | MemoryLocationKind::Property { base, .. } => base,
+                | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Dereference { address: base } => base,
                 MemoryLocationKind::Static { .. }
                 | MemoryLocationKind::LexicalCell { .. }
                 | MemoryLocationKind::Capture { .. } => return false,

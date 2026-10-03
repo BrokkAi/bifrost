@@ -1291,6 +1291,7 @@ fn relationship_label(related: &RelatedPolicyLocation) -> &'static str {
         PolicyLocationRelationship::CallTarget => "call target",
         PolicyLocationRelationship::Subject => "subject",
         PolicyLocationRelationship::ExpectedOccurrence => "expected occurrence",
+        PolicyLocationRelationship::AlsoFailsAt => "also fails at",
         PolicyLocationRelationship::SelectedCandidate => "selected candidate",
         PolicyLocationRelationship::ConsideredCandidate => "considered candidate",
         PolicyLocationRelationship::BindingOf => "binding of",

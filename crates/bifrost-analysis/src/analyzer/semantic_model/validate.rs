@@ -73,6 +73,7 @@ fn validate_pack_internal(
     validate_references: bool,
 ) -> Vec<Diagnostic> {
     let mut validator = Validator {
+        language: pack.language.clone(),
         diagnostics: Vec::new(),
         limits,
         stable_ids: HashMap::new(),
@@ -106,6 +107,7 @@ fn validate_pack_internal(
 }
 
 struct Validator {
+    language: String,
     diagnostics: Vec<Diagnostic>,
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
@@ -142,7 +144,25 @@ impl Validator {
         self.version("$.producer.version", &pack.producer.version);
         self.stable_component("$.language", &pack.language);
         self.stable_component("$.ecosystem", &pack.ecosystem);
-        self.version_requirement("$.compatibility.bifrost", &pack.compatibility.bifrost);
+        if let Some(requirement) = &pack.compatibility.bifrost {
+            self.text("$.compatibility.bifrost", requirement);
+        }
+        if SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&pack.schema_version)
+            && let Err(error) = pack.compatibility.validate_for_schema(pack.schema_version)
+        {
+            let (code, message) = match error {
+                CompatibilityError::InvalidLegacyRequirement => (
+                    "version.invalid_requirement",
+                    "expected a semantic-version requirement",
+                ),
+                _ => ("compatibility.schema_shape", "invalid compatibility shape"),
+            };
+            self.error(
+                code,
+                "$.compatibility.bifrost",
+                format!("{message}: {error}"),
+            );
+        }
         for (index, toolchain) in pack.compatibility.toolchains.iter().enumerate() {
             self.stable_component(
                 &format!("$.compatibility.toolchains[{index}].name"),
@@ -777,6 +797,15 @@ impl Validator {
                 relations,
             } => {
                 for (index, fact) in types.iter().enumerate() {
+                    if fact.callable_surface_complete
+                        && self.schema_version < CALLABLE_SURFACE_MIN_SCHEMA_VERSION
+                    {
+                        self.error(
+                            "schema.callable_surface_version",
+                            format!("{path}.types[{index}].callable_surface_complete"),
+                            format!("callable surface coverage requires schema version {CALLABLE_SURFACE_MIN_SCHEMA_VERSION}"),
+                        );
+                    }
                     let fact_path = format!("{path}.types[{index}]");
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.qualified_name(&format!("{fact_path}.name"), &fact.name);
@@ -901,6 +930,15 @@ impl Validator {
                 }
                 for (index, fact) in members.iter().enumerate() {
                     let fact_path = format!("{path}.members[{index}]");
+                    if fact.non_overridable.is_some()
+                        && (self.language != "java"
+                            || fact.member_kind != MemberKind::Method
+                            || fact.is_static
+                            || fact.is_virtual
+                            || fact.is_abstract)
+                    {
+                        self.error("declaration.non_overridable", format!("{fact_path}.non_overridable"), "Java final-method evidence requires a non-static, non-abstract Java method with non-virtual declaration metadata");
+                    }
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
@@ -1859,6 +1897,18 @@ impl Validator {
             );
         }
 
+        if summary.no_concurrency_effects
+            && self.schema_version < NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION
+        {
+            self.error(
+                "summary.no_concurrency_effects_schema_version",
+                format!("{path}.no_concurrency_effects"),
+                format!(
+                    "no_concurrency_effects requires schema version {NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION}"
+                ),
+            );
+        }
+
         // #2371: `covers_overrides` is an author's claim that every
         // implementation of this member outside the workspace conforms to the
         // summary. A partial summary does not describe even its own target, so
@@ -1883,6 +1933,7 @@ impl Validator {
         }
 
         self.ordinary_heap_unchanged(path, summary);
+        self.no_concurrency_effects(path, summary);
 
         if let Some(normal_result_count) = summary.normal_result_count
             && normal_result_count > MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
@@ -2617,6 +2668,26 @@ impl Validator {
                     conflict,
                 );
             }
+        }
+    }
+
+    fn no_concurrency_effects(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        if !summary.no_concurrency_effects {
+            return;
+        }
+        if summary.completeness != Completeness::Complete {
+            self.error(
+                "summary.no_concurrency_effects_on_partial_summary",
+                format!("{path}.no_concurrency_effects"),
+                "no_concurrency_effects requires completeness: complete",
+            );
+        }
+        if !summary.concurrency_effects.is_empty() {
+            self.error(
+                "summary.no_concurrency_effects_conflict",
+                format!("{path}.concurrency_effects"),
+                "no_concurrency_effects conflicts with declared concurrency effects",
+            );
         }
     }
 

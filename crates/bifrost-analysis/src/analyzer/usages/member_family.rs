@@ -35,7 +35,8 @@ use std::collections::VecDeque;
 
 use brokk_bifrost_core::analyzer::model::CallableOverrideModifier;
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
+    DeclaredVisibility, MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason,
+    MethodFamilyRelation,
 };
 pub use brokk_bifrost_jvm::realm::{JvmExternalMemberIdentity, JvmReceiverSemantics};
 
@@ -734,11 +735,27 @@ pub struct MemberFacts {
 
 impl MemberFacts {
     pub(crate) fn read(analyzer: &dyn IAnalyzer, member: &CodeUnit) -> Option<Self> {
-        let metadata = analyzer
-            .signature_metadata(member)
-            .into_iter()
-            .find(|metadata| metadata.callable_modifiers_recorded())?;
+        let alternatives = analyzer.signature_metadata(member);
+        let metadata = alternatives.first()?;
+        let visibility = metadata.callable_declared_visibility()?;
+        if visibility == DeclaredVisibility::Unknown
+            || alternatives.iter().any(|alternative| {
+                !alternative.callable_modifiers_recorded()
+                    || alternative.callable_declared_visibility() != Some(visibility)
+                    || alternative.callable_is_static() != metadata.callable_is_static()
+                    || alternative.callable_is_constructor() != metadata.callable_is_constructor()
+            })
+        {
+            return None;
+        }
+        let arity = metadata.callable_arity();
         let parameter_types = metadata.callable_parameter_types().map(<[String]>::to_vec);
+        if alternatives.iter().any(|alternative| {
+            alternative.callable_arity() != arity
+                || alternative.callable_parameter_types() != metadata.callable_parameter_types()
+        }) {
+            return None;
+        }
         let override_modifier = metadata.callable_override_modifier();
         let capability = if parameter_types.is_some() {
             // Measured level for Java: the declaration walk records each
@@ -754,11 +771,8 @@ impl MemberFacts {
             identifier: member.identifier().to_string(),
             is_static: metadata.callable_is_static(),
             is_constructor: metadata.callable_is_constructor(),
-            is_private: metadata.callable_declared_visibility()
-                == Some(
-                    brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Private,
-                ),
-            arity: metadata.callable_arity(),
+            is_private: visibility == DeclaredVisibility::Private,
+            arity,
             parameter_types,
             override_modifier,
             capability,
@@ -1132,10 +1146,10 @@ pub fn scala_member_family_capability(
 /// A `CodeUnit` can carry more than one metadata entry, and an entry that no
 /// producer qualified spells the flag `false` because `false` is its default.
 /// Reading only the first entry therefore let an unqualified entry outvote a
-/// producer that positively recorded `interface_declaration`. The same `find`
-/// discipline [`MemberFacts::read`] uses applies here: the positive record is
-/// the one that answers, and `false` is the answer only when no entry claims
-/// the owner is an interface.
+/// producer that positively recorded `interface_declaration`. This owner-kind
+/// property retains its positive-record rule: `false` is the answer only when
+/// no entry claims the owner is an interface. Callable visibility separately
+/// requires agreement across all recorded alternatives.
 fn owner_is_interface(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> Option<bool> {
     let metadata = analyzer.signature_metadata(owner);
     if metadata.is_empty() {
@@ -1151,6 +1165,39 @@ fn owner_is_interface(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{CodeUnitIndex, JavaAnalyzer};
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn java_member_family_conflicting_visibility_alternatives_are_incomplete() {
+        for members in [
+            "public void run() {} private void run() {}",
+            "private void run() {} public void run() {}",
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Java)
+                .file("Contract.java", "interface Contract { void run(); }")
+                .file(
+                    "Worker.java",
+                    format!("class Worker implements Contract {{ {members} }}"),
+                )
+                .build();
+            let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+            let member = analyzer
+                .declarations(&fixture.file("Worker.java"))
+                .into_iter()
+                .find(|unit| unit.is_function() && unit.identifier() == "run")
+                .expect("written run method");
+            assert_eq!(analyzer.signature_metadata(&member).len(), 2);
+            let answer = java_member_family(&analyzer, &analyzer, &member, None);
+            assert_eq!(
+                answer.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "{answer:?}"
+            );
+            assert_eq!(answer.reason, Some(MemberFamilyReason::ModifiersUnrecorded));
+            assert!(answer.edges.is_empty(), "{answer:?}");
+        }
+    }
 
     /// The support table is total and honest.
     ///

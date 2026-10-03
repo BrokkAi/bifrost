@@ -475,17 +475,16 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     .expect("set remote default");
 
     let mut command = Command::new(mcp_server_binary());
-    apply_test_request_budget(&mut command);
-    let mut child = command
+    command
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--mcp")
         .arg("searchtools")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost");
+        .stderr(Stdio::piped());
+    apply_test_request_budget(&mut command);
+    let mut child = command.spawn().expect("spawn bifrost");
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -638,6 +637,22 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .find(|tool| tool["name"] == "missing_tests")
         .expect("missing_tests descriptor");
     assert!(missing_tests["outputSchema"].is_object());
+    let missing_tests_schema = missing_tests["outputSchema"].to_string();
+    for closed_value in [
+        "file_imports_then_exact_usages",
+        "file_graph_narrowed_binding_reachability",
+        "unresolved_changed_target",
+        "open_binding_frontier",
+        "unsupported_binding_boundary",
+        "unproven_binding_edge",
+        "reference_graph_cancelled",
+        "reference_graph_stale",
+    ] {
+        assert!(
+            missing_tests_schema.contains(closed_value),
+            "missing_tests output schema omitted {closed_value}: {missing_tests_schema}"
+        );
+    }
 
     let list_resources = round_trip(
         &mut stdin,
@@ -1801,7 +1816,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     let code_smells_policies = packs[0]["policies"]
         .as_array()
         .expect("code-smells policies");
-    assert_eq!(code_smells_policies.len(), 30);
+    assert_eq!(code_smells_policies.len(), 31);
     assert!(code_smells_policies.iter().all(|policy| {
         policy["authored_hash"].as_str().is_some()
             && policy["resolved_semantic_hash"]
@@ -1940,6 +1955,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.loop-body-never-repeats",
             "bifrost.correctness.overwritten-unread-value",
             "bifrost.correctness.python-absent-member",
+            "bifrost.correctness.python-absent-member-conditional",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.redundant-boolean-branches",
             "bifrost.correctness.repeated-branch-condition",
@@ -1993,6 +2009,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.loop-body-never-repeats",
             "bifrost.correctness.overwritten-unread-value",
             "bifrost.correctness.python-absent-member",
+            "bifrost.correctness.python-absent-member-conditional",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.redundant-boolean-branches",
             "bifrost.correctness.repeated-branch-condition",

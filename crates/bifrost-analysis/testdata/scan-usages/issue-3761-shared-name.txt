@@ -1,0 +1,286 @@
+=== opcore/src/ops.rs:10 json
+{
+  "scope": {
+    "include_tests": false,
+    "whole_workspace": true
+  },
+  "summary": {
+    "requested": 1,
+    "resolved": 1,
+    "total_hits": 4,
+    "partial": false,
+    "found": 1,
+    "verified_absent": 0,
+    "no_external_usages": 0,
+    "unverified_absent": 0,
+    "not_found": 0,
+    "ambiguous": 0,
+    "failure": 0,
+    "too_many_callsites": 0
+  },
+  "results": [
+    {
+      "input": {
+        "path": "opcore/src/ops.rs",
+        "line": 10
+      },
+      "input_kind": "target",
+      "status": "found",
+      "symbol": "opcore.ops.Add.name",
+      "total_hits": 4,
+      "unproven_hits": 1,
+      "rendering": "full",
+      "files": [
+        {
+          "path": "app/src/main.rs",
+          "hits": [
+            {
+              "line": 9,
+              "column": 24,
+              "end_line": 9,
+              "end_column": 28,
+              "enclosing": "app.main.main",
+              "snippet": "    println!(\"{}\", Add.name());"
+            }
+          ]
+        },
+        {
+          "path": "opcore/src/graph.rs",
+          "hits": [
+            {
+              "line": 13,
+              "column": 9,
+              "end_line": 13,
+              "end_column": 13,
+              "enclosing": "opcore.graph.concrete",
+              "snippet": "    add.name() + &mul.name()"
+            },
+            {
+              "line": 21,
+              "column": 35,
+              "end_line": 21,
+              "end_column": 39,
+              "enclosing": "opcore.graph.qualified",
+              "snippet": "    Op::name(add) + &<Add as Op>::name(add)"
+            }
+          ]
+        },
+        {
+          "path": "opcore/src/ops.rs",
+          "hits": [
+            {
+              "line": 17,
+              "column": 31,
+              "end_line": 17,
+              "end_column": 35,
+              "enclosing": "opcore.ops.Mul.name",
+              "snippet": "        format!(\"mul-{}\", Add.name())"
+            }
+          ]
+        }
+      ],
+      "unproven_files": [
+        {
+          "path": "app/src/main.rs",
+          "hits": [
+            {
+              "line": 7,
+              "column": 27,
+              "end_line": 7,
+              "end_column": 31,
+              "enclosing": "app.main.main",
+              "snippet": "        println!(\"{}\", op.name());",
+              "confidence": 0.0
+            }
+          ]
+        }
+      ],
+      "fq_name": "opcore.ops.Add.name",
+      "definition_path": "opcore/src/ops.rs",
+      "definition_line": 10
+    }
+  ]
+}
+=== opcore/src/ops.rs:10 text
+opcore/src/ops.rs:10: found
+  resolved: opcore.ops.Add.name (opcore/src/ops.rs:10)
+  proven usage(s): 4
+  unproven match(es): 1
+app/src/main.rs
+  line 9:24-9:28 in app.main.main
+        println!("{}", Add.name());
+opcore/src/graph.rs
+  line 13:9-13:13 in opcore.graph.concrete
+        add.name() + &mul.name()
+  line 21:35-21:39 in opcore.graph.qualified
+        Op::name(add) + &<Add as Op>::name(add)
+opcore/src/ops.rs
+  line 17:31-17:35 in opcore.ops.Mul.name
+            format!("mul-{}", Add.name())
+unproven matches:
+  app/src/main.rs
+    line 7:27-7:31 in app.main.main [confidence 0.00]
+              println!("{}", op.name());
+=== opcore/src/lib.rs:5 json
+{
+  "scope": {
+    "include_tests": false,
+    "whole_workspace": true
+  },
+  "summary": {
+    "requested": 1,
+    "resolved": 1,
+    "total_hits": 8,
+    "partial": false,
+    "found": 1,
+    "verified_absent": 0,
+    "no_external_usages": 0,
+    "unverified_absent": 0,
+    "not_found": 0,
+    "ambiguous": 0,
+    "failure": 0,
+    "too_many_callsites": 0
+  },
+  "results": [
+    {
+      "input": {
+        "path": "opcore/src/lib.rs",
+        "line": 5
+      },
+      "input_kind": "target",
+      "status": "found",
+      "symbol": "opcore.Op.name",
+      "total_hits": 8,
+      "unproven_hits": 1,
+      "rendering": "full",
+      "files": [
+        {
+          "path": "app/src/main.rs",
+          "hits": [
+            {
+              "line": 9,
+              "column": 24,
+              "end_line": 9,
+              "end_column": 28,
+              "enclosing": "app.main.main",
+              "snippet": "    println!(\"{}\", Add.name());"
+            }
+          ]
+        },
+        {
+          "path": "opcore/src/graph.rs",
+          "hits": [
+            {
+              "line": 5,
+              "column": 8,
+              "end_line": 5,
+              "end_column": 12,
+              "enclosing": "opcore.graph.describe",
+              "snippet": "    op.name()"
+            },
+            {
+              "line": 9,
+              "column": 8,
+              "end_line": 9,
+              "end_column": 12,
+              "enclosing": "opcore.graph.generic",
+              "snippet": "    op.name()"
+            },
+            {
+              "line": 13,
+              "column": 9,
+              "end_line": 13,
+              "end_column": 13,
+              "enclosing": "opcore.graph.concrete",
+              "snippet": "    add.name() + &mul.name()"
+            },
+            {
+              "line": 13,
+              "column": 23,
+              "end_line": 13,
+              "end_column": 27,
+              "enclosing": "opcore.graph.concrete",
+              "snippet": "    add.name() + &mul.name()"
+            },
+            {
+              "line": 21,
+              "column": 9,
+              "end_line": 21,
+              "end_column": 13,
+              "enclosing": "opcore.graph.qualified",
+              "snippet": "    Op::name(add) + &<Add as Op>::name(add)"
+            },
+            {
+              "line": 21,
+              "column": 35,
+              "end_line": 21,
+              "end_column": 39,
+              "enclosing": "opcore.graph.qualified",
+              "snippet": "    Op::name(add) + &<Add as Op>::name(add)"
+            }
+          ]
+        },
+        {
+          "path": "opcore/src/ops.rs",
+          "hits": [
+            {
+              "line": 17,
+              "column": 31,
+              "end_line": 17,
+              "end_column": 35,
+              "enclosing": "opcore.ops.Mul.name",
+              "snippet": "        format!(\"mul-{}\", Add.name())"
+            }
+          ]
+        }
+      ],
+      "unproven_files": [
+        {
+          "path": "app/src/main.rs",
+          "hits": [
+            {
+              "line": 7,
+              "column": 27,
+              "end_line": 7,
+              "end_column": 31,
+              "enclosing": "app.main.main",
+              "snippet": "        println!(\"{}\", op.name());",
+              "confidence": 0.0
+            }
+          ]
+        }
+      ],
+      "fq_name": "opcore.Op.name",
+      "definition_path": "opcore/src/lib.rs",
+      "definition_line": 5
+    }
+  ]
+}
+=== opcore/src/lib.rs:5 text
+opcore/src/lib.rs:5: found
+  resolved: opcore.Op.name (opcore/src/lib.rs:5)
+  proven usage(s): 8
+  unproven match(es): 1
+app/src/main.rs
+  line 9:24-9:28 in app.main.main
+        println!("{}", Add.name());
+opcore/src/graph.rs
+  line 5:8-5:12 in opcore.graph.describe
+        op.name()
+  line 9:8-9:12 in opcore.graph.generic
+        op.name()
+  line 13:9-13:13 in opcore.graph.concrete
+        add.name() + &mul.name()
+  line 13:23-13:27 in opcore.graph.concrete
+        add.name() + &mul.name()
+  line 21:9-21:13 in opcore.graph.qualified
+        Op::name(add) + &<Add as Op>::name(add)
+  line 21:35-21:39 in opcore.graph.qualified
+        Op::name(add) + &<Add as Op>::name(add)
+opcore/src/ops.rs
+  line 17:31-17:35 in opcore.ops.Mul.name
+            format!("mul-{}", Add.name())
+unproven matches:
+  app/src/main.rs
+    line 7:27-7:31 in app.main.main [confidence 0.00]
+              println!("{}", op.name());

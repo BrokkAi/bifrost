@@ -1239,14 +1239,14 @@ mod tests {
         }
     }
 
-    /// An adapter that classifies one role and no others reports incomplete for
-    /// the roles it cannot name, and covers exactly the one it can.
+    /// An adapter that classifies some roles and not others reports incomplete
+    /// for the roles it cannot name, and covers exactly the ones it can.
     ///
-    /// Go declares `member_position` and nothing else, so the roles it stays
-    /// silent about must never come back as a clean empty answer. This guard
-    /// used to point at Scala, which declared no roles at all until #1597
-    /// graduated it, and then at PHP, which classifies every role its grammar
-    /// establishes as of #2962.
+    /// Go declares `member_position` and `binder` (as of #3547) and nothing
+    /// else, so the roles it stays silent about must never come back as a
+    /// clean empty answer. This guard used to point at Scala, which declared no
+    /// roles at all until #1597 graduated it, and then at PHP, which classifies
+    /// every role its grammar establishes as of #2962.
     #[test]
     fn an_adapter_with_a_partial_role_table_reports_incomplete_not_empty_complete() {
         let source = concat!(
@@ -1263,26 +1263,26 @@ mod tests {
         let fixture = Fixture::new(Language::Go, "widget/widget.go", source);
         let result = fixture.result();
 
+        let declared = [OccurrenceRole::MemberPosition, OccurrenceRole::Binder];
         assert!(
-            result
-                .rows
-                .iter()
-                .all(|row| row.role == OccurrenceRole::MemberPosition),
-            "go must publish only the role it declares: {:?}",
+            result.rows.iter().all(|row| declared.contains(&row.role)),
+            "go must publish only the roles it declares: {:?}",
             result.rows
         );
         match &result.completeness {
             OccurrenceCompleteness::Incomplete {
                 unsupported_roles, ..
             } => {
-                assert_eq!(unsupported_roles.len(), ALL_OCCURRENCE_ROLES.len() - 1);
-                assert!(
-                    result.completeness.covers(OccurrenceRole::MemberPosition),
-                    "the one declared role is covered"
+                assert_eq!(
+                    unsupported_roles.len(),
+                    ALL_OCCURRENCE_ROLES.len() - declared.len()
                 );
+                for role in declared {
+                    assert!(result.completeness.covers(role), "{role} is declared");
+                }
                 for role in ALL_OCCURRENCE_ROLES
                     .iter()
-                    .filter(|role| **role != OccurrenceRole::MemberPosition)
+                    .filter(|role| !declared.contains(role))
                 {
                     assert!(!result.completeness.covers(*role), "{role} claimed covered");
                 }
@@ -1385,8 +1385,8 @@ mod tests {
 
         assert_eq!(
             trace.completeness,
-            TraceCompleteness::Full,
-            "Rust declares the rejection axis, so its trace claims Full"
+            TraceCompleteness::SelectionOnly,
+            "native Rust retains these lexical rejections but does not instrument every rejected path"
         );
         assert!(
             trace.selects_at(PrecedenceTier::LexicalBinding),

@@ -27,8 +27,9 @@ labelled_enum! {
     /// language: everything else (name equality, scope ancestry, nearest scope
     /// wins) is language-neutral.
     ///
-    /// - `SourceOrder`: in effect from the end of its declarator to the end of
-    ///   its scope (a Rust `let`, a Java local).
+    /// - `SourceOrder`: in effect from the adapter's exact source activation
+    ///   point to the end of its scope (for example, a Java local starts at
+    ///   its own initializer, or at the declarator end when it has none).
     /// - `ScopeWide`: in effect for the whole scope whatever the position (a
     ///   JavaScript `var` or function declaration, a Python function local, a
     ///   Rust item).
@@ -246,6 +247,86 @@ labelled_enum! {
 }
 
 labelled_enum! {
+    /// The persisted shape of a partial-path or typed-frontier completion.
+    ResolutionCompletionKind, ALL_RESOLUTION_COMPLETION_KINDS {
+        Complete => "complete",
+        Incomplete => "incomplete",
+    }
+}
+
+labelled_enum! {
+    /// The persisted discriminator for an incomplete resolution reason.
+    ResolutionCompletionReasonKind, ALL_RESOLUTION_COMPLETION_REASON_KINDS {
+        CyclicExpansion => "cyclic_expansion",
+        InconsistentPrecedence => "inconsistent_precedence",
+        OpenBoundary => "open_boundary",
+        UnsupportedSemantic => "unsupported_semantic",
+    }
+}
+
+labelled_enum! {
+    /// The persisted discriminator for one partial-path witness step.
+    ResolutionWitnessKind, ALL_RESOLUTION_WITNESS_KINDS {
+        Node => "node",
+        Candidate => "candidate",
+        Boundary => "boundary",
+    }
+}
+
+labelled_enum! {
+    /// The coarse persisted outcome; a rejected outcome carries its reason separately.
+    CandidateOutcomeKind, ALL_CANDIDATE_OUTCOME_KINDS {
+        Selected => "selected",
+        Rejected => "rejected",
+    }
+}
+
+labelled_enum! {
+    /// The open persisted vocabulary for why structured lowering withheld a claim.
+    ResolutionGapOriginKind, ALL_RESOLUTION_GAP_ORIGIN_KINDS {
+        UnsupportedTypeSyntax => "unsupported_type_syntax",
+        UnsupportedExpression => "unsupported_expression",
+        UnsupportedRoute => "unsupported_route",
+        UnsupportedScopeOrBinder => "unsupported_scope_or_binder",
+        AmbiguousQualifiedType => "ambiguous_qualified_type",
+        InferredType => "inferred_type",
+        PostfixArrayDimensions => "postfix_array_dimensions",
+        AmbiguousNumericLiteral => "ambiguous_numeric_literal",
+        ImplicitConstructor => "implicit_constructor",
+        UnsupportedHierarchyTraversal => "unsupported_hierarchy_traversal",
+        UnsupportedVisibility => "unsupported_visibility",
+        UnsupportedImplicitReceiver => "unsupported_implicit_receiver",
+        UnsupportedCallApplicability => "unsupported_call_applicability",
+        UnsupportedPlacementBoundary => "unsupported_placement_boundary",
+        MalformedSyntax => "malformed_syntax",
+        QualifiedReference => "qualified_reference",
+        UnsupportedActivationSourceOrder => "unsupported_activation_source_order",
+        UnsupportedActivationScopeWide => "unsupported_activation_scope_wide",
+        UnsupportedActivationDeclaredHead => "unsupported_activation_declared_head",
+        MissingBinder => "missing_binder",
+        UnsupportedMemberScope => "unsupported_member_scope",
+        UnprovenActivation => "unproven_activation",
+    /// The lowering modelled every authored site of an item but not the
+    /// surface an attribute expansion would generate for it.
+        GeneratedItemSurface => "generated_item_surface",
+    /// One route head names a crate the build reaches through an implicit
+    /// prelude whose source Bifrost never indexes. Lowering claims nothing
+    /// about that name, so the candidate inventory at the shared root stays
+    /// open for it.
+        ExternalPreludeBoundary => "external_prelude_boundary",
+    /// A call argument is a macro invocation whose expansion is not replayed
+    /// as a value.
+        MacroArgument => "macro_argument",
+    /// An item-position invocation whose visible definition's expansion no
+    /// row holds.
+        UnexpandedItemMacro => "unexpanded_item_macro",
+    /// An item-position invocation whose visible definition writes only
+    /// `impl` blocks no row holds.
+        UnexpandedImplMacro => "unexpanded_impl_macro",
+    }
+}
+
+labelled_enum! {
     /// The visibility a declaration states, as far as an adapter can read it
     /// from source. `Unknown` is never equal to `Public`: an adapter that
     /// cannot read a modifier says so.
@@ -390,16 +471,20 @@ pub enum CandidateOutcome {
 impl CandidateOutcome {
     /// The value domain the `resolution_candidate.outcome` row field publishes
     /// (issue #2515).
-    pub const LABELS: &'static [&'static str] = &["selected", "rejected"];
+    pub const LABELS: &'static [&'static str] = CandidateOutcomeKind::LABELS;
+
+    pub const fn kind(self) -> CandidateOutcomeKind {
+        match self {
+            CandidateOutcome::Selected => CandidateOutcomeKind::Selected,
+            CandidateOutcome::Rejected(_) => CandidateOutcomeKind::Rejected,
+        }
+    }
 
     /// The coarse label. The rejection reason is a separate field on every
     /// surface that renders an outcome, so the label stays a two-value
     /// vocabulary a filter can be written against.
     pub const fn label(self) -> &'static str {
-        match self {
-            CandidateOutcome::Selected => "selected",
-            CandidateOutcome::Rejected(_) => "rejected",
-        }
+        self.kind().label()
     }
 
     pub const fn is_selected(self) -> bool {
@@ -660,6 +745,14 @@ mod tests {
         check!(ALL_MEMBER_DISPATCH_TIERS, MemberDispatchTier);
         check!(ALL_HIERARCHY_RELATIONS, HierarchyRelation);
         check!(ALL_BOUNDARY_STATUSES, BoundaryStatus);
+        check!(ALL_RESOLUTION_COMPLETION_KINDS, ResolutionCompletionKind);
+        check!(
+            ALL_RESOLUTION_COMPLETION_REASON_KINDS,
+            ResolutionCompletionReasonKind
+        );
+        check!(ALL_RESOLUTION_WITNESS_KINDS, ResolutionWitnessKind);
+        check!(ALL_CANDIDATE_OUTCOME_KINDS, CandidateOutcomeKind);
+        check!(ALL_RESOLUTION_GAP_ORIGIN_KINDS, ResolutionGapOriginKind);
         check!(ALL_DECLARED_VISIBILITIES, DeclaredVisibility);
         check!(ALL_ENVIRONMENT_AXES, EnvironmentAxis);
         check!(ALL_METHOD_FAMILY_RELATIONS, MethodFamilyRelation);

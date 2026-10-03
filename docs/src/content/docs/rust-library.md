@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.12.0"
+brokk-bifrost = "0.13.0"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -36,7 +36,7 @@ use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 
 `brokk-bifrost` is the supported default dependency. It is the compatibility
 facade: it re-exports the analyzer and service API, and Cargo resolves the
-analysis, language-adapter, runtime, MCP, and LSP implementation crates
+analysis, language-adapter, runtime, and MCP implementation crates
 automatically. Most applications should depend on this package alone.
 
 ### Language Adapters
@@ -65,27 +65,6 @@ Use a direct adapter dependency only when you own a focused host or an adapter
 integration. Keep every direct Bifrost dependency on the same release version.
 The adapter APIs are internal and can change between releases.
 
-For an application that only hosts Bifrost over the Language Server Protocol,
-depend directly on the focused LSP host instead:
-
-```bash
-cargo add brokk-bifrost-lsp@0.8
-```
-
-Start its stdio server with a deterministic fallback workspace root:
-
-```rust
-use std::path::PathBuf;
-
-fn main() -> Result<(), String> {
-    brokk_bifrost_lsp::run_lsp_stdio_server(PathBuf::from("/path/to/project"))
-}
-```
-
-The LSP client can replace that fallback with its advertised workspace folders
-during initialization. Reserve the process's standard input and output for LSP
-messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
-
 `brokk-bifrost-core`, the language adapters above, `brokk-bifrost-analysis`,
 `brokk-bifrost-policy`, `brokk-bifrost-runtime`, and
 `brokk-bifrost-mcp` are lower-level workspace components. They are published
@@ -104,8 +83,7 @@ The lower-level packages listed above exist so that a host owning one of those
 protocol boundaries can compose them, not as a general-purpose API; their types,
 traits, module paths, and crate boundaries move whenever the internal design
 calls for it. Each of them carries the same note on its crates.io and docs.rs
-page. `brokk-bifrost-lsp` is the one documented exception: its stdio server
-entry point above is a supported way to host Bifrost over LSP.
+page.
 
 There is no sealing and no `#[doc(hidden)]` sweep enforcing this. Depending
 directly on an internal package compiles and works; it just means you are

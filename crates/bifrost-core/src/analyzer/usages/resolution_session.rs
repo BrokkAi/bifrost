@@ -69,7 +69,9 @@ impl ResolutionSession {
     ) -> Self {
         Self {
             budget: Some(budget),
-            cancellation: cancellation.cloned(),
+            cancellation: Some(
+                cancellation.map_or_else(CancellationToken::new, |token| token.child()),
+            ),
             state: RefCell::new(ResolutionState::default()),
         }
     }
@@ -92,6 +94,15 @@ impl ResolutionSession {
 
     pub fn scope_step(&self) -> bool {
         self.charge(ReceiverBudgetLimit::ScopeNodes)
+    }
+
+    /// Charge copied scope operands without walking a no-op unbounded session.
+    /// Bounded sessions retain exactly the per-step cancellation cadence.
+    pub fn scope_steps(&self, count: usize) -> bool {
+        if self.budget.is_none() && self.cancellation.is_none() {
+            return true;
+        }
+        (0..count).all(|_| self.scope_step())
     }
 
     pub fn summary_step(&self) -> bool {
@@ -198,6 +209,12 @@ impl ResolutionSession {
         self.cancellation.as_ref()
     }
 
+    /// Maximum provider rows needed to either consume the remaining scope
+    /// budget or observe the first row that proves exhaustion.
+    pub fn scope_lookahead_limit(&self) -> usize {
+        self.remaining_scope_steps().saturating_add(1)
+    }
+
     pub fn mark_scope_incomplete(&self) {
         self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
     }
@@ -218,6 +235,12 @@ impl ResolutionSession {
         let mut state = self.state.borrow_mut();
         if state.stop.is_none() {
             state.stop = Some(stop);
+            drop(state);
+            if matches!(stop, ResolutionStop::Exceeded(_))
+                && let Some(cancellation) = self.cancellation.as_ref()
+            {
+                cancellation.cancel();
+            }
         }
     }
 
@@ -243,10 +266,81 @@ impl ResolutionSession {
         };
         if *used == maximum {
             state.stop = Some(ResolutionStop::Exceeded(limit));
+            drop(state);
+            self.cancellation
+                .as_ref()
+                .expect("a bounded session has an operation cancellation token")
+                .cancel();
             false
         } else {
             *used += 1;
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_scope_charges_preserve_budgets_and_skip_unbounded_work() {
+        let unbounded = ResolutionSession::unbounded();
+        assert!(unbounded.scope_steps(usize::MAX));
+        assert_eq!(unbounded.finish(()).work(), ReceiverAnalysisWork::default());
+        for count in 0..=5 {
+            let budget = ReceiverAnalysisBudget {
+                max_scope_nodes: 3,
+                ..ReceiverAnalysisBudget::default()
+            };
+            let bulk = ResolutionSession::bounded(budget, None);
+            let individual = ResolutionSession::bounded(budget, None);
+            assert_eq!(
+                bulk.scope_steps(count),
+                (0..count).all(|_| individual.scope_step())
+            );
+            assert_eq!(bulk.finish(()).work(), individual.finish(()).work());
+            assert_eq!(
+                bulk.cancellation().unwrap().is_cancelled(),
+                individual.cancellation().unwrap().is_cancelled()
+            );
+        }
+        let caller = CancellationToken::new();
+        let cancelled =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&caller));
+        caller.cancel();
+        assert!(!cancelled.scope_steps(1));
+        assert!(matches!(
+            cancelled.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn budget_stop_cancels_only_the_operation_token() {
+        let caller = CancellationToken::new();
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                ..ReceiverAnalysisBudget::default()
+            },
+            Some(&caller),
+        );
+
+        assert!(!session.scope_step());
+        assert!(
+            session
+                .cancellation()
+                .expect("bounded session token")
+                .is_cancelled()
+        );
+        assert!(!caller.is_cancelled());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                work: ReceiverAnalysisWork { scope_nodes: 0, .. }
+            }
+        ));
     }
 }

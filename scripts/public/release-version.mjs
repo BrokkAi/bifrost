@@ -64,7 +64,6 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-policy/Cargo.toml",
   "crates/bifrost-runtime/Cargo.toml",
   "crates/bifrost-mcp/Cargo.toml",
-  "crates/bifrost-lsp/Cargo.toml",
   "crates/bifrost-semantic-packs/Cargo.toml",
 ];
 
@@ -96,12 +95,8 @@ export const BIFROST_OWNED_SEMANTIC_PACK_SPECS = [
   "semantic-packs/sanitizers/staged/bifrost.spring-web-sanitizers.json",
 ];
 
-export const BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES = [
-  "crates/bifrost-semantic-packs/src/summary_foundry/mod.rs",
-  "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
-  "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
-  "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
-];
+// Current native producers use schema admission rather than an engine range.
+export const BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES = [];
 
 export const RELEASE_BUNDLE_SPECS = [
   ...THIRD_PARTY_SEMANTIC_PACK_SPECS,
@@ -328,7 +323,7 @@ function collectProjectionUpdates(repoRoot, version) {
   return updates;
 }
 
-function sameMinorSeries(left, right) {
+export function sameMinorSeries(left, right) {
   const leftParts = String(left ?? "").split(".");
   const rightParts = String(right ?? "").split(".");
   return leftParts.length >= 2
@@ -354,7 +349,7 @@ function readTomlSection(contents, section, sourceName) {
   return lines.slice(start + 1, end).join("\n");
 }
 
-function escapeRegExp(value) {
+export function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 

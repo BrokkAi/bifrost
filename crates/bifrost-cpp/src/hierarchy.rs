@@ -5,9 +5,10 @@
 //! `TypeHierarchyProvider` impl, the two moka caches it reads through and the
 //! `test-support` build counter; every decision they memoize is a function here.
 
-use crate::declarations::normalize_cpp_whitespace;
 use crate::graph_support::CppSource;
-use crate::imports::{include_paths, resolve_include_targets_with_index};
+use crate::imports::resolve_include_targets_with_index;
+use brokk_bifrost_core::analyzer::cpp_facts::CppStructuredAliasTarget;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::path_utils::rel_path_string;
@@ -26,6 +27,7 @@ use brokk_bifrost_core::profiling;
 /// memoize it (issue #1748).
 pub fn build_cpp_visible_type_units(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<Vec<CodeUnit>> {
@@ -52,9 +54,9 @@ pub fn build_cpp_visible_type_units(
 
         let imports = {
             let _imports = profiling::scope("cpp.visible_types.imports");
-            cpp.import_statements(&current)
+            cpp.canonical_include_paths(token, &current)?
         };
-        for include in include_paths(&imports) {
+        for include in imports {
             for target in resolve_include_targets_with_index(&current, &include, include_targets) {
                 if visited.insert(target.clone()) {
                     pending.push(target);
@@ -79,11 +81,11 @@ pub fn build_cpp_visible_type_units(
 /// The direct base classes of `code_unit`, resolved through the include-visible
 /// class table and canonicalized past any type-alias hops.
 ///
-/// `None` means the include-closure walk this resolution needs stopped at the
-/// caller's deadline. An empty vector still means "no resolvable bases", so the
-/// two outcomes stay distinguishable.
+/// `None` means cancellation or unavailable canonical publication, including
+/// any alias in a base-type chain. An empty vector means no resolvable bases.
 pub fn cpp_resolve_direct_ancestors(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<Vec<CodeUnit>> {
@@ -92,12 +94,22 @@ pub fn cpp_resolve_direct_ancestors(
     }
 
     let visible = cpp.visible_type_units_while(code_unit.source(), keep_going)?;
+    let facts = cpp.declaration_source_properties(token, code_unit)?;
     let mut ancestors = Vec::new();
-    for raw in cpp.raw_supertypes_of(code_unit) {
-        if let Some(ancestor) = resolve_base_type(cpp, code_unit, &raw, &visible)
-            && !ancestors.iter().any(|existing| existing == &ancestor)
-        {
-            ancestors.push(ancestor);
+    for fact in facts {
+        for base in fact.bases {
+            if let Some(ancestor) = resolve_base_type(
+                cpp,
+                token,
+                code_unit,
+                &base.components,
+                base.absolute,
+                &visible,
+                keep_going,
+            )? && !ancestors.iter().any(|existing| existing == &ancestor)
+            {
+                ancestors.push(ancestor);
+            }
         }
     }
     Some(ancestors)
@@ -105,22 +117,26 @@ pub fn cpp_resolve_direct_ancestors(
 
 fn resolve_base_type(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
-    raw: &str,
+    components: &[String],
+    global: bool,
     visible: &[CodeUnit],
-) -> Option<CodeUnit> {
-    let normalized = normalize_cpp_type_reference(raw)?;
-    let resolved = if normalized.name.contains("::") || normalized.global {
-        resolve_qualified_type(
-            code_unit.package_name(),
-            &normalized.name,
-            normalized.global,
-            visible,
-        )
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Option<CodeUnit>> {
+    if !keep_going() {
+        return None;
+    }
+    let name = components.join("::");
+    let resolved = if components.len() > 1 || global {
+        resolve_qualified_type(code_unit.package_name(), &name, global, visible)
     } else {
-        resolve_unqualified_base(code_unit, &normalized.name, visible)
-    }?;
-    canonicalize_alias(cpp, resolved, visible, &mut HashSet::default())
+        resolve_unqualified_base(code_unit, &name, visible)
+    };
+    let Some(resolved) = resolved else {
+        return Some(None);
+    };
+    canonicalize_alias(cpp, token, resolved, visible, keep_going)
 }
 
 fn resolve_unqualified_base<'a>(
@@ -143,33 +159,63 @@ fn resolve_unqualified_base<'a>(
 
 fn canonicalize_alias(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
     visible: &[CodeUnit],
-    seen: &mut HashSet<String>,
-) -> Option<CodeUnit> {
-    if !cpp.is_type_alias(unit) {
-        return Some(unit.clone());
-    }
-    if !seen.insert(unit.fq_name()) {
-        return None;
-    }
-    let target = alias_target_text(unit)?;
-    let resolved = if target.name.contains("::") || target.global {
-        resolve_qualified_type(unit.package_name(), &target.name, target.global, visible)
-    } else {
-        visible
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Option<CodeUnit>> {
+    let mut current = unit.clone();
+    let mut seen = HashSet::default();
+    loop {
+        if !keep_going() {
+            return None;
+        }
+        if !cpp.is_type_alias(&current) {
+            return Some(Some(current));
+        }
+        if !seen.insert(current.fq_name()) {
+            return Some(None);
+        }
+        let facts = cpp.declaration_source_properties(token, &current)?;
+        let Some(target) = facts.first().and_then(|fact| fact.alias_target.as_ref()) else {
+            return Some(None);
+        };
+        if !facts
             .iter()
-            .find(|candidate| {
-                candidate.identifier() == target.name
-                    && candidate.package_name() == unit.package_name()
-            })
-            .or_else(|| {
-                visible
-                    .iter()
-                    .find(|candidate| candidate.identifier() == target.name)
-            })
-    }?;
-    canonicalize_alias(cpp, resolved, visible, seen)
+            .all(|fact| fact.alias_target.as_ref() == Some(target))
+        {
+            return Some(None);
+        }
+        let CppStructuredAliasTarget::Named {
+            components, global, ..
+        } = target
+        else {
+            return Some(None);
+        };
+        let name = components.join("::");
+        if name.is_empty() {
+            return Some(None);
+        }
+        let resolved = if components.len() > 1 || *global {
+            resolve_qualified_type(current.package_name(), &name, *global, visible)
+        } else {
+            visible
+                .iter()
+                .find(|candidate| {
+                    candidate.identifier() == name
+                        && candidate.package_name() == current.package_name()
+                })
+                .or_else(|| {
+                    visible
+                        .iter()
+                        .find(|candidate| candidate.identifier() == name)
+                })
+        };
+        let Some(resolved) = resolved else {
+            return Some(None);
+        };
+        current = resolved.clone();
+    }
 }
 
 fn resolve_qualified_type<'a>(
@@ -208,56 +254,6 @@ fn namespace_search_order(package_name: &str) -> Vec<&str> {
         };
         current = parent;
     }
-}
-
-fn alias_target_text(alias: &CodeUnit) -> Option<NormalizedCppTypeReference> {
-    let signature = alias.signature()?.trim();
-    let target = signature
-        .strip_prefix("using ")
-        .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
-        .or_else(|| {
-            signature
-                .strip_prefix("typedef ")
-                .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
-        })?
-        .trim()
-        .trim_end_matches(';');
-    normalize_cpp_type_reference(target)
-}
-
-struct NormalizedCppTypeReference {
-    name: String,
-    global: bool,
-}
-
-fn normalize_cpp_type_reference(value: &str) -> Option<NormalizedCppTypeReference> {
-    let mut text = normalize_cpp_whitespace(value)
-        .trim_start_matches("new ")
-        .trim()
-        .to_string();
-    if let Some(index) = text.find(['(', '{']) {
-        text.truncate(index);
-    }
-    if let Some(index) = text.find('<') {
-        text.truncate(index);
-    }
-    let normalized = text
-        .trim()
-        .trim_start_matches("const ")
-        .trim_end_matches(|ch: char| ch == '*' || ch == '&' || ch.is_whitespace())
-        .trim();
-    let global = normalized.starts_with("::");
-    let normalized = normalized.trim_matches(':').trim();
-    let normalized = normalized
-        .strip_prefix("struct ")
-        .or_else(|| normalized.strip_prefix("class "))
-        .or_else(|| normalized.strip_prefix("enum "))
-        .unwrap_or(normalized)
-        .trim();
-    (!normalized.is_empty()).then(|| NormalizedCppTypeReference {
-        name: normalized.to_string(),
-        global,
-    })
 }
 
 fn cpp_name_for(unit: &CodeUnit) -> String {

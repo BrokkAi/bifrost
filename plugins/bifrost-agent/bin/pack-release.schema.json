@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BrokkAi/bifrost-packs/blob/main/release-contract/manifest.schema.json",
+  "title": "Bifrost pack release manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_schema_version",
+    "pack",
+    "release_version",
+    "source",
+    "compatibility",
+    "contents",
+    "artifacts",
+    "qualification",
+    "release_dependencies"
+  ],
+  "properties": {
+    "manifest_schema_version": {
+      "const": 2
+    },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "repository",
+        "visibility"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "format": "uri"
+        },
+        "visibility": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        }
+      }
+    },
+    "release_version": {
+      "$ref": "#/$defs/semver"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "format": "uri"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "content_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "format": "uri"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "lock_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemas",
+        "capabilities"
+      ],
+      "properties": {
+        "schemas": {
+          "$ref": "#/$defs/schema-set"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required",
+            "provided",
+            "contract_version"
+          ],
+          "properties": {
+            "contract_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "required": {
+              "$ref": "#/$defs/string-set"
+            },
+            "provided": {
+              "$ref": "#/$defs/string-set"
+            }
+          }
+        }
+      }
+    },
+    "contents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "identity",
+          "path",
+          "sha256",
+          "languages",
+          "dependencies",
+          "schemas",
+          "required_capabilities"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "policy-pack",
+              "policy",
+              "semantic-model",
+              "semantic-spec",
+              "policy-bundle"
+            ]
+          },
+          "identity": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "languages": {
+            "$ref": "#/$defs/string-set"
+          },
+          "dependencies": {
+            "$ref": "#/$defs/string-set"
+          },
+          "schemas": {
+            "$ref": "#/$defs/schema-set"
+          },
+          "required_capabilities": {
+            "$ref": "#/$defs/string-set"
+          },
+          "license": {
+            "type": "string",
+            "minLength": 1
+          },
+          "authored_hash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "resolved_semantic_hash": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/sha256"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case_ids": {
+            "$ref": "#/$defs/string-set"
+          },
+          "content_version": {
+            "$ref": "#/$defs/semver"
+          },
+          "completeness": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "sha256",
+          "size_bytes",
+          "format",
+          "role"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "format": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "enum": [
+              "source",
+              "native",
+              "policy"
+            ]
+          }
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "integrity",
+        "behavior"
+      ],
+      "properties": {
+        "integrity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "evidence"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "pending",
+                "verified",
+                "failed"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "behavior": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "evidence"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "pending",
+                "limited",
+                "qualified",
+                "failed"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "release_dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "pack_id",
+          "release_version",
+          "repository"
+        ],
+        "properties": {
+          "pack_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "release_version": {
+            "$ref": "#/$defs/semver"
+          },
+          "repository": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "build_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "testing": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/engine-provenance"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "string-set": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "schema-set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_document",
+        "rql",
+        "builtin_catalog",
+        "policy_bundle",
+        "semantic_model_read",
+        "semantic_model_write",
+        "semantic_spec",
+        "release_index",
+        "runtime"
+      ],
+      "properties": {
+        "policy_document": {
+          "$ref": "#/$defs/version-set"
+        },
+        "rql": {
+          "$ref": "#/$defs/version-set"
+        },
+        "builtin_catalog": {
+          "$ref": "#/$defs/version-set"
+        },
+        "policy_bundle": {
+          "$ref": "#/$defs/version-set"
+        },
+        "semantic_model_read": {
+          "$ref": "#/$defs/version-set"
+        },
+        "semantic_model_write": {
+          "$ref": "#/$defs/version-set"
+        },
+        "semantic_spec": {
+          "$ref": "#/$defs/version-set"
+        },
+        "release_index": {
+          "$ref": "#/$defs/version-set"
+        },
+        "runtime": {
+          "$ref": "#/$defs/version-set"
+        }
+      }
+    },
+    "version-set": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "engine-provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "build_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    }
+  }
+}

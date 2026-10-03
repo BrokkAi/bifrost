@@ -514,6 +514,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallResultObligation>,
     },
+    ResultSubjectUse {
+        #[serde(flatten)]
+        value: Box<CodeQueryResultSubjectUse>,
+    },
     ResultContractUse {
         #[serde(flatten)]
         value: Box<CodeQueryResultContractUse>,

@@ -1,9 +1,12 @@
+use super::results::CodeQueryAbsentMemberLocation;
 use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryRuntimeKeyedReadValue;
+use super::results::CodeQueryUnresolvedCall;
 use super::*;
 
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
+use brokk_bifrost_flow::type_flow::AbsentMemberProof;
 
 use super::call_binding::{
     semantic_model_completeness_label, semantic_model_origin_label, semantic_model_proof_label,
@@ -128,6 +131,21 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CallResultObligation(value) => CodeQueryResultValue::CallResultObligation {
             value: Box::new(render_call_result_obligation(analyzer, &value, cache)),
         },
+        PipelineValue::ResultSubjectUse(value) => {
+            debug_assert!(
+                value.row.proof != "proven"
+                    || (!value.assignment_conversions.is_empty()
+                        && value.assignment_conversions.len()
+                            == value.row.conversion_witnesses.len()
+                        && value
+                            .assignment_conversions
+                            .iter()
+                            .all(|evidence| evidence.preserves_reference_identity()))
+            );
+            CodeQueryResultValue::ResultSubjectUse {
+                value: Box::new(value.row),
+            }
+        }
         PipelineValue::ResultContractUse(value) => CodeQueryResultValue::ResultContractUse {
             value: Box::new(render_result_contract_use(analyzer, &value, cache)),
         },
@@ -421,6 +439,18 @@ pub(super) fn render_provenance(
                             obligation_kind: rendered.obligation_kind,
                             result_use: rendered.result_use,
                             coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::ResultSubjectUse(value) => {
+                        let row = &value.row;
+                        CodeQueryResultRef::ResultSubjectUse {
+                            id: row.id.clone(),
+                            origin_id: row.origin.as_ref().map(|origin| origin.id.clone()),
+                            path: row.path.clone(),
+                            range: row.receiver_range,
+                            proof: row.proof,
+                            completeness: row.completeness,
+                            outcome: row.outcome,
                         }
                     }
                     PipelineTraceValue::ResultContractUse(value) => {
@@ -1240,6 +1270,10 @@ pub(super) fn render_trace_candidate_ref(
                 },
             }
         }
+        TraceCandidateRef::Modeled { symbol_id, name } => CodeQueryCandidateRef::Modeled {
+            symbol_id: symbol_id.clone(),
+            name: name.clone(),
+        },
         TraceCandidateRef::Lexical(lexical) => CodeQueryCandidateRef::Lexical {
             name: lexical.identifier.clone(),
             kind: lexical.kind.label(),
@@ -3269,6 +3303,28 @@ pub(super) fn render_concurrent_access_conflict(
             format!("unmodeled_memory:{capability}")
         }
     };
+    let mut unresolved_calls = value
+        .unresolved_calls
+        .iter()
+        .map(|call| CodeQueryUnresolvedCall {
+            callee: call.callee.clone(),
+            reason: call.reason.clone(),
+            path: rel_path_string(&call.file),
+            range: render_source_range(analyzer, &call.file, &call.range, cache),
+        })
+        .collect::<Vec<_>>();
+    unresolved_calls.sort_by_key(|call| {
+        (
+            call.path.clone(),
+            call.range.start_line,
+            call.range.start_column,
+            call.range.end_line,
+            call.range.end_column,
+            call.callee.clone(),
+            call.reason.clone(),
+        )
+    });
+    unresolved_calls.dedup();
     CodeQueryConcurrentAccessConflict {
         id: value.id.clone(),
         root_procedure_id: value.root_procedure_id.clone(),
@@ -3316,6 +3372,7 @@ pub(super) fn render_concurrent_access_conflict(
             "open"
         },
         reasons: value.conflict.reasons.iter().map(reason).collect(),
+        unresolved_calls,
     }
 }
 
@@ -3342,20 +3399,98 @@ pub(super) fn render_absent_member_finding(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryAbsentMemberFinding {
     let root = value.representative();
+    let mut additional_sites = value
+        .roots
+        .iter()
+        .filter(|candidate| candidate.origin_span == root.origin_span)
+        .flat_map(|candidate| candidate.also_fails_at.iter().cloned())
+        .collect::<Vec<_>>();
+    additional_sites.sort_unstable();
+    additional_sites.dedup();
+    let mut also_fails_at = Vec::with_capacity(additional_sites.len());
+    let mut also_fails_at_locations = Vec::with_capacity(additional_sites.len());
+    for (site_file, site_span) in additional_sites {
+        let path = rel_path_string(&site_file);
+        let range = render_source_range(
+            analyzer,
+            &site_file,
+            &super::type_flow::source_range(site_span),
+            cache,
+        );
+        also_fails_at.push(format!(
+            "{path}:{}:{}-{}:{}",
+            range.start_line, range.start_column, range.end_line, range.end_column
+        ));
+        also_fails_at_locations.push(CodeQueryAbsentMemberLocation {
+            path,
+            range,
+            start_byte: site_span.start_byte() as usize,
+            end_byte: site_span.end_byte() as usize,
+        });
+    }
+    let origin_file = rel_path_string(&root.origin_file);
+    let origin_range = render_source_range(analyzer, &root.origin_file, &root.origin_range, cache);
+    let (remainders, condition) = match &value.proof {
+        AbsentMemberProof::Proven => (Vec::new(), None),
+        AbsentMemberProof::Conditional { remainders } => {
+            let origin = format!("{origin_file}:{}", origin_range.start_line);
+            let admission = if root.origin_is_guard {
+                format!("which the guard at {origin} admits")
+            } else {
+                format!("as the value at {origin} supplies")
+            };
+            let class = &value.class;
+            let member = &value.member;
+            let condition = match absent_member_receiver_text(analyzer, value, cache) {
+                Some(receiver) => format!(
+                    "if `{receiver}` is a `{class}`, {admission}, then `{receiver}.{member}` fails"
+                ),
+                None => format!(
+                    "if the receiver is a `{class}`, {admission}, then the access to `{member}` fails"
+                ),
+            };
+            (
+                remainders.iter().map(ToString::to_string).collect(),
+                Some(condition),
+            )
+        }
+    };
     CodeQueryAbsentMemberFinding {
         id: value.id.clone(),
         file: rel_path_string(&value.file),
         range: render_source_range(analyzer, &value.file, &value.range, cache),
         member: value.member.clone(),
         class: value.class.clone(),
-        origin_file: rel_path_string(&root.origin_file),
-        origin_range: render_source_range(analyzer, &root.origin_file, &root.origin_range, cache),
+        origin_file,
+        origin_range,
         caller: root.caller.clone(),
         witness_steps: root
             .witness
             .as_ref()
             .map_or(0, |witness| witness.steps().len()),
+        proof: value.proof.label(),
+        remainders,
+        condition,
+        also_fails_at,
+        also_fails_at_locations,
     }
+}
+
+/// The receiver expression's source text, for a one-line finding message. A
+/// receiver that spans lines or is long is not quoted.
+fn absent_member_receiver_text(
+    analyzer: &dyn IAnalyzer,
+    value: &type_flow::AbsentMemberFindingValue,
+    cache: &mut PipelineRenderCache,
+) -> Option<String> {
+    const MAX_RECEIVER_TEXT_BYTES: usize = 80;
+    let coordinates =
+        cache.coordinates_for(&value.file, || analyzer.indexed_source(&value.file))?;
+    let text = coordinates
+        .source
+        .get(value.range.start_byte..value.range.end_byte)?;
+    (!text.is_empty() && !text.contains('\n') && text.len() <= MAX_RECEIVER_TEXT_BYTES)
+        .then(|| text.to_owned())
 }
 
 pub(super) fn render_detached_task_transfer(

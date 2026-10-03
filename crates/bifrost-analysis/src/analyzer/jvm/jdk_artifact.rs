@@ -833,7 +833,7 @@ mod tests {
             pack_version: version.to_owned(),
             ecosystem: "jdk".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: format!("={version}"),

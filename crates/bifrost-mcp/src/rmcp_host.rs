@@ -21,6 +21,7 @@ use crate::mcp_common::{
     analyzer_stop_deadline, attach_run_policy_correlation, attach_run_policy_correlation_result,
     client_root_to_path, file_uri_to_path, file_watching_enabled,
     fit_get_summaries_output_to_budget, request_correlation_id, serial_tool_request,
+    usage_scan_soft_deadline,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -1345,17 +1346,23 @@ impl BifrostMcpHandler {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
         // it. A request that waited most of its budget gets what remains.
-        // A policy run asks its analyzer to stop `POLICY_REPORT_GRACE` before
-        // this request's timer, so the canonical deadline report -- status,
-        // terminal stage, completed and pending policy ids -- is what the
-        // client usually receives; the timer below remains the backstop that
-        // answers with the typed budget error when the work cannot stop. The
-        // reserve is measured from now, so readiness and admission wait already
-        // spent are never handed back as grace.
+        // A policy run asks its analyzer to stop before this request's timer,
+        // so its canonical deadline report can arrive first. Usage scans use
+        // the same reserve as a non-cancelling soft stop while retaining this
+        // request deadline as their hard backstop. The reserve is measured
+        // from now, so readiness and admission wait already spent are never
+        // handed back as grace.
         let bifrost_cancellation = match request_budget {
-            Some(request_budget) => crate::CancellationToken::default().with_deadline(
-                analyzer_stop_deadline(&name, Instant::now(), request_budget.deadline()),
-            ),
+            Some(request_budget) => {
+                let accepted_at = Instant::now();
+                let deadline = request_budget.deadline();
+                let cancellation = crate::CancellationToken::default()
+                    .with_deadline(analyzer_stop_deadline(&name, accepted_at, deadline));
+                match usage_scan_soft_deadline(&name, accepted_at, deadline) {
+                    Some(soft_deadline) => cancellation.with_soft_deadline(soft_deadline),
+                    None => cancellation,
+                }
+            }
             None => crate::CancellationToken::default(),
         };
         // How the analyzer's phases reach the client while the call is still
@@ -1423,6 +1430,13 @@ impl BifrostMcpHandler {
             let _in_flight = in_flight;
             let _bridge_guard = bridge_guard;
             let _execution_scope = profiling::scope(execution_label);
+            // The reader seam's per-request boundary (BIFROST_SEAM_PROFILE).
+            // It is a no-op unless that variable names an output file.
+            let _seam_scope = brokk_bifrost_analysis::seam_profile::request_scope(&execution_name);
+            // The reference-seed repetition boundary (BIFROST_SEED_KEY_PROFILE),
+            // a no-op on the same terms.
+            let _seed_key_scope =
+                brokk_bifrost_analysis::seed_key_profile::call_scope(&execution_name);
             let _cold_execution_scope =
                 cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
             let output = execution_service.call_tool_output_with_transport_timings_and_preflight(
@@ -1820,6 +1834,9 @@ async fn run_tool_as_task(
         let _permit = permit;
         let _in_flight = in_flight_guard;
         let _finished_guard = finished_guard;
+        // The reader seam's per-request boundary, as in `execute_tool`.
+        let _seam_scope = brokk_bifrost_analysis::seam_profile::request_scope(&execution_name);
+        let _seed_key_scope = brokk_bifrost_analysis::seed_key_profile::call_scope(&execution_name);
         let output = execution_service.call_tool_output_with_transport_timings_and_preflight(
             &execution_name,
             arguments,

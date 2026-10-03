@@ -1390,7 +1390,10 @@ fn class_set_and_absent_member_steps_parse_and_lower_from_both_frontends() {
     }));
     assert_eq!(
         finding.plan.steps,
-        vec![QueryStep::ProcedureOf, QueryStep::AbsentMember]
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::AbsentMember(AbsentMemberProofFilter::Proven)
+        ]
     );
     assert_eq!(
         finding.validate_steps().unwrap(),
@@ -1410,7 +1413,7 @@ fn class_set_and_absent_member_steps_parse_and_lower_from_both_frontends() {
         witness.plan.steps,
         vec![
             QueryStep::ProcedureOf,
-            QueryStep::AbsentMember,
+            QueryStep::AbsentMember(AbsentMemberProofFilter::Proven),
             QueryStep::Witness(WitnessTraversal {
                 max_steps: Some(12),
                 max_bytes: Some(4096),
@@ -1468,6 +1471,65 @@ fn class_set_and_absent_member_reject_borrowed_options() {
         ]
     }));
     assert_eq!(absent_member.path, "steps[1].max_steps");
+}
+
+#[test]
+fn absent_member_proof_filter_parses_from_both_frontends_and_omits_the_default() {
+    for proof in AbsentMemberProofFilter::ALL {
+        let query = parse_ok(json!({
+            "schema_version": 1,
+            "match": { "kind": "function", "name": "check" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "absent_member", "finding_proof": proof.label() }
+            ]
+        }));
+        assert_eq!(
+            query.plan.steps,
+            vec![QueryStep::ProcedureOf, QueryStep::AbsentMember(proof)]
+        );
+        let rql = CodeQuery::from_sexp(&format!(
+            "(absent-member :proof {} (procedure-of (function :name \"check\")))",
+            proof.label()
+        ))
+        .expect("absent-member proof RQL should lower");
+        assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+        // The default tier is not spelled in canonical JSON, so a query
+        // written before the filter existed keeps its canonical form.
+        let canonical = query.to_canonical_json();
+        let step = &canonical["steps"][1];
+        assert_eq!(
+            step.get("finding_proof").is_some(),
+            proof != AbsentMemberProofFilter::Proven,
+            "{canonical}"
+        );
+        assert_eq!(parse_ok(canonical.clone()).plan.steps, query.plan.steps);
+    }
+    let unknown = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member", "finding_proof": "unproven" }
+        ]
+    }));
+    assert_eq!(unknown.path, "steps[1].finding_proof");
+    assert!(unknown.message.contains("conditional"), "{unknown:?}");
+    // The option belongs to absent_member alone.
+    let borrowed = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set", "finding_proof": "any" }
+        ]
+    }));
+    assert_eq!(borrowed.path, "steps[1].finding_proof");
+    for source in [
+        "(absent-member :proof unproven (procedure-of (function)))",
+        "(absent-member :tier any (procedure-of (function)))",
+        "(absent-member :proof any :proof proven (procedure-of (function)))",
+    ] {
+        assert!(CodeQuery::from_sexp(source).is_err(), "{source}");
+    }
 }
 
 #[test]
@@ -2712,6 +2774,53 @@ fn result_contract_uses_enriches_a_contract_row_without_changing_its_type() {
     .expect_err("result_contract_uses must reject a call-shape upstream");
     assert!(
         wrong.message.contains("requires call_result_contract"),
+        "{}",
+        wrong.message
+    );
+}
+
+#[test]
+fn result_subject_uses_project_typed_rows_from_call_results() {
+    let rql = CodeQuery::from_sexp(
+        r#"(result-subject-uses (call-results (call-shape (call :callee "build"))))"#,
+    )
+    .expect("result subject use RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::ResultSubjectUse
+    );
+
+    let underscored = CodeQuery::from_sexp(
+        r#"(result_subject_uses (call_results (call_shape (call :callee "build"))))"#,
+    )
+    .expect("underscored result subject use RQL");
+    assert_eq!(underscored.to_canonical_json(), rql.to_canonical_json());
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "build" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_results" },
+            { "op": "result_subject_uses" }
+        ]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::ResultSubjectUse
+    );
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "result_subject_uses" }
+        ]
+    }))
+    .expect_err("result_subject_uses must reject a call-shape upstream");
+    assert!(
+        wrong.message.contains("requires call_result"),
         "{}",
         wrong.message
     );

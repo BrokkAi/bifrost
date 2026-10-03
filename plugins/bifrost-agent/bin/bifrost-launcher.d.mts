@@ -7,6 +7,7 @@ export interface BifrostLaunch {
   preferredVersion: string;
   selectedVersion: string;
   compatibilityMode: "exact" | "compatible";
+  openPackReceipt?: import("./open-packs.mjs").OpenPackReceipt;
 }
 
 export function resolveBifrostLaunch(options: {

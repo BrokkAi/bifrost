@@ -29,6 +29,7 @@ use crate::analyzer::tree_walk::{
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_js_ts::model::node_text;
+use brokk_bifrost_js_ts::syntax::static_string_literal_fragment;
 use brokk_bifrost_js_ts::tsconfig::{
     TypeScriptLibrarySelection, canonical_library_name, effective_library_selection_for_config,
     typescript_library_activation_closure,
@@ -1518,6 +1519,15 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         } = pending;
         match node.kind() {
             "export_statement" => {
+                if is_default_export(node)
+                    && (owner_name != self.root_module_name || default_export_local(node).is_none())
+                {
+                    self.diagnostics.warning(
+                        "typescript.default_export.unsupported",
+                        Some(self.artifact_path.clone()),
+                        "default export has no supported local declaration identity",
+                    );
+                }
                 if let Some(declaration) = node.child_by_field_name("declaration") {
                     stack.push(PendingDeclaration {
                         node: declaration,
@@ -1539,6 +1549,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                         "declaration uses `export =`, which replaces the module's export shape",
                     );
                 }
+            }
+            "import_alias" if exported => {
+                self.diagnostics.warning(
+                    "typescript.export_import.unsupported",
+                    Some(self.artifact_path.clone()),
+                    "exported import alias requires a target this declaration producer cannot resolve",
+                );
             }
             "ambient_declaration" | "statement_block" => {
                 let exported = exported || is_global_ambient_declaration(node);
@@ -1562,7 +1579,10 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                     self.collect_type_declaration(node, &owner_name, stack, ambient);
                 }
             }
-            "internal_module" => {
+            // `namespace N {}` and `module N {}` (the grammar's `internal_module`
+            // and `module`) declare the same namespace; `module 'name' {}`
+            // declares an ambient external module.
+            "internal_module" | "module" => {
                 if exported || (ambient && is_global_internal_module(node, self.source)) {
                     self.collect_module(node, &owner_name, stack);
                 }
@@ -1639,17 +1659,32 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         owner_name: &str,
         stack: &mut Vec<PendingDeclaration<'tree>>,
     ) {
-        let Some(raw_name) = field_text(node, "name", self.source) else {
+        let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let short_name = raw_name.trim_matches(['\'', '"']);
-        let name = if (self.global_scope && owner_name == self.root_module_name)
-            || short_name == self.root_module_name
-            || short_name.starts_with('@')
-        {
-            short_name.to_owned()
+        let name = if name_node.kind() == "string" {
+            // `declare module 'name' { ... }` names a module by its import
+            // specifier, never by its lexical owner. When the specifier is the
+            // module this entry file is imported as, the block is that
+            // module's body (the shape dts-buddy emits). Any other specifier,
+            // such as `'*.svg'` or another package, declares a different
+            // module. That module is outside this pack's activation scope, so
+            // skipping it leaves this pack's own surface complete.
+            let specifier = static_string_literal_fragment(name_node)
+                .map(|fragment| node_text(fragment, self.source));
+            if specifier != Some(self.root_module_name.as_str()) {
+                return;
+            }
+            self.root_module_name.clone()
         } else {
-            format!("{owner_name}.{short_name}")
+            let short_name = node_text(name_node, self.source);
+            if (self.global_scope && owner_name == self.root_module_name)
+                || short_name == self.root_module_name
+            {
+                short_name.to_owned()
+            } else {
+                format!("{owner_name}.{short_name}")
+            }
         };
         let Some(module_id) = self.add_type(&name, TypeKind::Module, node, Vec::new(), Vec::new())
         else {
@@ -1659,11 +1694,30 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             return;
         };
         let container = body.child_by_field_name("body").unwrap_or(body);
+        // TypeScript exports every declaration of an ambient module or
+        // namespace body implicitly, unless the body has its own export
+        // clause or export assignment (for example a trailing `export {};`).
+        // Then only `export`-marked declarations and the clause's names are
+        // exported.
+        let has_export_clause = named_children_iter(container).any(|statement| {
+            statement.kind() == "export_statement"
+                && statement.child_by_field_name("declaration").is_none()
+        });
+        if name == self.root_module_name {
+            for (local, exported_names) in explicit_export_aliases(container, self.source) {
+                let aliases = self.export_aliases.entry(local).or_default();
+                for exported in exported_names {
+                    if !aliases.contains(&exported) {
+                        aliases.push(exported);
+                    }
+                }
+            }
+        }
         push_named_children_reversed_as(container, stack, |child| PendingDeclaration {
             node: child,
             owner_name: name.clone(),
             owner_id: module_id.clone(),
-            exported: true,
+            exported: !has_export_clause,
             ambient: true,
         });
     }
@@ -1809,6 +1863,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             visibility: Visibility::Public,
             is_abstract: node.kind() == "abstract_class_declaration",
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters,
             type_parameter_constraints: Vec::new(),
@@ -1857,6 +1912,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .and_then(|signature| signature.returns.as_ref()),
         });
         self.members.push(MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id,
             owner: owner_id.to_owned(),
@@ -1937,7 +1993,9 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
     fn apply_export_aliases(&mut self, root_id: &str) {
         for (local_name, exported_names) in &self.export_aliases {
             let qualified_local = format!("{}.{}", self.root_module_name, local_name);
+            let mut represented = false;
             if let Some(&index) = self.type_index_by_name.get(&qualified_local) {
+                represented = true;
                 let aliases = &mut self.types[index].aliases;
                 for exported_name in exported_names {
                     aliases.push(exported_name.clone());
@@ -1947,12 +2005,22 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             for member in self.members.iter_mut().filter(|member| {
                 member.owner == root_id && member.name.as_str() == local_name.as_str()
             }) {
+                represented = true;
                 for exported_name in exported_names {
                     member.aliases.push(exported_name.clone());
                     member
                         .aliases
                         .push(format!("{}.{}", self.root_module_name, exported_name));
                 }
+            }
+            if !represented && exported_names.iter().any(|name| name == "default") {
+                self.diagnostics.warning(
+                    "typescript.default_export.unresolved",
+                    Some(self.artifact_path.clone()),
+                    format!(
+                        "default export target {local_name} has no collected local declaration"
+                    ),
+                );
             }
         }
     }
@@ -1961,8 +2029,19 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
 fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<String>> {
     let mut aliases = HashMap::default();
     for statement in named_children_iter(root) {
-        if statement.kind() != "export_statement"
-            || statement.child_by_field_name("declaration").is_some()
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        if is_default_export(statement) {
+            if let Some(local) = default_export_local(statement) {
+                aliases
+                    .entry(node_text(local, source).to_owned())
+                    .or_insert_with(Vec::new)
+                    .push("default".to_owned());
+            }
+            continue;
+        }
+        if statement.child_by_field_name("declaration").is_some()
             || statement.child_by_field_name("source").is_some()
         {
             continue;
@@ -1992,6 +2071,22 @@ fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<
         }
     }
     aliases
+}
+
+// Read the grammar's keyword and fields, never declaration source text.
+fn is_default_export(node: Node<'_>) -> bool {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .any(|child| child.kind() == "default")
+}
+
+fn default_export_local(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("declaration")
+        .and_then(|declaration| declaration.child_by_field_name("name"))
+        .or_else(|| {
+            node.child_by_field_name("value")
+                .filter(|value| value.kind() == "identifier")
+        })
 }
 
 /// Whether an `export_statement` is a TypeScript export assignment (`export = X`).
@@ -2058,15 +2153,25 @@ fn callable_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
         let name_node = parameter
             .child_by_field_name("pattern")
             .or_else(|| parameter.child_by_field_name("name"));
-        let parameter_name = name_node
-            .map(|name| node_text(name, source).trim().to_owned())
-            .filter(|name| !name.is_empty());
+        let variadic = name_node.is_some_and(|name| name.kind() == "rest_pattern")
+            || parameter.kind() == "rest_pattern";
+        // A parameter has a name only when its pattern binds one identifier.
+        // A destructuring pattern such as `{ file, sourceRoot }` binds several
+        // names and gives the parameter itself none, so the parameter stays
+        // unnamed rather than carrying the pattern's source text.
+        let bound_identifier = name_node.and_then(|name| {
+            let binding = if name.kind() == "rest_pattern" {
+                name.named_child(0)?
+            } else {
+                name
+            };
+            matches!(binding.kind(), "identifier" | "this").then_some(binding)
+        });
+        let parameter_name = bound_identifier.map(|name| node_text(name, source).to_owned());
         let parameter_type = parameter
             .child_by_field_name("type")
             .map(|node| type_ref(node, source, max_depth))
             .unwrap_or_else(|| named_type("unknown".to_owned()));
-        let variadic = name_node.is_some_and(|name| name.kind() == "rest_pattern")
-            || parameter.kind() == "rest_pattern";
         parsed_parameters.push(Parameter {
             name: parameter_name,
             r#type: parameter_type,
@@ -2131,11 +2236,17 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
             }),
         "tuple_type" => {
             let mut cursor = node.walk();
-            TypeRef::Tuple {
-                elements: node
-                    .named_children(&mut cursor)
-                    .map(|element| type_ref(element, source, remaining_depth - 1))
-                    .collect(),
+            let elements = node
+                .named_children(&mut cursor)
+                .filter(|element| !element.is_extra())
+                .map(|element| type_ref(element, source, remaining_depth - 1))
+                .collect::<Vec<_>>();
+            // The semantic model has no empty tuple, so `[]` takes the same
+            // `unknown` stand-in as the other type forms it cannot express.
+            if elements.is_empty() {
+                named_type("unknown".to_owned())
+            } else {
+                TypeRef::Tuple { elements }
             }
         }
         "function_type" | "constructor_type" => {
@@ -2308,7 +2419,7 @@ fn js_ts_dependency_production_request(
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
@@ -2366,7 +2477,7 @@ fn typescript_library_production_request(
         pack_version: TYPESCRIPT_STDLIB_VERSION.to_owned(),
         ecosystem: "npm".to_owned(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {
@@ -3521,6 +3632,354 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
         assert!(!outcome.diagnostics.is_empty());
     }
 
+    fn declaration_production(source: &str, limits: &ArtifactProducerLimits) -> ArtifactProduction {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("index.d.ts");
+        std::fs::write(&path, source).expect("write declaration");
+        TypeScriptDeclarationPackProducer.produce_exact_artifact(&request(path), limits)
+    }
+
+    /// Produce a pack for `widget` and require the compiler to accept it,
+    /// as pack installation does.
+    fn compiled_declarations(source: &str) -> (Completeness, Vec<TypeFact>, Vec<MemberFact>) {
+        let production = declaration_production(source, &ArtifactProducerLimits::default());
+        let pack = production.pack.unwrap_or_else(|| {
+            panic!("no pack: {:?}", production.diagnostics);
+        });
+        if let Err(errors) = compile_pack(&pack, &Default::default()) {
+            panic!("pack does not compile: {errors:?}");
+        }
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            pack.shards.into_iter().next().expect("one shard").payload
+        else {
+            panic!("declaration payload expected");
+        };
+        (production.completeness, types, members)
+    }
+
+    fn assert_default_export(source: &str) {
+        let (completeness, _, members) = compiled_declarations(source);
+        assert_eq!(completeness, Completeness::Complete);
+        let value = members
+            .iter()
+            .find(|member| member.name == "create")
+            .expect("local callable");
+        assert!(
+            value.aliases.contains(&"widget.default".to_owned()),
+            "{members:?}"
+        );
+        assert!(value.aliases.contains(&"default".to_owned()));
+        assert_eq!(signature_of(&members, "create").parameters.len(), 1);
+    }
+
+    #[test]
+    fn default_value_export_at_top_level() {
+        assert_default_export(
+            "declare function create(input: string): string; export default create;",
+        );
+    }
+
+    #[test]
+    fn default_value_export_in_self_named_module() {
+        assert_default_export(
+            "declare module 'widget' { function create(input: string): string; export default create; }",
+        );
+    }
+
+    fn assert_export_import_partial(source: &str) {
+        let (completeness, _, members) = compiled_declarations(source);
+        assert_eq!(completeness, Completeness::Partial, "{members:?}");
+        assert!(members.iter().any(|member| member.name == "version"));
+    }
+
+    #[test]
+    fn export_import_at_top_level_is_partial() {
+        assert_export_import_partial(
+            "export declare const version: string; export import api = require('api');",
+        );
+    }
+
+    #[test]
+    fn export_import_in_self_named_module_is_partial() {
+        assert_export_import_partial(
+            "declare module 'widget' { export const version: string; export import api = require('api'); }",
+        );
+    }
+
+    #[test]
+    fn named_default_exports_preserve_declarations_and_signatures() {
+        for wrapped in [false, true] {
+            for body in [
+                "export default function create(input: string): string;",
+                "declare const create: (input: string) => string; export default create;",
+                "export default class Builder { build(input: string): string; }",
+                "export default interface Builder { build(input: string): string; }",
+            ] {
+                let source = if wrapped {
+                    format!("declare module 'widget' {{ {body} }}")
+                } else {
+                    body.to_owned()
+                };
+                let (completeness, types, members) = compiled_declarations(&source);
+                assert_eq!(completeness, Completeness::Complete, "{source}");
+                if body.contains("Builder") {
+                    let builder = types
+                        .iter()
+                        .find(|fact| fact.name == "widget.Builder")
+                        .unwrap();
+                    assert!(
+                        builder.aliases.contains(&"widget.default".to_owned()),
+                        "{source}"
+                    );
+                    assert!(
+                        members
+                            .iter()
+                            .any(|member| member.owner == builder.id && member.name == "build")
+                    );
+                    assert_eq!(signature_of(&members, "build").parameters.len(), 1);
+                } else {
+                    let create = members
+                        .iter()
+                        .find(|member| member.name == "create")
+                        .unwrap();
+                    assert!(
+                        create.aliases.contains(&"widget.default".to_owned()),
+                        "{source}"
+                    );
+                    assert!(create.signature.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_exports_have_bounded_warnings_and_partial_packs() {
+        for (body, code) in [
+            (
+                "export default class { run(): void; }",
+                "typescript.default_export.unsupported",
+            ),
+            (
+                "import create from 'other'; export default create;",
+                "typescript.default_export.unresolved",
+            ),
+            (
+                "import * as other from 'other'; export default other.create;",
+                "typescript.default_export.unsupported",
+            ),
+            (
+                "export import api = require('api');",
+                "typescript.export_import.unsupported",
+            ),
+            (
+                "import other = require('other'); export import api = other.Api;",
+                "typescript.export_import.unsupported",
+            ),
+        ] {
+            for wrapped in [false, true] {
+                let body = format!("export const version: string; {body}");
+                let source = if wrapped {
+                    format!("declare module 'widget' {{ {body} }}")
+                } else {
+                    body
+                };
+                for max_diagnostics in [0, 1] {
+                    let production = declaration_production(
+                        &source,
+                        &ArtifactProducerLimits {
+                            max_diagnostics,
+                            ..ArtifactProducerLimits::default()
+                        },
+                    );
+                    assert_eq!(production.completeness, Completeness::Partial, "{source}");
+                    assert_eq!(production.diagnostics.len(), max_diagnostics, "{source}");
+                    if max_diagnostics == 0 {
+                        assert_eq!(production.suppressed_diagnostics.warnings, 1, "{source}");
+                    } else {
+                        let diagnostic = &production.diagnostics[0];
+                        assert_eq!(diagnostic.code, code, "{source}");
+                        assert_eq!(diagnostic.severity, ProducerDiagnosticSeverity::Warning);
+                        assert!(diagnostic.location.is_some());
+                    }
+                    let pack = production.pack.expect("retained version declaration");
+                    assert_eq!(pack.completeness, Completeness::Partial);
+                    compile_pack(&pack, &Default::default()).expect("partial pack compiles");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_import_alias_and_foreign_default_do_not_degrade_pack() {
+        let (completeness, _, members) = compiled_declarations(
+            "import api = require('api'); export const version: string; declare module 'foreign' { export default class {} }",
+        );
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "version");
+        assert!(members[0].aliases.is_empty());
+    }
+
+    fn signature_of<'a>(members: &'a [MemberFact], name: &str) -> &'a Signature {
+        members
+            .iter()
+            .find(|member| member.name == name)
+            .and_then(|member| member.signature.as_ref())
+            .unwrap_or_else(|| panic!("member {name} with a signature in {members:?}"))
+    }
+
+    fn parameter_names(parameters: &[Parameter]) -> Vec<Option<&str>> {
+        parameters
+            .iter()
+            .map(|parameter| parameter.name.as_deref())
+            .collect()
+    }
+
+    /// Each fixture is the failing shape from one npm package's published
+    /// declaration entry (#3762).
+    #[test]
+    fn destructured_parameters_produce_compilable_packs() {
+        let fixtures = [
+            (
+                "@jridgewell/gen-mapping",
+                "export declare class GenMapping {\n    constructor({ file, sourceRoot }?: Options);\n}\n",
+            ),
+            (
+                "fdir",
+                "export declare class Builder {\n  withSymlinks({\n    resolvePaths\n  }?: {\n    resolvePaths?: boolean | undefined;\n  }): this;\n}\n",
+            ),
+            (
+                "@tailwindcss/node",
+                "declare function optimize(input: string, { file, minify, map }?: OptimizeOptions): TransformResult;\nexport { optimize };\n",
+            ),
+            (
+                "tailwind-merge",
+                "declare const mergeConfigs: <T extends string>(baseConfig: AnyConfig, { cacheSize, prefix, }: ConfigExtension<T>) => AnyConfig;\nexport { mergeConfigs };\n",
+            ),
+        ];
+        for (package, source) in fixtures {
+            let (completeness, _, members) = compiled_declarations(source);
+            assert_eq!(completeness, Completeness::Complete, "{package}");
+            assert!(!members.is_empty(), "{package}");
+        }
+
+        let (_, _, members) = compiled_declarations(
+            "export declare function spread(first: string, [left, right]: [number, number], { a, b }: Options, ...rest: string[]): void;\n\
+             export declare function spreadPattern(...[head, tail]: string[]): void;\n\
+             export declare const merge: (base: Config, { cacheSize }: Extension) => Config;\n",
+        );
+        let spread = signature_of(&members, "spread");
+        assert_eq!(
+            parameter_names(&spread.parameters),
+            [Some("first"), None, None, Some("rest")]
+        );
+        assert!(spread.parameters[3].variadic);
+        let spread_pattern = signature_of(&members, "spreadPattern");
+        assert_eq!(parameter_names(&spread_pattern.parameters), [None]);
+        assert!(spread_pattern.parameters[0].variadic);
+        let Some(TypeRef::Function { parameters, .. }) = &signature_of(&members, "merge").returns
+        else {
+            panic!("function-typed constant");
+        };
+        assert_eq!(parameter_names(parameters), [Some("base"), None]);
+    }
+
+    /// `@oxc-project/types` declares `decorators?: [];` on AST node interfaces.
+    #[test]
+    fn empty_tuple_type_produces_compilable_pack() {
+        let (_, _, members) = compiled_declarations(
+            "export interface IdentifierName {\n  decorators?: [];\n  annotated?: [/* none */];\n  pair: [string, number];\n}\n",
+        );
+        assert_eq!(
+            signature_of(&members, "decorators").returns,
+            Some(named_type("unknown".to_owned()))
+        );
+        assert_eq!(
+            signature_of(&members, "annotated").returns,
+            Some(named_type("unknown".to_owned()))
+        );
+        assert_eq!(
+            signature_of(&members, "pair").returns,
+            Some(TypeRef::Tuple {
+                elements: vec![
+                    named_type("string".to_owned()),
+                    named_type("number".to_owned())
+                ]
+            })
+        );
+    }
+
+    /// `locate-character` wraps its whole entry in `declare module
+    /// 'locate-character' { ... }` with no export clause, so every declaration
+    /// in the block is exported, including the ones without `export`.
+    #[test]
+    fn self_named_ambient_module_is_the_module_body() {
+        let (completeness, types, members) = compiled_declarations(
+            "declare module 'widget' {\n\
+             \texport function getLocator(source: string, options?: Options | undefined): (search: string | number) => Location | undefined;\n\
+             \texport type Location = Location_1;\n\
+             \tinterface Options {\n\t\toffsetLine?: number;\n\t}\n\
+             \tinterface Location_1 {\n\t\tline: number;\n\t}\n\
+             }\n\
+             declare module '*.svg' {\n\tconst content: string;\n\texport default content;\n}\n",
+        );
+        assert_eq!(completeness, Completeness::Complete);
+        let root = types
+            .iter()
+            .find(|fact| fact.name == "widget")
+            .expect("root module");
+        assert_eq!(
+            types
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "widget",
+                "widget.Location",
+                "widget.Location_1",
+                "widget.Options"
+            ]
+        );
+        assert!(members.iter().any(|member| {
+            member.name == "getLocator"
+                && member.owner == root.id
+                && member.member_kind == MemberKind::Function
+        }));
+        assert!(!members.iter().any(|member| member.name == "content"));
+    }
+
+    /// `devalue` wraps its entry the same way but ends the block with
+    /// `export {};`, so only `export`-marked declarations and the export
+    /// clause's names are exported.
+    #[test]
+    fn ambient_module_export_clause_limits_implicit_exports() {
+        let (completeness, types, members) = compiled_declarations(
+            "declare module 'widget' {\n\
+             \texport type StringifyOptions = StringifyOptions_1;\n\
+             \texport function uneval(value: any): string;\n\
+             \ttype StringifyOptions_1 = { reducers?: object };\n\
+             \tfunction hidden(): void;\n\
+             \tinterface Renamed { value: string }\n\
+             \texport { Renamed as Public };\n\
+             }\n",
+        );
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(
+            types
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            ["widget", "widget.Renamed", "widget.StringifyOptions"]
+        );
+        let renamed = types
+            .iter()
+            .find(|fact| fact.name == "widget.Renamed")
+            .expect("clause-exported interface");
+        assert!(renamed.aliases.contains(&"widget.Public".to_owned()));
+        assert!(members.iter().any(|member| member.name == "uneval"));
+        assert!(!members.iter().any(|member| member.name == "hidden"));
+    }
+
     fn request(path: PathBuf) -> ArtifactProductionRequest {
         ArtifactProductionRequest {
             path,
@@ -3529,7 +3988,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
             pack_version: "1.0.0".to_owned(),
             ecosystem: "npm".to_owned(),
             compatibility: Compatibility {
-                bifrost: "*".to_owned(),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {

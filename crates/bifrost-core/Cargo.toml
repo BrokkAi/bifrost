@@ -31,6 +31,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = [
     "bundled",
     "cache",
     "fallible_uint",
+    "trace",
 ] }
 rustc-hash = "2"
 # The MCP `get_active_workspace` output schema is derived from the result

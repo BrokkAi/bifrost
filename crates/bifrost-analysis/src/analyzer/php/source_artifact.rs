@@ -497,6 +497,7 @@ fn project_type<'tree>(
         visibility: Visibility::Public,
         is_abstract: has_modifier(work.node, source, "abstract"),
         is_sealed: has_modifier(work.node, source, "final"),
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
@@ -640,6 +641,7 @@ fn project_callable(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        non_overridable: None,
         ambient_use: None,
         id,
         owner: owner.id,
@@ -762,6 +764,7 @@ fn project_properties(
             return_type: signature.returns.as_ref(),
         });
         members.push(MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id,
             owner: owner.id.clone(),
@@ -846,6 +849,7 @@ fn constant_member(
         return_type: None,
     });
     MemberFact {
+        non_overridable: None,
         ambient_use: None,
         id,
         owner: owner.id,
@@ -893,6 +897,7 @@ fn namespace_fact(
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),

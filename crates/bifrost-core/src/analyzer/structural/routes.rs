@@ -72,6 +72,18 @@ macro_rules! described_vocab {
             }
         }
 
+        impl crate::analyzer::structural::code::VocabularyCode for $name {
+            /// The declaration ordinal. `#[repr(u8)]` on the enum makes the
+            /// cast the ordinal itself.
+            fn code(self) -> u8 {
+                self as u8
+            }
+
+            fn from_code(code: u8) -> Option<$name> {
+                $all.get(code as usize).copied()
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(self.label())

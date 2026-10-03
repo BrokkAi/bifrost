@@ -55,6 +55,8 @@ fn usage_diagnostic(
 pub enum GraphFailureReason {
     UnsupportedTargetLanguage(&'static str),
     MissingAnalyzerCapability(&'static str),
+    UnavailableCanonicalFacts(&'static str),
+    Cancelled(&'static str),
     UnsupportedTargetShape(&'static str),
     NoGraphSeed(&'static str),
 }
@@ -80,6 +82,8 @@ impl GraphFailureReason {
         match self {
             GraphFailureReason::UnsupportedTargetLanguage(_) => "unsupported_target_language",
             GraphFailureReason::MissingAnalyzerCapability(_) => "missing_analyzer_capability",
+            GraphFailureReason::UnavailableCanonicalFacts(_) => "unavailable_canonical_facts",
+            GraphFailureReason::Cancelled(_) => "cancelled",
             GraphFailureReason::UnsupportedTargetShape(_) => "unsupported_target_shape",
             GraphFailureReason::NoGraphSeed(_) => "no_graph_seed",
         }
@@ -89,6 +93,8 @@ impl GraphFailureReason {
         let detail = match self {
             GraphFailureReason::UnsupportedTargetLanguage(message)
             | GraphFailureReason::MissingAnalyzerCapability(message)
+            | GraphFailureReason::UnavailableCanonicalFacts(message)
+            | GraphFailureReason::Cancelled(message)
             | GraphFailureReason::UnsupportedTargetShape(message)
             | GraphFailureReason::NoGraphSeed(message) => message,
         };

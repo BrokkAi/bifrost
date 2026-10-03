@@ -536,10 +536,16 @@ pub struct CodeQueryClassSetRow {
     pub guard_only: Option<bool>,
 }
 
-/// A member access whose receiver class set is fully known and contains a
-/// class that does not declare the member. `origin_file`/`origin_range` name
-/// the site that introduced the class; `caller` is the root procedure the
-/// propagation ran from; `witness_steps` counts the retained path steps.
+/// A member access whose receiver may hold a class that does not declare the
+/// member. `origin_file`/`origin_range` name the site that introduced the
+/// class; `caller` is the root procedure the propagation ran from;
+/// `witness_steps` counts the retained path steps.
+///
+/// `proof` is `proven` when the receiver class set is fully known, and
+/// `conditional` when the class certainly reaches the access and lacks the
+/// member while other unclassified values may also reach it. A conditional
+/// row lists those open `remainders` (empty for a proven row) and states its
+/// `condition` as one plain sentence.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryAbsentMemberFinding {
@@ -552,6 +558,24 @@ pub struct CodeQueryAbsentMemberFinding {
     pub origin_range: CodeQueryRange,
     pub caller: String,
     pub witness_steps: usize,
+    pub proof: &'static str,
+    pub remainders: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Later accesses made unreachable by the reported access raising.
+    pub also_fails_at: Vec<String>,
+    /// Exact byte and display locations retained for policy related locations.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) also_fails_at_locations: Vec<CodeQueryAbsentMemberLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeQueryAbsentMemberLocation {
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]

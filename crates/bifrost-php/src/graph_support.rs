@@ -8,67 +8,16 @@
 //! the functions below reach back for the memoized products they need without
 //! naming the analyzer type.
 
-use super::aliases::{
-    PhpFileContext, PhpFileContextIndex, PhpUseAliases, parse_php_use_aliases_from_source,
-    resolve_php_type,
-};
+use super::aliases::{PhpFileContext, PhpUseAliases, resolve_php_type};
+use crate::source_facts::PhpSourceFactProvider;
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::php_facts::{PhpAliasKind, PhpDeclarationKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use moka::sync::Cache;
-use std::sync::{Arc, OnceLock};
-use tree_sitter::{Node, Parser, Tree};
 
-/// A whole-file PHP parse memoized on the exact source bytes (#2679).
-///
-/// `php_is_interface` / `php_is_trait` re-read and re-parsed an ancestor's
-/// whole file once per classification, and the definition resolver asks them
-/// once per hierarchy ancestor per reference occurrence. A parse is a pure
-/// function of the source bytes, so the memo is observationally identical,
-/// and the byte-weighted cache ages stale sources out like the analogous
-/// per-language tree memos in the definition resolvers.
-static PHP_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
+pub trait PhpSource: CodeUnitIndex + TypeHierarchyProvider + PhpSourceFactProvider {}
 
-const PHP_TREE_MEMO_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
-
-fn parse_php_tree_memoized(source: &str) -> Option<Tree> {
-    let cache = PHP_TREES.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(PHP_TREE_MEMO_SOURCE_BUDGET_BYTES)
-            .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
-                key.len().min(u32::MAX as usize) as u32
-            })
-            .build()
-    });
-    if let Some(tree) = cache.get(source) {
-        return tree;
-    }
-    let tree = (|| {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .ok()?;
-        parser.parse(source, None)
-    })();
-    cache.insert(Arc::from(source), tree.clone());
-    tree
-}
-
-/// The analyzer-resident products PHP's language logic resolves through: the
-/// core declaration index plus the memoized type hierarchy. `PhpAnalyzer` is the
-/// only implementor that matters and every method it answers comes from one of
-/// its own accessors, so the ancestor cache stays where it is and no free
-/// function below can reach past this surface.
-///
-/// Empty on purpose. Rust has no `dyn CodeUnitIndex + TypeHierarchyProvider`:
-/// a trait object can name at most one non-auto trait. The free functions below
-/// need both halves behind a single `&dyn`, so this names the intersection and
-/// the blanket impl below makes every type that already satisfies both a
-/// `PhpSource` without writing an impl. Adding a method here would
-/// defeat that -- implementors would have to opt in one by one.
-pub trait PhpSource: CodeUnitIndex + TypeHierarchyProvider {}
-
-impl<T: CodeUnitIndex + TypeHierarchyProvider + ?Sized> PhpSource for T {}
+impl<T: CodeUnitIndex + TypeHierarchyProvider + PhpSourceFactProvider + ?Sized> PhpSource for T {}
 
 pub fn php_is_constructor(method: &CodeUnit, class_unit: &CodeUnit, _package_name: &str) -> bool {
     method.is_function()
@@ -90,58 +39,66 @@ pub fn php_use_aliases_of(php: &dyn PhpSource, file: &ProjectFile) -> HashMap<St
 }
 
 pub fn php_use_aliases_by_kind_of(php: &dyn PhpSource, file: &ProjectFile) -> PhpUseAliases {
-    let Ok(source) = php.project().read_source(file) else {
+    let Some(source) = php.php_source_facts(file) else {
         return PhpUseAliases::default();
     };
-    php_use_aliases_by_kind_from_source(&source)
+    let mut aliases = PhpUseAliases::default();
+    for alias in &source.facts.aliases {
+        let map = match alias.kind {
+            PhpAliasKind::Type => &mut aliases.type_aliases,
+            PhpAliasKind::Function => &mut aliases.function_aliases,
+            PhpAliasKind::Constant => &mut aliases.const_aliases,
+        };
+        let (local, target) = alias.binding(&source.imports);
+        map.insert(local.to_owned(), target);
+    }
+    aliases
 }
 
-pub fn php_use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
-    parse_php_use_aliases_from_source(source)
+pub fn php_file_context_from_source(
+    php: &dyn PhpSource,
+    file: &ProjectFile,
+    _source: &str,
+) -> PhpFileContext {
+    PhpFileContext {
+        namespace: php_namespace_of_file(php, file),
+        aliases: php_use_aliases_by_kind_of(php, file),
+    }
 }
 
 fn php_declaration_context(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<PhpFileContext> {
-    let namespace = code_unit.package_name().to_string();
-    let start = php_declaration_start(php, code_unit)?;
-    let aliases = php_aliases_visible_before_declaration(php, code_unit.source(), start)?;
-    Some(PhpFileContext { namespace, aliases })
-}
-
-fn php_declaration_start(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<usize> {
-    php.ranges(code_unit)
-        .iter()
-        .map(|range| range.start_byte)
-        .min()
-}
-
-fn php_aliases_visible_before_declaration(
-    php: &dyn PhpSource,
-    file: &ProjectFile,
-    declaration_start: usize,
-) -> Option<PhpUseAliases> {
-    let source = php.project().read_source(file).ok()?;
-    let tree = parse_php_tree_memoized(&source)?;
-    let index = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
-    Some(index.context_at(declaration_start).aliases.clone())
-}
-
-pub fn php_is_interface(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
-    if !code_unit.is_class() {
-        return false;
+    let source = php.php_source_facts(code_unit.source())?;
+    let mut declarations = source.declarations_for(code_unit);
+    let first = declarations.next()?;
+    let context = &source.facts.contexts[first.context.index()];
+    if declarations
+        .any(|declaration| &source.facts.contexts[declaration.context.index()] != context)
+    {
+        return None;
     }
-    if let Some(kind) = php_declaration_kind(php, code_unit) {
-        return kind == "interface_declaration";
+    let mut aliases = PhpUseAliases::default();
+    for id in &context.aliases {
+        let alias = &source.facts.aliases[*id as usize];
+        let map = match alias.kind {
+            PhpAliasKind::Type => &mut aliases.type_aliases,
+            PhpAliasKind::Function => &mut aliases.function_aliases,
+            PhpAliasKind::Constant => &mut aliases.const_aliases,
+        };
+        let (local, target) = alias.binding(&source.imports);
+        map.insert(local.to_owned(), target);
     }
-    php.signatures(code_unit).iter().any(|signature| {
-        signature
-            .split_whitespace()
-            .any(|token| token == "interface")
+    Some(PhpFileContext {
+        namespace: context.namespace.clone(),
+        aliases,
     })
 }
 
+pub fn php_is_interface(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
+    php_declaration_kind(php, code_unit) == Some(PhpDeclarationKind::Interface)
+}
+
 pub fn php_is_trait(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
-    code_unit.is_class()
-        && php_declaration_kind(php, code_unit).is_some_and(|kind| kind == "trait_declaration")
+    php_declaration_kind(php, code_unit) == Some(PhpDeclarationKind::Trait)
 }
 
 pub fn php_resolve_declared_supertype(
@@ -164,41 +121,16 @@ pub fn php_direct_declared_class_parent(
         .find(|ancestor| !php_is_interface(php, ancestor) && !php_is_trait(php, ancestor))
 }
 
-fn php_declaration_kind(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<&'static str> {
-    let source = php.project().read_source(code_unit.source()).ok()?;
-    let tree = parse_php_tree_memoized(&source)?;
-    let ranges = php.ranges(code_unit);
-    let start = ranges.iter().map(|range| range.start_byte).min()?;
-    let end = ranges.iter().map(|range| range.end_byte).max()?;
-    php_declaration_kind_for_range(tree.root_node(), start, end)
-}
-
-fn php_declaration_kind_for_range(
-    root: Node<'_>,
-    start: usize,
-    end: usize,
-) -> Option<&'static str> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "class_declaration" | "interface_declaration" | "trait_declaration"
-        ) && node.start_byte() >= start
-            && node.end_byte() <= end
-        {
-            return Some(node.kind());
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index)
-                && child.end_byte() >= start
-                && child.start_byte() <= end
-            {
-                stack.push(child);
-            }
-        }
+fn php_declaration_kind(php: &dyn PhpSource, unit: &CodeUnit) -> Option<PhpDeclarationKind> {
+    if !unit.is_class() {
+        return None;
     }
-    None
+    let source = php.php_source_facts(unit.source())?;
+    let mut declarations = source.declarations_for(unit);
+    let kind = declarations.next()?.kind;
+    declarations
+        .all(|declaration| declaration.kind == kind)
+        .then_some(kind)
 }
 
 /// Files declaring the target's owning type or a descendant of it, plus every PHP file
@@ -230,7 +162,8 @@ pub fn php_import_alias_candidates(
     for file in analyzed_php_files() {
         let aliases = php_use_aliases_by_kind_of(php, &file);
         if aliases
-            .type_targets()
+            .type_aliases
+            .values()
             .any(|fq_name| relevant_types.contains(fq_name))
         {
             candidates.insert(file);

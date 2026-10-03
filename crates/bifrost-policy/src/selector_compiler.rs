@@ -107,6 +107,7 @@ pub(super) struct PolicyDecoratedParameterSelection {
     pub(super) port: brokk_bifrost_analysis::analyzer::semantic::DurablePortIdentity,
 }
 
+#[cfg(test)]
 fn query_plan_contains_decorator_bindings(plan: &CodeQueryPlan) -> bool {
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
@@ -173,6 +174,31 @@ fn query_guarantees_workspace_exact_call_proof(plan: &CodeQueryPlan) -> bool {
     true
 }
 
+fn admits_existing_incomplete_call_bindings(
+    result: &CodeQueryResult,
+    declared_call: bool,
+    workspace_exact_call: bool,
+) -> bool {
+    let declared_call_complete = declared_call
+        && !result.truncated
+        && !result.diagnostics.is_empty()
+        && result.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::CallBindingDispatchPartial
+        });
+    let workspace_exact_positive = workspace_exact_call
+        && !result.results.is_empty()
+        && !result.truncated
+        && !result.diagnostics.is_empty()
+        && result.diagnostics.iter().all(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::CallBindingDispatchPartial
+                    | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            )
+        });
+    declared_call_complete || workspace_exact_positive
+}
+
 impl From<DetailedCodeQueryDecoratedParameterEvidence> for PolicyDecoratedParameterSelection {
     fn from(value: DetailedCodeQueryDecoratedParameterEvidence) -> Self {
         Self {
@@ -228,6 +254,7 @@ struct PolicySelectorQueryResult {
     evidence: Vec<DetailedCodeQueryEvidence>,
     artifact_charge: Option<SemanticArtifactLeaseCharge>,
     retained_incomplete_result_contracts: bool,
+    retained_incomplete_taint_rows: bool,
 }
 
 /// Admit a positive result-contract subset when only its guard/use derivation
@@ -288,6 +315,57 @@ fn retains_independently_proven_result_contracts(
         }
     }
     retained
+}
+
+/// A taint endpoint row is useful only when the query retained a located
+/// structural or semantic site. An open dispatch may still have a concrete
+/// call-binding row; a terminal or identity-less row cannot name an operand.
+fn usable_taint_row(item: &CodeQueryResultItem, evidence: &DetailedCodeQueryEvidence) -> bool {
+    if evidence.byte_span.is_none() || matches!(evidence.domain, DetailedCodeQueryDomain::File) {
+        return false;
+    }
+    match &item.value {
+        CodeQueryResultValue::CallBinding { value } => {
+            !value.terminal
+                && value.argument_id.is_some()
+                && value.actual_index.is_some()
+                && value.formal_index.is_some()
+                && value.formal_name.is_some()
+                && value.formal_layout_id.is_some()
+                && value.selector_proof.is_some()
+                && (value.semantic_target_id.is_some() || value.model_callable_id.is_some())
+        }
+        CodeQueryResultValue::DecoratedParameter { value } => {
+            value.completion == "complete"
+                && value.coverage == "complete"
+                && value.parameter_ordinal.is_some()
+                && value.procedure_id.is_some()
+                && value.value_id.is_some()
+                && value.port_id.is_some()
+                && evidence.decorated_parameter.is_some()
+        }
+        CodeQueryResultValue::RuntimeKeyedReadValue { value } => {
+            !value.terminal && evidence.runtime_keyed_read.is_some()
+        }
+        // A located name or shape match alone cannot identify the selected
+        // semantic endpoint when the query as a whole is incomplete.
+        _ => false,
+    }
+}
+
+fn retains_usable_taint_rows(
+    result: &CodeQueryResult,
+    evidence: &[DetailedCodeQueryEvidence],
+) -> bool {
+    matches!(
+        result.completion(),
+        CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::ProvenSubset { .. }
+    ) && evidence.iter().any(|row| {
+        result
+            .results
+            .get(row.result_index)
+            .is_some_and(|item| usable_taint_row(item, row))
+    })
 }
 
 pub(super) type PolicyArtifactLeases = SemanticArtifactLeaseSet;
@@ -565,6 +643,7 @@ pub(super) struct PolicySelectorSession<'a> {
     // guard/use projection remained incomplete. Typestate carries this query-
     // level fact into its final completion even when no row can seed a subject.
     retained_incomplete_result_contract_selectors: usize,
+    incomplete_taint_selectors: Vec<String>,
 }
 
 impl<'a> PolicySelectorSession<'a> {
@@ -629,6 +708,7 @@ impl<'a> PolicySelectorSession<'a> {
             selector_scans: 0,
             result_contract_artifact_leases: 0,
             retained_incomplete_result_contract_selectors: 0,
+            incomplete_taint_selectors: Vec::new(),
         }
     }
 
@@ -759,6 +839,7 @@ impl<'a> PolicySelectorSession<'a> {
             .collect())
     }
 
+    #[cfg(test)]
     pub(super) fn select(
         &mut self,
         selector: &ResolvedPolicySelector,
@@ -779,6 +860,61 @@ impl<'a> PolicySelectorSession<'a> {
             )?;
         }
         Ok(selected)
+    }
+
+    pub(super) fn select_taint(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let query = self.selector_query(selector)?;
+        let mut detailed = self.execute_taint_selector_query(&query)?;
+        let completion = detailed.result.completion();
+        if matches!(
+            completion,
+            CodeQueryCompletion::Cancelled | CodeQueryCompletion::Invalid { .. }
+        ) {
+            return Err(PolicySelectorSessionError::Incomplete {
+                completion,
+                detail: format!(
+                    "selector `{}` was cancelled or invalid: {:?}",
+                    selector.path, detailed.result.diagnostics
+                ),
+            });
+        }
+        let declared_call = selector
+            .as_query()
+            .is_some_and(|(_, query)| query_guarantees_declared_call_proof(&query.plan));
+        let workspace_exact_call = selector
+            .as_query()
+            .is_some_and(|(_, query)| query_guarantees_workspace_exact_call_proof(&query.plan));
+        if !matches!(completion, CodeQueryCompletion::Complete)
+            && !admits_existing_incomplete_call_bindings(
+                &detailed.result,
+                declared_call,
+                workspace_exact_call,
+            )
+        {
+            let diagnostics = detailed
+                .result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{}: {diagnostic:?}", diagnostic.code.as_str()))
+                .collect::<Vec<_>>();
+            self.incomplete_taint_selectors.push(format!(
+                "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}",
+                selector.path, completion, diagnostics
+            ));
+            detailed.retained_incomplete_taint_rows = true;
+        }
+        let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
+        if let Some(artifact_charge) = artifact_charge {
+            self.apply_artifact_charge(Ok(artifact_charge), "taint selector continuation")?;
+        }
+        Ok(selected)
+    }
+
+    pub(super) fn take_incomplete_taint_selectors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.incomplete_taint_selectors)
     }
 
     /// Compile this session's selectors one seed file at a time, reusing what
@@ -972,6 +1108,7 @@ impl<'a> PolicySelectorSession<'a> {
                 evidence: detailed.evidence,
                 artifact_charge,
                 retained_incomplete_result_contracts: false,
+                retained_incomplete_taint_rows: false,
             },
         )?;
         if let Some(artifact_charge) = artifact_charge {
@@ -1062,6 +1199,7 @@ impl<'a> PolicySelectorSession<'a> {
         Ok(query)
     }
 
+    #[cfg(test)]
     fn execute_selector_query(
         &mut self,
         query: &brokk_bifrost_rql::CodeQuery,
@@ -1087,6 +1225,7 @@ impl<'a> PolicySelectorSession<'a> {
             evidence: detailed.evidence,
             artifact_charge: None,
             retained_incomplete_result_contracts: false,
+            retained_incomplete_taint_rows: false,
         })
     }
 
@@ -1122,6 +1261,41 @@ impl<'a> PolicySelectorSession<'a> {
             evidence: detailed.evidence,
             artifact_charge,
             retained_incomplete_result_contracts: retain_result_contract_subset,
+            retained_incomplete_taint_rows: false,
+        })
+    }
+
+    fn execute_taint_selector_query(
+        &mut self,
+        query: &brokk_bifrost_rql::CodeQuery,
+    ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
+        self.selector_scans = self.selector_scans.saturating_add(1);
+        let query_limits = self.remaining_query_limits()?;
+        let artifact_leases = self.artifact_leases.snapshot();
+        let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
+            self.workspace,
+            query,
+            query_limits,
+            Some(self.cancellation),
+            &self.semantic_budget,
+            &self.semantic_execution_budget,
+            artifact_leases,
+            self.execution_scope,
+        );
+        let semantic_receipt = detailed.take_semantic_receipt();
+        self.query_work = self.query_work.saturating_add(detailed.work);
+        let retain_rows = retains_usable_taint_rows(&detailed.result, &detailed.evidence);
+        let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
+            detailed.work.semantic,
+            semantic_receipt,
+            matches!(detailed.result.completion(), CodeQueryCompletion::Complete) || retain_rows,
+        )?;
+        Ok(PolicySelectorQueryResult {
+            result: detailed.result,
+            evidence: detailed.evidence,
+            artifact_charge,
+            retained_incomplete_result_contracts: false,
+            retained_incomplete_taint_rows: false,
         })
     }
 
@@ -1134,33 +1308,21 @@ impl<'a> PolicySelectorSession<'a> {
         PolicySelectorSessionError,
     > {
         let result_contract_subset = detailed.retained_incomplete_result_contracts;
+        let taint_subset = detailed.retained_incomplete_taint_rows;
         let declared_call = selector
             .as_query()
             .is_some_and(|(_, query)| query_guarantees_declared_call_proof(&query.plan));
-        let declared_call_complete = declared_call
-            && !detailed.result.truncated
-            && !detailed.result.diagnostics.is_empty()
-            && detailed.result.diagnostics.iter().all(|diagnostic| {
-                diagnostic.code == CodeQueryDiagnosticCode::CallBindingDispatchPartial
-            });
         let workspace_exact_call = selector
             .as_query()
             .is_some_and(|(_, query)| query_guarantees_workspace_exact_call_proof(&query.plan));
-        let workspace_exact_positive = workspace_exact_call
-            && !detailed.result.results.is_empty()
-            && !detailed.result.truncated
-            && !detailed.result.diagnostics.is_empty()
-            && detailed.result.diagnostics.iter().all(|diagnostic| {
-                matches!(
-                    diagnostic.code,
-                    CodeQueryDiagnosticCode::CallBindingDispatchPartial
-                        | CodeQueryDiagnosticCode::SemanticAnalysisPartial
-                )
-            });
         if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete)
-            && !declared_call_complete
-            && !workspace_exact_positive
+            && !admits_existing_incomplete_call_bindings(
+                &detailed.result,
+                declared_call,
+                workspace_exact_call,
+            )
             && !result_contract_subset
+            && !taint_subset
         {
             let diagnostics = detailed
                 .result
@@ -1178,6 +1340,11 @@ impl<'a> PolicySelectorSession<'a> {
             .evidence
             .into_iter()
             .filter(|evidence| !matches!(evidence.domain, DetailedCodeQueryDomain::File))
+            .filter(|evidence| {
+                !taint_subset
+                    || detailed.result.results.get(evidence.result_index)
+                        .is_some_and(|item| usable_taint_row(item, evidence))
+            })
             .map(|evidence| {
                 let item = detailed
                     .result
@@ -1248,7 +1415,8 @@ impl<'a> PolicySelectorSession<'a> {
                         selector.path
                     ))
                 })?;
-                let (proof, completeness) = if (declared_call || workspace_exact_call)
+                let (proof, completeness) = if !taint_subset
+                    && (declared_call || workspace_exact_call)
                     && matches!(item.value, CodeQueryResultValue::CallBinding { .. })
                 {
                     (ProofStatus::Proven, EvidenceCompleteness::Complete)
@@ -1363,9 +1531,9 @@ impl<'a> PolicySelectorSession<'a> {
                             signature_id: value.signature_id.clone(),
                             model_id: value.model_id.clone(),
                             pack_id: value.pack_id.clone(),
-                            selector_proof: if declared_call {
+                            selector_proof: if declared_call && !taint_subset {
                                 "declared"
-                            } else if workspace_exact_call {
+                            } else if workspace_exact_call && !taint_subset {
                                 "resolved_workspace"
                             } else {
                                 value.selector_proof.ok_or_else(|| {
@@ -1375,22 +1543,30 @@ impl<'a> PolicySelectorSession<'a> {
                                     ))
                                 })?
                             },
-                            selector_summary_id: if declared_call || workspace_exact_call {
+                            selector_summary_id: if !taint_subset
+                                && (declared_call || workspace_exact_call)
+                            {
                                 None
                             } else {
                                 value.selector_summary_id.clone()
                             },
-                            selector_summary_model_id: if declared_call || workspace_exact_call {
+                            selector_summary_model_id: if !taint_subset
+                                && (declared_call || workspace_exact_call)
+                            {
                                 None
                             } else {
                                 value.selector_summary_model_id.clone()
                             },
-                            selector_summary_pack_id: if declared_call || workspace_exact_call {
+                            selector_summary_pack_id: if !taint_subset
+                                && (declared_call || workspace_exact_call)
+                            {
                                 None
                             } else {
                                 value.selector_summary_pack_id.clone()
                             },
-                            selector_summary_pack_digest: if declared_call || workspace_exact_call {
+                            selector_summary_pack_digest: if !taint_subset
+                                && (declared_call || workspace_exact_call)
+                            {
                                 None
                             } else {
                                 value.selector_summary_pack_digest.clone()
@@ -2758,6 +2934,16 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::ResultSubjectUse { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        value.reason.unwrap_or("normal-result subject coverage is incomplete").into(),
+                    )
+                },
+            ),
             // A topology row states its own completeness the same way: a build
             // model nobody could read in full makes the selector's evidence
             // partial rather than silently complete (#2448).
@@ -3120,12 +3306,32 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
-            // An absent-member finding fires only on a fully known class set
-            // and a proven-absent member lookup, so the row is its own proof;
-            // set-level completeness is the query diagnostics' business, the
-            // reference-edge precedent.
-            CodeQueryResultValue::AbsentMemberFinding { .. } => {
-                (ProofStatus::Proven, EvidenceCompleteness::Complete)
+            // A proven absent-member finding fires only on a fully known class
+            // set and a proven-absent member lookup, so the row is its own
+            // proof; set-level completeness is the query diagnostics'
+            // business, the reference-edge precedent. A conditional finding
+            // proves the class and the absence but not that the class is the
+            // only value that reaches the access, so it is reported unproven
+            // with the open remainders as its partial evidence.
+            CodeQueryResultValue::AbsentMemberFinding { value } => {
+                if value.proof == "proven" {
+                    (ProofStatus::Proven, EvidenceCompleteness::Complete)
+                } else {
+                    let condition = value
+                        .condition
+                        .as_deref()
+                        .expect("a conditional absent-member row states its condition");
+                    (
+                        ProofStatus::Unproven(condition.into()),
+                        EvidenceCompleteness::Partial(
+                            format!(
+                                "receiver class set is open: {}",
+                                value.remainders.join(", ")
+                            )
+                            .into(),
+                        ),
+                    )
+                }
             }
             CodeQueryResultValue::DetachedTaskTransfer { value } => (
                 if value.proof == "exact" {
@@ -3494,6 +3700,50 @@ mod tests {
             ..AnalyzerConfig::default()
         });
         (project, workspace)
+    }
+
+    #[test]
+    fn taint_selection_retains_located_rows_under_a_result_limit() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "subject.go",
+                "package subject\nfunc target(value int) {}\nfunc run() { target(1); target(2) }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let selector = resolved_selector(
+            "(language go (call-bindings (call-shape (call :callee (name \"target\")))))",
+            "/analysis/sources/entries/target/selector",
+        );
+        let cancellation = CancellationToken::default();
+        let limits = PolicyBudget::default().query_limits();
+        let mut limited = PolicySelectorSession::new(
+            &workspace,
+            "taint",
+            limits,
+            1,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let retained = limited
+            .select_taint(&selector)
+            .expect("a located positive row survives incomplete enumeration");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(limited.take_incomplete_taint_selectors().len(), 1);
+
+        let mut complete = PolicySelectorSession::new(
+            &workspace,
+            "taint",
+            limits,
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        assert_eq!(complete.select_taint(&selector).unwrap().len(), 2);
+        assert!(complete.take_incomplete_taint_selectors().is_empty());
     }
 
     fn cfg_entry_selector(name: &str, path: &str) -> ResolvedPolicySelector {

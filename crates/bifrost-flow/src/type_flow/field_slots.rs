@@ -269,7 +269,20 @@ impl FieldStoreSurvey {
                             )
                             .saturating_add(
                                 effect
+                                    .bounds
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<ClassIdentity>()),
+                            )
+                            .saturating_add(
+                                effect
                                     .classes
+                                    .iter()
+                                    .map(class_identity_heap_bytes)
+                                    .sum::<usize>(),
+                            )
+                            .saturating_add(
+                                effect
+                                    .bounds
                                     .iter()
                                     .map(class_identity_heap_bytes)
                                     .sum::<usize>(),
@@ -282,7 +295,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 21;
+    const ALGORITHM_VERSION: u32 = 22;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -671,7 +684,14 @@ impl FieldSlotIndex {
                             next.classes.push(class.clone());
                         }
                     }
+                    for bound in &previous.bounds {
+                        if !next.bounds.contains(bound) {
+                            next.bounds.push(bound.clone());
+                        }
+                    }
                     next.classes.sort_by(class_order);
+                    next.bounds.sort_by(class_order);
+                    next.global |= previous.global;
                     if previous.evidence.reason.is_some() {
                         next.evidence.reason = previous.evidence.reason.clone();
                     }
@@ -773,15 +793,22 @@ impl FieldSlotIndex {
             related.sort_by(class_order);
             related.dedup();
 
+            let has_related_dynamic_effect = related.iter().any(|related_class| {
+                let related_hierarchy = hierarchy_cache
+                    .entry(related_class.clone())
+                    .or_insert_with(|| adapter.class_hierarchy(workspace, related_class));
+                collected
+                    .dynamic_effects
+                    .iter()
+                    .any(|write| write.affects(related_class, related_hierarchy))
+            });
+
             let mut atoms = Vec::new();
             let mut incomplete = collected.globally_incomplete
                 || hierarchy.descendants.is_none()
                 || hierarchy.unresolved_base
                 || hierarchy.dynamic_attributes
-                || collected
-                    .dynamic_effects
-                    .iter()
-                    .any(|write| related.iter().any(|class| write.affects(class)))
+                || has_related_dynamic_effect
                 || collected.foreign_members.contains(member.as_ref())
                 || collected.dynamic_members.contains(member.as_ref());
             let mut declared_procedure = false;
@@ -1101,7 +1128,7 @@ impl FieldSlotIndex {
             .store_survey
             .dynamic_effects
             .iter()
-            .any(|write| write.affects(class))
+            .any(|write| write.affects(class, &hierarchy))
             || self.store_survey.unknown_members
             || self.store_survey.unowned_members.contains(member)
             || hierarchy.unresolved_base
@@ -1120,10 +1147,11 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
     ) -> impl Iterator<Item = &DynamicWriteEvidence> {
         let closed = adapter.member_surface_is_closed(workspace, class);
+        let hierarchy = adapter.class_hierarchy(workspace, class);
         self.store_survey
             .dynamic_effects
             .iter()
-            .filter(move |write| !closed && write.affects(class))
+            .filter(move |write| !closed && write.affects(class, &hierarchy))
             .map(|write| &write.evidence)
     }
 
@@ -2046,8 +2074,14 @@ fn digest_index(
     digest.push(&[u8::from(survey.unknown_members)]);
     for write in &survey.dynamic_effects {
         digest.push(write.evidence.origin().as_bytes());
+        digest.push(&[u8::from(write.global)]);
         for class in &write.classes {
+            digest.push(b"exact");
             push_class(&mut digest, class);
+        }
+        for bound in &write.bounds {
+            digest.push(b"bound");
+            push_class(&mut digest, bound);
         }
     }
     for (owner, member) in survey.ordered_stores() {

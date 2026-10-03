@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.12.0
+    default: v0.13.0
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -49,6 +49,12 @@ inputs:
       revision.
     required: false
     default: ''
+  full-evaluation:
+    description: >-
+      Disable incremental policy evidence reuse and evaluate the full diff-base
+      request. Passes --no-incremental to Bifrost.
+    required: false
+    default: 'false'
   sarif-file:
     description: SARIF output path, relative to working-directory.
     required: false
@@ -70,7 +76,7 @@ inputs:
     required: false
     default: bifrost-policy
   cache:
-    description: Restore and save a dedicated analyzer cache, scoped to this working directory and exact build.
+    description: Restore and save the shared repository analyzer cache, scoped to this working directory and exact build.
     required: false
     default: 'true'
   working-directory:
@@ -80,8 +86,8 @@ inputs:
 
 outputs:
   analyzer-cache-hit:
-    description: Whether the analyzer cache restored an exact entry (empty when caching is disabled).
-    value: ${{ steps.analyzer-cache.outputs.cache-hit }}
+    description: Whether a compatible analyzer cache snapshot was restored (empty when caching is disabled).
+    value: ${{ steps.analyzer-cache.outputs.cache-matched-key != '' }}
   exit-code:
     description: Raw bifrost policy exit code (0, 1, or 2).
     value: ${{ steps.run.outputs.exit-code }}
@@ -177,13 +183,41 @@ runs:
           workspace_key=$(printf '%s' "${WORKDIR}" | shasum -a 256 | cut -d ' ' -f 1)
         fi
         echo "workspace-key=${workspace_key}" >> "${GITHUB_OUTPUT}"
-        # The cached path participates in GitHub's cache version: keep it
-        # workspace-relative and stable across invocations and runner locations.
-        # Scope this action-owned root by the build and selected workspace.
-        cache_path=".bifrost/cache/policy-action/${identity}/${workspace_key}"
-        mkdir -p "${GITHUB_WORKSPACE}/${cache_path}"
+        # Resolve the selected workspace inside the checkout before deriving
+        # Bifrost's standard primary-repository cache directory. The GitHub
+        # cache path must stay inside the checkout.
+        workspace_path="${GITHUB_WORKSPACE}/${WORKDIR}"
+        workspace_real=$(cd "${workspace_path}" && pwd -P)
+        checkout_real=$(cd "${GITHUB_WORKSPACE}" && pwd -P)
+        case "${workspace_real}/" in
+          "${checkout_real}/"*) ;;
+          *) echo "::error::working-directory resolves outside GITHUB_WORKSPACE: ${WORKDIR}"; exit 1 ;;
+        esac
+        repo_root=$(git -C "${workspace_real}" rev-parse --show-toplevel)
+        repo_root=$(cd "${repo_root}" && pwd -P)
+        git_dir=$(git -C "${workspace_real}" rev-parse --absolute-git-dir)
+        common_dir=$(git -C "${workspace_real}" rev-parse --path-format=absolute --git-common-dir)
+        if [ "${git_dir}" != "${common_dir}" ] && [ "$(basename "${common_dir}")" = .git ]; then
+          # Match Bifrost's linked-worktree resolver: common_dir is the
+          # primary checkout's .git directory, whose parent owns the cache.
+          repo_root=$(cd "$(dirname "${common_dir}")" && pwd -P)
+        fi
+        case "${repo_root}/" in
+          "${checkout_real}/"*) ;;
+          *) echo "::error::primary Git repository root resolves outside GITHUB_WORKSPACE: ${repo_root}"; exit 1 ;;
+        esac
+        relative_repo=${repo_root#"${checkout_real}"/}
+        if [ "${repo_root}" = "${checkout_real}" ]; then relative_repo=.; fi
+        if [ "${relative_repo}" = . ]; then
+          cache_path=".bifrost/cache"
+        else
+          cache_path="${relative_repo}/.bifrost/cache"
+        fi
+        cache_nonce="$(date +%s)-${RANDOM}-$$"
+        echo "cache-nonce=${cache_nonce}" >> "${GITHUB_OUTPUT}"
+        mkdir -p "${repo_root}/.bifrost/cache"
         echo "cache-path=${cache_path}" >> "${GITHUB_OUTPUT}"
-        echo "cache-root=${GITHUB_WORKSPACE}/${cache_path}" >> "${GITHUB_OUTPUT}"
+        echo "cache-root=${repo_root}/.bifrost/cache" >> "${GITHUB_OUTPUT}"
 
     - name: Restore analyzer cache
       id: analyzer-cache
@@ -191,7 +225,9 @@ runs:
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}
-        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}-${{ steps.analyzer-cache-identity.outputs.workspace-key }}
+        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}-${{ steps.analyzer-cache-identity.outputs.workspace-key }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.analyzer-cache-identity.outputs.cache-nonce }}
+        restore-keys: |
+          bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ steps.analyzer-cache-identity.outputs.value }}-${{ steps.analyzer-cache-identity.outputs.workspace-key }}-
 
     - name: Run policies
       id: run
@@ -205,6 +241,7 @@ runs:
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
         DIFF_BASE: ${{ inputs.diff-base }}
+        FULL_EVALUATION: ${{ inputs.full-evaluation }}
         MANAGED_CACHE: ${{ inputs.cache }}
         MANAGED_CACHE_ROOT: ${{ steps.analyzer-cache-identity.outputs.cache-root }}
         POLICY_TIMINGS: ${{ inputs.policy-timings }}
@@ -213,10 +250,11 @@ runs:
         set -euo pipefail
         cd "${WORKDIR}"
         if [ "${MANAGED_CACHE:-false}" = true ]; then
-          export BIFROST_CACHE_ROOT="${MANAGED_CACHE_ROOT}"
-          # Avoid the default repository child hash changing with the runner's
-          # absolute checkout path. The action key already scopes this workspace.
-          export BIFROST_CACHE_DIR="${MANAGED_CACHE_ROOT}/analyzer"
+          unset BIFROST_CACHE_ROOT
+          # This is the standard repository cache directory used by CLI and
+          # MCP. The action key partitions the GitHub archive, not Bifrost's
+          # analyzer store or evidence keys.
+          export BIFROST_CACHE_DIR="${MANAGED_CACHE_ROOT}"
         fi
         args=(--root . --format sarif --output "${SARIF_FILE}" --fail-on "${FAIL_ON}")
         for p in ${POLICY_PACKS}; do args+=(--policy-pack "${p}"); done
@@ -224,6 +262,7 @@ runs:
         for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
+        if [ "${FULL_EVALUATION:-false}" = true ]; then args+=(--no-incremental); fi
         if [ "${POLICY_TIMINGS:-false}" = true ]; then args+=(--policy-timings); fi
         stderr_file="${SARIF_FILE}.stderr.log"
         stderr_path="${WORKDIR}/${stderr_file}"
@@ -255,18 +294,72 @@ runs:
         echo "sarif-file=${WORKDIR}/${SARIF_FILE}" >> "${GITHUB_OUTPUT}"
         if [ -f "${SARIF_FILE}" ]; then
           echo "has-sarif=true" >> "${GITHUB_OUTPUT}"
+          has_sarif=true
         else
           echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
+          has_sarif=false
         fi
         if [ "${stderr_capture_code}" -ne 0 ]; then
           echo "::error::Bifrost policy stderr capture or drain failed with status ${stderr_capture_code}; analyzer exit status was ${code}."
           exit 1
         fi
 
-    # Save after the analyzer exits, even when its policy gate will fail. Never
-    # restore another producer's build identity as a cache fallback.
+    - name: Qualify analyzer cache snapshot
+      id: analyzer-cache-qualification
+      if: always() && inputs.cache == 'true'
+      shell: bash
+      env:
+        CODE: ${{ steps.run.outputs.exit-code }}
+        STDERR_CAPTURE_CODE: ${{ steps.run.outputs.stderr-capture-code }}
+        SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
+        DIFF_BASE: ${{ inputs.diff-base }}
+      run: |
+        set -euo pipefail
+        echo "eligible=false" >> "${GITHUB_OUTPUT}"
+        case "${CODE:-}" in 0|1) ;; *) exit 0 ;; esac
+        if [ "${STDERR_CAPTURE_CODE:-1}" != 0 ] || [ ! -f "${SARIF_PATH:-}" ]; then exit 0; fi
+        if jq -e '
+          .version == "2.1.0"
+          and (.runs | type == "array" and length > 0)
+          and all(.runs[];
+            type == "object"
+            and (.results | type == "array")
+            and all(.results[]; type == "object")
+            and (.invocations | type == "array" and length > 0)
+            and all(.invocations[];
+              type == "object"
+              and .executionSuccessful == true
+              and (.exitCode == 0 or .exitCode == 1)
+              and all((.toolExecutionNotifications // [])[];
+                (.descriptor.id // "") as $id
+                | ($id != "BIFROST_POLICY_INCONCLUSIVE"
+                  and $id != "BIFROST_POLICY_UNSUPPORTED"
+                  and $id != "BIFROST_POLICY_FAILED")
+              )
+            )
+            and (.properties | type == "object")
+            and (.properties["bifrost.policyRuns"] | type == "array")
+            and all(.properties["bifrost.policyRuns"][];
+              .completion.type == "complete"
+            )
+            and (.properties["bifrost.reportDiagnostics"] | type == "array")
+            and all(.properties["bifrost.reportDiagnostics"][]; .severity != "error")
+            and (.properties["bifrost.reportDiagnosticsTruncated"] == false)
+            and (.properties["bifrost.execution"] | has("termination") and .termination == null)
+            and ($diff_base == "" or (
+              (.properties["bifrost.diffBaseline"] | type == "object")
+              and .properties["bifrost.diffBaseline"].degraded == false
+            ))
+          )
+        ' --arg diff_base "${DIFF_BASE}" "${SARIF_PATH}" >/dev/null; then
+          echo "eligible=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    # Save a fresh immutable snapshot after each exhaustive scan, including a
+    # policy-gate failure. Restore prefixes still require exact build/workspace
+    # identity, and incomplete scans never publish a snapshot.
     - name: Save analyzer cache
-      if: always() && inputs.cache == 'true' && steps.analyzer-cache.outputs.cache-hit != 'true' && steps.run.outputs.has-sarif == 'true'
+      if: always() && inputs.cache == 'true' && steps.analyzer-cache-qualification.outputs.eligible == 'true'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ steps.analyzer-cache-identity.outputs.cache-path }}

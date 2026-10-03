@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, Compatibility,
-    CompilerOptions, Completeness, Diagnostic, Producer, Provenance, Safety, SourceFormat,
-    compile_source,
+    CompilerOptions, Completeness, Diagnostic, Producer, Provenance, SEMANTIC_MODEL_SCHEMA_VERSION,
+    Safety, SourceFormat, compile_source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,13 +54,6 @@ use join::{FoundryJoin, join_corpora};
 /// gated on byte equality with the generator, and reading the crate version
 /// would break that gate at every release bump without any content change.
 pub const FOUNDRY_PRODUCER_VERSION: &str = "0.9.0";
-
-/// Bifrost compatibility window every foundry-generated pack declares. It is
-/// a pack contract, not the crate version. `release-version.mjs` used to
-/// rewrite the exclusive upper bound from the crate minor, which would
-/// deactivate already-shipped packs at 0.11 without any content change.
-/// Advance this only when a generated pack actually requires a newer Bifrost.
-pub const FOUNDRY_BIFROST_REQUIREMENT: &str = ">=0.8.0, <1.0.0";
 
 /// The report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -554,7 +547,7 @@ fn round_trip(
         Completeness::Partial
     };
     let pack = AuthoredSemanticModelPack {
-        schema_version: 2,
+        schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: format!("bifrost.summary-foundry.{}", corpus.as_str()),
         version: "0.0.0".to_owned(),
         producer: Producer {
@@ -564,7 +557,7 @@ fn round_trip(
         language: "java".to_owned(),
         ecosystem: "maven".to_owned(),
         compatibility: Compatibility {
-            bifrost: ">=0.8.0, <1.0.0".to_owned(),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         provenance: Provenance {

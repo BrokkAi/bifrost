@@ -1,17 +1,22 @@
+use crate::structural::{CSHARP_KIND_TABLE, CSHARP_STRUCTURAL_SPEC};
 use brokk_bifrost_core::analyzer::common::IdentifierSigil;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CallableOverrideModifier, CodeUnitType, DispatchExtensibility,
+    CallableArity, CallableOverrideModifier, ClassLikeKind, CodeUnitType, DispatchExtensibility,
     ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
-use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{
-    ParentIndex, WalkControl, node_range, walk_named_tree_preorder,
+use brokk_bifrost_core::analyzer::parsed_file::{
+    CSharpSemanticDeclaration, CSharpSemanticDeclarationKind, ParsedFile, ParsedSourceFacts,
+    SourceDeclarationMetadataLink, SourceImportFact,
 };
+use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, node_range};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
 
 use crate::imports::csharp_import_info_from_using_directive;
@@ -64,16 +69,155 @@ fn csharp_package_fq(package_name: &str) -> FqName {
 
 pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
+    parsed.contains_tests = Some(false);
     let root = tree.root_node();
-    collect_csharp_type_identifiers(root, source, &mut parsed.type_identifiers);
-    let ancestry = ParentIndex::new(root);
+    let ancestry = ParentIndex::unindexed();
+    let grammar = tree_sitter_c_sharp::LANGUAGE.into();
+    let kinds = CompiledKinds::compile(&grammar, CSHARP_KIND_TABLE);
+    let context = CSHARP_STRUCTURAL_SPEC.call_site_context(root, source);
+    let mut structural = StructuralFactCollector::new(
+        &CSHARP_STRUCTURAL_SPEC,
+        source,
+        &context,
+        ParentIndex::unindexed(),
+        usize::MAX,
+        None,
+    );
     let mut visitor = CSharpVisitor {
         file,
         source,
-        ancestry: &ancestry,
+        ancestry,
         parsed: &mut parsed,
+        source_facts: PrimarySourceFactCollector::new(source),
+        source_imports: Vec::new(),
+        current_is_test_method: false,
+        current_properties: CSharpDeclarationProperties::default(),
     };
-    visitor.visit_container(root, "");
+    // Declaration admission preserves the existing namespace/type-container
+    // rules. Every node still enters structural and type-identifier extraction,
+    // including bodies and malformed syntax omitted by declaration admission.
+    let mut declarations = Vec::new();
+    visitor.push_children(
+        root,
+        CSharpScope {
+            package_name: String::new(),
+            lexical_scope: Vec::new(),
+            enclosing_type: None,
+        },
+        &mut declarations,
+    );
+    let mut pending: HashMap<_, _> = declarations
+        .drain(..)
+        .map(|work| {
+            let node = match &work {
+                CSharpWork::Node { node, .. } | CSharpWork::RecoveredMember { node, .. } => node,
+            };
+            (node.id(), work)
+        })
+        .collect();
+    let mut stack = vec![(root, None)];
+    while let Some((node, enclosing)) = stack.pop() {
+        collect_csharp_type_identifier(node, source, &mut visitor.parsed.type_identifiers);
+        visitor.current_is_test_method = csharp_method_has_runnable_test_attribute(node, source);
+        if visitor.current_is_test_method {
+            visitor.parsed.contains_tests = Some(true);
+        }
+        let work = pending.remove(&node.id());
+        let scope = work.as_ref().map(|work| match work {
+            CSharpWork::Node { scope, .. } | CSharpWork::RecoveredMember { scope, .. } => scope,
+        });
+        visitor.current_properties = CSharpDeclarationProperties::capture(
+            node,
+            source,
+            scope
+                .as_ref()
+                .map(|scope| scope.lexical_scope.as_slice())
+                .unwrap_or_default(),
+        );
+        if let Some(work) = work {
+            match work {
+                CSharpWork::Node { node, scope } => {
+                    visitor.visit_node(node, &scope, &mut declarations)
+                }
+                CSharpWork::RecoveredMember { node, scope } => {
+                    visitor.visit_recovered_member(node, &scope)
+                }
+            }
+            pending.extend(declarations.drain(..).map(|work| {
+                let node = match &work {
+                    CSharpWork::Node { node, .. } | CSharpWork::RecoveredMember { node, .. } => {
+                        node
+                    }
+                };
+                (node.id(), work)
+            }));
+        }
+        visitor.capture_semantic_declaration(node);
+        structural.record_children(node);
+        let mut structural_parent = enclosing;
+        if node.is_named()
+            && let Some(kind) = kinds.kind_of(&node)
+            && CSHARP_STRUCTURAL_SPEC.should_extract(node, kind)
+        {
+            let kind = CSHARP_STRUCTURAL_SPEC.refine_kind(
+                node,
+                kind,
+                enclosing.map(|id| structural.normalized_kind(id)),
+                source,
+                &context,
+            );
+            let id = structural
+                .enter(node, kind, enclosing, &mut visitor.source_facts)
+                .expect("complete C# preparation has no structural admission limit");
+            let mut sink = structural.role_sink(&mut visitor.source_facts);
+            CSHARP_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+            structural
+                .accept_roles(id, sink.into_parts())
+                .expect("complete C# preparation has no structural admission limit");
+            structural_parent = Some(id);
+        }
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                visitor.ancestry.record_parent(child, node);
+                stack.push((child, structural_parent));
+            }
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "C# declaration events must belong to the primary tree"
+    );
+    let occurrences = visitor.source_facts.finish();
+    let imports = visitor.source_imports;
+    parsed.imports = imports
+        .iter()
+        .map(|import| import.import_info(&occurrences))
+        .collect();
+    parsed.source_facts = Some(ParsedSourceFacts {
+        cpp: None,
+        go: None,
+        java: None,
+        js_ts: None,
+        php: None,
+        scala: None,
+        ruby: None,
+        python: None,
+        source_bytes: source.len(),
+        occurrences,
+        structural: structural.finish().expect("complete C# structural facts"),
+        native_site_occurrences: Vec::new(),
+        native_declaration_sources: Vec::new(),
+        declaration_visibilities: None,
+        rust_declaration_properties: Vec::new(),
+        rust_modules: None,
+        rust_types: Vec::new(),
+        rust_items: Default::default(),
+        generic_imports: (0..imports.len())
+            .map(|index| SourceImportId::try_from_index(index).expect("C# import ids fit u32"))
+            .collect(),
+        imports,
+        rust_import_contexts: Vec::new(),
+    });
     parsed
 }
 
@@ -113,33 +257,185 @@ enum CSharpWork<'tree> {
     },
 }
 
+#[derive(Default)]
+struct CSharpDeclarationProperties {
+    return_type_text: Option<String>,
+    display_type_text: Option<String>,
+    return_type_identity: Option<StructuredTypeIdentity>,
+    semantic_type_spelling: Option<String>,
+    is_static: bool,
+    is_const: bool,
+}
+
+impl CSharpDeclarationProperties {
+    fn capture(node: Node<'_>, source: &str, lexical_scope: &[String]) -> Self {
+        if !matches!(
+            node.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "property_declaration"
+                | "event_declaration"
+                | "field_declaration"
+                | "event_field_declaration"
+                | "class_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) {
+            return Self::default();
+        }
+        let type_node = if matches!(node.kind(), "field_declaration" | "event_field_declaration") {
+            first_named_child_of_kind(node, "variable_declaration")
+                .and_then(|declaration| declaration.child_by_field_name("type"))
+        } else {
+            csharp_declared_type_node(node)
+        };
+        let return_type_text = type_node
+            .map(|ty| csharp_type_node_identity(ty, source))
+            .filter(|text| !text.is_empty());
+        let display_type_text =
+            type_node.map(|ty| normalize_cs_whitespace(cs_node_text(ty, source)));
+        let return_type_identity =
+            type_node.and_then(|ty| csharp_structured_type_identity(ty, source, lexical_scope));
+        let semantic_type_spelling = type_node.and_then(|ty| {
+            crate::syntax::csharp_declared_type_spelling(ty, return_type_text.as_deref()?)
+        });
+        Self {
+            return_type_text,
+            display_type_text,
+            return_type_identity,
+            semantic_type_spelling,
+            is_static: csharp_has_modifier(source, node, "static"),
+            is_const: csharp_has_modifier(source, node, "const"),
+        }
+    }
+}
+
 struct CSharpVisitor<'context, 'tree> {
     file: &'context ProjectFile,
     source: &'context str,
-    ancestry: &'context ParentIndex<'tree>,
+    ancestry: ParentIndex<'tree>,
     parsed: &'context mut ParsedFile,
+    source_facts: PrimarySourceFactCollector<'context>,
+    source_imports: Vec<SourceImportFact>,
+    current_is_test_method: bool,
+    current_properties: CSharpDeclarationProperties,
 }
 
 impl CSharpVisitor<'_, '_> {
-    fn visit_container(&mut self, node: Node<'_>, package_name: &str) {
-        let mut stack = Vec::new();
-        self.push_children(
-            node,
-            CSharpScope {
-                package_name: package_name.to_string(),
-                lexical_scope: Vec::new(),
-                enclosing_type: None,
-            },
-            &mut stack,
-        );
-        while let Some(work) = stack.pop() {
-            match work {
-                CSharpWork::Node { node, scope } => self.visit_node(node, &scope, &mut stack),
-                CSharpWork::RecoveredMember { node, scope } => {
-                    self.visit_recovered_member(node, &scope)
+    fn capture_semantic_declaration(&mut self, node: Node<'_>) {
+        let kind = match node.kind() {
+            "method_declaration" if self.current_properties.is_static => {
+                CSharpSemanticDeclarationKind::StaticMethodReturn
+            }
+            "field_declaration"
+            | "event_field_declaration"
+            | "property_declaration"
+            | "event_declaration" => CSharpSemanticDeclarationKind::Member,
+            _ => return,
+        };
+        let mut current = self.ancestry.parent(node);
+        let mut owner = None;
+        let mut namespace = Vec::new();
+        let mut nested_type = false;
+        while let Some(parent) = current {
+            if matches!(
+                parent.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "struct_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "record_struct_declaration"
+            ) {
+                if owner.is_none() {
+                    owner = parent.child_by_field_name("name");
+                } else {
+                    nested_type = true;
                 }
             }
+            if matches!(
+                parent.kind(),
+                "namespace_declaration" | "file_scoped_namespace_declaration"
+            ) && let Some(name) = parent.child_by_field_name("name")
+            {
+                namespace.push(cs_node_text(name, self.source).to_owned());
+            }
+            current = self.ancestry.parent(parent);
         }
+        let Some(owner) = owner else {
+            return;
+        };
+        if nested_type && kind == CSharpSemanticDeclarationKind::StaticMethodReturn {
+            return;
+        }
+        let owner = cs_node_text(owner, self.source).to_owned();
+        namespace.reverse();
+        let declarations = if matches!(node.kind(), "field_declaration" | "event_field_declaration")
+        {
+            first_named_child_of_kind(node, "variable_declaration")
+                .map(|declaration| {
+                    let mut cursor = declaration.walk();
+                    declaration
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "variable_declarator")
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![node]
+        };
+        for declaration in declarations {
+            let Some(name) = declaration
+                .child_by_field_name("name")
+                .or_else(|| declaration.named_child(0))
+            else {
+                continue;
+            };
+            if cs_node_text(name, self.source).is_empty() {
+                continue;
+            }
+            let occurrence = self.source_facts.intern_node(declaration);
+            let name = self.source_facts.intern_node(name);
+            let declaration = self.source_facts.declare(occurrence, Some(name));
+            self.parsed
+                .csharp_semantic_declarations
+                .push(CSharpSemanticDeclaration {
+                    declaration,
+                    namespace: namespace.clone(),
+                    owner: owner.clone(),
+                    kind,
+                    is_static: self.current_properties.is_static
+                        || self.current_properties.is_const,
+                    type_spelling: self.current_properties.semantic_type_spelling.clone(),
+                });
+        }
+    }
+
+    fn add_source_signature(
+        &mut self,
+        node: Node<'_>,
+        unit: CodeUnit,
+        metadata: SignatureMetadata,
+    ) {
+        let occurrence = self.source_facts.intern_node(node);
+        let name = node
+            .child_by_field_name("name")
+            .map(|name| self.source_facts.intern_node(name));
+        let declaration = self.source_facts.declare(occurrence, name);
+        self.parsed
+            .source_declaration_units
+            .push((declaration, unit.clone()));
+        let metadata_ordinal = self
+            .parsed
+            .add_signature_with_metadata(unit.clone(), metadata);
+        self.parsed
+            .source_declaration_metadata
+            .push(SourceDeclarationMetadataLink {
+                declaration,
+                unit,
+                metadata_ordinal,
+            });
     }
 
     fn push_children<'tree>(
@@ -309,7 +605,17 @@ impl CSharpVisitor<'_, '_> {
             return;
         }
         if let Some(info) = csharp_import_info_from_using_directive(node, self.source, raw) {
-            self.parsed.imports.push(info);
+            let declaration = self.source_facts.intern_node(node);
+            let alias = node
+                .child_by_field_name("name")
+                .map(|alias| self.source_facts.intern_node(alias));
+            self.source_imports.push(SourceImportFact::from_import(
+                info,
+                declaration,
+                None,
+                alias,
+                Vec::new(),
+            ));
         }
     }
 
@@ -363,7 +669,8 @@ impl CSharpVisitor<'_, '_> {
             code_unit.clone(),
             extract_csharp_supertypes(node, self.source),
         );
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit.clone(),
             // Recorded, not merely present: canonical identity reads a type
             // declaration's arity, so a nongeneric type must be a proven zero
@@ -373,13 +680,13 @@ impl CSharpVisitor<'_, '_> {
                     node,
                     self.source,
                 ))
-                // Interface-ness is a declaration fact a bounded consumer
-                // cannot recover from the indexed identity: a class, a struct
-                // and an interface are all `CodeUnitType::Class` rows, and
-                // telling them apart otherwise means reparsing the declaring
-                // file. The C# extension-argument refutation asks exactly this
-                // question about a candidate's parameter type (#2225).
-                .with_class_like_interface(node.kind() == "interface_declaration"),
+                .with_class_like_kind(match node.kind() {
+                    "class_declaration" | "record_declaration" => ClassLikeKind::Class,
+                    "interface_declaration" => ClassLikeKind::Interface,
+                    "struct_declaration" | "record_struct_declaration" => ClassLikeKind::Struct,
+                    "enum_declaration" => ClassLikeKind::Enum,
+                    _ => unreachable!("admitted C# type declaration"),
+                }),
         );
         self.visit_primary_constructor(node, scope, &code_unit, &name);
 
@@ -408,7 +715,7 @@ impl CSharpVisitor<'_, '_> {
     fn visit_method(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) -> Option<CodeUnit> {
         let enclosing = scope.enclosing_type.as_ref()?;
         let parent = &enclosing.unit;
-        if csharp_method_has_runnable_test_attribute(node, self.source) {
+        if self.current_is_test_method {
             self.parsed.mark_test_region(parent);
         }
         let name_node = node.child_by_field_name("name")?;
@@ -438,14 +745,16 @@ impl CSharpVisitor<'_, '_> {
             None,
         );
         let signature = csharp_method_skeleton(node, self.source);
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit.clone(),
             csharp_signature_metadata(
                 signature,
                 node,
                 self.source,
                 &scope.lexical_scope,
-                self.ancestry,
+                &self.ancestry,
+                &self.current_properties,
             )
             .with_dispatch_extensibility(crate::syntax::csharp_type_member_dispatch_extensibility(
                 self.source,
@@ -454,7 +763,7 @@ impl CSharpVisitor<'_, '_> {
                 Some(enclosing.declaration),
             ))
             .with_callable_modifiers(
-                csharp_has_modifier(self.source, node, "static"),
+                self.current_properties.is_static,
                 false,
                 csharp_declared_visibility(
                     node,
@@ -520,14 +829,16 @@ impl CSharpVisitor<'_, '_> {
             "{declared_name}{}",
             csharp_rendered_parameter_text(node, self.source)
         );
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit,
             csharp_signature_metadata(
                 signature,
                 node,
                 self.source,
                 &scope.lexical_scope,
-                self.ancestry,
+                &self.ancestry,
+                &self.current_properties,
             )
             // No constructor is dynamically dispatched, which
             // `csharp_callable_dispatch_extensibility` states for the
@@ -579,22 +890,24 @@ impl CSharpVisitor<'_, '_> {
             None,
         );
         let signature = csharp_constructor_skeleton(node, self.source);
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit,
             csharp_signature_metadata(
                 signature,
                 node,
                 self.source,
                 &scope.lexical_scope,
-                self.ancestry,
+                &self.ancestry,
+                &self.current_properties,
             )
             .with_callable_modifiers(
-                csharp_has_modifier(self.source, node, "static"),
+                self.current_properties.is_static,
                 true,
                 csharp_declared_visibility(
                     node,
                     self.source,
-                    csharp_default_member_visibility(node, self.ancestry),
+                    csharp_default_member_visibility(node, &self.ancestry),
                 ),
             ),
         );
@@ -631,14 +944,15 @@ impl CSharpVisitor<'_, '_> {
             None,
         );
         let signature = csharp_property_signature(node, self.source);
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit,
             csharp_dispatch_signature_metadata(
                 signature,
                 node,
                 self.source,
-                &scope.lexical_scope,
-                self.ancestry,
+                &self.ancestry,
+                &self.current_properties,
             ),
         );
     }
@@ -655,15 +969,13 @@ impl CSharpVisitor<'_, '_> {
             return;
         };
 
-        let prefix = csharp_field_prefix(node, declaration, self.source);
-        let type_node = declaration.child_by_field_name("type");
-        let type_text = type_node
-            .map(|child| normalize_cs_whitespace(cs_node_text(child, self.source)))
+        let prefix = csharp_field_prefix(node, self.source);
+        let type_text = self
+            .current_properties
+            .display_type_text
+            .clone()
             .unwrap_or_default();
-        let return_type_identity = type_node.and_then(|type_node| {
-            csharp_structured_type_identity(type_node, self.source, &scope.lexical_scope)
-        });
-        let declaration_text = normalize_cs_whitespace(cs_node_text(node, self.source));
+        let return_type_identity = self.current_properties.return_type_identity.clone();
 
         let mut cursor = declaration.walk();
         for child in declaration.named_children(&mut cursor) {
@@ -695,13 +1007,17 @@ impl CSharpVisitor<'_, '_> {
                 Some(parent.clone()),
                 None,
             );
-            let signature =
-                csharp_field_signature(&prefix, &type_text, &declaration_text, child, self.source);
-            self.parsed.add_signature_with_metadata(
+            let signature = csharp_field_signature(&prefix, &type_text, child, self.source);
+            self.add_source_signature(
+                child,
                 code_unit,
                 SignatureMetadata::new(signature, Vec::new())
-                    .with_return_type_text((!type_text.is_empty()).then(|| type_text.clone()))
+                    .with_return_type_text(self.current_properties.display_type_text.clone())
                     .with_return_type_identity(return_type_identity.clone())
+                    .with_field_modifiers(
+                        self.current_properties.is_static || self.current_properties.is_const,
+                        self.current_properties.is_const,
+                    )
                     .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
         }
@@ -738,7 +1054,8 @@ impl CSharpVisitor<'_, '_> {
             None,
         );
         let signature = normalize_cs_whitespace(cs_node_text(node, self.source));
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature(
+            node,
             code_unit,
             SignatureMetadata::new(signature, Vec::new())
                 .with_dispatch_extensibility(DispatchExtensibility::Closed),
@@ -827,37 +1144,30 @@ fn count_type_parameters(node: Node<'_>) -> usize {
         .count()
 }
 
-fn collect_csharp_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "attribute"
-            && let Some(name) = node.child_by_field_name("name")
-        {
-            identifiers.extend(crate::syntax::csharp_attribute_type_names(name, source));
+fn collect_csharp_type_identifier(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
+    if node.kind() == "attribute"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        identifiers.extend(crate::syntax::csharp_attribute_type_names(name, source));
+    }
+    if let Some(root) = csharp_type_reference_root(node) {
+        let text = csharp_type_node_identity(root, source);
+        if !text.is_empty() {
+            identifiers.insert(text);
         }
-        if let Some(root) = csharp_type_reference_root(node) {
-            let text = csharp_type_node_identity(root, source);
-            if !text.is_empty() {
-                identifiers.insert(text);
-            }
+    }
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        let text = csharp_type_node_identity(candidate, source);
+        if !text.is_empty() {
+            identifiers.insert(text);
         }
-        if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
-            let text = csharp_type_node_identity(candidate, source);
-            if !text.is_empty() {
-                identifiers.insert(text);
-            }
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        let text = csharp_type_node_identity(receiver, source);
+        if !text.is_empty() {
+            identifiers.insert(text);
         }
-        if let Some(receiver) = csharp_member_access_type_receiver(node) {
-            let text = csharp_type_node_identity(receiver, source);
-            if !text.is_empty() {
-                identifiers.insert(text);
-            }
-        }
-        WalkControl::Continue
-    });
+    }
 }
 
 fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -962,23 +1272,20 @@ fn csharp_dispatch_signature_metadata<'tree>(
     signature: String,
     node: Node<'tree>,
     source: &str,
-    lexical_scope: &[String],
     ancestry: &ParentIndex<'tree>,
+    properties: &CSharpDeclarationProperties,
 ) -> SignatureMetadata {
-    let return_type = csharp_declared_type_node(node);
     SignatureMetadata::new(signature, Vec::new())
-        .with_return_type_text(
-            return_type
-                .map(|return_type| csharp_type_node_identity(return_type, source))
-                .filter(|return_type| !return_type.is_empty()),
+        .with_return_type_text(properties.return_type_text.clone())
+        .with_return_type_identity(properties.return_type_identity.clone())
+        .with_field_modifiers(
+            properties.is_static || properties.is_const,
+            properties.is_const,
         )
-        .with_return_type_identity(return_type.and_then(|return_type| {
-            csharp_structured_type_identity(return_type, source, lexical_scope)
-        }))
         .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
             source,
             node,
-            crate::syntax::csharp_has_modifier(source, node, "static"),
+            properties.is_static,
             ancestry,
         ))
 }
@@ -1038,16 +1345,12 @@ fn csharp_signature_metadata<'tree>(
     source: &str,
     lexical_scope: &[String],
     ancestry: &ParentIndex<'tree>,
+    properties: &CSharpDeclarationProperties,
 ) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node, source);
     let type_parameters = csharp_method_type_parameters(node, source);
-    let return_type = csharp_declared_type_node(node);
-    let return_type_text = return_type
-        .map(|return_type| csharp_type_node_identity(return_type, source))
-        .filter(|return_type| !return_type.is_empty());
-    let return_type_identity = return_type.and_then(|return_type| {
-        csharp_structured_type_identity(return_type, source, lexical_scope)
-    });
+    let return_type_text = properties.return_type_text.clone();
+    let return_type_identity = properties.return_type_identity.clone();
     let bare_return_type_parameter =
         csharp_bare_return_type_parameter(node, source, &type_parameters);
     let extension_receiver_type_node = csharp_extension_receiver_type_node(node, source);
@@ -1082,7 +1385,10 @@ fn csharp_signature_metadata<'tree>(
                 let start_byte = search_start + relative_start;
                 let end_byte = start_byte + label.len();
                 search_start = end_byte;
-                Some(ParameterMetadata::new(label, start_byte, end_byte))
+                Some(
+                    ParameterMetadata::new(label, start_byte, end_byte)
+                        .with_name(cs_ident_text(label_node, source)),
+                )
             })
             .collect();
         SignatureMetadata::new(signature, parameters)
@@ -1116,7 +1422,7 @@ fn csharp_signature_metadata<'tree>(
         .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
             source,
             node,
-            crate::syntax::csharp_has_modifier(source, node, "static"),
+            properties.is_static,
             ancestry,
         ))
 }
@@ -1599,23 +1905,19 @@ fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
     format!("({})", parts.join(", "))
 }
 
-fn csharp_field_prefix(field_node: Node<'_>, declaration: Node<'_>, source: &str) -> String {
-    let field_text = cs_node_text(field_node, source);
-    let end = declaration
-        .start_byte()
-        .saturating_sub(field_node.start_byte());
-    let prefix = field_text.get(..end).unwrap_or(field_text);
-    let prefix = normalize_cs_whitespace(prefix);
-    regex::Regex::new(r"^(?:\[[^\]]+\]\s*)+")
-        .ok()
-        .map(|regex| regex.replace(&prefix, "").trim().to_string())
-        .unwrap_or(prefix)
+fn csharp_field_prefix(field_node: Node<'_>, source: &str) -> String {
+    let mut cursor = field_node.walk();
+    field_node
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "modifier")
+        .map(|node| cs_node_text(node, source))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn csharp_field_signature(
     prefix: &str,
     type_text: &str,
-    declaration_text: &str,
     declarator: Node<'_>,
     source: &str,
 ) -> String {
@@ -1626,9 +1928,14 @@ fn csharp_field_signature(
     let initializer = declarator
         .child_by_field_name("value")
         .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name");
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| Some(*child) != name && child.kind() != "bracketed_argument_list")
+        })
         .and_then(|value| csharp_literal_initializer(value, source));
-    let initializer =
-        initializer.or_else(|| csharp_literal_initializer_from_text(declaration_text, &name));
 
     let base = if prefix.is_empty() {
         format!("{type_text} {name}")
@@ -1644,9 +1951,16 @@ fn csharp_field_signature(
 }
 
 fn csharp_literal_initializer(node: Node<'_>, source: &str) -> Option<String> {
-    let kind = node.kind();
+    if node.kind() == "prefix_unary_expression" {
+        let value = last_named_child(node)?;
+        let has_sign = (0..node.child_count())
+            .filter_map(|index| node.child(index))
+            .any(|child| !child.is_named() && matches!(child.kind(), "+" | "-"));
+        return (has_sign && matches!(value.kind(), "integer_literal" | "real_literal"))
+            .then(|| normalize_cs_whitespace(cs_node_text(node, source)));
+    }
     if matches!(
-        kind,
+        node.kind(),
         "integer_literal"
             | "real_literal"
             | "string_literal"
@@ -1657,18 +1971,6 @@ fn csharp_literal_initializer(node: Node<'_>, source: &str) -> Option<String> {
         return Some(normalize_cs_whitespace(cs_node_text(node, source)));
     }
     None
-}
-
-fn csharp_literal_initializer_from_text(declaration_text: &str, name: &str) -> Option<String> {
-    let pattern = format!(
-        r#"\b{}\s*=\s*("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|[-+]?\d+(?:\.\d+)?|true|false|null)\s*(?:,|;)"#,
-        regex::escape(name)
-    );
-    regex::Regex::new(&pattern)
-        .ok()
-        .and_then(|regex| regex.captures(declaration_text))
-        .and_then(|captures| captures.get(1))
-        .map(|value| value.as_str().to_string())
 }
 
 fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -1728,6 +2030,250 @@ public class Outer<T> : Example.Base<Example.Model.Value>, System.IDisposable {
                 "System.IDisposable".to_string(),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod primary_source_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+
+    fn parse(source: &str) -> ParsedFile {
+        let tree = crate::preprocessor::parse_csharp(source).expect("C# primary tree");
+        let file = ProjectFile::new(std::env::temp_dir(), "Primary.cs");
+        parse_csharp_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn primary_declaration_and_structural_projections_share_occurrences() {
+        let source = "using Alias = System.Text; namespace Demo; class Box(int size) { int x, y; void Run() { void Local() { Work(); } Local(); } }";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().expect("canonical C# facts");
+        assert_eq!(facts.source_bytes, source.len());
+        assert!(parsed.declarations().iter().all(|unit| {
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(|(_, linked)| linked == unit)
+        }));
+        assert_eq!(
+            parsed.source_declaration_metadata.len(),
+            parsed.source_declaration_units.len()
+        );
+        for link in &parsed.source_declaration_metadata {
+            assert!(
+                parsed.signature_metadata[&link.unit]
+                    .get(link.metadata_ordinal)
+                    .is_some()
+            );
+        }
+        let class = parsed
+            .source_declaration_metadata
+            .iter()
+            .find(|link| link.unit.short_name() == "Box")
+            .expect("class metadata link");
+        let constructor = parsed
+            .source_declaration_metadata
+            .iter()
+            .find(|link| link.unit.short_name() == "Box.Box")
+            .expect("primary constructor metadata link");
+        assert_eq!(class.declaration, constructor.declaration);
+        assert_ne!(class.unit, constructor.unit);
+        let class_metadata = &parsed.signature_metadata[&class.unit][class.metadata_ordinal];
+        let constructor_metadata =
+            &parsed.signature_metadata[&constructor.unit][constructor.metadata_ordinal];
+        assert_eq!(class_metadata.class_like_kind(), Some(ClassLikeKind::Class));
+        assert_eq!(constructor_metadata.class_like_kind(), None);
+        assert!(class_metadata.parameters().is_empty());
+        assert_eq!(constructor_metadata.parameters()[0].name(), Some("size"));
+        let run = parsed
+            .source_declaration_units
+            .iter()
+            .find(|(_, unit)| unit.short_name() == "Box.Run")
+            .expect("method source link");
+        let declaration = facts.occurrences.declaration(run.0);
+        assert!(
+            facts
+                .structural
+                .nodes()
+                .iter()
+                .any(|node| node.kind == NormalizedKind::Method
+                    && node.occurrence == declaration.occurrence)
+        );
+        assert!(
+            facts
+                .structural
+                .nodes()
+                .iter()
+                .any(|node| node.kind == NormalizedKind::Function)
+        );
+        assert_eq!(
+            facts
+                .structural
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == NormalizedKind::Call)
+                .count(),
+            2
+        );
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.identifier() == "Local"),
+            "body structural extraction must not broaden declaration admission"
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.package_name() == "Demo")
+        );
+        assert_eq!(facts.imports.len(), 1);
+        assert_eq!(
+            facts.imports[0].import_info(&facts.occurrences),
+            parsed.imports[0]
+        );
+        let alias = facts.imports[0].alias_occurrence.expect("alias occurrence");
+        let range = facts.occurrences.occurrence(alias).range;
+        assert_eq!(&source[range.start_byte..range.end_byte], "Alias");
+    }
+
+    #[test]
+    fn primary_using_imports_ignore_comment_extras() {
+        use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
+
+        for (source, kind, alias, is_global) in [
+            (
+                "global /* before using */ using /* before target */ Shared.Tools;",
+                StructuredImportPathKind::Namespace,
+                None,
+                true,
+            ),
+            (
+                "global /* before using */ using static /* before target */ Shared.Tools;",
+                StructuredImportPathKind::StaticMember,
+                None,
+                true,
+            ),
+            (
+                "global using /* before alias */ Alias /* before equals */ = /* before target */ Shared.Tools;",
+                StructuredImportPathKind::ImportFrom,
+                Some("Alias"),
+                true,
+            ),
+            (
+                "using /* before target */ Shared.Tools;",
+                StructuredImportPathKind::Namespace,
+                None,
+                false,
+            ),
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.imports.len(), 1, "{source}");
+            let import = &parsed.imports[0];
+            assert_eq!(import.raw_snippet, source);
+            assert_eq!(import.is_global, is_global, "{source}");
+            assert_eq!(import.alias.as_deref(), alias, "{source}");
+            let path = import.path.as_ref().expect("structured import path");
+            assert_eq!(path.kind, Some(kind), "{source}");
+            assert_eq!(path.segments, ["Shared", "Tools"], "{source}");
+            let facts = parsed.source_facts.as_ref().expect("canonical C# facts");
+            assert_eq!(facts.imports.len(), 1, "{source}");
+            assert_eq!(facts.imports[0].import_info(&facts.occurrences), *import);
+        }
+    }
+
+    #[test]
+    fn field_literals_and_modifiers_come_from_declarator_nodes() {
+        let parsed = parse(
+            r#"class C {
+            [System.Obsolete("x = 99;")] public const int x = -2, y = +3;
+            string text = "x = 10;";
+            int computed = Make();
+        }"#,
+        );
+        for (name, expected) in [
+            ("x", "public const int x = -2;"),
+            ("y", "public const int y = +3;"),
+            ("text", "string text = \"x = 10;\";"),
+            ("computed", "int computed;"),
+        ] {
+            let unit = parsed
+                .declarations()
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .expect("field declaration");
+            assert_eq!(parsed.signatures[unit], [expected]);
+        }
+    }
+
+    #[test]
+    fn semantic_source_only_events_share_primary_properties_without_display_units() {
+        let source = "namespace N { class C { static int[] Make() { return null; } const int Value = 1; event System.Action Changed; } }";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let projections = parsed
+            .csharp_semantic_declarations
+            .iter()
+            .map(|declaration| {
+                let name = facts
+                    .occurrences
+                    .declaration(declaration.declaration)
+                    .name
+                    .unwrap();
+                let range = facts.occurrences.occurrence(name).range;
+                (&source[range.start_byte..range.end_byte], declaration)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(projections["Make"].type_spelling.as_deref(), Some("int[]"));
+        assert_eq!(
+            projections["Make"].kind,
+            CSharpSemanticDeclarationKind::StaticMethodReturn
+        );
+        assert_eq!(projections["Value"].type_spelling.as_deref(), Some("int"));
+        assert!(projections["Value"].is_static);
+        assert_eq!(
+            projections["Changed"].type_spelling.as_deref(),
+            Some("System.Action")
+        );
+        assert_eq!(projections["Changed"].namespace, ["N"]);
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.identifier() == "Changed")
+        );
+    }
+
+    #[test]
+    fn primary_facts_preserve_preprocessor_admission_and_empty_files() {
+        let source = "#if false\nclass Hidden { void Missing() { Lost(); } }\n#endif\nclass Visible { void Run() { Found(); } }";
+        let parsed = parse(source);
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("canonical preprocessed facts");
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.identifier() == "Hidden")
+        );
+        assert_eq!(
+            facts
+                .structural
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == NormalizedKind::Call)
+                .count(),
+            1
+        );
+        let empty = parse("");
+        let empty_facts = empty.source_facts.expect("empty C# is a ready publication");
+        assert!(empty_facts.occurrences.declarations().is_empty());
+        assert!(empty_facts.structural.nodes().is_empty());
+        assert!(empty_facts.imports.is_empty());
     }
 }
 

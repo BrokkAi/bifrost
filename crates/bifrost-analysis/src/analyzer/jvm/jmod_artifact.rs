@@ -885,6 +885,7 @@ fn equivalent_member_fact(left: &MemberFact, right: &MemberFact) -> bool {
         && left.is_static == right.is_static
         && left.is_abstract == right.is_abstract
         && left.is_virtual == right.is_virtual
+        && left.non_overridable == right.non_overridable
         && left.signature == right.signature
         && left.receiver == right.receiver
         && left.extension_receiver == right.extension_receiver
@@ -1430,7 +1431,7 @@ mod tests {
             pack_version: "21.0.8".to_owned(),
             ecosystem: "jdk".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: "=21.0.8".to_owned(),

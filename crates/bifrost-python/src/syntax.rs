@@ -120,121 +120,81 @@ pub struct PythonOverloadDecoratorBindings {
     namespaces: HashSet<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum PythonOverloadDecoratorName {
+    Direct(String),
+    Namespace(String),
+}
+
 impl PythonOverloadDecoratorBindings {
-    pub fn collect(root: Node<'_>, source: &str) -> Self {
-        let mut bindings = Self::default();
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            match node.kind() {
-                "function_definition" | "class_definition" | "lambda" => continue,
-                "import_statement" => bindings.collect_namespace_imports(node, source),
-                "import_from_statement" => bindings.collect_direct_imports(node, source),
-                _ => {}
+    /// Capture typing bindings from the import interpretation already owned by
+    /// the primary producer. Only module-level leaves reach this collector.
+    pub(crate) fn collect_import(
+        &mut self,
+        import: &brokk_bifrost_core::analyzer::model::ImportInfo,
+    ) {
+        use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
+        let Some(path) = &import.path else { return };
+        match (path.kind, path.segments.as_slice()) {
+            (Some(StructuredImportPathKind::Namespace), [module]) if is_typing_module(module) => {
+                self.namespaces
+                    .insert(import.alias.as_ref().unwrap_or(module).clone());
             }
-
-            let mut cursor = node.walk();
-            let children: Vec<_> = node.named_children(&mut cursor).collect();
-            stack.extend(children.into_iter().rev());
-        }
-
-        bindings
-    }
-
-    fn collect_namespace_imports(&mut self, node: Node<'_>, source: &str) {
-        let mut cursor = node.walk();
-        for imported in node.children_by_field_name("name", &mut cursor) {
-            match imported.kind() {
-                "dotted_name" => {
-                    let module = node_text(imported, source).trim();
-                    if is_typing_module(module) {
-                        self.namespaces.insert(module.to_string());
-                    }
-                }
-                "aliased_import" => {
-                    let Some(name) = imported.child_by_field_name("name") else {
-                        continue;
-                    };
-                    if !is_typing_module(node_text(name, source).trim()) {
-                        continue;
-                    }
-                    let Some(alias) = imported.child_by_field_name("alias") else {
-                        continue;
-                    };
-                    let alias = node_text(alias, source).trim();
-                    if !alias.is_empty() {
-                        self.namespaces.insert(alias.to_string());
-                    }
-                }
-                _ => {}
+            (Some(StructuredImportPathKind::ImportFrom), [module, name])
+                if is_typing_module(module) && name == "overload" =>
+            {
+                self.direct
+                    .insert(import.alias.as_ref().unwrap_or(name).clone());
             }
+            _ => {}
         }
     }
 
-    fn collect_direct_imports(&mut self, node: Node<'_>, source: &str) {
-        let Some(module) = node.child_by_field_name("module_name") else {
-            return;
-        };
-        if !is_typing_module(node_text(module, source).trim()) {
-            return;
-        }
-
-        let mut cursor = node.walk();
-        for imported in node.children_by_field_name("name", &mut cursor) {
-            match imported.kind() {
-                "dotted_name" if node_text(imported, source).trim() == "overload" => {
-                    self.direct.insert("overload".to_string());
-                }
-                "aliased_import" => {
-                    let Some(name) = imported.child_by_field_name("name") else {
-                        continue;
-                    };
-                    if node_text(name, source).trim() != "overload" {
-                        continue;
-                    }
-                    let Some(alias) = imported.child_by_field_name("alias") else {
-                        continue;
-                    };
-                    let alias = node_text(alias, source).trim();
-                    if !alias.is_empty() {
-                        self.direct.insert(alias.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    pub fn decorates_as_overload(&self, function: Node<'_>, source: &str) -> bool {
+    /// Return the exact decorator binding shapes used by one function. The
+    /// names are captured during the primary walk; the import binding set is
+    /// resolved after the walk so a later typing import is handled exactly as
+    /// the historical whole-file predicate did.
+    pub(crate) fn overload_decorator_names(
+        function: Node<'_>,
+        source: &str,
+    ) -> Vec<PythonOverloadDecoratorName> {
         let Some(parent) = function
             .parent()
             .filter(|node| node.kind() == "decorated_definition")
         else {
-            return false;
+            return Vec::new();
         };
-
         let mut cursor = parent.walk();
         parent
             .named_children(&mut cursor)
             .filter(|child| child.kind() == "decorator")
             .filter_map(decorator_callee)
-            .any(|callee| match callee.kind() {
-                "identifier" => self.direct.contains(node_text(callee, source).trim()),
+            .filter_map(|callee| match callee.kind() {
+                "identifier" => Some(PythonOverloadDecoratorName::Direct(
+                    node_text(callee, source).trim().to_string(),
+                )),
                 "attribute" => {
-                    let Some(attribute) = callee.child_by_field_name("attribute") else {
-                        return false;
-                    };
+                    let attribute = callee.child_by_field_name("attribute")?;
                     if node_text(attribute, source).trim() != "overload" {
-                        return false;
+                        return None;
                     }
-                    let Some(object) = callee.child_by_field_name("object") else {
-                        return false;
-                    };
-                    object.kind() == "identifier"
-                        && self.namespaces.contains(node_text(object, source).trim())
+                    let object = callee.child_by_field_name("object")?;
+                    (object.kind() == "identifier").then(|| {
+                        PythonOverloadDecoratorName::Namespace(
+                            node_text(object, source).trim().to_string(),
+                        )
+                    })
                 }
-                _ => false,
+                _ => None,
             })
+            .collect()
+    }
+
+    pub(crate) fn matches_overload_binding(&self, name: &PythonOverloadDecoratorName) -> bool {
+        match name {
+            PythonOverloadDecoratorName::Direct(name) => self.direct.contains(name),
+            PythonOverloadDecoratorName::Namespace(name) => self.namespaces.contains(name),
+        }
     }
 }
 

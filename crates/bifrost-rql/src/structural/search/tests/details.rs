@@ -1369,6 +1369,7 @@ public class Caller {
         .find(|provider| provider.structural_language() == Language::CSharp)
         .expect("C# structural provider");
     let extractions_before = provider.structural_extraction_count();
+    let hydrations_before = provider.structural_hydration_count();
 
     let result = execute_workspace(
         &workspace,
@@ -1377,9 +1378,10 @@ public class Caller {
     );
 
     assert_eq!(
-        provider.structural_extraction_count(),
-        extractions_before + 2,
-        "the seed and reference traversal each extract their own file; receiver analysis must not perform a third extraction"
+        (provider.structural_extraction_count() - extractions_before)
+            + (provider.structural_hydration_count() - hydrations_before),
+        2,
+        "the seed and reference traversal each materialize their own file; receiver analysis must not materialize a third file"
     );
     assert!(
         matches!(

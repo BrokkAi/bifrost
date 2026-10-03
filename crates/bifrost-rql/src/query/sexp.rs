@@ -1,15 +1,17 @@
 use super::ir::{
-    CallIdentity, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep, ResolvedCallReceiverType,
+    AbsentMemberProofFilter, CallIdentity, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQueryResultDetail, MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep,
+    ResolvedCallReceiverType,
 };
 use super::schema::{
     BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, ConfigurationFactsFilterField,
     DECORATOR_BINDING_STEP_OPTIONS, QueryStepField, QueryStepOp, ReceiverTypeConstraintForm,
     RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
     binding_option_for_rql_label, candidate_option_for_rql_label,
-    configuration_facts_field_for_rql_label, declaration_state_option_for_rql_label,
-    export_field_for_rql_label, generation_site_field_for_rql_label,
-    occurrence_option_for_rql_label, resolve_rql_schema_version,
+    configuration_facts_field_for_rql_label, constrained_step_option_labels,
+    declaration_state_option_for_rql_label, export_field_for_rql_label,
+    generation_site_field_for_rql_label, occurrence_option_for_rql_label,
+    resolve_rql_schema_version,
 };
 #[cfg(test)]
 use crate::sexp::MAX_SEXP_DEPTH;
@@ -478,7 +480,6 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
         | RqlForm::ClassSet
-        | RqlForm::AbsentMember
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf
@@ -605,6 +606,48 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::AbsentMember => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let op = QueryStepOp::AbsentMember;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
+                let option = op.option_for_rql_label(key).ok_or_else(|| {
+                    lower_error(&pair[0], format!("({head} ...) accepts only :proof"))
+                })?;
+                let label = symbol_or_string(&pair[1])?;
+                if AbsentMemberProofFilter::from_label(&label).is_none() {
+                    return Err(lower_error(
+                        &pair[1],
+                        format!(
+                            "({head} :proof ...) must be one of {}",
+                            constrained_step_option_labels(option.field()).join(", ")
+                        ),
+                    ));
+                }
+                if step
+                    .insert(option.field().label().to_string(), Value::String(label))
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
         }
         RqlForm::Witness => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
@@ -1018,6 +1061,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
+        | RqlForm::ResultSubjectUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::NilnessOperations
         | RqlForm::SwitchCoverage
@@ -1043,6 +1087,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallResultContracts => "call_result_contracts",
                 RqlForm::CallResultObligations => "call_result_obligations",
                 RqlForm::ResultContractUses => "result_contract_uses",
+                RqlForm::ResultSubjectUses => "result_subject_uses",
                 RqlForm::ResultContractOperationUses => "result_contract_operation_uses",
                 RqlForm::NilnessOperations => "nilness_operations",
                 RqlForm::SwitchCoverage => "switch_coverage",
@@ -2217,6 +2262,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
+        | RqlForm::ResultSubjectUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::ResultContractFailureUses
         | RqlForm::NilnessOperations
@@ -2747,11 +2793,16 @@ fn row_literal_value(expr: &Expr) -> LowerResult<Value> {
                 .ok_or_else(|| lower_error(&parts[1], "enum literal requires a label"))?;
             literal.insert("enum".to_string(), Value::String(label.to_owned()));
         }
-        ExprKind::List(_) | ExprKind::Vector(_) => {
-            return Err(lower_error(
-                expr,
-                "row literal must be a string, non-negative integer, boolean, or constrained-enum label",
-            ));
+        ExprKind::List(values) | ExprKind::Vector(values) => {
+            let strings = values
+                .iter()
+                .map(|value| {
+                    value.as_string().map(str::to_owned).ok_or_else(|| {
+                        lower_error(value, "string-list row literals contain only strings")
+                    })
+                })
+                .collect::<LowerResult<Vec<_>>>()?;
+            literal.insert("string_list".to_string(), json!(strings));
         }
     }
     Ok(Value::Object(literal))

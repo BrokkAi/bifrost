@@ -337,9 +337,10 @@ pub struct DefinitionLookupResult {
     /// Outcome of this lookup. Known values are `resolved`, `no_definition`,
     /// `no_declaration` (the declaration-operation counterpart of
     /// `no_definition`), `unresolvable_import_boundary`, `ambiguous`,
-    /// `unsupported_language`, `invalid_location`, and `not_found`. The set is
-    /// deliberately open: a new inconclusive state is an additive change, not a
-    /// contract break, so this is not a closed enumeration.
+    /// `unsupported_language`, `invalid_location`, `not_found`, `incomplete`,
+    /// `cancelled`, and `exceeded_budget`. The set is deliberately open: a new
+    /// inconclusive state is an additive change, not a contract break, so this
+    /// is not a closed enumeration.
     pub status: String,
     #[serde(
         default = "definition_lookup_complete_default",
@@ -1153,7 +1154,6 @@ fn get_navigation_by_location_with_cancellation(
             requests,
             operation,
             cancellation,
-            false,
         );
         for ((index, query, request), outcome) in chunk.iter().zip(outcomes) {
             results[*index] = Some(render_definition_lookup(
@@ -1404,6 +1404,12 @@ pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> Re
     ) {
         Ok(result) => render_rename_symbol_result(analyzer, params, result),
         Err(err) => {
+            // Only a genuine location miss earns the retry advice. An
+            // inconclusive definition status -- `cancelled`, `incomplete`,
+            // `exceeded_budget`, `unavailable`, `ambiguous` -- now arrives as
+            // itself from `symbol_rename::resolve_rename_target`, and telling
+            // its caller to move to another identifier token would present
+            // unproven absence as proven absence.
             let message = if matches!(err.kind, "invalid_location" | "not_found") {
                 location_failure_message(
                     analyzer,
@@ -1599,6 +1605,12 @@ pub(super) fn render_definition_lookup(
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
     let _scope = profiling::scope("searchtools::render_definition_lookup");
+    let terminal_incomplete = matches!(
+        outcome.status,
+        crate::analyzer::usages::get_definition::DefinitionLookupStatus::Incomplete
+            | crate::analyzer::usages::get_definition::DefinitionLookupStatus::Cancelled
+            | crate::analyzer::usages::get_definition::DefinitionLookupStatus::ExceededBudget(_)
+    );
     let mut status = if operation == NavigationOperation::Declaration
         && outcome.status
             == crate::analyzer::usages::get_definition::DefinitionLookupStatus::NoDefinition
@@ -1607,12 +1619,30 @@ pub(super) fn render_definition_lookup(
     } else {
         outcome.status.as_str().to_string()
     };
+    let stopped_without_prefix = matches!(
+        outcome.status,
+        crate::analyzer::usages::get_definition::DefinitionLookupStatus::Cancelled
+            | crate::analyzer::usages::get_definition::DefinitionLookupStatus::ExceededBudget(_)
+    );
     let mut definitions = {
         let _scope = profiling::scope("searchtools::render_definition_lookup.candidates");
-        navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache)
+        if stopped_without_prefix {
+            Vec::new()
+        } else {
+            navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache)
+        }
     };
-    let mut source_unavailable = definitions.len() < outcome.targets.len();
-    if let Some(definition) = outcome.lexical_definition.as_ref() {
+    let mut source_unavailable =
+        !stopped_without_prefix && definitions.len() < outcome.targets.len();
+    if !stopped_without_prefix {
+        definitions.extend(
+            outcome
+                .modeled_definitions
+                .iter()
+                .map(|symbol| semantic_model_definition_candidate(analyzer, symbol)),
+        );
+    }
+    if !stopped_without_prefix && let Some(definition) = outcome.lexical_definition.as_ref() {
         if let Some(candidate) = lexical_definition_candidate(analyzer, file, definition) {
             definitions.push(candidate);
         } else {
@@ -1628,7 +1658,7 @@ pub(super) fn render_definition_lookup(
         .diagnostics
         .into_iter()
         .map(|diagnostic| DefinitionDiagnostic {
-            claim: None,
+            claim: diagnostic.claim,
             message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
             kind: diagnostic.kind,
         })
@@ -1649,7 +1679,7 @@ pub(super) fn render_definition_lookup(
         {
             attach_generated_member_provenance(&overlay, target, &mut definitions);
         }
-        if definitions.is_empty() {
+        if definitions.is_empty() && !terminal_incomplete {
             if let Some(target) = reference_target.as_deref() {
                 let member_name = target
                     .rsplit(['.', '#', ':'])
@@ -1729,11 +1759,21 @@ pub(super) fn render_definition_lookup(
                         .records
                         .retain(|symbol| !crate::analyzer::is_rust_generated_function(symbol));
                     if let Some(reference) = outcome.reference.as_ref() {
-                        matched
-                            .records
-                            .extend(crate::analyzer::resolve_rust_generated_functions(
-                                analyzer, &overlay, file, reference,
-                            ));
+                        match crate::analyzer::resolve_rust_generated_functions(
+                            analyzer, &overlay, file, reference,
+                        ) {
+                            Ok(records) => matched.records.extend(records),
+                            Err(error) => {
+                                status = "incomplete".to_owned();
+                                diagnostics.push(DefinitionDiagnostic {
+                                    claim: None,
+                                    kind: "rust_generated_route_unavailable".to_owned(),
+                                    message: format!(
+                                        "Rust generated declaration route failed: {error:?}"
+                                    ),
+                                });
+                            }
+                        }
                     }
                     matched.disposition = if matched.records.is_empty() {
                         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
@@ -1910,7 +1950,10 @@ pub(super) fn render_definition_lookup(
             },
         );
     }
-    let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
+    let (mut complete, incomplete_reason) = definition_result_completion(&status, &diagnostics);
+    if terminal_incomplete {
+        complete = false;
+    }
     DefinitionLookupResult {
         query,
         operation,
@@ -2015,6 +2058,16 @@ fn structured_receiver_owner(
     if let [result] = result.results.as_slice()
         && let [candidate] = result.types.as_slice()
     {
+        // The type tool reports the written spelling, indirection included, so
+        // a `&Record` receiver answers `&Record`. The semantic-model overlay
+        // keys a generated member by its owner's declaration identity, so take
+        // that identity from the candidate's own resolved declaration and fall
+        // back to the spelling only when the type names none.
+        if let [definition] = candidate.definitions.as_slice()
+            && definition.fqn.is_some()
+        {
+            return definition.fqn.clone();
+        }
         return Some(candidate.fqn.clone());
     }
     let definition = get_definitions_by_location(

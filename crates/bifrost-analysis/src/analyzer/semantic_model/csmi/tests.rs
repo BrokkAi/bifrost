@@ -1327,6 +1327,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
@@ -1358,6 +1359,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                 },
                 completeness: Completeness::Complete,
                 ordinary_heap_unchanged: false,
+                no_concurrency_effects: false,
                 covers_overrides: false,
                 normal_continuation_absent: false,
                 normal_result_count: None,
@@ -2793,6 +2795,48 @@ fn python_distribution_requires_resolved_import_root_and_callable_binding() {
     let model: CsmiSemanticModel = serde_json::from_value(value.clone()).unwrap();
     super::python::validate_model(&model).expect("PyPI name need not resemble import root");
 
+    for (vocabulary, version) in [("csmi.other", "0.1.0"), ("csmi.python", "0.2.0")] {
+        let mut unsupported_constraint = value.clone();
+        unsupported_constraint["compatibilityConstraints"] = json!([{
+            "vocabulary": vocabulary,
+            "version": version,
+            "value": {"kind":"compatibility", "python":"3.12.0"}
+        }]);
+        let unsupported_constraint: CsmiSemanticModel =
+            serde_json::from_value(unsupported_constraint).unwrap();
+        assert!(super::python::validate_model(&unsupported_constraint).is_err());
+    }
+    let mut missing_compatibility_use = value.clone();
+    missing_compatibility_use["compatibilityConstraints"] = json!([{
+        "vocabulary":"csmi.python", "version":"0.1.0",
+        "value":{"kind":"compatibility", "python":"3.12.0"}
+    }]);
+    let missing_compatibility_use: CsmiSemanticModel =
+        serde_json::from_value(missing_compatibility_use).unwrap();
+    assert!(super::python::validate_model(&missing_compatibility_use).is_err());
+    let mut optional_compatibility_use = value.clone();
+    optional_compatibility_use["vocabularyUses"][0]["requirement"] = json!("optional");
+    optional_compatibility_use["compatibilityConstraints"] = json!([{
+        "vocabulary":"csmi.python", "version":"0.1.0",
+        "value":{"kind":"compatibility", "python":"3.12.0"}
+    }]);
+    let optional_compatibility_use: CsmiSemanticModel =
+        serde_json::from_value(optional_compatibility_use).unwrap();
+    assert!(super::python::validate_model(&optional_compatibility_use).is_err());
+
+    let mut malformed_fact_condition = value.clone();
+    malformed_fact_condition["extensionFacts"][0]["payload"]["conditions"] =
+        json!({"implementation":"cpython"});
+    let malformed_fact_condition: CsmiSemanticModel =
+        serde_json::from_value(malformed_fact_condition).unwrap();
+    assert!(super::python::validate_model(&malformed_fact_condition).is_err());
+    let mut malformed_binding_condition = value.clone();
+    malformed_binding_condition["extensionFacts"][1]["payload"]["bindings"][0]["conditions"] =
+        json!({"implementation":"cpython"});
+    let malformed_binding_condition: CsmiSemanticModel =
+        serde_json::from_value(malformed_binding_condition).unwrap();
+    assert!(super::python::validate_model(&malformed_binding_condition).is_err());
+
     value["extensionFacts"][1]["payload"]["bindings"] = json!([
         {"name":"parse", "bindingKind":"definition", "target":"parse"},
         {"name":"parse_alias", "bindingKind":"alias", "target":"parse"},
@@ -2872,22 +2916,92 @@ pub(crate) fn rewrite_raw_declaration_shard(
 #[test]
 fn python_distribution_round_trip_retains_resolver_facts_and_provenance() {
     let source = include_bytes!("fixtures/python-distribution-beautifulsoup4.json");
-    let original: Value = serde_json::from_slice(source).unwrap();
+    let mut original: Value = serde_json::from_slice(source).unwrap();
+    let project_config = json!({
+        "algorithm":"sha-256",
+        "coverage":"resolver-affecting-config",
+        "canonicalization":"https://brokk.ai/bifrost/python-declared-environment/v1",
+        "value":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    });
+    let model = &mut original["semanticModels"][0];
+    model["vocabularyUses"][0]["affects"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "kind":"core-slot",
+            "slot":"artifact-compatibility",
+            "target":{"semanticModel":"current"}
+        }));
+    model["compatibilityConstraints"] = json!([{
+        "vocabulary":"csmi.python",
+        "version":"0.1.0",
+        "value":{"kind":"compatibility", "python":"3.12.0", "projectConfig":project_config.clone()}
+    }]);
+    model["extensionFacts"][0]["payload"]["conditions"] = json!({
+        "python":"3.12.0",
+        "projectConfig":project_config.clone()
+    });
+    model["extensionFacts"][1]["payload"]["bindings"][0]["conditions"] = json!({
+        "implementation":["cpython"],
+        "projectConfig":project_config.clone()
+    });
+    let source = serde_json::to_vec(&original).unwrap();
     let support = CsmiVocabularySupport::support(
         CSMI_PYTHON_PROFILE_ID,
         CSMI_PYTHON_PROFILE_VERSION,
         CSMI_PYTHON_PROFILE_SCHEMA,
     );
-    let portable = logical_pack_from_semantic(source);
+    let portable = logical_pack_from_semantic(&source);
     let imported = import_logical_csmi_pack(&portable, &support, &CompilerOptions::default())
         .expect("resolver-proven distribution imports");
     assert!(super::python::validate_native_identities(&imported.pack).is_empty());
     assert!(super::python::validate_profile_evidence(&imported.pack).is_empty());
+    let profile = imported
+        .pack
+        .shards
+        .iter()
+        .find_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { types, members, .. } => types
+                .iter()
+                .map(|fact| &fact.locator)
+                .chain(members.iter().map(|fact| &fact.locator))
+                .find_map(|locator| match locator {
+                    crate::analyzer::semantic_model::Locator::Interchange {
+                        profile_evidence: Some(evidence),
+                        ..
+                    } => Some(evidence),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .expect("Python profile evidence is retained on a declaration");
+    assert_eq!(
+        serde_json::to_value(&profile.compatibility_constraints).unwrap(),
+        original["semanticModels"][0]["compatibilityConstraints"]
+    );
+    let mut wrong_constraint_kind = original.clone();
+    wrong_constraint_kind["semanticModels"][0]["compatibilityConstraints"][0]["value"] =
+        original["semanticModels"][0]["extensionFacts"][0]["payload"].clone();
+    let wrong_constraint_pack =
+        logical_pack_from_semantic(&serde_json::to_vec(&wrong_constraint_kind).unwrap());
+    assert!(
+        import_logical_csmi_pack(
+            &wrong_constraint_pack,
+            &support,
+            &CompilerOptions::default()
+        )
+        .is_err(),
+        "a schema-valid distribution payload cannot act as a compatibility constraint"
+    );
     let artifact = CsmiArtifactEvidence::new("pkg:pypi/beautifulsoup4@4.13.0", "a".repeat(64));
     let exported =
         export_authored_csmi_pack(&imported.pack, &artifact, &CsmiExportOptions::default())
             .expect("distribution profile evidence exports");
     let output = semantic_value(&exported);
+    assert_eq!(
+        output["semanticModels"][0]["compatibilityConstraints"],
+        original["semanticModels"][0]["compatibilityConstraints"]
+    );
     let output_facts = output["semanticModels"][0]["extensionFacts"]
         .as_array()
         .unwrap();
@@ -2942,8 +3056,13 @@ fn python_distribution_round_trip_retains_resolver_facts_and_provenance() {
     }
     let reexported = export_csmi_pack(&fresh, &artifact, &CsmiExportOptions::default())
         .expect("reordered fresh native shards retain full-pack evidence");
+    let native_output = semantic_value(&reexported);
     assert_eq!(
-        semantic_value(&reexported)["semanticModels"][0]["extensionFacts"],
+        native_output["semanticModels"][0]["compatibilityConstraints"],
+        original["semanticModels"][0]["compatibilityConstraints"]
+    );
+    assert_eq!(
+        native_output["semanticModels"][0]["extensionFacts"],
         output["semanticModels"][0]["extensionFacts"]
     );
 
@@ -3399,7 +3518,7 @@ fn python_cross_artifact_correspondence_survives_durable_round_trip() {
         configuration: None,
         artifact_sha256: Some(digest),
     };
-    let target = ProcedureSummaryTargetKey::new("python", "bs4", "parse", false, 1);
+    let target = ProcedureSummaryTargetKey::new("python", "bs4", "bs4.parse", false, 1);
     for (evidence, expected_summaries) in [
         (vec![row(stub_purl, "b".repeat(64))], 0),
         (vec![row(runtime_purl, "a".repeat(64))], 1),
@@ -4150,4 +4269,44 @@ fn python_complete_empty_partition_keeps_callable_partial() {
         &validation.diagnostics,
         "structural.profile_schema_mismatch"
     ));
+}
+
+#[test]
+fn export_does_not_silently_drop_callable_inventory_coverage() {
+    let mut authored: AuthoredSemanticModelPack =
+        serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    authored.schema_version = crate::analyzer::semantic_model::CALLABLE_SURFACE_MIN_SCHEMA_VERSION;
+    let AuthoredPayload::DeclarationFacts { types, .. } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    types[0].callable_surface_complete = true;
+    let artifact = CsmiArtifactEvidence::new("pkg:maven/example/fixture@1.0.0", "a".repeat(64));
+    let error =
+        export_authored_csmi_pack(&authored, &artifact, &CsmiExportOptions::default()).unwrap_err();
+    assert!(
+        matches!(error, CsmiExportError::Unsupported { path, .. } if path.ends_with("callable_surface_complete"))
+    );
+}
+
+#[test]
+fn export_does_not_silently_drop_non_overridable_evidence() {
+    let mut authored: AuthoredSemanticModelPack =
+        serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    let method = members
+        .iter_mut()
+        .find(|m| m.member_kind == MemberKind::Method && !m.is_static)
+        .unwrap();
+    method.is_virtual = false;
+    method.is_abstract = false;
+    method.non_overridable =
+        Some(crate::analyzer::semantic_model::NonOverridableEvidence::JavaFinalMethod);
+    let artifact = CsmiArtifactEvidence::new("pkg:maven/example/fixture@1.0.0", "a".repeat(64));
+    let error =
+        export_authored_csmi_pack(&authored, &artifact, &CsmiExportOptions::default()).unwrap_err();
+    assert!(
+        matches!(error, CsmiExportError::Unsupported { path, .. } if path.ends_with("non_overridable"))
+    );
 }

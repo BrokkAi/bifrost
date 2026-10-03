@@ -215,7 +215,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                 language: "php".to_owned(),
                 ecosystem: COMPOSER_ECOSYSTEM.to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 provenance: Provenance { source, revision },
@@ -1198,7 +1198,7 @@ mod declaration_stub_tests {
             pack_version: "1.0.0".to_owned(),
             ecosystem: "php".to_owned(),
             compatibility: Compatibility {
-                bifrost: "*".to_owned(),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {

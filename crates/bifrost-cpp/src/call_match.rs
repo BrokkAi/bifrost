@@ -183,7 +183,8 @@ pub fn cpp_literal_arg_type(node: Node<'_>, source: &str) -> Option<CppArgType> 
     }
 }
 
-pub fn cpp_filter_candidates_by_args(
+#[cfg(test)]
+fn cpp_filter_candidates_by_args(
     candidates: Vec<CodeUnit>,
     arg_types: &[Option<CppArgType>],
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
@@ -193,6 +194,7 @@ pub fn cpp_filter_candidates_by_args(
         candidates,
         arg_types,
         &|candidate| cpp_signature_param_types(candidate.signature().unwrap_or_default()),
+        &cpp_signature_is_template_candidate,
         resolve_type,
         assignable,
     )
@@ -202,6 +204,7 @@ pub fn cpp_filter_candidates_by_args_with_parameter_types(
     candidates: Vec<CodeUnit>,
     arg_types: &[Option<CppArgType>],
     parameter_types: &dyn Fn(&CodeUnit) -> Option<Vec<String>>,
+    is_template: &dyn Fn(&CodeUnit) -> bool,
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
     assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
 ) -> Vec<CodeUnit> {
@@ -239,7 +242,7 @@ pub fn cpp_filter_candidates_by_args_with_parameter_types(
     };
     if filtered.is_empty() {
         candidates
-    } else if filtered.iter().any(cpp_signature_is_template_candidate) {
+    } else if filtered.iter().any(is_template) {
         // A matching function template keeps the entire arity-compatible
         // overload set alive. The parameter metadata has no template
         // substitution or constraint ordering, so it cannot prove that a
@@ -273,7 +276,6 @@ fn cpp_candidates_matching(
         .cloned()
         .collect()
 }
-
 fn cpp_signature_is_template_candidate(candidate: &CodeUnit) -> bool {
     candidate
         .signature()

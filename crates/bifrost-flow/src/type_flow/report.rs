@@ -22,7 +22,8 @@ use crate::value_flow::{ClosureLimits, ValueFlowCache};
 
 use super::solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
-    TypeFlowRootResult, TypeFlowSolvePhase, prefer_retained_finding, solve_type_flow_for_root,
+    TypeFlowRootResult, TypeFlowSolvePhase, collapse_absent_member_findings,
+    prefer_retained_finding, solve_type_flow_for_root,
 };
 use super::{FieldSlotIndex, TypeFlowSummaryState};
 
@@ -152,6 +153,7 @@ impl TypeFlowReport {
                 self.findings.push(finding);
             }
         }
+        collapse_absent_member_findings(&mut self.findings);
     }
 
     /// Account for one root whose own solve failed hard. Its sinks recorded

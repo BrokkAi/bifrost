@@ -5,12 +5,15 @@
 //! lexical-resolution, reference-edge, identity-route and
 //! declaration-materialization vocabularies; `spec` the trait each language
 //! implements to normalize its grammar; `facts` the two values a spec
-//! produces; and `adapter_helpers` the small node-arithmetic mechanics every
-//! adapter uses to write one. The extraction engine, matcher, planner and RQL
+//! produces; `code` the integer-code mapping every vocabulary carries; and
+//! `adapter_helpers` the small node-arithmetic mechanics every adapter uses to
+//! write one. The extraction engine, matcher, planner and RQL
 //! query layer that consume them stay in `brokk-bifrost-analysis`.
 
 pub mod adapter_helpers;
 pub mod callable;
+pub mod code;
+pub mod collector;
 pub mod control_relation;
 pub mod edges;
 pub mod facts;

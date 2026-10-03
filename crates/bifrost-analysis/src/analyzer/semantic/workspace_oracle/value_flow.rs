@@ -27,15 +27,16 @@ use crate::analyzer::semantic::cfg_algorithms::{
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
-    AccessPathTail, AccessSelector, AllocationHandle, BackingStoreOffset, CallArgumentEndpoint,
-    CallArgumentExpansion, CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding,
-    CallBindings, CallPassingMode, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
-    CandidateCoverage, CaptureSource, ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate,
-    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind,
-    IndexSelector, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ObjectCardinality,
-    OracleCallContext, OracleCandidate, OracleRelationArena, OracleRelationHandle,
-    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    ProcedureCallBoundary, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
+    AccessPathTail, AccessSelector, AllocationHandle, BackingStoreOffset, BindingOriginIndex,
+    CallArgumentEndpoint, CallArgumentExpansion, CallArgumentGroup, CallArgumentMapping,
+    CallArgumentMember, CallBinding, CallBindings, CallPassingMode, CallableTarget,
+    CallableTargetResolution, CallerReceiverBinding, CandidateCoverage, CaptureSource,
+    ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate, EvidenceCompleteness,
+    EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector,
+    MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ObjectCardinality, OracleCallContext,
+    OracleCandidate, OracleRelationArena, OracleRelationHandle, OracleRelationId,
+    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, ProcedureCallBoundary,
+    ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
     ProcedureReceiverBinding, ProgramPointHandle, ProgramPointId, ProofStatus,
     ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapDischarge,
     SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
@@ -892,6 +893,7 @@ pub fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
         }
         MemoryLocationKind::Static { .. } => SemanticCapability::StaticMemory,
         MemoryLocationKind::Index { .. } => SemanticCapability::IndexMemory,
+        MemoryLocationKind::Dereference { .. } => SemanticCapability::FieldMemory,
         MemoryLocationKind::LexicalCell { .. } => SemanticCapability::LocalFlow,
         MemoryLocationKind::Capture { .. } => SemanticCapability::Captures,
     };
@@ -1415,6 +1417,7 @@ fn location_value_reads(location: &MemoryLocationKind) -> usize {
     match location {
         MemoryLocationKind::Field { .. }
         | MemoryLocationKind::Property { .. }
+        | MemoryLocationKind::Dereference { .. }
         | MemoryLocationKind::LexicalCell { .. } => 1,
         MemoryLocationKind::Index { index: Some(_), .. } => 2,
         MemoryLocationKind::Index { index: None, .. }
@@ -1511,6 +1514,7 @@ type MemberSlot = (ValueId, u32, u32);
 struct ValueOriginFacts<'facts> {
     load_origins: &'facts HashMap<ValueId, LoadOrigin>,
     copied_reference_members: &'facts HashMap<MemberSlot, ValueId>,
+    binding_origins: Option<&'facts BindingOriginIndex>,
 }
 
 struct ProcedureValueFacts {
@@ -1571,6 +1575,7 @@ fn stated_member_contents(
             | MemoryLocationKind::Property { base, .. } => {
                 bases.insert(base);
             }
+            MemoryLocationKind::Dereference { .. } => {}
             MemoryLocationKind::Static { .. }
             | MemoryLocationKind::LexicalCell { .. }
             | MemoryLocationKind::Capture { .. } => {}
@@ -2279,6 +2284,7 @@ fn resolve_access_path_with_choice<'location>(
             ValueOriginFacts {
                 load_origins,
                 copied_reference_members,
+                binding_origins,
             },
         selector_limit,
         cancellation,
@@ -2352,6 +2358,35 @@ fn resolve_access_path_with_choice<'location>(
                     &mut summarized,
                 );
                 *base
+            }
+            MemoryLocationKind::Dereference { address } => {
+                let unique_binding_cell = binding_origins.and_then(|origins| {
+                    origins
+                        .addressed_binding_origins(*address)
+                        .unique_binding()
+                        .and_then(|binding| origins.binding_memory_location(binding))
+                });
+                if let Some(cell) = unique_binding_cell {
+                    current = cell;
+                    continue 'locations;
+                }
+                match walk_value_origin(
+                    load_origins,
+                    *address,
+                    &mut visited_values,
+                    exact_integer,
+                    choices,
+                    &mut choice_index,
+                ) {
+                    ValueOriginWalk::Load { location, .. } => {
+                        current = location;
+                        continue 'locations;
+                    }
+                    _ => {
+                        summarized = true;
+                        break 'locations AccessPathRootDraft::Value(*address);
+                    }
+                }
             }
             MemoryLocationKind::Static { member } => {
                 break AccessPathRootDraft::Static(member.clone());
@@ -2502,6 +2537,7 @@ fn alternative_choice_plans<'location>(
                     MemoryLocationKind::Field { base, .. }
                     | MemoryLocationKind::Index { base, .. }
                     | MemoryLocationKind::Property { base, .. } => Some(*base),
+                    MemoryLocationKind::Dereference { .. } => None,
                     MemoryLocationKind::Static { .. }
                     | MemoryLocationKind::LexicalCell { .. }
                     | MemoryLocationKind::Capture { .. } => None,
@@ -2616,6 +2652,43 @@ fn access_root_endpoint(
     let container = AbstractLocation::new(location.object().clone(), path)
         .map_err(|error| internal_contract("invalid container location", error))?;
     Ok(ValueFlowEndpoint::Location(Box::new(container)))
+}
+
+fn possible_dereference_store_targets(
+    procedure: &ProcedureHandle,
+    location: MemoryLocationId,
+    binding_origins: Option<&BindingOriginIndex>,
+) -> Vec<MemoryLocationId> {
+    let Some(binding_origins) = binding_origins else {
+        return Vec::new();
+    };
+    let Some(MemoryLocationKind::Dereference { address }) = procedure
+        .semantics()
+        .memory_location(location)
+        .map(|location| &location.kind)
+    else {
+        return Vec::new();
+    };
+    let origins = binding_origins.addressed_binding_origins(*address);
+    if origins.unique_binding().is_some() {
+        return Vec::new();
+    }
+    let bindings = if origins.is_complete() {
+        origins.bindings().iter().copied().collect::<Vec<_>>()
+    } else {
+        binding_origins
+            .address_taken_binding_set()
+            .iter()
+            .copied()
+            .collect()
+    };
+    let mut targets = bindings
+        .into_iter()
+        .filter_map(|binding| binding_origins.binding_memory_location(binding))
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 /// The container an indexed access reads out of or writes into, with every
@@ -3561,6 +3634,7 @@ impl WorkspaceSemanticOracle<'_> {
         location: MemoryLocationId,
         stored: ValueId,
         bases: &LocalStoreBases,
+        binding_origins: Option<&BindingOriginIndex>,
         staged: &mut WorkStager,
         cancellation: &crate::cancellation::CancellationToken,
     ) -> Result<bool, StrongUpdateStop> {
@@ -3629,6 +3703,24 @@ impl WorkspaceSemanticOracle<'_> {
                         ),
                     })],
                 )
+            }
+            MemoryLocationKind::Dereference { address } => {
+                let Some(binding_origins) = binding_origins else {
+                    return Ok(false);
+                };
+                let origins = binding_origins.addressed_binding_origins(*address);
+                let Some(binding) = origins.unique_binding() else {
+                    return Ok(false);
+                };
+                let Some(cell) = binding_origins.binding_memory_location(binding) else {
+                    return Ok(false);
+                };
+                let handle = procedure.memory_location_handle(cell).ok_or_else(|| {
+                    StrongUpdateStop::Provider(SemanticProviderError::internal(
+                        "dereference binding origin is a stale lexical cell",
+                    ))
+                })?;
+                (None, AccessPathRoot::LexicalCell(handle), Vec::new())
             }
             MemoryLocationKind::Static { member } => (
                 None,
@@ -4161,9 +4253,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 whole_container_reads: HashSet::new(),
             }
         };
+        let binding_origins = BindingOriginIndex::from_semantics(procedure.semantics());
         let origins = ValueOriginFacts {
             load_origins: &load_origins,
             copied_reference_members: &copied_reference_members,
+            binding_origins: Some(&binding_origins),
         };
         let exact_integer =
             |value| exact_unsigned_integer_origin(procedure.semantics(), &load_origins, value);
@@ -4688,6 +4782,43 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             summary || location_has_unproven_exact_index(&location);
                         exact_index |= unproven_index;
                         let stored = ValueFlowEndpoint::Value(value_handle(procedure, *value)?);
+                        let dereference_targets = possible_dereference_store_targets(
+                            procedure,
+                            *memory,
+                            origins.binding_origins,
+                        );
+                        if !dereference_targets.is_empty() {
+                            completeness = EvidenceCompleteness::Partial(
+                                "dereference store may target multiple or incomplete binding origins"
+                                    .into(),
+                            );
+                            open = true;
+                        }
+                        for target in dereference_targets {
+                            let (target, _) = materialize_abstract_location(
+                                procedure,
+                                AccessPathDraft {
+                                    root: AccessPathRootDraft::LexicalCell(target),
+                                    selectors: Vec::new(),
+                                    tail: AccessPathTail::Exact,
+                                },
+                                *self.limits(),
+                            )?;
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                source: stored.clone(),
+                                target: ValueFlowEndpoint::Location(Box::new(target)),
+                                quality: Some((
+                                    ProofStatus::Unproven(
+                                        "dereference store has multiple or incomplete binding origins"
+                                            .into(),
+                                    ),
+                                    EvidenceCompleteness::Partial(
+                                        "dereference store may target multiple bindings".into(),
+                                    ),
+                                )),
+                            });
+                        }
                         // #2453, the write direction. Every element store also
                         // writes the wildcard cell, which is what an unprovable
                         // subscript later reads.
@@ -4836,6 +4967,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         *location,
                         *value,
                         bases,
+                        origins.binding_origins,
                         &mut staged,
                         request.cancellation,
                     ) {
@@ -5471,6 +5603,15 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             // structurally proven; otherwise the missing operand keeps the
             // binding honestly open.
             let (actual, extra_evidence) = match (call_row.receiver, caller_receiver_binding) {
+                (Some(_), Some(CallerReceiverBinding::ModuleQualified(_))) => match construction {
+                    Some(result) => (
+                        Some(result),
+                        construction_evidence
+                            .map(|evidence| evidence_handle(call.procedure(), evidence))
+                            .transpose()?,
+                    ),
+                    None => (None, None),
+                },
                 (Some(actual_id), _) => (Some(actual_id), None),
                 (None, Some(CallerReceiverBinding::TypeQualified(qualifier)))
                     if callee.semantics().properties().receiver_binding
@@ -6777,6 +6918,7 @@ func arrayCopy() int {
             ValueOriginFacts {
                 load_origins: &load_origins,
                 copied_reference_members: &HashMap::default(),
+                binding_origins: None,
             },
             8,
             &crate::CancellationToken::default(),
@@ -7001,6 +7143,7 @@ func shifted(dynamic int) int {
                 ValueOriginFacts {
                     load_origins: &facts.load_origins,
                     copied_reference_members: &facts.copied_reference_members,
+                    binding_origins: None,
                 },
                 8,
                 &cancellation,
@@ -7072,6 +7215,7 @@ func shifted(dynamic int) int {
             ValueOriginFacts {
                 load_origins: &load_origins,
                 copied_reference_members: &HashMap::default(),
+                binding_origins: None,
             },
             8,
             &crate::CancellationToken::default(),
@@ -7119,6 +7263,7 @@ func shifted(dynamic int) int {
             ValueOriginFacts {
                 load_origins: &load_origins,
                 copied_reference_members: &HashMap::default(),
+                binding_origins: None,
             },
             8,
             &crate::CancellationToken::default(),

@@ -1136,6 +1136,111 @@ pub struct CodeQueryCallResultObligation {
     pub terminal: bool,
 }
 
+/// The bounded outcome of one normal-result-to-receiver subject projection.
+///
+/// Outcomes preserve why a receiver was not linked to an exact result
+/// occurrence instead of reducing every open case to a free-form reason.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryResultSubjectOutcome {
+    #[cfg_attr(feature = "query-result-fixtures", default)]
+    Proven,
+    RepeatableOrigin,
+    Unsupported,
+    Ambiguous,
+    UncertainReceiver,
+    MissingOrigin,
+    Cancelled,
+    BudgetExhausted,
+    Incomplete,
+}
+
+impl CodeQueryResultSubjectOutcome {
+    pub const LABELS: &'static [&'static str] = &[
+        "proven",
+        "repeatable_origin",
+        "unsupported",
+        "ambiguous",
+        "uncertain_receiver",
+        "missing_origin",
+        "cancelled",
+        "budget_exhausted",
+        "incomplete",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::RepeatableOrigin => "repeatable_origin",
+            Self::Unsupported => "unsupported",
+            Self::Ambiguous => "ambiguous",
+            Self::UncertainReceiver => "uncertain_receiver",
+            Self::MissingOrigin => "missing_origin",
+            Self::Cancelled => "cancelled",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// One receiver observation linked to a normal call-result reference subject,
+/// or a typed open row explaining why that link could not be established.
+///
+/// `subject_id` identifies a non-repeatable normal-result occurrence and its
+/// proven copies. It is not a runtime object identity: the result may be null,
+/// and different subjects may still refer to the same object.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryResultSubjectUse {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CodeQueryCallResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_site_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_site_ast_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_point_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_range: Option<CodeQueryRange>,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    pub outcome: CodeQueryResultSubjectOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub witness_event_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub conversion_witnesses: Vec<CodeQueryResultSubjectAssignment>,
+}
+
+/// Public projection of one exact typed Java assignment-conversion witness.
+/// The IDs identify resolver-proven source and target reference types; the
+/// assignment itself remains scoped to the source digest.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CodeQueryResultSubjectAssignment {
+    pub source_digest: String,
+    pub assignment: CodeQueryRange,
+    pub target_binding: CodeQueryRange,
+    pub source_type_id: String,
+    pub target_type_id: String,
+    pub conversion: &'static str,
+}
+
 /// One exact operation on a protected result, anchored at the operation rather
 /// than at the call that acquired the result.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -1267,6 +1372,19 @@ pub struct CodeQueryAssignmentRelation {
 /// policies select only `conflict`, `proven`, and `exhaustive` rows whose
 /// ordering is `unordered` and whose protection is `unprotected`.
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryUnresolvedCall {
+    /// Exact package/member identity when target resolution established one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<String>,
+    /// Why the call boundary remains open, such as `unmodeled_external` or
+    /// `dynamic_dispatch`.
+    pub reason: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+}
+
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryConcurrentAccessConflict {
     pub id: String,
@@ -1305,6 +1423,10 @@ pub struct CodeQueryConcurrentAccessConflict {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub reasons: Vec<String>,
+    /// Call boundaries that contribute `unresolved_target` to this row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub unresolved_calls: Vec<CodeQueryUnresolvedCall>,
 }
 
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
@@ -1586,6 +1708,12 @@ pub struct CodeQueryDecoratedParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_id: Option<String>,
     pub decorator_name: String,
+    /// Exact Java annotation declaration, independently proved from its type
+    /// namespace and lexical position. Missing evidence never admits a source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_type: Option<Box<CodeQueryDeclaration>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_status: Option<crate::analyzer::JavaAnnotationTypeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

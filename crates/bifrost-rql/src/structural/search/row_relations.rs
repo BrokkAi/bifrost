@@ -453,7 +453,7 @@ pub(super) fn inverse_edge_expansions(
 ) -> Vec<PipelineExpansion> {
     let result = edge_cache.inverse_for(analyzer, &declaration.unit, cancellation);
     let language = crate::analyzer::common::language_for_file(declaration.unit.source());
-    edge_cache.report_completeness(&declaration.unit.fq_name(), language, &result, diagnostics);
+    edge_cache.report_inverse_completeness(&declaration.unit, language, &result, diagnostics);
     edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
 }
 

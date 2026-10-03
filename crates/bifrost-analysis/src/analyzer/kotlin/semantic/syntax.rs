@@ -460,6 +460,14 @@ pub(super) fn assignment_parts<'tree>(
     Some((target, value))
 }
 
+/// Whether an `assignment` uses a compound operator (`+=`, `-=`, `*=`, `/=`,
+/// `%=`). The grammar spells the operator as an anonymous token.
+pub(super) fn is_compound_assignment(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && matches!(child.kind(), "+=" | "-=" | "*=" | "/=" | "%="))
+}
+
 /// How a `directly_assignable_expression` names its destination.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum AssignmentTarget<'tree> {
@@ -801,4 +809,104 @@ pub(super) const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
     }
+}
+
+/// Procedure syntax roles for the Kotlin lowering. Every child of a
+/// `statements` block, and a non-block loop or branch body, is a statement;
+/// statement labels are siblings peeled off before lowering. `for` iterates
+/// and is not a conditional loop.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: kotlin_statement_kind,
+        loop_site: |node| {
+            use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+            match node.kind() {
+                "while_statement" => {
+                    let (condition, body) = while_statement_parts(node)?;
+                    Some(LoopSyntax {
+                        kind: LoopKind::While,
+                        body,
+                        condition: Some(condition),
+                    })
+                }
+                "do_while_statement" => {
+                    let (body, condition) = do_while_statement_parts(node)?;
+                    Some(LoopSyntax {
+                        kind: LoopKind::Do,
+                        body,
+                        condition: Some(condition),
+                    })
+                }
+                _ => None,
+            }
+        },
+        // Initializer procedures (class properties, primary-constructor
+        // defaults, enum entries) have expression bodies and no statements.
+        procedure_matches: |_, node| {
+            matches!(
+                node.kind(),
+                "function_declaration"
+                    | "secondary_constructor"
+                    | "anonymous_initializer"
+                    | "getter"
+                    | "setter"
+                    | "lambda_literal"
+                    | "anonymous_function"
+                    | "property_declaration"
+                    | "class_parameter"
+                    | "enum_entry"
+            )
+        },
+        nested_procedure: |node| {
+            matches!(
+                node.kind(),
+                "function_declaration"
+                    | "secondary_constructor"
+                    | "anonymous_initializer"
+                    | "getter"
+                    | "setter"
+                    | "lambda_literal"
+                    | "anonymous_function"
+                    | "class_declaration"
+                    | "object_declaration"
+                    | "object_literal"
+                    | "class_body"
+            )
+        },
+    };
+
+fn kotlin_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    let parent = node.parent()?;
+    let in_block = parent.kind() == "statements";
+    let single_body = parent.kind() == "control_structure_body" && node.kind() != "statements";
+    if !(in_block || single_body)
+        || is_inert_statement(node.kind())
+        || matches!(node.kind(), "label" | "line_comment" | "multiline_comment")
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "jump_expression" => {
+            let keyword = node.child(0)?.kind();
+            if keyword.starts_with("return") {
+                "return"
+            } else if keyword.starts_with("throw") {
+                "throw"
+            } else if keyword.starts_with("break") {
+                "break"
+            } else if keyword.starts_with("continue") {
+                "continue"
+            } else {
+                "expression"
+            }
+        }
+        "property_declaration" | "destructuring_declaration" => "local_declaration",
+        "while_statement" => "while",
+        "do_while_statement" => "do",
+        "for_statement" => "enhanced_for",
+        "if_expression" => "if",
+        "when_expression" => "switch",
+        "try_expression" => "try",
+        _ => "expression",
+    })
 }

@@ -17,15 +17,11 @@ use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::php_graph::syntax::{
     PhpMagicSurface, anonymous_function_capture_names, captured_local_scope_bindings,
-    collection_element_type_fq_name, constructor_parameter_type_node, declaration_doc_comment,
-    declared_callable_return_type_fq_name, declared_field_type_fq_name, declared_type_of,
-    dominating_instanceof_type_node, enclosing_array_map_collection,
-    enclosing_class_declaration_for_field, enclosing_foreach_collection,
-    foreach_value_reassigned_before, infer_constructor_assigned_field_type,
-    infer_indexed_field_element_type, infer_indexed_local_element_type,
-    infer_static_assigned_field_type, is_local_scope as php_is_local_scope, magic_member_names,
-    object_creation_type as php_object_creation_type, parameter_doc_element_type,
-    parameter_type_node, promoted_property_doc_element_type, relative_declared_type_keyword,
+    collection_element_type_fq_name, declared_callable_return_type_fq_name,
+    declared_field_type_fq_name, declared_type_of, dominating_instanceof_type_node,
+    enclosing_array_map_collection, enclosing_foreach_collection, foreach_value_reassigned_before,
+    infer_indexed_local_element_type, is_local_scope as php_is_local_scope, magic_member_names,
+    object_creation_type as php_object_creation_type, relative_declared_type_keyword,
     seed_assignment_binding, seed_parameter_types, static_member_parts as php_static_member_parts,
     unwrap_parenthesized as php_unwrap_parenthesized,
     variable_identifier as php_variable_identifier,
@@ -34,17 +30,17 @@ use crate::analyzer::usages::php_graph::{
     PhpAnalyzerFacts, php_dynamic_type_keyword, php_graph_source, resolve_php_type_arms,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::php_facts::{
+    PhpDeclarationKind, PhpDeclaredSourceType, PhpFieldWriteKind,
+};
 use brokk_bifrost_php::aliases::{PhpFileContextIndex, php_file_context_from_tree_at};
 use brokk_bifrost_php::graph::PhpCallableFacts;
-use brokk_bifrost_php::graph_support::{php_direct_declared_class_parent, php_is_interface};
-use brokk_bifrost_php::phpdoc::{
-    return_element_type as phpdoc_return_element_type,
-    return_nominal_type as phpdoc_return_nominal_type, var_element_type as phpdoc_var_element_type,
-    var_nominal_type as phpdoc_var_nominal_type,
+use brokk_bifrost_php::graph::syntax::{
+    canonical_declared_type, canonical_doc_element_type, canonical_doc_nominal_type,
+    canonical_field_element_type, canonical_inferred_field_type,
 };
-
-const PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
-    crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;
+use brokk_bifrost_php::graph_support::{php_direct_declared_class_parent, php_is_interface};
+use brokk_bifrost_php::source_facts::{PhpFileSourceFacts, PhpSourceFactProvider};
 
 pub(crate) struct PhpDefinitionProvider<'a> {
     php: &'a PhpAnalyzer,
@@ -1936,46 +1932,51 @@ fn php_parent_fqn(
     }
 }
 
+fn php_canonical_source_bounded(
+    php: &PhpAnalyzer,
+    file: &ProjectFile,
+    session: &ResolutionSession,
+) -> Option<Arc<PhpFileSourceFacts>> {
+    if !session.summary_step() {
+        return None;
+    }
+    let Some(source) = php.php_source_facts_while(file, &|| session.scope_step()) else {
+        session.mark_scope_incomplete();
+        return None;
+    };
+    for _ in 0..source.facts.declarations.len()
+        + source.facts.contexts.len()
+        + source.facts.aliases.len()
+        + source.facts.writes.len()
+    {
+        if !session.scope_step() {
+            return None;
+        }
+    }
+    session.observe_cancellation().then_some(source)
+}
+
 fn php_direct_ancestor_fqns_bounded(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner: &CodeUnit,
     session: &ResolutionSession,
 ) -> Vec<String> {
-    if !session.summary_step() {
-        return Vec::new();
-    }
-    let Some((prepared, range)) = php_prepared_declaration_bounded(php, owner, session) else {
-        return Vec::new();
-    };
-    let source = prepared.source();
-    let root = prepared.tree().root_node();
-    let Some(declaration) = php_declaration_node_bounded(root, source, owner, &range, session)
-    else {
-        return Vec::new();
-    };
-    let Some(ctx) = php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
-        session.scope_step()
-    }) else {
-        return Vec::new();
-    };
-    let Some(type_nodes) = php_direct_supertype_nodes_bounded(declaration, session) else {
+    let Some(source) = php_canonical_source_bounded(php, owner.source(), session) else {
         return Vec::new();
     };
     let mut ancestors = Vec::new();
-    for type_node in type_nodes {
-        if !session.scope_step() {
-            return Vec::new();
-        }
-        let Some(fqn) = resolve_php_type_node(type_node, source, &ctx, || session.scope_step())
-        else {
-            continue;
-        };
-        if php_fqn_candidates(support, &fqn)
-            .iter()
-            .any(CodeUnit::is_class)
-        {
-            ancestors.push(fqn);
+    for declaration in source.declarations_for(owner) {
+        for fqn in &declaration.supertypes {
+            if !session.scope_step() {
+                return Vec::new();
+            }
+            if php_fqn_candidates(support, fqn)
+                .iter()
+                .any(CodeUnit::is_class)
+            {
+                ancestors.push(fqn.clone());
+            }
         }
     }
     ancestors.sort();
@@ -1989,44 +1990,16 @@ fn php_direct_class_parent_fqn_bounded(
     owner: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<String> {
-    if !session.summary_step() {
+    let source = php_canonical_source_bounded(php, owner.source(), session)?;
+    let mut declarations = source.declarations_for(owner);
+    let first = declarations.next()?.class_parent.as_ref()?;
+    if declarations.any(|declaration| declaration.class_parent.as_ref() != Some(first)) {
         return None;
     }
-    let (prepared, range) = php_prepared_declaration_bounded(php, owner, session)?;
-    let source = prepared.source();
-    let root = prepared.tree().root_node();
-    let declaration = php_declaration_node_bounded(root, source, owner, &range, session)?;
-    let ctx = php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
-        session.scope_step()
-    })?;
-    let mut cursor = declaration.walk();
-    for clause in declaration.named_children(&mut cursor) {
-        if !session.scope_step() {
-            return None;
-        }
-        if clause.kind() != "base_clause" {
-            continue;
-        }
-        let mut bases = clause.walk();
-        for base in clause.named_children(&mut bases) {
-            if !session.scope_step() {
-                return None;
-            }
-            if !matches!(
-                base.kind(),
-                "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
-            ) {
-                continue;
-            }
-            let fqn = resolve_php_type_node(base, source, &ctx, || session.scope_step())?;
-            return php_fqn_candidates(support, &fqn)
-                .iter()
-                .any(CodeUnit::is_class)
-                .then_some(fqn);
-        }
-        return None;
-    }
-    None
+    php_fqn_candidates(support, first)
+        .iter()
+        .any(CodeUnit::is_class)
+        .then(|| first.clone())
 }
 
 fn php_direct_ancestor_units_bounded(
@@ -2051,251 +2024,22 @@ fn php_direct_ancestor_units_bounded(
     ancestors
 }
 
-fn php_prepared_declaration_bounded(
-    php: &PhpAnalyzer,
-    owner: &CodeUnit,
-    session: &ResolutionSession,
-) -> Option<(
-    Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>,
-    Range,
-)> {
-    let ranges = session.query_limited_rows(|limit| php.ranges_limited(owner, limit));
-    let [range] = ranges.as_slice() else {
-        return None;
-    };
-    let prepared = php_prepared_syntax_bounded(php, owner.source(), session)?;
-    Some((prepared, *range))
-}
-
-fn php_declaration_node_bounded<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    owner: &CodeUnit,
-    range: &Range,
-    session: &ResolutionSession,
-) -> Option<Node<'tree>> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if !session.scope_step() {
-            return None;
-        }
-        if node.end_byte() < range.start_byte || node.start_byte() > range.end_byte {
-            continue;
-        }
-        if node.end_byte() == range.end_byte
-            && node.start_byte() >= range.start_byte
-            && php_declaration_node_matches_owner(node, source, owner, session)?
-        {
-            return Some(node);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !session.scope_step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index)
-                && child.end_byte() >= range.start_byte
-                && child.start_byte() <= range.end_byte
-            {
-                stack.push(child);
-            }
-        }
-    }
-    None
-}
-
-fn php_declaration_node_matches_owner(
-    node: Node<'_>,
-    source: &str,
-    owner: &CodeUnit,
-    session: &ResolutionSession,
-) -> Option<bool> {
-    let expected = owner.identifier();
-    if owner.is_function() {
-        if !matches!(node.kind(), "function_definition" | "method_declaration") {
-            return Some(false);
-        }
-        let name = node.child_by_field_name("name")?;
-        if !session.scope_step() {
-            return None;
-        }
-        return Some(php_node_text(name, source) == expected);
-    }
-    if owner.is_class() {
-        if !matches!(
-            node.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "trait_declaration"
-                | "enum_declaration"
-        ) {
-            return Some(false);
-        }
-        let name = node.child_by_field_name("name")?;
-        if !session.scope_step() {
-            return None;
-        }
-        return Some(php_node_text(name, source) == expected);
-    }
-    if !owner.is_field() {
-        return Some(false);
-    }
-    match node.kind() {
-        "property_promotion_parameter" => {
-            let name = node.child_by_field_name("name")?;
-            if !session.scope_step() {
-                return None;
-            }
-            Some(php_variable_identifier(name, source) == expected)
-        }
-        "property_declaration" => {
-            let mut cursor = node.walk();
-            for element in node.named_children(&mut cursor) {
-                if !session.scope_step() {
-                    return None;
-                }
-                if element.kind() != "property_element" {
-                    continue;
-                }
-                let Some(name) = element.child_by_field_name("name") else {
-                    continue;
-                };
-                if !session.scope_step() {
-                    return None;
-                }
-                if php_variable_identifier(name, source) == expected {
-                    return Some(true);
-                }
-            }
-            Some(false)
-        }
-        _ => Some(false),
-    }
-}
-
-fn php_direct_supertype_nodes_bounded<'tree>(
-    declaration: Node<'tree>,
-    session: &ResolutionSession,
-) -> Option<Vec<Node<'tree>>> {
-    let mut type_nodes = Vec::new();
-    let mut body = None;
-    let mut cursor = declaration.walk();
-    for child in declaration.named_children(&mut cursor) {
-        if !session.scope_step() {
-            return None;
-        }
-        if matches!(child.kind(), "base_clause" | "class_interface_clause") {
-            let mut types = child.walk();
-            for type_node in child.named_children(&mut types) {
-                if !session.scope_step() {
-                    return None;
-                }
-                if matches!(
-                    type_node.kind(),
-                    "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
-                ) {
-                    type_nodes.push(type_node);
-                }
-            }
-        } else if child.kind() == "declaration_list" {
-            body = Some(child);
-        }
-    }
-    if declaration.kind() != "class_declaration" {
-        return Some(type_nodes);
-    }
-    let Some(body) = body else {
-        return Some(type_nodes);
-    };
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        if !session.scope_step() {
-            return None;
-        }
-        if child.kind() != "use_declaration" {
-            continue;
-        }
-        let mut traits = child.walk();
-        for type_node in child.named_children(&mut traits) {
-            if !session.scope_step() {
-                return None;
-            }
-            if matches!(
-                type_node.kind(),
-                "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
-            ) {
-                type_nodes.push(type_node);
-            }
-        }
-    }
-    Some(type_nodes)
-}
-
 fn php_declaration_kind_bounded(
     php: &PhpAnalyzer,
     owner: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<&'static str> {
-    let ranges = session.query_limited_rows(|limit| php.ranges_limited(owner, limit));
-    let start = ranges.iter().map(|range| range.start_byte).min()?;
-    let end = ranges.iter().map(|range| range.end_byte).max()?;
-    let prepared = php_prepared_syntax_bounded(php, owner.source(), session)?;
-    let mut stack = vec![prepared.tree().root_node()];
-    while let Some(node) = stack.pop() {
-        if !session.scope_step() {
-            return None;
-        }
-        if matches!(
-            node.kind(),
-            "class_declaration" | "interface_declaration" | "trait_declaration"
-        ) && node.start_byte() >= start
-            && node.end_byte() <= end
-        {
-            return Some(node.kind());
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !session.scope_step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index)
-                && child.end_byte() >= start
-                && child.start_byte() <= end
-            {
-                stack.push(child);
-            }
-        }
-    }
-    None
-}
-
-fn php_prepared_syntax_bounded(
-    php: &PhpAnalyzer,
-    file: &ProjectFile,
-    session: &ResolutionSession,
-) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-    use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
-
-    if !session.scope_step() {
+    let source = php_canonical_source_bounded(php, owner.source(), session)?;
+    let mut declarations = source.declarations_for(owner);
+    let first = declarations.next()?.kind;
+    if declarations.any(|declaration| declaration.kind != first) {
         return None;
     }
-    let scope = crate::analyzer::AnalyzerQueryScope::new(php);
-    match php.prepared_syntax_limited_cancellable(
-        scope.token(),
-        file,
-        PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
-        session.cancellation(),
-    ) {
-        PreparedSyntaxLimitedOutcome::Available(_, prepared) => {
-            session.observe_cancellation().then_some(prepared)
-        }
-        PreparedSyntaxLimitedOutcome::Exceeded(_) => {
-            session.mark_scope_incomplete();
-            None
-        }
-        PreparedSyntaxLimitedOutcome::Cancelled => {
-            session.observe_cancellation();
-            None
-        }
-        PreparedSyntaxLimitedOutcome::Unavailable => None,
+    match first {
+        PhpDeclarationKind::Class => Some("class_declaration"),
+        PhpDeclarationKind::Interface => Some("interface_declaration"),
+        PhpDeclarationKind::Trait => Some("trait_declaration"),
+        _ => None,
     }
 }
 
@@ -2647,24 +2391,10 @@ fn php_declared_callable_return_element_type_fqn_bounded(
     if !callable.is_function() {
         return None;
     }
-    let (prepared, range) = php_prepared_declaration_bounded(php, callable, session)?;
-    let source = prepared.source();
-    let root = prepared.tree().root_node();
-    let declaration = php_declaration_node_bounded(root, source, callable, &range, session)?;
-    let raw = phpdoc_return_element_type(declaration_doc_comment(declaration, source)?)?;
-    let ctx = php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
-        session.scope_step()
-    })?;
-    let mut arms = resolve_php_type_arms(&raw, &ctx);
-    (arms.len() == 1).then(|| arms.remove(0))
+    php_canonical_source_bounded(php, callable.source(), session)?;
+    canonical_doc_element_type(php, callable)
 }
 
-/// What the declared return or field type of `unit` proves, read from the
-/// declaration's own parser nodes.
-///
-/// [`php_declared_unit_type_fqn_bounded`] is this computation's exactly-one-arm
-/// case, so a chain step that must hand on one owner and a final receiver that
-/// may carry a union read the same declaration the same way.
 fn php_declared_unit_type_bounded(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -2684,179 +2414,104 @@ fn php_declared_unit_type_bounded_inner(
     if !unit.is_function() && !unit.is_field() {
         return None;
     }
-    let (prepared, range) = php_prepared_declaration_bounded(php, unit, session)?;
-    let source = prepared.source();
-    let root = prepared.tree().root_node();
-    let declaration = php_declaration_node_bounded(root, source, unit, &range, session)?;
-    let field_name = match declaration.kind() {
-        "function_definition" | "method_declaration" => "return_type",
-        "property_declaration" | "property_promotion_parameter" => "type",
-        _ => return None,
-    };
-    let Some(type_node) = declaration.child_by_field_name(field_name) else {
-        if unit.is_function() {
-            let raw = phpdoc_return_nominal_type(declaration_doc_comment(declaration, source)?)?;
-            let ctx =
-                php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
-                    session.scope_step()
-                })?;
-            return Some(PhpDeclaredType::nominal(resolve_php_type_arms(&raw, &ctx)));
-        }
-        if !unit.is_field() {
-            return None;
-        }
-        let owner = php.parent_of(unit).filter(CodeUnit::is_class)?;
-        let class = enclosing_class_declaration_for_field(
-            root,
-            source,
-            &owner,
-            std::slice::from_ref(&range),
-            || session.scope_step(),
-        )?;
-        let ctx = php_file_context_from_tree_at(root, source, class.start_byte(), || {
-            session.scope_step()
-        })?;
-        let enclosing = php_enclosing_type_from_tree(support, declaration, source, &ctx, session)?;
-        if let Some(raw) = phpdoc_var_nominal_type(declaration_doc_comment(declaration, source)?) {
-            return Some(PhpDeclaredType::nominal(resolve_php_type_arms(&raw, &ctx)));
-        }
-        let inferred = infer_constructor_assigned_field_type(
-            class,
-            source,
-            unit.identifier(),
-            || session.scope_step(),
-            |right| {
-                let right = php_unwrap_parenthesized(right);
-                if right.kind() == "object_creation_expression" {
-                    let type_node = php_object_creation_type_with_session(right, Some(session))?;
-                    return php_bounded_type_reference_fqn(
-                        php, support, type_node, source, &ctx, &enclosing, session,
-                    );
-                }
-                let type_node =
-                    constructor_parameter_type_node(right, source, || session.scope_step())?;
-                let mut arms =
-                    resolve_php_type_node_arms(type_node, source, &ctx, || session.scope_step());
-                (arms.len() == 1).then(|| arms.remove(0))
-            },
-        )
-        .or_else(|| {
-            infer_static_assigned_field_type(
-                class,
-                source,
-                unit.identifier(),
-                || session.scope_step(),
-                |right| {
-                    let right = php_unwrap_parenthesized(right);
-                    let type_node = (right.kind() == "object_creation_expression")
-                        .then(|| php_object_creation_type_with_session(right, Some(session)))
-                        .flatten()?;
-                    php_bounded_type_reference_fqn(
-                        php, support, type_node, source, &ctx, &enclosing, session,
-                    )
-                },
-            )
-        });
-        return inferred.map(|fqn| PhpDeclaredType::Nominal(vec![fqn]));
-    };
-    if !session.scope_step() {
+    let source = php_canonical_source_bounded(php, unit.source(), session)?;
+    let mut declarations = source.declarations_for(unit);
+    let first = declarations.next()?;
+    if declarations.any(|declaration| {
+        declaration.declared_type != first.declared_type
+            || declaration.declared_type_occurrence.is_some()
+                != first.declared_type_occurrence.is_some()
+    }) {
         return None;
     }
-    let ctx = php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
-        session.scope_step()
-    })?;
-    if let Some(keyword) = php_relative_type_keyword_bounded(type_node, source, session) {
-        let enclosing = php_enclosing_type_from_tree(support, declaration, source, &ctx, session)?;
-        let relative =
-            if keyword.eq_ignore_ascii_case("self") || keyword.eq_ignore_ascii_case("static") {
-                enclosing.fqn().map(str::to_string)
-            } else if keyword.eq_ignore_ascii_case("parent") {
-                let parent_fqn = enclosing.direct_parent_fqn?;
-                let candidates = php_fqn_candidates(support, &parent_fqn);
-                let [parent] = candidates.as_slice() else {
+    if matches!(
+        first.declared_type,
+        PhpDeclaredSourceType::SelfType
+            | PhpDeclaredSourceType::StaticType
+            | PhpDeclaredSourceType::ParentType
+    ) {
+        let owner = php.parent_of(unit).filter(CodeUnit::is_class)?;
+        let candidates = php_fqn_candidates(support, &owner.fq_name());
+        let [owner] = candidates.as_slice() else {
+            return None;
+        };
+        if !owner.is_class() {
+            return None;
+        }
+        if first.declared_type != PhpDeclaredSourceType::ParentType {
+            return Some(PhpDeclaredType::Nominal(vec![owner.fq_name()]));
+        }
+        let parent = php_direct_class_parent_fqn_bounded(php, support, owner, session)?;
+        let candidates = php_fqn_candidates(support, &parent);
+        let [candidate] = candidates.as_slice() else {
+            return None;
+        };
+        return candidate
+            .is_class()
+            .then_some(PhpDeclaredType::Nominal(vec![parent]));
+    }
+    let declared = canonical_declared_type(php, unit);
+    if first.declared_type_occurrence.is_some() || declared != PhpDeclaredType::Unknown {
+        return Some(declared);
+    }
+    if let Some(doc) = canonical_doc_nominal_type(php, unit) {
+        return Some(PhpDeclaredType::Nominal(vec![doc]));
+    }
+    if unit.is_field() {
+        let owner = php.parent_of(unit).filter(CodeUnit::is_class)?;
+        for write in source.facts.writes.iter().filter(|write| {
+            write.field == unit.identifier()
+                && write.kind != PhpFieldWriteKind::Indexed
+                && source
+                    .declarations_for(&owner)
+                    .any(|class| class.declaration == write.class)
+        }) {
+            if matches!(
+                write.value_type,
+                PhpDeclaredSourceType::SelfType
+                    | PhpDeclaredSourceType::StaticType
+                    | PhpDeclaredSourceType::ParentType
+            ) {
+                let candidates = php_fqn_candidates(support, &owner.fq_name());
+                let [candidate] = candidates.as_slice() else {
                     return None;
                 };
-                parent.is_class().then_some(parent_fqn)
-            } else {
-                None
-            };
-        return Some(PhpDeclaredType::nominal(relative.into_iter().collect()));
+                if !candidate.is_class() {
+                    return None;
+                }
+                if write.value_type == PhpDeclaredSourceType::ParentType {
+                    let parent =
+                        php_direct_class_parent_fqn_bounded(php, support, &owner, session)?;
+                    let candidates = php_fqn_candidates(support, &parent);
+                    let [candidate] = candidates.as_slice() else {
+                        return None;
+                    };
+                    if !candidate.is_class() {
+                        return None;
+                    }
+                }
+            }
+        }
     }
-    if let Some(builtin) = php_dynamic_type_keyword_node(type_node, source, || session.scope_step())
-    {
-        return Some(PhpDeclaredType::Dynamic(builtin));
-    }
-    Some(PhpDeclaredType::nominal(resolve_php_type_node_arms(
-        type_node,
-        source,
-        &ctx,
-        || session.scope_step(),
-    )))
+    unit.is_field()
+        .then(|| {
+            canonical_inferred_field_type(php, unit)
+                .map(|name| PhpDeclaredType::Nominal(vec![name]))
+        })
+        .flatten()
 }
 
 fn php_declared_field_element_type_fqn_bounded(
     php: &PhpAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    _support: &dyn BoundedDefinitionLookup,
     field: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<String> {
     if !field.is_field() {
         return None;
     }
-    let owner = php.parent_of(field).filter(CodeUnit::is_class)?;
-    let (prepared, range) = php_prepared_declaration_bounded(php, field, session)?;
-    let source = prepared.source();
-    let root = prepared.tree().root_node();
-    let declaration = php_declaration_node_bounded(root, source, field, &range, session)?;
-    let class = enclosing_class_declaration_for_field(
-        root,
-        source,
-        &owner,
-        std::slice::from_ref(&range),
-        || session.scope_step(),
-    )?;
-    let ctx =
-        php_file_context_from_tree_at(root, source, class.start_byte(), || session.scope_step())?;
-    let enclosing = php_enclosing_type_from_tree(support, class, source, &ctx, session)?;
-    infer_indexed_field_element_type(
-        class,
-        source,
-        field.identifier(),
-        || session.scope_step(),
-        |right| {
-            let right = php_unwrap_parenthesized(right);
-            if right.kind() == "object_creation_expression" {
-                let type_node = php_object_creation_type_with_session(right, Some(session))?;
-                return php_bounded_type_reference_fqn(
-                    php, support, type_node, source, &ctx, &enclosing, session,
-                );
-            }
-            let type_node = parameter_type_node(right, source, || session.scope_step())?;
-            let mut arms =
-                resolve_php_type_node_arms(type_node, source, &ctx, || session.scope_step());
-            (arms.len() == 1).then(|| arms.remove(0))
-        },
-    )
-    .or_else(|| {
-        let raw = phpdoc_var_element_type(declaration_doc_comment(declaration, source)?)?;
-        resolve_php_type(&raw, &ctx)
-    })
-    .or_else(|| {
-        let raw = promoted_property_doc_element_type(declaration, source, || session.scope_step())?;
-        resolve_php_type(&raw, &ctx)
-    })
-    .or_else(|| {
-        infer_constructor_assigned_field_type(
-            class,
-            source,
-            field.identifier(),
-            || session.scope_step(),
-            |right| {
-                let raw = parameter_doc_element_type(right, source, || session.scope_step())?;
-                resolve_php_type(&raw, &ctx)
-            },
-        )
-    })
+    php_canonical_source_bounded(php, field.source(), session)?;
+    canonical_field_element_type(php, field)
 }
 
 fn php_relative_type_keyword_bounded<'a>(
@@ -4374,6 +4029,26 @@ class Duplicate extends BaseB {}
     }
 
     #[test]
+    fn bounded_constructor_relative_type_rejects_an_ambiguous_owner() {
+        let first = "<?php namespace Demo; class Duplicate { public $value; public function __construct() { $this->value = new self(); } }";
+        let second = "<?php namespace Demo; class Duplicate {}";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Php,
+            &[("First.php", first), ("Second.php", second)],
+        );
+        let outcome = declared_php_type_outcome(
+            &fixture,
+            "Demo.Duplicate.value",
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        assert!(
+            matches!(outcome, BoundedResolution::Complete { value: None, .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn bounded_relative_return_stops_at_tiny_budget_and_on_cancellation() {
         let source = r#"<?php
 namespace Demo;
@@ -4394,7 +4069,7 @@ class RelativeFactory {
             } if work.scope_nodes == budget.max_scope_nodes
         ));
 
-        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
         let cancellation_outcome = declared_php_type_outcome(
             &fixture,
             "Demo.RelativeFactory.make",

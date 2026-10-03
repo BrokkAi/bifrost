@@ -1,9 +1,8 @@
 //! C++ structural spec for `query_code`.
 
-use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CallSiteContext, CallSiteFacts,
@@ -20,13 +19,15 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
+    ScopeFormation, default_scope_formation,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, named_children_iter, node_range};
+use brokk_bifrost_core::analyzer::{Language, Range};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
@@ -73,6 +74,11 @@ pub const CPP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("catch_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::Loop),
+    ("for_range_loop", NormalizedKind::Loop),
+    // A braced block is a scope, and so is a `switch`, whose condition may
+    // declare a variable.
+    ("compound_statement", NormalizedKind::Block),
+    ("switch_statement", NormalizedKind::Block),
     ("while_statement", NormalizedKind::WhileLoop),
     ("do_statement", NormalizedKind::WhileLoop),
 ];
@@ -132,7 +138,7 @@ fn namespace_name_node<'tree>(namespace: Node<'tree>) -> Option<Node<'tree>> {
     Some(current)
 }
 
-fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
+pub(crate) fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = declarator;
     loop {
         match current.kind() {
@@ -315,6 +321,200 @@ fn cpp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
     None
 }
 
+/// What declares a C or C++ binder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CppBinderOwner<'tree> {
+    /// A parameter of a function definition, a lambda or a `catch` clause.
+    Parameter,
+    /// A local declaration; the node is the declarator the name completes.
+    Local(Node<'tree>),
+    /// A range-based `for` variable; the node is the loop.
+    RangeFor(Node<'tree>),
+    /// A structured binding; the node is the binding declarator.
+    StructuredBinding(Node<'tree>),
+    /// A lambda init-capture (`[x = y]`).
+    InitCapture,
+}
+
+/// Declarator wrappers that carry a name inward through their `declarator`
+/// field or their single named child.
+const CPP_DECLARATOR_WRAPPERS: &[&str] = &[
+    "pointer_declarator",
+    "array_declarator",
+    "reference_declarator",
+    "parenthesized_declarator",
+    "attributed_declarator",
+    "variadic_declarator",
+];
+
+/// What declares `node` as a C or C++ variable, or `None` when it is not a
+/// variable binder.
+///
+/// The name is found by walking up the declarator chain. A name that reaches
+/// a function declarator without passing a pointer or reference declarator
+/// names a function; one that does names a function pointer variable. A
+/// parameter binds only in a function definition, a lambda or a `catch`
+/// clause; a prototype's parameter names bind nothing. A file-scope or
+/// member declaration names a member or a global, not a lexical binding.
+fn cpp_binder_owner<'tree>(
+    node: Node<'tree>,
+    parent: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<CppBinderOwner<'tree>> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let mut child = node;
+    let mut current = parent(node)?;
+    let mut indirect = false;
+    loop {
+        let field = field_name_in_parent(current, child);
+        match current.kind() {
+            kind if CPP_DECLARATOR_WRAPPERS.contains(&kind) => {
+                if field.is_some() && field != Some("declarator") {
+                    return None;
+                }
+                indirect |= matches!(kind, "pointer_declarator" | "reference_declarator");
+            }
+            "function_declarator" => {
+                if field != Some("declarator") || !indirect {
+                    return None;
+                }
+            }
+            "init_declarator" => {
+                if field != Some("declarator") {
+                    return None;
+                }
+            }
+            "declaration" => {
+                if field != Some("declarator") {
+                    return None;
+                }
+                let local = std::iter::successors(parent(current), |node| parent(*node))
+                    .take_while(|node| {
+                        !matches!(
+                            node.kind(),
+                            "translation_unit"
+                                | "field_declaration_list"
+                                | "declaration_list"
+                                | "namespace_definition"
+                        )
+                    })
+                    .any(|node| {
+                        matches!(
+                            node.kind(),
+                            "compound_statement" | "for_statement" | "condition_clause"
+                        )
+                    });
+                // The name's scope starts at the end of its declarator, before
+                // any initializer.
+                let declarator = if child.kind() == "init_declarator" {
+                    child.child_by_field_name("declarator")?
+                } else {
+                    child
+                };
+                return local.then_some(CppBinderOwner::Local(declarator));
+            }
+            "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "variadic_parameter_declaration" => {
+                if field != Some("declarator") {
+                    return None;
+                }
+                let list = parent(current)?;
+                let owner = parent(list)?;
+                let binds = match owner.kind() {
+                    "catch_clause" => true,
+                    "abstract_function_declarator" => {
+                        parent(owner).is_some_and(|lambda| lambda.kind() == "lambda_expression")
+                    }
+                    "function_declarator" => {
+                        let mut declarator = owner;
+                        loop {
+                            let Some(up) = parent(declarator) else {
+                                break false;
+                            };
+                            if up.kind() == "function_definition" {
+                                break field_name_in_parent(up, declarator) == Some("declarator");
+                            }
+                            if !CPP_DECLARATOR_WRAPPERS.contains(&up.kind()) {
+                                break false;
+                            }
+                            declarator = up;
+                        }
+                    }
+                    _ => false,
+                };
+                return binds.then_some(CppBinderOwner::Parameter);
+            }
+            "for_range_loop" => {
+                return (field == Some("declarator")).then_some(CppBinderOwner::RangeFor(current));
+            }
+            "structured_binding_declarator" => {
+                return Some(CppBinderOwner::StructuredBinding(current));
+            }
+            "lambda_capture_initializer" => {
+                return (field == Some("left")).then_some(CppBinderOwner::InitCapture);
+            }
+            _ => return None,
+        }
+        child = current;
+        current = parent(current)?;
+    }
+}
+
+/// Whether `node` declares a C or C++ variable, climbing through the walk's
+/// parent index: asking `Node::parent` re-descends from the root, which is
+/// quadratic over a large file.
+fn cpp_is_binder<'tree>(node: Node<'tree>, parents: &ParentIndex<'tree>) -> bool {
+    cpp_binder_owner(node, |node| parents.parent(node)).is_some()
+}
+
+/// The binding one C or C++ binder token introduces, and the interval it is
+/// in effect over.
+///
+/// A parameter or init-capture is in effect over its whole function, lambda
+/// or catch clause. A local is in effect from the end of its declarator: C
+/// and C++ start a name's scope there, before its initializer, so in
+/// `int x = x;` the right side reads the new `x`. A condition declaration is
+/// therefore in effect over the rest of its `if`, including `else`. A
+/// range-`for` variable is in effect over the loop body, and a structured
+/// binding from the end of its binding declarator.
+fn cpp_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let binding = |kind, hoisting, activation| {
+        Some(BindingActivation {
+            kind,
+            hoisting,
+            activation,
+        })
+    };
+    let after = |node: Node<'_>| Range {
+        start_byte: node.end_byte(),
+        end_byte: scope.end_byte,
+        start_line: node.end_position().row + 1,
+        end_line: scope.end_line,
+    };
+    match cpp_binder_owner(binder, |node| node.parent())? {
+        CppBinderOwner::Parameter | CppBinderOwner::InitCapture => {
+            binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope)
+        }
+        CppBinderOwner::Local(declarator) => binding(
+            BindingKind::Local,
+            HoistingClass::SourceOrder,
+            after(declarator),
+        ),
+        CppBinderOwner::RangeFor(loop_node) => binding(
+            BindingKind::LoopVariable,
+            HoistingClass::DeclaredHead,
+            node_range(loop_node.child_by_field_name("body")?),
+        ),
+        CppBinderOwner::StructuredBinding(declarator) => binding(
+            BindingKind::Local,
+            HoistingClass::SourceOrder,
+            after(declarator),
+        ),
+    }
+}
+
 impl StructuralSpec for CppStructuralSpec {
     fn language(&self) -> Language {
         Language::Cpp
@@ -399,15 +599,34 @@ impl StructuralSpec for CppStructuralSpec {
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         static SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
             .supported(OccurrenceRole::MemberPosition)
-            .supported(OccurrenceRole::ValueReference);
+            .supported(OccurrenceRole::ValueReference)
+            .supported(OccurrenceRole::Binder);
         &SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        // C and C++ classify no scopes, binding intervals, import binders or
-        // package clause, but the call seams report per-candidate callable
-        // applicability (#1478 M3). The per-axis table states exactly that.
-        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
+        // C and C++ derive scopes and binding intervals; import binders and
+        // the package clause are not derived. The call seams report
+        // per-candidate callable applicability (#1478 M3).
+        static SUPPORT: LexicalEnvironmentSupport = LexicalEnvironmentSupport::NONE
+            .supported(EnvironmentAxis::Scopes)
+            .supported(EnvironmentAxis::BindingIntervals)
+            .supported(EnvironmentAxis::CallableApplicability);
+        &SUPPORT
+    }
+
+    /// An `if` statement is a scope: a C++ condition or init-statement
+    /// declaration is in effect in both branches and nowhere after.
+    fn scope_formation(&self, kind: NormalizedKind) -> ScopeFormation {
+        if kind == NormalizedKind::If {
+            ScopeFormation::BindingScope
+        } else {
+            default_scope_formation(kind)
+        }
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        cpp_binding_activation(binder, scope)
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
@@ -440,6 +659,8 @@ impl StructuralSpec for CppStructuralSpec {
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = cpp_member_position(node) {
             sink.occurrence_role(node, role);
+        } else if cpp_is_binder(node, sink.parents()) {
+            sink.occurrence_role(node, OccurrenceRole::Binder);
         }
 
         match kind {
@@ -729,7 +950,6 @@ mod tests {
         // fact id to start byte mapping to name the tokens.
         let language: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
         let compiled = CompiledKinds::compile(&language, CPP_STRUCTURAL_SPEC.kind_table());
-        let mut facts = HashMap::default();
         let mut start_by_fact = HashMap::default();
         let mut extractions = Vec::new();
         let mut pending = vec![tree.root_node()];
@@ -738,9 +958,7 @@ mod tests {
                 && let Some(kind) = compiled.kind_of(&node)
                 && CPP_STRUCTURAL_SPEC.should_extract(node, kind)
             {
-                let fact = facts.len() as u32;
-                facts.insert(node.id(), fact);
-                start_by_fact.insert(fact, node.start_byte());
+                start_by_fact.insert(node.id(), node.start_byte());
                 extractions.push((node.start_byte(), node, kind));
             }
             for index in (0..node.named_child_count()).rev() {
@@ -750,21 +968,22 @@ mod tests {
             }
         }
         extractions.sort_by_key(|(start, _, _)| *start);
-        let mut roles = Vec::new();
-        let mut occurrences = Vec::new();
+        let mut source_facts =
+            brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector::new(source);
         let parents = ParentIndex::new(tree.root_node());
-        let mut sink = RoleSink::new(&facts, &mut roles, &mut occurrences, 64, None, &parents);
+        let mut sink = RoleSink::new(&mut source_facts, 64, None, &parents);
         for (_, node, kind) in extractions {
             CPP_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
         }
-        assert_eq!(sink.into_parts().1, None);
+        let (_, _, occurrences, stop) = sink.into_parts();
+        assert_eq!(stop, None);
 
         let roles_at = |needle: &str| {
             let start = source.find(needle).expect("fixture token");
             occurrences
                 .iter()
-                .filter(|(fact, _)| start_by_fact[fact] == start)
-                .map(|(_, role)| *role)
+                .filter(|occurrence| start_by_fact[&occurrence.target_node] == start)
+                .map(|occurrence| occurrence.role)
                 .collect::<Vec<_>>()
         };
         // Free-function callees are value reads, including a qualified callee

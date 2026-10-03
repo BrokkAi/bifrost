@@ -21,6 +21,10 @@ use crate::analyzer::weighted_cache::{
 /// wrappers (JS a private struct, TS flat `Arc<..>`-per-cell fields); this is
 /// the reconciled shape.
 pub(crate) struct JsTsMemoCaches {
+    pub(crate) source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,
+    >,
     /// Declarations imported by a file, keyed by importing file.
     pub(crate) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     /// Raw file-path resolution targets of a file's imports (module specifier -> file), keyed by the
@@ -56,6 +60,12 @@ pub(crate) struct JsTsMemoCaches {
 impl JsTsMemoCaches {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
+            source_facts: build_weighted_cache(
+                budget_bytes / 8,
+                |_, value: &Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>| {
+                    u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
+                },
+            ),
             imported_code_units: build_weighted_cache(budget_bytes / 3, weight_code_unit_set),
             imported_target_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),

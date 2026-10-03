@@ -11,8 +11,7 @@ use crate::profiling;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_cpp::adapter::{
     CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver, cpp_projections_differ,
-    parse_cpp_c_reading_with_orphaned_namespaces, parse_cpp_file,
-    parse_cpp_file_with_ancestry_and_orphaned_namespaces,
+    parse_cpp_file, parse_cpp_file_with_readings,
 };
 use brokk_bifrost_cpp::imports::{claimable_include_demand, included_claimable_files};
 use brokk_bifrost_cpp::queries::CPP_QUERY_DIRECTORY;
@@ -31,6 +30,22 @@ pub(crate) const CPP_C_STORAGE_LANGUAGE_KEY: &str = "cpp:c";
 pub struct CppAdapter;
 
 impl LanguageAdapter for CppAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::cpp::source_publication::SOURCE_STORAGE)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn cpp_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::cpp_facts::CPP_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::Cpp
     }
@@ -112,6 +127,17 @@ impl LanguageAdapter for CppAdapter {
         parse_cpp_file(file, source, tree)
     }
 
+    fn possible_additional_storage_language_keys_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> &'static [&'static str] {
+        if super::imports::is_cpp_translation_unit(file) {
+            &[]
+        } else {
+            &[CPP_C_STORAGE_LANGUAGE_KEY]
+        }
+    }
+
     /// A header's second reading (#1970).
     ///
     /// A translation unit's compilation language is settled by its own
@@ -142,43 +168,21 @@ impl LanguageAdapter for CppAdapter {
             crate::analyzer::tree_sitter_analyzer::ParsedFile,
         )>,
     ) {
-        let root = tree.root_node();
-        // One index over this tree serves both readings: the parent relation is
-        // a property of the tree, and it costs a hash entry per node.
-        let ancestry = ParentIndex::new(root);
-        let orphaned_namespaces =
-            brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceScopeIndex::build(root, source);
-        let primary = parse_cpp_file_with_ancestry_and_orphaned_namespaces(
-            file,
-            source,
-            root,
-            &ancestry,
-            &orphaned_namespaces,
-        );
-        let c_tag_scope_witness = primary.c_tag_scope_witness;
-        let primary = primary.parsed;
-        // The span covers only the second reading, so the counter answers what
-        // the second reading costs rather than what parsing C++ costs. Started
-        // before the translation-unit exit so the file count stays "every file
-        // this adapter parsed", as it was when this was a separate call.
+        // Both declaration policies consume one primary extraction. The timing
+        // includes their shared source-fact work; there is no second extraction
+        // whose duration could be measured independently.
         let started = profiling::enabled().then(Instant::now);
-        // For headers, a witness only signals possible divergence, so the full
-        // C walk and comparison below remain required. Absence permits skipping
-        // only while every C-sensitive declaration path passes through the
-        // visitor decision that records this witness. C translation units keep
-        // their direct dialect.
-        if super::imports::is_cpp_translation_unit(file) || !c_tag_scope_witness {
+        if super::imports::is_cpp_translation_unit(file) {
+            record_additional_projection(Language::Cpp, started, 0);
+            return (parse_cpp_file(file, source, tree), Vec::new());
+        }
+        let root = tree.root_node();
+        let ancestry = ParentIndex::new(root);
+        let (primary, c_reading) = parse_cpp_file_with_readings(file, source, root, &ancestry);
+        let Some(c_reading) = c_reading else {
             record_additional_projection(Language::Cpp, started, 0);
             return (primary, Vec::new());
-        }
-        let c_reading = parse_cpp_c_reading_with_orphaned_namespaces(
-            file,
-            source,
-            root,
-            &ancestry,
-            &primary,
-            &orphaned_namespaces,
-        );
+        };
         let differs = cpp_projections_differ(&primary, &c_reading);
         record_additional_projection(Language::Cpp, started, usize::from(differs));
         if !differs {

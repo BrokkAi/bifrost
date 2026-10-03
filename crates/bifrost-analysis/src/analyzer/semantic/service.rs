@@ -486,6 +486,12 @@ pub(crate) struct SemanticAdapterIdentity {
 /// service merges it with the validated artifact's retained work at
 /// publication, and only publication mutates the caller's budget.
 pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
+    /// A lowerer that consumes declaration properties opts into the ordinary
+    /// primary source producer on the exact prepared tree.
+    fn primary_declaration_lowerer(&self) -> Option<&dyn PrimaryDeclarationSemanticsLowerer> {
+        None
+    }
+
     fn identity(&self) -> SemanticAdapterIdentity;
 
     fn capabilities(&self) -> SemanticCapabilities;
@@ -498,6 +504,22 @@ pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
         cancellation: &super::CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
 }
+
+/// Executable lowering that also consumes the primary declaration projection.
+pub(crate) trait PrimaryDeclarationSemanticsLowerer: Send + Sync {
+    fn lower_with_primary_declarations(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        primary: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+        budget: &super::SemanticBudget,
+        cancellation: &super::CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
+}
+
+#[path = "primary_declarations.rs"]
+mod primary_declarations;
+pub(crate) use primary_declarations::lower_with_primary_declarations;
 
 fn validate_semantic_file<A: LanguageAdapter>(
     analyzer: &TreeSitterAnalyzer<A>,
@@ -737,7 +759,22 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
 
     #[cfg(any(test, feature = "test-support"))]
     cache.record_lowering(key.path());
-    let lowered = lowerer.lower(file, &prepared, &staged_budget, request.cancellation)?;
+    let lowered = if let Some(primary_lowerer) = lowerer.primary_declaration_lowerer() {
+        lower_with_primary_declarations(
+            primary_lowerer,
+            file,
+            &prepared,
+            &staged_budget,
+            request.cancellation,
+            || {
+                analyzer
+                    .adapter()
+                    .parse_file(file, prepared.source(), prepared.tree())
+            },
+        )?
+    } else {
+        lowerer.lower(file, &prepared, &staged_budget, request.cancellation)?
+    };
     if request.cancellation.is_cancelled() {
         if let SemanticOutcome::Cancelled {
             partial: Some(_), ..

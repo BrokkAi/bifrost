@@ -160,19 +160,37 @@ pub(super) fn scan_access(
     SeedStructuralAccess::Scan
 }
 
+pub(super) fn ready_seed_index(
+    provider: &dyn StructuralFactProvider,
+    state: &QueryExecutionState<'_>,
+) -> Option<Arc<SnapshotStructuralIndex>> {
+    if state.access_mode == StructuralAccessMode::ScanOnly {
+        return None;
+    }
+    let cache = provider
+        .snapshot_structural_index_cache()
+        .map(super::super::provider::StructuralFactSnapshotCache::inner)?;
+    let content_identity = provider.structural_content_identity()?;
+    let uncancelled = CancellationToken::default();
+    let cancellation = state.cancellation.unwrap_or(&uncancelled);
+    cache.get_ready(content_identity, cancellation)
+}
+
 pub(super) fn prepare_seed_access(
     provider: &dyn StructuralFactProvider,
     provider_file_count: usize,
-    files: &[ProjectFile],
+    files: Option<&[ProjectFile]>,
     plan: &QueryPlan,
     include_inside_decl_anchors: bool,
     state: &mut QueryExecutionState<'_>,
+    ready_index: Option<Arc<SnapshotStructuralIndex>>,
 ) -> SeedStructuralAccess {
+    let scoped_file_count = files.map_or(provider_file_count, <[ProjectFile]>::len);
     if state.access_mode == StructuralAccessMode::ScanOnly {
-        return scan_access(state, files.len(), None);
+        return scan_access(state, scoped_file_count, None);
     }
     if plan.structural_access().terms().is_empty() {
-        return scan_access(state, files.len(), None);
+        return scan_access(state, scoped_file_count, None);
     }
     let Some(cache) = provider
         .snapshot_structural_index_cache()
@@ -180,7 +198,7 @@ pub(super) fn prepare_seed_access(
     else {
         return scan_access(
             state,
-            files.len(),
+            scoped_file_count,
             Some("structural provider has no snapshot index cache"),
         );
     };
@@ -190,17 +208,19 @@ pub(super) fn prepare_seed_access(
     let Some(content_identity) = provider.structural_content_identity() else {
         return scan_access(
             state,
-            files.len(),
+            scoped_file_count,
             Some("structural provider states no content identity for its analyzed files"),
         );
     };
-    let ready_index = cache.get_ready(content_identity, cancellation);
+    let ready_index = ready_index.or_else(|| cache.get_ready(content_identity, cancellation));
     let cache_ready_before_lookup = ready_index.is_some();
-    let auto_build_is_viable = files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
-        && files.len().saturating_mul(4) >= provider_file_count;
+    let auto_build_is_viable = files.is_some_and(|files| {
+        files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
+            && files.len().saturating_mul(4) >= provider_file_count
+    });
     if state.access_mode.uses_auto_index_admission() && ready_index.is_none() {
         if !auto_build_is_viable {
-            return scan_access(state, files.len(), None);
+            return scan_access(state, scoped_file_count, None);
         }
         if state.access_mode.defers_first_snapshot_build()
             && !cache.auto_reuse_observed(content_identity)
@@ -208,7 +228,7 @@ pub(super) fn prepare_seed_access(
             state
                 .structural_index_session
                 .defer_auto_build(cache, content_identity);
-            return scan_access(state, files.len(), None);
+            return scan_access(state, scoped_file_count, None);
         }
         if cache.build_in_flight(content_identity) {
             // Somebody else is already building this snapshot's postings --
@@ -218,7 +238,7 @@ pub(super) fn prepare_seed_access(
             // the scan and record the fallback (#2879).
             return scan_access(
                 state,
-                files.len(),
+                scoped_file_count,
                 Some("structural index build already in flight"),
             );
         }
@@ -263,7 +283,7 @@ pub(super) fn prepare_seed_access(
             if Some(index.content_identity()) != provider.structural_content_identity() {
                 return scan_access(
                     state,
-                    files.len(),
+                    scoped_file_count,
                     Some("structural analyzed content changed before index selection"),
                 );
             }
@@ -325,7 +345,7 @@ pub(super) fn prepare_seed_access(
             if Some(index.content_identity()) != provider.structural_content_identity() {
                 return scan_access(
                     state,
-                    files.len(),
+                    scoped_file_count,
                     Some("structural analyzed content changed during index selection"),
                 );
             }
@@ -335,7 +355,7 @@ pub(super) fn prepare_seed_access(
                     else {
                         return scan_access(
                             state,
-                            files.len(),
+                            scoped_file_count,
                             Some("analyzer states no workspace content identity"),
                         );
                     };
@@ -344,7 +364,7 @@ pub(super) fn prepare_seed_access(
                     {
                         return scan_access(
                             state,
-                            files.len(),
+                            scoped_file_count,
                             Some("structural analyzed content changed after index selection"),
                         );
                     }
@@ -393,7 +413,7 @@ pub(super) fn prepare_seed_access(
                         workspace_content,
                     }
                 }
-                Ok(None) => scan_access(state, files.len(), None),
+                Ok(None) => scan_access(state, scoped_file_count, None),
                 Err(reason) => {
                     if reason.contains("cancelled")
                         && let Some(profile) = &mut state.profile
@@ -401,7 +421,7 @@ pub(super) fn prepare_seed_access(
                         profile.access_path.index_cancelled =
                             profile.access_path.index_cancelled.saturating_add(1);
                     }
-                    scan_access(state, files.len(), Some(reason))
+                    scan_access(state, scoped_file_count, Some(reason))
                 }
             }
         }
@@ -419,7 +439,7 @@ pub(super) fn prepare_seed_access(
                     access.index_over_budget = access.index_over_budget.saturating_add(1);
                 }
             }
-            scan_access(state, files.len(), Some(&reason))
+            scan_access(state, scoped_file_count, Some(&reason))
         }
         StructuralIndexAcquisition::Cancelled { build, .. } => {
             record_index_build_facts(state.cache_profile.as_mut(), build);
@@ -434,7 +454,7 @@ pub(super) fn prepare_seed_access(
             }
             scan_access(
                 state,
-                files.len(),
+                scoped_file_count,
                 Some("structural index acquisition cancelled"),
             )
         }
@@ -1058,8 +1078,15 @@ pub(super) fn execute_seed(
         seed.languages.is_empty() || seed.languages.contains(&provider.structural_language())
     });
 
+    let unrestricted_explicit_scope = !seed.languages.is_empty()
+        && seed.where_globs.is_empty()
+        && state.scope.seed_files().is_none();
     let mut owned_workspace_files = Vec::new();
-    let workspace_files = workspace_files_for_scope(state, &mut owned_workspace_files);
+    let workspace_files = if unrestricted_explicit_scope {
+        &[]
+    } else {
+        workspace_files_for_scope(state, &mut owned_workspace_files)
+    };
     let mut scoped_languages = BTreeSet::new();
     for file in workspace_files {
         if state
@@ -1085,26 +1112,60 @@ pub(super) fn execute_seed(
     for provider in providers {
         let language = provider.structural_language();
         supported.insert(language);
+        let explicitly_requested = seed.languages.contains(&language);
+        let unsupported_features = || {
+            plan.features()
+                .unsupported_by(|feature| provider_supports_feature(provider, feature))
+                .into_diagnostics(language)
+                .into_iter()
+                .map(|diagnostic| CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: diagnostic.language().config_label(),
+                    message: diagnostic.message(),
+                    exhausted_roots: Vec::new(),
+                })
+        };
+        if unrestricted_explicit_scope
+            && !plan.structural_access().terms().is_empty()
+            && let Some(index) = ready_seed_index(provider, state)
+        {
+            // Each provider reports its unsupported features once: here for
+            // the indexed path, or below for the scoped path.
+            if explicitly_requested {
+                diagnostics.extend(unsupported_features());
+            }
+            let access = prepare_seed_access(
+                provider,
+                index.file_count(),
+                None,
+                &plan,
+                language != Language::Rust,
+                state,
+                Some(index),
+            );
+            let mut files = match &access {
+                SeedStructuralAccess::Indexed { candidates, .. } => {
+                    candidates.files().cloned().collect()
+                }
+                SeedStructuralAccess::Scan => {
+                    let (mut files, _) =
+                        provider_scope_files(state, provider, language, workspace_files);
+                    files.retain(|file| file_matches_globs(file, seed));
+                    files
+                }
+            };
+            files.sort();
+            provider_scopes.push((language, provider, files, access));
+            continue;
+        }
         let (mut files, provider_file_count) =
             provider_scope_files(state, provider, language, workspace_files);
         files.retain(|file| file_matches_globs(file, seed));
         files.sort();
-        let explicitly_requested = seed.languages.contains(&language);
         if !files.is_empty() || explicitly_requested {
-            diagnostics.extend(
-                plan.features()
-                    .unsupported_by(|feature| provider_supports_feature(provider, feature))
-                    .into_diagnostics(language)
-                    .into_iter()
-                    .map(|diagnostic| CodeQueryDiagnostic {
-                        code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
-                        impact: CodeQueryDiagnosticImpact::Incomplete,
-                        branch: Vec::new(),
-                        language: diagnostic.language().config_label(),
-                        message: diagnostic.message(),
-                        exhausted_roots: Vec::new(),
-                    }),
-            );
+            diagnostics.extend(unsupported_features());
         }
         let access = if files.is_empty() {
             SeedStructuralAccess::Scan
@@ -1112,10 +1173,11 @@ pub(super) fn execute_seed(
             prepare_seed_access(
                 provider,
                 provider_file_count,
-                &files,
+                Some(&files),
                 &plan,
                 language != Language::Rust,
                 state,
+                None,
             )
         };
         provider_scopes.push((language, provider, files, access));

@@ -14,15 +14,12 @@
 //! and the supertrait's `import_statements`, and none of those reads back into
 //! reconciliation.
 //!
-//! Three members are load-bearing beyond their signature:
+//! The visible-type table remains analyzer-owned:
 //!
 //! * [`CppSource::visible_type_units`] is the moka-cached include-closure
 //!   class table. Its *builder* is [`crate::hierarchy::build_cpp_visible_type_units`];
 //!   the cell and its `test-support` build counter stay analyzer-side, so this
 //!   accessor is the only way the reconciler reaches a warm table.
-//! * [`CppSource::raw_supertypes_of`] is
-//!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
-//!   analysis; the analyzer hands the decoded base-specifier strings across.
 
 use crate::compile_context::CppCompileContext;
 use crate::declarations::CppRecoveredExportClassIndex;
@@ -31,7 +28,7 @@ use crate::graph::resolver::{
     CppClassDeclarationStrength, OrphanedNamespaceScopeIndex, SourceUsingIndex,
 };
 use crate::identity::CppCallableUnitRole;
-use crate::imports::IncludeTargetIndex;
+use crate::imports::{IncludeTargetIndex, canonical_include_paths, canonical_include_statements};
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -45,13 +42,98 @@ use std::sync::Arc;
 pub trait CppSource:
     CodeUnitIndex + TypeAliasProvider + TypeHierarchyProvider + CppWorkspaceSource
 {
+    /// Canonical declaration syntax for the file's primary compilation reading.
+    fn declaration_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+    ) -> Option<Arc<crate::source_facts::CppFileSourceFacts>> {
+        None
+    }
+
+    /// Canonical AST-owned include facts for the file's primary reading.
+    /// `None` means source-facts publication is unavailable; an empty vector
+    /// is an authoritative include-free file.
+    fn canonical_include_facts(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppIncludeFact>> {
+        self.declaration_source_facts(token, file)
+            .map(|source| source.facts.includes.clone())
+    }
+
+    /// Canonical include paths for a file's primary reading.
+    fn canonical_include_paths(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<String>> {
+        self.declaration_source_facts(token, file)
+            .map(|source| canonical_include_paths(&source))
+    }
+
+    /// Exact source alternatives for a mounted declaration. Unavailable source
+    /// publication stays unknown; consumers must never reparse the candidate.
+    fn declaration_source_properties(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>> {
+        let source = self.declaration_source_facts(token, unit.source())?;
+        let facts: Vec<_> = source.for_unit(unit).cloned().collect();
+        (!facts.is_empty()).then_some(facts)
+    }
+
+    fn declaration_source_occurrences(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<crate::source_facts::CppDeclarationOccurrence>> {
+        let source = self.declaration_source_facts(token, unit.source())?;
+        let occurrences = source.declaration_occurrences(unit);
+        (!occurrences.is_empty()).then_some(occurrences)
+    }
+
+    /// Navigation alternatives come from the same canonical occurrences as
+    /// declaration properties. An analyzer that selects alternate dialects must
+    /// override this method to join against the selected dialect's own arena.
+    fn declaration_navigation_occurrences(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Vec<crate::source_facts::CppNavigationOccurrence>> {
+        let source = self.declaration_source_facts(token, unit.source())?;
+        let facts = self.declaration_source_properties(token, unit)?;
+        Some(
+            facts
+                .into_iter()
+                .map(|fact| {
+                    let declaration = source.source.declaration(fact.declaration);
+                    let range = source.source.occurrence(declaration.occurrence).range;
+                    let conditional_family = fact.conditional_family.map(|id| {
+                        let range = source.source.occurrence(id).range;
+                        (range.start_byte, range.end_byte)
+                    });
+                    crate::source_facts::CppNavigationOccurrence {
+                        range,
+                        role: fact.occurrence_role,
+                        conditional_family,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// Structured includes for a disposable visibility traversal.
     fn visibility_import_statements(
         &self,
-        _token: QueryToken<'_>,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Vec<String> {
-        self.import_statements(file)
+        self.declaration_source_facts(token, file)
+            .map(|source| canonical_include_statements(&source))
+            .unwrap_or_default()
     }
 
     /// Physical identifier candidates used only to discover source files for
@@ -88,10 +170,6 @@ pub trait CppSource:
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
     fn include_target_index(&self) -> &IncludeTargetIndex;
-
-    /// The declared base specifiers of `code_unit`, as written
-    /// (`TreeSitterAnalyzer::raw_supertypes_of`).
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
     /// Every class-like or alias declaration reachable from `file` through its
     /// `#include` closure, memoized per file. See this module's note.
@@ -151,7 +229,7 @@ pub trait CppSource:
     ) -> Option<Arc<PreparedSyntaxTree>>;
 
     /// The persisted linkage fact for one C++ field, when the parser recorded
-    /// it. A missing fact requires the resolver's syntax fallback.
+    /// it. A missing fact is unavailable linkage evidence.
     fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage>;
 
     /// The cached result of a preprocessor-visible include-reachability walk.

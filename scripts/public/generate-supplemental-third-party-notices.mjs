@@ -26,6 +26,7 @@ const auditedLinksPackages = new Set([
   "ring",
   "tree-sitter",
   "tree-sitter-language",
+  "tikv-jemalloc-sys",
   "wasm-bindgen-shared",
 ]);
 
@@ -206,6 +207,13 @@ async function main() {
       "libgit2/COPYING",
       "libgit2 and its bundled third-party components",
       "compiled when a compatible system libgit2 is unavailable",
+    ),
+    await legalFile(
+      metadata,
+      "tikv-jemalloc-sys",
+      "jemalloc/COPYING",
+      "jemalloc (BSD-2-Clause)",
+      "used by the Bifrost CLI as its global allocator on non-MSVC targets",
     ),
     await legalFile(
       metadata,

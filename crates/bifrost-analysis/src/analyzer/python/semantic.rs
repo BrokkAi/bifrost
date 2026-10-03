@@ -4,6 +4,8 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use std::cell::OnceCell;
+
 use tree_sitter::Node;
 
 use super::lexical_scope::python_lexical_scope_inventory_bounded;
@@ -35,7 +37,7 @@ use brokk_bifrost_python::syntax::{
 };
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v34";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v38";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -163,6 +165,9 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         let structural_node_index = structural_node_index.as_ref();
 
         let mut binding_inventories = HashMap::default();
+        // These proofs depend only on this prepared file. Keep them local and
+        // initialize only after a procedure passes its existing admission work.
+        let proven_instance_fields = OnceCell::new();
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -180,6 +185,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     self.overlay.as_deref(),
                     structural_node_index,
                     &mut binding_inventories,
+                    &proven_instance_fields,
                     staged_budget,
                     cancellation,
                 )
@@ -259,8 +265,15 @@ enum PythonModuleBinding<'tree> {
 }
 
 struct PythonModuleImport {
+    candidates: Box<[PythonModuleImportCandidate]>,
+    namespace_path: Option<Box<[Box<str>]>>,
+}
+
+#[derive(Clone)]
+struct PythonModuleImportCandidate {
     canonical_path: Box<[Box<str>]>,
     consumed_attributes: usize,
+    unaliased_namespace_import: bool,
 }
 
 /// Whether each builtin this lowering reads still denotes its builtin at the
@@ -352,10 +365,22 @@ fn enumerate_procedures<'tree>(
                 let Some(name) = node_text(prepared.source(), binding.declaration) else {
                     continue;
                 };
+                let next = python_module_binding(frame.node, binding.kind, name, prepared.source());
                 if let Some(existing) = module_bindings.get_mut(name) {
-                    // Multiple module bindings are not a proven class identity,
-                    // callable identity, or import identity.
-                    *existing = PythonModuleBinding::Other;
+                    let compatible = match (&mut *existing, next) {
+                        (
+                            PythonModuleBinding::Import(existing),
+                            PythonModuleBinding::Import(next),
+                        ) => merge_python_namespace_imports(existing, next),
+                        _ => false,
+                    };
+                    if !compatible {
+                        // Repeated local names are ambiguous unless they are
+                        // unaliased namespace imports of one Python package
+                        // root. In that case each structured path narrows a
+                        // different dotted module reference below.
+                        *existing = PythonModuleBinding::Other;
+                    }
                     continue;
                 }
                 if let Err(stop) = inventory.observe_additional_work(SemanticWork {
@@ -364,10 +389,7 @@ fn enumerate_procedures<'tree>(
                 }) {
                     return Ok(stop.into_outcome());
                 }
-                module_bindings.insert(
-                    name.into(),
-                    python_module_binding(frame.node, binding.kind, name, prepared.source()),
-                );
+                module_bindings.insert(name.into(), next);
             }
         }
 
@@ -580,32 +602,91 @@ fn python_module_binding<'tree>(
     {
         return PythonModuleBinding::Other;
     }
-    let mut matches = python_import_infos_from_node(node, source)
+    let matches = python_import_infos_from_node(node, source)
         .into_iter()
         .filter(|import| !import.is_wildcard && import.local_name() == Some(local_name));
-    let Some(import) = matches.next() else {
-        return PythonModuleBinding::Other;
-    };
-    if matches.next().is_some() {
-        return PythonModuleBinding::Other;
-    }
-    let Some(path) = import.path else {
-        return PythonModuleBinding::Other;
-    };
-    let consumed_attributes =
-        if path.kind == Some(StructuredImportPathKind::Namespace) && import.alias.is_none() {
+    let mut binding: Option<PythonModuleImport> = None;
+    for import in matches {
+        let Some(path) = import.path else {
+            return PythonModuleBinding::Other;
+        };
+        let is_namespace_import = path.kind == Some(StructuredImportPathKind::Namespace);
+        let consumed_attributes = if is_namespace_import && import.alias.is_none() {
             path.segments.len().saturating_sub(1)
         } else {
             0
         };
-    PythonModuleBinding::Import(PythonModuleImport {
-        canonical_path: path
-            .segments
-            .into_iter()
-            .map(String::into_boxed_str)
-            .collect(),
-        consumed_attributes,
-    })
+        let namespace_path = is_namespace_import.then(|| {
+            let segments = if import.alias.is_some() {
+                vec![local_name.to_owned()]
+            } else {
+                let binding_segment_count = path.segments.len().saturating_sub(consumed_attributes);
+                path.segments[..binding_segment_count].to_vec()
+            };
+            segments
+                .into_iter()
+                .map(String::into_boxed_str)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let next = PythonModuleImport {
+            candidates: Box::new([PythonModuleImportCandidate {
+                canonical_path: path
+                    .segments
+                    .into_iter()
+                    .map(String::into_boxed_str)
+                    .collect(),
+                consumed_attributes,
+                unaliased_namespace_import: is_namespace_import && import.alias.is_none(),
+            }]),
+            namespace_path,
+        };
+        if let Some(binding) = binding.as_mut() {
+            if !merge_python_namespace_imports(binding, next) {
+                return PythonModuleBinding::Other;
+            }
+        } else {
+            binding = Some(next);
+        }
+    }
+    binding.map_or(PythonModuleBinding::Other, PythonModuleBinding::Import)
+}
+
+fn merge_python_namespace_imports(
+    existing: &mut PythonModuleImport,
+    next: PythonModuleImport,
+) -> bool {
+    let Some(namespace_path) = existing.namespace_path.as_ref() else {
+        return false;
+    };
+    if next.namespace_path.as_ref() != Some(namespace_path)
+        || existing
+            .candidates
+            .iter()
+            .chain(next.candidates.iter())
+            .any(|candidate| {
+                !candidate.unaliased_namespace_import
+                    || candidate.canonical_path.len() < namespace_path.len()
+                    || !candidate
+                        .canonical_path
+                        .iter()
+                        .zip(namespace_path.iter())
+                        .all(|(actual, expected)| actual == expected)
+            })
+    {
+        return false;
+    }
+    let mut candidates = existing.candidates.to_vec();
+    for candidate in next.candidates {
+        if !candidates.iter().any(|existing| {
+            existing.canonical_path == candidate.canonical_path
+                && existing.consumed_attributes == candidate.consumed_attributes
+        }) {
+            candidates.push(candidate);
+        }
+    }
+    existing.candidates = candidates.into_boxed_slice();
+    true
 }
 
 /// The built-in descriptors keep the authored callable's parameters and
@@ -916,6 +997,32 @@ fn body_contains_yield(body: Node<'_>) -> bool {
     false
 }
 
+/// Whether this procedure's own body calls a builtin that can read its local
+/// namespace. The names may be rebound, so a match only keeps local-flow
+/// proofs open; it never establishes a fact. A nested callable has its own
+/// frame and sees only the enclosing locals it captures.
+fn body_observes_locals_dynamically(source: &str, body: Node<'_>) -> bool {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node != body && is_callable_kind(node.kind()) {
+            continue;
+        }
+        if node.kind() == "call"
+            && let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "identifier"
+            && matches!(
+                node_text(source, function),
+                Some("locals" | "vars" | "dir" | "eval" | "exec" | "breakpoint")
+            )
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
     parent
         .child_by_field_name(field)
@@ -979,14 +1086,18 @@ enum CleanupBody<'tree> {
     Statement(Node<'tree>),
     /// A `with` statement runs the implicit `__exit__` of every context
     /// manager it entered at the construct's own exit, so the region carries
-    /// the statement whose clause names those context managers.
-    WithStatement(Node<'tree>),
+    /// the statement whose clause names those context managers. `after` is the
+    /// statement's own exit point, where a suppressed exception resumes.
+    WithStatement {
+        node: Node<'tree>,
+        after: ProgramPointId,
+    },
 }
 
 impl<'tree> CleanupBody<'tree> {
     const fn source_node(self) -> Node<'tree> {
         match self {
-            Self::Statement(node) | Self::WithStatement(node) => node,
+            Self::Statement(node) | Self::WithStatement { node, .. } => node,
         }
     }
 }
@@ -1015,7 +1126,7 @@ struct LoweringContext<'tree, 'targets> {
     /// that receives the object can rebind its attributes or install a
     /// descriptor, so only an access that ends before this byte is proven.
     known_binding_escapes_after: HashMap<Box<str>, usize>,
-    proven_instance_fields: HashMap<Box<str>, HashSet<Box<str>>>,
+    proven_instance_fields: &'targets HashMap<Box<str>, HashSet<Box<str>>>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
@@ -1047,6 +1158,7 @@ fn lower_procedure<'tree, 'targets>(
     overlay: Option<&'targets SemanticModelOverlay>,
     structural_node_index: Option<&'targets StructuralNodeIndex>,
     binding_inventories: &mut HashMap<usize, PythonLexicalScopeInventory<'tree>>,
+    proven_instance_fields: &'targets OnceCell<HashMap<Box<str>, HashSet<Box<str>>>>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -1089,6 +1201,10 @@ fn lower_procedure<'tree, 'targets>(
     let bindings = binding_inventories
         .get(&spec.callable.id())
         .expect("the callable inventory was prepared before lowering");
+    let proven_instance_fields = proven_instance_fields.get_or_init(|| {
+        let _scope = crate::profiling::scope("python.semantic.instance_field_proofs");
+        instance_field_proofs(prepared, prepared.source(), builtin_proofs.exception)
+    });
     let mut context = LoweringContext {
         prepared,
         callable: spec.callable,
@@ -1103,7 +1219,7 @@ fn lower_procedure<'tree, 'targets>(
         known_instance_fields: HashMap::default(),
         known_binding_available_after: HashMap::default(),
         known_binding_escapes_after: HashMap::default(),
-        proven_instance_fields: HashMap::default(),
+        proven_instance_fields,
         catch_binders: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
@@ -1122,8 +1238,6 @@ fn lower_procedure<'tree, 'targets>(
         binding_inventories,
         cleanups: Vec::new(),
     };
-    let proven_instance_fields =
-        instance_field_proofs(prepared, prepared.source(), builtin_proofs.exception);
     let HeapBindingProofs {
         known_lists,
         known_sequences,
@@ -1137,7 +1251,7 @@ fn lower_procedure<'tree, 'targets>(
         spec.callable,
         prepared.source(),
         class_names,
-        &proven_instance_fields,
+        proven_instance_fields,
         || true,
     )
     .expect("an unmetered heap proof cannot stop");
@@ -1148,7 +1262,6 @@ fn lower_procedure<'tree, 'targets>(
     context.known_instance_fields = known_fields;
     context.known_binding_available_after = available_after;
     context.known_binding_escapes_after = escapes_after;
-    context.proven_instance_fields = proven_instance_fields;
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_local_bindings(&mut builder)?;
 
@@ -1170,6 +1283,16 @@ fn lower_procedure<'tree, 'targets>(
             SemanticCapability::GeneratorSuspension,
             SemanticGapKind::Unsupported,
             "generator construction, suspension, and resumption are not fully modeled",
+        )?;
+    }
+    if body_observes_locals_dynamically(prepared.source(), spec.body) {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::LocalFlow,
+            SemanticGapKind::Unsupported,
+            "locals(), vars(), dir(), eval, exec or breakpoint() can observe a local without a projected binding event",
         )?;
     }
     if spec.lexical_parent.is_some() {
@@ -2465,6 +2588,69 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }))
     }
 
+    /// Whether this expression names an imported module namespace.
+    ///
+    /// A namespace import qualifies an attribute call but is not the call's
+    /// runtime receiver. Attribute paths are read from tree-sitter nodes and
+    /// matched against the structured import path retained during inventory.
+    fn imported_module_receiver(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        reference: Node<'tree>,
+    ) -> Result<bool, PythonLoweringError> {
+        if self.module_has_wildcard_import {
+            return Ok(false);
+        }
+        let Some(path) = python_static_attribute_path(reference) else {
+            return Ok(false);
+        };
+        let Some(local) = path
+            .first()
+            .and_then(|segment| node_text(self.prepared.source(), *segment))
+        else {
+            return Ok(false);
+        };
+        if !self.module_name_fallback_allowed(builder, path[0], local)? {
+            return Ok(false);
+        }
+        let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(local) else {
+            return Ok(false);
+        };
+        let Some(namespace_path) = binding.namespace_path.as_ref() else {
+            return Ok(false);
+        };
+        let Some(receiver_path) = path
+            .iter()
+            .map(|segment| node_text(self.prepared.source(), *segment))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
+        let root_matches = receiver_path.len() == namespace_path.len()
+            && receiver_path
+                .iter()
+                .zip(namespace_path.iter())
+                .all(|(actual, expected)| *actual == expected.as_ref());
+        if root_matches {
+            return Ok(true);
+        }
+        if receiver_path.len() <= namespace_path.len() {
+            return Ok(false);
+        }
+        let namespace_prefix_matches = receiver_path
+            .iter()
+            .zip(namespace_path.iter())
+            .all(|(actual, expected)| *actual == expected.as_ref());
+        let imported_module_prefix_matches = binding.candidates.iter().any(|candidate| {
+            receiver_path.len() <= candidate.canonical_path.len()
+                && receiver_path
+                    .iter()
+                    .zip(candidate.canonical_path.iter())
+                    .all(|(actual, expected)| *actual == expected.as_ref())
+        });
+        Ok(namespace_prefix_matches && imported_module_prefix_matches)
+    }
+
     fn module_class_fallback_allowed(
         &self,
         builder: &mut ProcedureCfgBuilder,
@@ -2840,7 +3026,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, None, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, None, stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -4250,9 +4439,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         .child_by_field_name("value")
                         .zip(binding.child_by_field_name("subscript"))
                         .is_some_and(|(value, index)| self.proven_list_index(node, value, index)),
+                    // Binding a simple name cannot raise. The boundary abort
+                    // stands in only for RHS failures the RHS lowering does
+                    // not publish, such as NameError on a bare name read.
                     "identifier" => {
                         self.proven_local_instance_initialization(binding, source)
-                            || source.kind() == "call"
+                            || rhs_failure_is_lowered_or_impossible(self.prepared.source(), source)
                     }
                     _ => false,
                 }
@@ -4410,7 +4602,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             source,
             self.prepared.source(),
             self.class_names,
-            &self.proven_instance_fields,
+            self.proven_instance_fields,
         )
         .is_some_and(|class_name| class_name.as_ref() == expected_class.as_ref())
     }
@@ -5247,19 +5439,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 node.kind(),
                 "set_comprehension" | "dictionary_comprehension"
             ) {
-                for capability in [
+                // Hashing and equality can raise. The abort route states that
+                // structurally, as for any other operation that can throw; an
+                // open exceptional-control gap here would carry return-transfer
+                // impact and leave every caller's normal return unproven.
+                self.implicit_abort_route(builder, node, insertion, scope, stack)?;
+                self.add_gap(
+                    builder,
+                    insertion,
+                    SemanticGapSubject::Point,
                     SemanticCapability::Calls,
-                    SemanticCapability::ExceptionalControlFlow,
-                ] {
-                    self.add_gap(
-                        builder,
-                        insertion,
-                        SemanticGapSubject::Point,
-                        capability,
-                        SemanticGapKind::Unknown,
-                        "comprehension insertion can invoke hashing and equality",
-                    )?;
-                }
+                    SemanticGapKind::Unknown,
+                    "comprehension insertion can invoke hashing and equality",
+                )?;
             }
             self.edge(builder, insertion, next)?;
             stack.push(Work::Expression {
@@ -5357,19 +5549,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         for (source, binding, continuation) in iterations {
             if binding_requires_runtime_protocol(target) {
-                for capability in [
+                self.add_gap(
+                    builder,
+                    binding,
+                    SemanticGapSubject::Point,
                     SemanticCapability::Calls,
-                    SemanticCapability::ExceptionalControlFlow,
-                ] {
-                    self.add_gap(
-                        builder,
-                        binding,
-                        SemanticGapSubject::Point,
-                        capability,
-                        SemanticGapKind::Unknown,
-                        "comprehension target assignment may invoke runtime protocols",
-                    )?;
-                }
+                    SemanticGapKind::Unknown,
+                    "comprehension target assignment may invoke runtime protocols",
+                )?;
+                // Unpacking and attribute or item stores lower their own abort
+                // routes below, as they do for a `for` statement's target.
             }
             let completion = self.append_target_source_assignments(
                 builder,
@@ -5509,6 +5698,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .transpose()?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        // Each iteration re-enters the condition, not the statement point.
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let alternative_entry = alternative
             .map(|body| self.point(builder, body, Vec::new()))
             .transpose()?;
@@ -5638,14 +5830,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "iterator acquisition and advancement are not represented as call sites",
             )?;
-            self.add_gap(
-                builder,
-                test,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "iterator acquisition and advancement failures are not lowered",
-            )?;
+            // `iter()` and every `next()` may raise. The call sites stay
+            // unrepresented, but their failure is a lowered abort route
+            // through the enclosing handlers and cleanups, not a missing edge.
+            self.implicit_abort_route(builder, node, test, scope, stack)?;
         }
         if binding_requires_runtime_protocol(binding) {
             self.add_gap(
@@ -5656,14 +5844,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "iteration-target unpacking, descriptor assignment, or item assignment calls require runtime refinement",
             )?;
-            self.add_gap(
-                builder,
-                binding_boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "iteration-target evaluation, unpacking, and assignment failures are not lowered",
-            )?;
+            // Unpacking and attribute or item stores lower their own abort
+            // routes below, as they do for an assignment statement.
         }
         let iteration_source = single_literal_sequence_element(iterable);
         let unknown_kind = if is_unpacking_target(binding) {
@@ -5858,24 +6040,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(local) else {
             return false;
         };
-        let suffix_start = 1usize.saturating_add(binding.consumed_attributes);
-        if suffix_start > path.len() {
-            return false;
-        }
-        let mut canonical = binding
-            .canonical_path
-            .iter()
-            .map(Box::as_ref)
-            .collect::<Vec<_>>();
-        canonical.extend(
-            path[suffix_start..]
+        binding.candidates.iter().any(|candidate| {
+            let suffix_start = 1usize.saturating_add(candidate.consumed_attributes);
+            if suffix_start > path.len() {
+                return false;
+            }
+            let mut canonical = candidate
+                .canonical_path
                 .iter()
-                .filter_map(|segment| node_text(self.prepared.source(), *segment)),
-        );
-        matches!(
-            canonical.as_slice(),
-            ["typing" | "typing_extensions", "NoReturn" | "Never"]
-        )
+                .map(Box::as_ref)
+                .collect::<Vec<_>>();
+            canonical.extend(
+                path[suffix_start..]
+                    .iter()
+                    .filter_map(|segment| node_text(self.prepared.source(), *segment)),
+            );
+            matches!(
+                canonical.as_slice(),
+                ["typing" | "typing_extensions", "NoReturn" | "Never"]
+            )
+        })
     }
 
     fn imported_callable_identity(
@@ -5901,35 +6085,66 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(local) else {
             return Ok(None);
         };
-        let mut canonical = binding
-            .canonical_path
+        let suffix = path
             .iter()
-            .map(Box::as_ref)
-            .collect::<Vec<_>>();
-        if path.len() == 1 {
-            if binding.consumed_attributes != 0 {
-                return Ok(None);
-            }
-        } else {
-            let attributes_after_local = path.len() - 1;
-            if attributes_after_local != binding.consumed_attributes + 1 {
-                return Ok(None);
-            }
-            let Some(member) = path
-                .last()
-                .and_then(|segment| node_text(self.prepared.source(), *segment))
-            else {
-                return Ok(None);
-            };
-            canonical.push(member);
-        }
-        let Some((member, owner)) = canonical.split_last() else {
+            .skip(1)
+            .map(|segment| node_text(self.prepared.source(), *segment))
+            .collect::<Option<Vec<_>>>();
+        let Some(suffix) = suffix else {
             return Ok(None);
         };
-        if owner.is_empty() {
-            return Ok(None);
+        let mut identity = None;
+        for candidate in binding.candidates.iter() {
+            let direct_imported_name = suffix.is_empty() && candidate.consumed_attributes == 0;
+            if !direct_imported_name && suffix.len() != candidate.consumed_attributes + 1 {
+                continue;
+            }
+            if candidate.unaliased_namespace_import {
+                let Some(namespace_path) = binding.namespace_path.as_ref() else {
+                    continue;
+                };
+                if direct_imported_name {
+                    continue;
+                }
+                if namespace_path.len() + candidate.consumed_attributes
+                    != candidate.canonical_path.len()
+                    || !candidate
+                        .canonical_path
+                        .iter()
+                        .take(namespace_path.len())
+                        .zip(namespace_path.iter())
+                        .all(|(actual, expected)| actual == expected)
+                    || !candidate
+                        .canonical_path
+                        .iter()
+                        .skip(namespace_path.len())
+                        .zip(suffix.iter().take(candidate.consumed_attributes))
+                        .all(|(actual, expected)| actual.as_ref() == *expected)
+                {
+                    continue;
+                }
+            }
+            let mut canonical = candidate
+                .canonical_path
+                .iter()
+                .map(Box::as_ref)
+                .collect::<Vec<_>>();
+            if !direct_imported_name {
+                canonical.push(suffix[candidate.consumed_attributes]);
+            }
+            let Some((member, owner)) = canonical.split_last() else {
+                continue;
+            };
+            if owner.is_empty() {
+                continue;
+            }
+            let next = (owner.join("."), (*member).to_owned());
+            if identity.as_ref().is_some_and(|existing| existing != &next) {
+                return Ok(None);
+            }
+            identity = Some(next);
         }
-        Ok(Some((owner.join("."), (*member).to_owned())))
+        Ok(identity)
     }
 
     fn semantic_model_callable_diverges(
@@ -6303,21 +6518,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), PythonLoweringError> {
         let body = required_field(node, "body")?;
         let items = with_items(node)?;
+        // The exit point resumes the statement's own continuation, so the
+        // implicit exits always run before anything that follows the `with`.
+        let after = self.point(builder, node, Vec::new())?;
+        self.edge(builder, after, next)?;
         let region = CleanupRegionId::new(
             u32::try_from(self.cleanups.len())
                 .map_err(|_| PythonLoweringError::Invalid("too many cleanup regions".into()))?,
         );
         self.cleanups.push(CleanupRegion {
             id: region,
-            body: CleanupBody::WithStatement(node),
+            body: CleanupBody::WithStatement { node, after },
             outer_scope: scope,
         });
         let body_scope = builder.push_scope(Some(scope), ScopeBinding::Cleanup { region });
-
-        // The exit point resumes the statement's own continuation, so the
-        // implicit exits always run before anything that follows the `with`.
-        let after = self.point(builder, node, Vec::new())?;
-        self.edge(builder, after, next)?;
         let normal_route = builder.normal_cleanup_completion(region, after);
         let body_exit = self.point(builder, body, Vec::new())?;
         self.route(builder, body_exit, &normal_route, stack)?;
@@ -6373,6 +6587,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
+        suppression_resume: Option<ProgramPointId>,
         step: CleanupSpecialization<CleanupRegion<'tree>>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
@@ -6500,6 +6715,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .map(EdgeTarget::normal)
                 .unwrap_or(step.next);
             self.edge(builder, normal, next)?;
+            // Every exit still runs when one of them suppresses the exception,
+            // so the suppressed continuation leaves from the last exit.
+            if is_last && let Some(after) = suppression_resume {
+                self.edge(builder, normal, EdgeTarget::normal(after))?;
+            }
             if is_last {
                 self.abrupt(
                     builder,
@@ -6667,7 +6887,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let receiver_node = python_call_receiver(function);
-        let qualifier = if let Some(receiver) = receiver_node
+        let module_receiver = receiver_node
+            .map(|receiver| self.imported_module_receiver(builder, receiver))
+            .transpose()?
+            .unwrap_or(false);
+        let qualifier = if module_receiver {
+            None
+        } else if let Some(receiver) = receiver_node
             && receiver.kind() == "identifier"
             && self.module_class_fallback_allowed(builder, receiver)?
         {
@@ -6686,6 +6912,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let callable_kind = if let Some(qualifier) = qualifier {
             CallableReferenceKind::TypeQualifiedMethod { qualifier }
+        } else if module_receiver {
+            CallableReferenceKind::ModuleQualified {
+                qualifier: receiver.expect("module-qualified calls retain their namespace value"),
+            }
         } else if receiver.is_some() {
             CallableReferenceKind::BoundMethod
         } else {
@@ -6715,7 +6945,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     kind: callable_kind,
                     targets: resolution.clone(),
                     target_evidence: metadata.evidence,
-                    bound_receiver: receiver,
+                    bound_receiver: if module_receiver { None } else { receiver },
                     environment: None,
                 },
             },
@@ -7270,8 +7500,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope: step.region.outer_scope,
                     });
                 }
-                CleanupBody::WithStatement(node) => {
-                    self.lower_implicit_context_manager_exits(builder, node, step, stack)?;
+                CleanupBody::WithStatement { node, after } => {
+                    // `__exit__` receives the in-flight exception and may
+                    // suppress it by returning a true value; control then
+                    // resumes after the `with`. A return, break or continue
+                    // passes no exception, and the exit's result is ignored.
+                    let suppression_resume = (route.destination().edge_kind()
+                        == ControlEdgeKind::Exceptional)
+                        .then_some(after);
+                    self.lower_implicit_context_manager_exits(
+                        builder,
+                        node,
+                        suppression_resume,
+                        step,
+                        stack,
+                    )?;
                 }
             }
         }
@@ -8069,6 +8312,74 @@ fn is_callable_kind(kind: &str) -> bool {
     matches!(kind, "function_definition" | "lambda")
 }
 
+/// Procedure syntax roles for the Python lowering. Python has no module
+/// procedure, so assessment covers function and lambda bodies. Only `while`
+/// is a conditional loop; `for` iterates.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: python_statement_kind,
+        loop_site: |node| {
+            (node.kind() == "while_statement").then(|| crate::analyzer::loop_facts::LoopSyntax {
+                kind: crate::analyzer::loop_facts::LoopKind::While,
+                body: node.child_by_field_name("body"),
+                condition: node.child_by_field_name("condition"),
+            })
+        },
+        procedure_matches: |kind, node| match kind {
+            ProcedureKind::Lambda => node.kind() == "lambda",
+            _ => node.kind() == "function_definition",
+        },
+        nested_procedure: |node| {
+            matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition" | "decorated_definition"
+            )
+        },
+    };
+
+/// Classify an executable Python statement.
+///
+/// A `block` is excluded: it is a suite, not a statement, and a one-statement
+/// suite has the same span as its statement. Declarations that act at compile
+/// time (`global`, `nonlocal`, `from __future__ import`) and definitions,
+/// which are nested procedures, are excluded. An expression statement that
+/// contains a `yield` is excluded because the yield makes the function a
+/// generator even when it cannot run: `raise NotImplementedError` followed by
+/// a bare `yield` is a deliberate idiom, not dead code.
+fn python_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    Some(match node.kind() {
+        "expression_statement" | "print_statement" | "exec_statement" => {
+            let mut stack = vec![node];
+            while let Some(current) = stack.pop() {
+                if current.kind() == "yield" {
+                    return None;
+                }
+                if current.kind() == "lambda" {
+                    continue;
+                }
+                let mut cursor = current.walk();
+                stack.extend(current.named_children(&mut cursor));
+            }
+            "expression"
+        }
+        "return_statement" => "return",
+        "raise_statement" => "throw",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "pass_statement" => "empty",
+        "assert_statement" => "assert",
+        "delete_statement" => "delete",
+        "import_statement" | "import_from_statement" => "import",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "for_statement" => "for_in",
+        "match_statement" => "switch",
+        "try_statement" => "try",
+        "with_statement" => "with",
+        _ => return None,
+    })
+}
+
 fn is_statement_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -8314,6 +8625,20 @@ fn missing_field(node: Node<'_>, field: &str) -> PythonLoweringError {
     ))
 }
 
+/// Whether evaluating an assignment's RHS either cannot raise or publishes
+/// its own abort route: a literal constant, a call, or an operator whose
+/// lowering carries its implicit abort. Other shapes, including a bare name
+/// read that can raise NameError, keep the assignment boundary's abort.
+fn rhs_failure_is_lowered_or_impossible(source: &str, rhs: Node<'_>) -> bool {
+    match rhs.kind() {
+        "true" | "false" | "none" | "ellipsis" | "call" | "binary_operator" | "unary_operator"
+        | "not_operator" => true,
+        "integer" | "float" => python_numeric_literal_kind(source, rhs).is_some(),
+        "string" => !may_invoke_user_code(rhs),
+        _ => false,
+    }
+}
+
 fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -8375,7 +8700,21 @@ mod tests {
         lower_fixture_named(source, None)
     }
 
-    fn lower_fixture_named(source: &str, procedure_name: Option<&str>) -> ProcedureSemanticsParts {
+    fn fixture_lowerer() -> PythonSemanticLowerer {
+        PythonSemanticLowerer {
+            overlay: None,
+            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        }
+    }
+
+    fn lower_fixture_all(source: &str) -> Vec<ProcedureSemanticsParts> {
+        lower_fixture_all_with(&fixture_lowerer(), source)
+    }
+
+    fn lower_fixture_all_with(
+        lowerer: &PythonSemanticLowerer,
+        source: &str,
+    ) -> Vec<ProcedureSemanticsParts> {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_python::LANGUAGE.into())
@@ -8390,11 +8729,7 @@ mod tests {
             None,
         );
         let file = ProjectFile::new(std::env::temp_dir(), "fixture.py");
-        let lowerer = PythonSemanticLowerer {
-            overlay: None,
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        };
-        let SemanticOutcome::Complete { mut value, .. } = lowerer
+        let SemanticOutcome::Complete { value, .. } = lowerer
             .lower(
                 &file,
                 &prepared,
@@ -8405,6 +8740,11 @@ mod tests {
         else {
             panic!("Python fixture lowering must complete");
         };
+        value
+    }
+
+    fn lower_fixture_named(source: &str, procedure_name: Option<&str>) -> ProcedureSemanticsParts {
+        let mut value = lower_fixture_all(source);
         let selected = match procedure_name {
             Some(name) => value
                 .iter()
@@ -9249,6 +9589,91 @@ mod tests {
         let (name, fields) = class_field_proof(class, source, true).expect("simple class proof");
         assert_eq!(&*name, "Holder");
         assert!(fields.contains("value"));
+    }
+
+    #[test]
+    fn file_instance_proofs_are_shared_and_scoped_to_the_prepared_source() {
+        let proven_source = r#"class Holder:
+    def __init__(self):
+        self.value = 0
+
+def first():
+    item = Holder()
+    return item.value
+
+def second():
+    item = Holder()
+    return item.value
+"#;
+        let edited_source = r#"class Holder:
+    def __init__(self):
+        self.value = 0
+    def __getattribute__(self, name):
+        return object.__getattribute__(self, name)
+
+def first():
+    item = Holder()
+    return item.value
+"#;
+        let lowerer = fixture_lowerer();
+        let proven = lower_fixture_all_with(&lowerer, proven_source);
+        let edited = lower_fixture_all_with(&lowerer, edited_source);
+        fn named<'a>(
+            procedures: &'a [ProcedureSemanticsParts],
+            name: &str,
+        ) -> &'a ProcedureSemanticsParts {
+            procedures
+                .iter()
+                .find(|parts| {
+                    parts
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing lowered procedure {name}"))
+        }
+        let field_load = |parts: &ProcedureSemanticsParts| {
+            parts
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::MemoryLoad {
+                            kind: MemoryAccessKind::Field,
+                            ..
+                        }
+                    )
+                })
+        };
+        let descriptor_gap = |parts: &ProcedureSemanticsParts| {
+            parts.gaps.iter().any(|gap| {
+                gap.detail.as_ref()
+                    == "descriptor or special-method invocation requires type refinement"
+            })
+        };
+
+        for name in ["first", "second"] {
+            let parts = named(&proven, name);
+            assert!(field_load(parts), "{name} must lower its field read");
+            assert!(
+                !descriptor_gap(parts),
+                "{name} must consume the class proof"
+            );
+        }
+        let edited_first = named(&edited, "first");
+        assert!(
+            field_load(edited_first),
+            "edited read still lowers a field load"
+        );
+        assert!(
+            descriptor_gap(edited_first),
+            "a proof from the previous prepared source must not survive an edit"
+        );
     }
 
     #[test]

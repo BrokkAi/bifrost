@@ -19,16 +19,26 @@ CREATE TEMP VIEW IF NOT EXISTS workspace_snapshots AS
 SELECT lang, generation, printf('%s:%d', workspace_id, revision) AS fingerprint
 FROM selected_workspace_revisions;
 
-CREATE TEMP VIEW IF NOT EXISTS workspace_files AS
-SELECT versions.file_version_id AS file_id, versions.lang, versions.generation,
-       versions.rel_path, versions.blob_oid
+-- The one shared half-open projection boundary. Resolution selection needs the
+-- projection digest and exact revision identity; the older workspace views
+-- retain their narrow shape by projecting this view below.
+CREATE TEMP VIEW IF NOT EXISTS selected_workspace_file_versions AS
+SELECT selected.workspace_id, selected.revision,
+       versions.file_version_id, versions.lang, versions.generation,
+       versions.rel_path, versions.blob_oid, versions.projection_digest,
+       versions.valid_from
 FROM main.workspace_file_versions AS versions
 JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = versions.workspace_id
  AND selected.lang = versions.lang
  AND selected.generation = versions.generation
-WHERE versions.valid_from <= selected.revision
+WHERE versions.input_kind = 'source'
+  AND versions.valid_from <= selected.revision
   AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until);
+
+CREATE TEMP VIEW IF NOT EXISTS workspace_files AS
+SELECT file_version_id AS file_id, lang, generation, rel_path, blob_oid
+FROM selected_workspace_file_versions;
 
 CREATE TEMP VIEW IF NOT EXISTS workspace_package_files AS
 SELECT files.lang, files.generation, rows.package_name,
@@ -65,6 +75,85 @@ LEFT JOIN main.analysis_epochs AS epochs ON epochs.lang = files.lang
 JOIN main.live_parsed_blobs AS live
   ON live.lang = files.lang AND live.blob_oid = files.blob_oid
 WHERE files.generation = COALESCE(epochs.generation, 0);
+
+-- Callable-facts lookup needs to distinguish "no callable has this name" from
+-- "a matching callable exists in a complete blob whose required source family
+-- is unavailable." Keep the ordinary live views above ready-only. The
+-- candidate projection below retains matching rows with the persisted
+-- availability witness for that one preflight.
+-- These are intentionally the stable and anchored name arms separately. The
+-- caller applies the requested name predicates to this view, while the arm
+-- indexes keep that preflight proportional to exact-name candidates rather
+-- than to the whole workspace.
+CREATE TEMP VIEW IF NOT EXISTS callable_candidate_definition_names AS
+SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
+       units.blob_id, units.unit_key,
+       '' AS prefix, units.exact_fqn_tail AS tail,
+       units.exact_parent_fqn_tail AS exact_parent_tail,
+       units.identifier, COALESCE(visibility.available, 0) AS visibility_available
+FROM main.code_units AS units INDEXED BY idx_code_units_stable_parent_identifier
+CROSS JOIN main.blob_meta AS meta
+  ON meta.blob_id = units.blob_id
+CROSS JOIN main.blobs AS blobs
+  ON blobs.id = units.blob_id
+CROSS JOIN selected_workspace_revisions AS selected
+  ON selected.lang = units.lang
+CROSS JOIN main.workspace_file_versions AS files
+     INDEXED BY idx_workspace_file_versions_snapshot_blob
+  ON files.input_kind = 'source'
+ AND files.workspace_id = selected.workspace_id
+ AND files.lang = selected.lang
+ AND files.generation = selected.generation
+ AND files.blob_oid = blobs.blob_oid
+LEFT JOIN main.analysis_epochs AS epochs
+  ON epochs.lang = files.lang
+LEFT JOIN main.source_fact_readiness AS visibility
+  ON visibility.blob_id = units.blob_id
+WHERE units.fq_anchor_kind IS NULL
+  AND units.exact_fqn_tail IS NOT NULL
+  AND units.exact_parent_fqn_tail IS NOT NULL
+  AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
+  AND meta.is_complete = 1
+  AND files.valid_from <= selected.revision
+  AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
+  AND files.generation = COALESCE(epochs.generation, 0)
+  AND blobs.generation = files.generation
+UNION ALL
+SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
+       units.blob_id, units.unit_key,
+       anchors.package_name AS prefix, units.exact_fqn_tail AS tail,
+       units.exact_parent_fqn_tail AS exact_parent_tail,
+       units.identifier, COALESCE(visibility.available, 0) AS visibility_available
+FROM main.workspace_file_anchor_rows AS anchors
+     INDEXED BY idx_workspace_file_anchor_rows_package
+CROSS JOIN main.workspace_file_versions AS files
+  ON files.input_kind = 'source'
+ AND files.file_version_id = anchors.file_version_id
+CROSS JOIN selected_workspace_revisions AS selected
+  ON selected.workspace_id = files.workspace_id
+ AND selected.lang = files.lang
+ AND selected.generation = files.generation
+CROSS JOIN main.blobs AS blobs
+  ON blobs.lang = files.lang AND blobs.blob_oid = files.blob_oid
+CROSS JOIN main.blob_meta AS meta
+  ON meta.blob_id = blobs.id
+CROSS JOIN main.code_units AS units INDEXED BY idx_code_units_anchored_parent_identifier
+  ON units.blob_id = blobs.id
+ AND units.fq_anchor_kind = anchors.anchor_kind
+ AND units.fq_anchor_pop = anchors.anchor_pop
+LEFT JOIN main.analysis_epochs AS epochs
+  ON epochs.lang = files.lang
+LEFT JOIN main.source_fact_readiness AS visibility
+  ON visibility.blob_id = blobs.id
+WHERE units.fq_anchor_kind IS NOT NULL
+  AND units.exact_fqn_tail IS NOT NULL
+  AND units.exact_parent_fqn_tail IS NOT NULL
+  AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
+  AND meta.is_complete = 1
+  AND files.valid_from <= selected.revision
+  AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
+  AND files.generation = COALESCE(epochs.generation, 0)
+  AND blobs.generation = files.generation;
 
 CREATE TEMP VIEW IF NOT EXISTS live_workspace_packages AS
 SELECT packages.lang, packages.generation, packages.package_name
@@ -222,20 +311,29 @@ FROM live_path_symbol_names AS symbols;
 CREATE TEMP VIEW IF NOT EXISTS live_structural_members AS
 SELECT * FROM live_definition_exact_names WHERE exact_parent_tail IS NOT NULL;
 
+-- C# exposes a nested class both under its lexical owner and under its package
+-- for visible-member lookup. The final relational FQ segment records whether
+-- a class is nested, so this projection preserves that behavior without the
+-- retired per-unit visibility-container copy.
 CREATE TEMP VIEW IF NOT EXISTS live_visible_members AS
 SELECT * FROM live_structural_members
 UNION ALL
 SELECT names.lang, names.generation, names.rel_path, names.blob_oid,
-       names.blob_id,
-       names.unit_key, names.kind, names.short_name, names.identifier,
-       names.source_kind, names.prefix, names.tail, names.normalized_tail,
-       containers.exact_container_tail AS exact_parent_tail,
-       containers.normalized_container_tail AS normalized_parent_tail,
-       names.package_tail, names.simple_type_name, names.signature
+       names.blob_id, names.unit_key, names.kind, names.short_name,
+       names.identifier, names.source_kind, names.prefix, names.tail,
+       names.normalized_tail, names.package_tail AS exact_parent_tail,
+       NULL AS normalized_parent_tail, names.package_tail,
+       names.simple_type_name, names.signature
 FROM live_definition_exact_names AS names
-JOIN main.unit_visibility_containers AS containers
-  ON containers.blob_id = names.blob_id
- AND containers.unit_key = names.unit_key;
+JOIN main.code_units AS units
+  ON units.blob_id = names.blob_id AND units.unit_key = names.unit_key
+JOIN main.code_unit_fq_segments AS final_segment
+  ON final_segment.blob_id = units.blob_id
+ AND final_segment.unit_key = units.unit_key
+ AND final_segment.seg_ordinal = units.fq_segment_count - 1
+WHERE names.lang = 'csharp' AND names.kind = 0
+  AND final_segment.seg_kind = 'nested'
+  AND names.package_tail IS NOT NULL;
 
 CREATE TEMP VIEW IF NOT EXISTS live_definition_identifiers AS
 SELECT lang, generation, rel_path, blob_oid, blob_id, unit_key, kind, identifier,
@@ -313,15 +411,33 @@ SELECT names.lang, names.generation, names.rel_path, names.blob_oid,
        metadata.class_like_is_interface, metadata.class_like_is_static,
        metadata.type_parameters_recorded, metadata.result_type_identities,
        metadata.parameter_type_identities,
-       metadata.callable_override_modifier
+       metadata.callable_override_modifier,
+       metadata.java_constructor_shape, metadata.java_constructor_arity_required,
+       metadata.java_constructor_arity_total, metadata.java_constructor_arity_repeated,
+       metadata.class_like_kind, metadata.metadata_available,
+       metadata.ordinal AS metadata_ordinal,
+       CASE WHEN pairing_manifest.blob_id IS NULL THEN 1
+            ELSE pairing_manifest.row_count = pairing_meta.signature_metadata_count END
+         AS pairing_available
 FROM live_definition_exact_names AS names
 JOIN main.unit_signatures AS signatures
-  ON signatures.blob_id = names.blob_id
+ ON signatures.blob_id = names.blob_id
  AND signatures.unit_key = names.unit_key
-LEFT JOIN main.unit_signature_metadata AS metadata
+LEFT JOIN main.blob_optional_fact_manifest AS pairing_manifest
+  ON pairing_manifest.blob_id = names.blob_id
+ AND pairing_manifest.fact_kind = 6
+LEFT JOIN main.blob_meta AS pairing_meta
+  ON pairing_meta.blob_id = names.blob_id
+LEFT JOIN main.unit_signature_metadata_signatures AS pairing
+  ON pairing.blob_id = signatures.blob_id
+ AND pairing.unit_key = signatures.unit_key
+ AND pairing.signature_ordinal = signatures.ordinal
+ AND pairing_manifest.blob_id IS NOT NULL
+LEFT JOIN main.unit_signature_metadata_values AS metadata
   ON metadata.blob_id = signatures.blob_id
  AND metadata.unit_key = signatures.unit_key
- AND metadata.ordinal = signatures.ordinal;
+ AND metadata.ordinal = CASE WHEN pairing_manifest.blob_id IS NULL THEN signatures.ordinal
+                             ELSE pairing.metadata_ordinal END;
 
 CREATE TEMP VIEW IF NOT EXISTS live_stable_definition_parent_names AS
 SELECT units.lang, files.generation, files.rel_path, live.blob_oid,
@@ -340,7 +456,8 @@ CROSS JOIN selected_workspace_revisions AS selected
   ON selected.lang = units.lang
 CROSS JOIN main.workspace_file_versions AS files
      INDEXED BY idx_workspace_file_versions_snapshot_blob
-  ON files.workspace_id = selected.workspace_id
+  ON files.input_kind = 'source'
+ AND files.workspace_id = selected.workspace_id
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
@@ -363,7 +480,8 @@ SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
 FROM main.workspace_file_anchor_rows AS anchors
      INDEXED BY idx_workspace_file_anchor_rows_package
 CROSS JOIN main.workspace_file_versions AS files
-  ON files.file_version_id = anchors.file_version_id
+  ON files.input_kind = 'source'
+ AND files.file_version_id = anchors.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
@@ -398,7 +516,8 @@ CROSS JOIN selected_workspace_revisions AS selected
   ON selected.lang = units.lang
 CROSS JOIN main.workspace_file_versions AS files
      INDEXED BY idx_workspace_file_versions_snapshot_blob
-  ON files.workspace_id = selected.workspace_id
+  ON files.input_kind = 'source'
+ AND files.workspace_id = selected.workspace_id
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
@@ -422,7 +541,8 @@ SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
 FROM main.workspace_file_anchor_rows AS anchors
      INDEXED BY idx_workspace_file_anchor_rows_package
 CROSS JOIN main.workspace_file_versions AS files
-  ON files.file_version_id = anchors.file_version_id
+  ON files.input_kind = 'source'
+ AND files.file_version_id = anchors.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
@@ -453,7 +573,8 @@ CROSS JOIN selected_workspace_revisions AS selected
   ON selected.lang = units.lang
 CROSS JOIN main.workspace_file_versions AS files
      INDEXED BY idx_workspace_file_versions_snapshot_blob
-  ON files.workspace_id = selected.workspace_id
+  ON files.input_kind = 'source'
+ AND files.workspace_id = selected.workspace_id
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
@@ -477,7 +598,8 @@ CROSS JOIN selected_workspace_revisions AS selected
   ON selected.lang = units.lang
 CROSS JOIN main.workspace_file_versions AS files
      INDEXED BY idx_workspace_file_versions_snapshot_blob
-  ON files.workspace_id = selected.workspace_id
+  ON files.input_kind = 'source'
+ AND files.workspace_id = selected.workspace_id
  AND files.lang = selected.lang
  AND files.generation = selected.generation
  AND files.blob_oid = live.blob_oid
@@ -537,7 +659,8 @@ SELECT units.lang, files.generation, files.rel_path, files.blob_oid,
 FROM main.workspace_file_anchor_rows AS anchors
      INDEXED BY idx_workspace_file_anchor_rows_package
 CROSS JOIN main.workspace_file_versions AS files
-  ON files.file_version_id = anchors.file_version_id
+  ON files.input_kind = 'source'
+ AND files.file_version_id = anchors.file_version_id
 CROSS JOIN selected_workspace_revisions AS selected
   ON selected.workspace_id = files.workspace_id
  AND selected.lang = files.lang
@@ -613,3 +736,77 @@ WHERE units.in_declarations = 1
            AND anchors.anchor_kind = units.fq_anchor_kind
            AND anchors.anchor_pop = units.fq_anchor_pop
        ));
+
+-- Crate bindings use the same half-open revision boundary as file versions.
+CREATE TEMP VIEW IF NOT EXISTS selected_rust_crates AS
+SELECT selected.workspace_id, selected.lang, selected.generation, selected.revision,
+       versions.valid_from, versions.manifest_file_version_id, topologies.*
+FROM selected_workspace_revisions AS selected
+JOIN main.rust_crate_versions AS versions
+  ON versions.workspace_id = selected.workspace_id
+ AND versions.lang = selected.lang AND versions.generation = selected.generation
+JOIN main.rust_crate_topologies AS topologies
+  ON topologies.topology_id = versions.topology_id
+WHERE versions.valid_from <= selected.revision
+  AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
+  AND topologies.publication_state = 'complete';
+
+CREATE TEMP VIEW IF NOT EXISTS selected_rust_crate_containers AS
+SELECT crates.workspace_id, crates.lang, crates.generation, crates.revision,
+       crates.crate_key, modules.*, sources.blob_id, sources.scope_ordinal, sources.enum_scope_node_key, sources.rel_path, sources.source_kind, files.file_version_id
+FROM selected_rust_crates AS crates
+JOIN main.rust_crate_containers AS modules ON modules.topology_id = crates.topology_id
+JOIN main.rust_crate_container_sources AS sources USING(topology_id, container_path)
+JOIN selected_workspace_file_versions AS files
+  ON files.workspace_id = crates.workspace_id AND files.lang = crates.lang
+ AND files.generation = crates.generation AND files.revision = crates.revision
+ AND files.rel_path = sources.rel_path
+JOIN main.blobs AS blobs ON blobs.id = sources.blob_id
+ AND blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.generation = files.generation;
+
+-- Re-export traversal stays bounded even for an invalid cyclic route graph.
+CREATE TEMP VIEW IF NOT EXISTS rust_crate_exports_reachable AS
+WITH RECURSIVE reachable(topology_id, module_path, namespace, name, visibility,
+                         restricted_module_path, declaration_blob_id,
+                         declaration_site, depth) AS (
+  SELECT exports.topology_id, exports.module_path, exports.namespace, exports.name,
+         exports.visibility, exports.restricted_module_path,
+         exports.declaration_blob_id, exports.declaration_site, 0
+  FROM selected_rust_crates AS crates
+  JOIN main.rust_crate_exports AS exports ON exports.topology_id = crates.topology_id
+  UNION ALL
+  SELECT routes.topology_id, routes.module_path, target.namespace,
+         routes.bound_name, routes.visibility,
+         routes.restricted_module_path, target.declaration_blob_id,
+         target.declaration_site, target.depth + 1
+  FROM reachable AS target
+  JOIN selected_rust_crates AS dependency ON dependency.topology_id = target.topology_id
+  JOIN main.rust_crate_reexport_routes AS routes
+    ON routes.target_crate_key = dependency.crate_key
+   AND routes.target_module_path = target.module_path
+   AND routes.target_name = target.name
+  JOIN selected_rust_crates AS owner ON owner.topology_id = routes.topology_id
+   AND owner.workspace_id = dependency.workspace_id
+   AND owner.lang = dependency.lang AND owner.generation = dependency.generation
+   AND owner.revision = dependency.revision
+  WHERE target.depth < 64 AND target.visibility = 'public'
+  UNION ALL
+  SELECT routes.topology_id, routes.module_path, target.namespace,
+         target.name, routes.visibility,
+         routes.restricted_module_path, target.declaration_blob_id,
+         target.declaration_site, target.depth + 1
+  FROM reachable AS target
+  JOIN selected_rust_crates AS dependency ON dependency.topology_id = target.topology_id
+  JOIN main.rust_crate_glob_reexport_routes AS routes
+    ON routes.target_crate_key = dependency.crate_key
+   AND routes.target_module_path = target.module_path
+  JOIN selected_rust_crates AS owner ON owner.topology_id = routes.topology_id
+   AND owner.workspace_id = dependency.workspace_id
+   AND owner.lang = dependency.lang AND owner.generation = dependency.generation
+   AND owner.revision = dependency.revision
+  WHERE target.depth < 64 AND target.visibility = 'public'
+)
+SELECT DISTINCT topology_id, module_path, namespace, name, visibility,
+                restricted_module_path, declaration_blob_id, declaration_site
+FROM reachable;

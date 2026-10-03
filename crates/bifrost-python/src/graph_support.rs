@@ -10,7 +10,7 @@
 //! type.
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
-use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo};
+use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::prepared_syntax::{IndexedFileFacts, PreparedSyntaxTree};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
@@ -31,9 +31,9 @@ use crate::declarations::{
     python_repeated_root_extension_dir,
 };
 use crate::imports::{
-    PythonImportDetails, python_import_details, python_import_infos_from_node,
-    python_namespace_binding_module, python_namespace_binding_name, resolve_exported_fqn,
-    resolve_import_bindings, resolve_python_relative_module,
+    PythonImportDetails, python_import_details, python_namespace_binding_module,
+    python_namespace_binding_name, resolve_exported_fqn, resolve_import_bindings,
+    resolve_python_relative_module,
 };
 use crate::syntax::{python_plain_string_literal, python_static_attribute_path};
 use crate::usage_index::PythonUsageIndex;
@@ -48,7 +48,9 @@ use crate::usage_index::PythonUsageIndex;
 /// everything it calls take this trait, so the build cannot re-enter the memo
 /// it is filling. Code that runs once the index exists takes
 /// [`PythonUsageSource`].
-pub trait PythonSource: CodeUnitIndex + ImportAnalysisProvider {
+pub trait PythonSource:
+    CodeUnitIndex + ImportAnalysisProvider + crate::source_facts::PythonSourceFactProvider
+{
     /// Path-derived module units for `module_fq`; `None` when the store could
     /// not answer the path-symbol query at all.
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>>;
@@ -75,17 +77,10 @@ pub trait PythonSource: CodeUnitIndex + ImportAnalysisProvider {
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex>;
 
-    /// The parsed tree and its source backing for `file`, from the analyzer's
-    /// query read cache.
-    ///
-    /// A caller that needs a syntax node for an already-indexed declaration
-    /// must reach it through here rather than re-parsing: `indexed_source`
-    /// hands out an owned copy of the whole file, and building a `Parser` per
-    /// declaration reparses text the analyzer has already parsed. `None` when
-    /// the analyzer holds no prepared tree, which is what keeps the re-parsing
-    /// path alive as a fallback.
-    /// The [`QueryToken`] is proof that a request scope is open, so the cache
-    /// this reads is live (issue #2414 step 3).
+    /// The admitted active syntax for executable-body and use-site queries.
+    /// Captured declaration properties are read from signature metadata.
+    /// `None` is unavailable and does not authorize a declaration parser
+    /// fallback. The token proves the request cache is live.
     fn prepared_syntax(
         &self,
         token: QueryToken<'_>,
@@ -987,21 +982,8 @@ pub fn compute_export_index_of(
         &mut events,
     );
 
-    if let Ok(source) = file.read_to_string()
-        && let Some(tree) = parse_python_tree(&source)
-    {
-        collect_reexport_events(
-            python,
-            file,
-            tree.root_node(),
-            &source,
-            &mut events,
-            &mut index,
-        );
-    } else {
-        let imports = python.import_info_of(token, file);
-        collect_reexport_events_from_imports(python, file, &imports, &mut events, &mut index);
-    }
+    let imports = python.import_info_of(token, file);
+    collect_reexport_events_from_imports(python, file, &imports, &mut events, &mut index);
 
     finish_export_index(events, index)
 }
@@ -1011,11 +993,10 @@ pub fn export_index_from_file_facts(
     file: &ProjectFile,
     facts: &dyn IndexedFileFacts,
     module_name: &str,
-    binder: &ImportBinder,
 ) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let mut events = Vec::new();
-    let mut local_names = collect_local_export_events(
+    collect_local_export_events(
         facts.top_level_declarations().iter(),
         |code_unit| {
             facts
@@ -1037,7 +1018,6 @@ pub fn export_index_from_file_facts(
         && !identifier.is_empty()
         && !identifier.starts_with('_')
     {
-        local_names.insert(identifier.to_string());
         events.push((
             0,
             identifier.to_string(),
@@ -1047,27 +1027,7 @@ pub fn export_index_from_file_facts(
         ));
     }
 
-    if import_order_requires_source(binder, &local_names)
-        && let Ok(source) = file.read_to_string()
-        && let Some(tree) = parse_python_tree(&source)
-    {
-        collect_reexport_events(
-            python,
-            file,
-            tree.root_node(),
-            &source,
-            &mut events,
-            &mut index,
-        );
-    } else {
-        collect_reexport_events_from_imports(
-            python,
-            file,
-            facts.imports(),
-            &mut events,
-            &mut index,
-        );
-    }
+    collect_reexport_events_from_imports(python, file, facts.imports(), &mut events, &mut index);
 
     finish_export_index(events, index)
 }
@@ -1106,35 +1066,6 @@ fn finish_export_index(
     index
 }
 
-fn collect_reexport_events(
-    python: &dyn PythonSource,
-    file: &ProjectFile,
-    root: tree_sitter::Node<'_>,
-    source: &str,
-    events: &mut Vec<(usize, String, ExportEntry)>,
-    index: &mut ExportIndex,
-) {
-    // Module scope is not depth one. A `from ... import` inside an if/else,
-    // try/except, with or match block still binds a module-level name, so it
-    // re-exports like any other (issue #1764). Only a function or class body
-    // opens a scope whose bindings are not module exports.
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "import_from_statement" => {
-                    for info in python_import_infos_from_node(child, source) {
-                        record_single_reexport_event(python, file, &info, events, index);
-                    }
-                }
-                "function_definition" | "class_definition" => {}
-                _ => stack.push(child),
-            }
-        }
-    }
-}
-
 fn collect_reexport_events_from_imports(
     python: &dyn PythonSource,
     file: &ProjectFile,
@@ -1143,6 +1074,13 @@ fn collect_reexport_events_from_imports(
     index: &mut ExportIndex,
 ) {
     for import in imports {
+        if import
+            .path
+            .as_ref()
+            .is_none_or(|path| !path.lexical_scopes.is_empty())
+        {
+            continue;
+        }
         record_single_reexport_event(python, file, import, events, index);
     }
 }
@@ -1410,89 +1348,48 @@ pub fn render_skeleton_recursive(
     header_only: bool,
     out: &mut String,
 ) {
-    if let Some(signature) = python_signature(index, code_unit, header_only) {
-        for line in signature.lines() {
-            out.push_str(indent);
-            out.push_str(line);
-            out.push('\n');
-        }
+    enum Work {
+        Declaration(CodeUnit, String),
+        Elision(String),
     }
-
-    let all_children = index.direct_children(code_unit);
-    let field_children: Vec<_> = all_children
-        .iter()
-        .filter(|child| child.is_field())
-        .cloned()
-        .collect();
-    let children = if header_only {
-        field_children.clone()
-    } else {
-        all_children.clone()
-    };
-    if !children.is_empty() || code_unit.is_class() || code_unit.is_module() {
-        let child_indent = format!("{indent}  ");
-        for child in children {
-            render_skeleton_recursive(index, &child, &child_indent, header_only, out);
-        }
-        if header_only && all_children.len() > field_children.len() {
-            out.push_str(&child_indent);
+    let mut stack = vec![Work::Declaration(code_unit.clone(), indent.to_string())];
+    while let Some(work) = stack.pop() {
+        let Work::Declaration(unit, indent) = work else {
+            let Work::Elision(indent) = work else {
+                unreachable!()
+            };
+            out.push_str(&indent);
             out.push_str("[...]\n");
-        }
-    }
-}
-
-fn python_signature(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-    _header_only: bool,
-) -> Option<String> {
-    if code_unit.is_module() {
-        return None;
-    }
-
-    let source = index.get_source(code_unit, false)?;
-    let lines: Vec<_> = source
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut decorators = Vec::new();
-    let mut header = None;
-    for line in lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('@') {
-            decorators.push(trimmed.to_string());
             continue;
+        };
+        if !unit.is_module()
+            && !unit.is_file_scope()
+            && let Some(signature) = index.signatures(&unit).first()
+        {
+            // A property's declaration label is callable-shaped, but the
+            // skeleton has always displayed its header as a field.
+            let signature = if unit.is_field() {
+                signature.strip_suffix(" ...").unwrap_or(signature)
+            } else {
+                signature
+            };
+            for line in signature.lines() {
+                out.push_str(&indent);
+                out.push_str(line);
+                out.push('\n');
+            }
         }
-        header = Some(trimmed.to_string());
-        break;
-    }
-    let mut rendered = String::new();
-    for decorator in decorators {
-        rendered.push_str(&decorator);
-        rendered.push('\n');
-    }
-
-    let header = header?;
-    match code_unit.kind() {
-        CodeUnitType::Class => rendered.push_str(&header),
-        CodeUnitType::Function => {
-            rendered.push_str(header.trim_end_matches(':'));
-            rendered.push_str(": ...");
+        let children = index.direct_children(&unit);
+        let child_indent = format!("{indent}  ");
+        if header_only && children.iter().any(|child| !child.is_field()) {
+            stack.push(Work::Elision(child_indent.clone()));
         }
-        CodeUnitType::Field | CodeUnitType::Macro => rendered.push_str(header.as_str()),
-        CodeUnitType::Module | CodeUnitType::FileScope => return None,
+        for child in children
+            .into_iter()
+            .rev()
+            .filter(|child| !header_only || child.is_field())
+        {
+            stack.push(Work::Declaration(child, child_indent.clone()));
+        }
     }
-    Some(rendered)
-}
-
-fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<String>) -> bool {
-    binder
-        .bindings
-        .keys()
-        .any(|bound_name| local_names.contains(bound_name))
 }

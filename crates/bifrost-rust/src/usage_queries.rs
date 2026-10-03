@@ -24,7 +24,6 @@
 //! a path enters, and it is why `facts_of` takes a `ProjectFile` rather than an
 //! `Oid`.
 
-use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -34,12 +33,11 @@ use git2::Oid;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
-use crate::graph_support::RustFactSource;
+use crate::graph_support::{RustCargoRouteError, RustFactSource};
 
 use crate::declarations::rust_package_name;
-use crate::graph_support::rust_value_constructor_visibilities;
-use crate::imports::{RustImportBindingName, RustVisibility, rust_item_visibility};
-use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
+use crate::imports::{RustImportBindingName, RustVisibility};
+use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
     Domain, ModuleKey, RustImportExtent, RustPathIdentity, RustSymbolIdentity, RustSymbolNamespace,
     direct_import_scope_for_module, rust_file_is_actual_crate_root,
@@ -51,17 +49,16 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 /// One `use` binding of one file, with its module names composed against the
 /// live path and its lexical reach in the shape the usage graph consumes.
 ///
-/// This is the persisted `rust_import_targets` row plus that composition. It is
-/// deliberately narrower than `RustProjectedImport`: the rendered snippet and
-/// the structured import path that value also carries are not usage facts, and
-/// reproducing them would mean re-parsing the file, which is the cost this
-/// design exists to remove.
+/// This is the persisted canonical `rust_import_targets` row plus that live
+/// placement composition. The route segments are already stored structurally;
+/// no rendered import snippet or source re-parsing is needed to reconstruct the
+/// binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct RustImportBinding {
-    /// The leaf path as written, split into segments. For a glob this is the
-    /// module path; for a named import it is the module path plus the imported
-    /// name, which is exactly `RustProjectedImport::import.path`.
+    /// The canonical route segments. For a glob this is the complete module
+    /// path; for a named import it is the qualifier followed by the imported
+    /// name.
     pub path: Vec<String>,
     /// The semantic local binding. Globs and explicit underscore aliases do
     /// not introduce a referenceable local name.
@@ -85,19 +82,16 @@ pub struct RustImportBinding {
 /// Every symbol identity one file introduces, with the visibility domain each
 /// identity carries.
 ///
-/// A per-file product in the plan's classification: deriving it needs the
-/// file's own declarations, their structural parents and their visibility, and
-/// nothing from any other file. The v1 index folded exactly this derivation
-/// into its workspace-wide build; both callers now go through
-/// [`rust_declaration_facts`], so the workspace map and the query-time answer
-/// cannot drift apart.
+/// A query-time per-file product: canonical source properties are combined
+/// with mounted declarations, structural parents, and the selected Cargo root
+/// through [`rust_declaration_facts`]. Cargo placement is not a source fact.
 #[derive(Debug, Default)]
 pub struct RustDeclarationFacts {
     /// Declaration -> the identity it introduces, in declaration order. A
     /// declaration whose visibility does not resolve to a domain still appears
     /// here; it simply contributes no entry to `domains`.
     pub identities: Vec<(CodeUnit, RustSymbolIdentity)>,
-    /// Tuple-struct and tuple-variant constructors, which bind a
+    /// Tuple-struct and unit-struct constructors, which bind a
     /// value-namespace identity of the declaration's own name under the
     /// constructor's (possibly narrower) visibility.
     pub value_constructors: Vec<(CodeUnit, RustSymbolIdentity)>,
@@ -112,9 +106,8 @@ pub struct RustDeclarationFacts {
     /// a `#[cfg(not(x))]` local declaration and a `#[cfg(x)]` import of the
     /// same name as alternatives rather than as an ambiguity (#1377).
     ///
-    /// Derived from the file's own tree, so it is a per-file product like the
-    /// rest of this struct and needs no stored row: the predicate sits on the
-    /// declaration's own item, in the file that declares it.
+    /// Read from canonical source-declaration properties. Distinct source
+    /// declarations retain their predicates even when they share a CodeUnit.
     pub cfg_conditions: Vec<(RustSymbolIdentity, Vec<RustCfgCondition>)>,
     /// Identity -> the exact declaration occurrences that contributed a
     /// visibility domain and its cfg guard. This paired view avoids assuming
@@ -126,27 +119,32 @@ pub struct RustDeclarationFacts {
 
 /// Derive one file's declaration facts.
 ///
-/// `declarations` is passed in rather than fetched, because both callers
-/// already hold the file's declaration set and re-reading it would double the
-/// store work on the build path.
+/// `declarations` is passed in because the caller already holds the file's
+/// declaration set. Visibility, cfg, and constructor restrictions come from
+/// the same generation's canonical source-declaration publication.
 ///
-/// `None` only when `keep_going` asked to stop.
+/// `Ok(None)` only when `keep_going` asked to stop. A missing canonical Cargo
+/// route is returned as `Err` so it cannot be cached as an empty fact set.
 pub fn rust_declaration_facts(
     analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
     file: &ProjectFile,
     declarations: &BTreeSet<CodeUnit>,
     keep_going: &impl Fn() -> bool,
-) -> Option<RustDeclarationFacts> {
+) -> Result<Option<RustDeclarationFacts>, RustCargoRouteError> {
+    let properties = match analyzer.declaration_source_properties(file, keep_going) {
+        Ok(properties) => properties,
+        Err(RustCargoRouteError::Cancelled) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let mut facts = RustDeclarationFacts::default();
-    let mut ordered_domains: Vec<(RustSymbolIdentity, Domain)> = Vec::new();
-    let mut ordered_cfg_conditions: Vec<(RustSymbolIdentity, RustCfgCondition)> = Vec::new();
-    let mut ordered_domain_cfg_occurrences: Vec<(RustSymbolIdentity, Domain, RustCfgCondition)> =
-        Vec::new();
-    let prepared = analyzer.prepared_syntax(token, file);
-    let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file);
+    let mut ordered_domains = Vec::new();
+    let mut ordered_cfg_conditions = Vec::new();
+    let mut ordered_domain_cfg_occurrences = Vec::new();
+    let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file)?;
     for declaration in declarations {
-        keep_going().then_some(())?;
+        if !keep_going() {
+            return Ok(None);
+        }
         let (owner, declared_module) = if declaration.is_module() {
             let declared = ModuleKey::new(file, &declaration.fq_name());
             let owner = declared
@@ -164,6 +162,9 @@ pub fn rust_declaration_facts(
         let Some(namespace) = RustSymbolNamespace::of(declaration) else {
             continue;
         };
+        let declaration_properties = properties
+            .get(declaration)
+            .ok_or(RustCargoRouteError::Unavailable)?;
         let identity = RustSymbolIdentity {
             file: file.clone(),
             module: owner.clone(),
@@ -173,62 +174,28 @@ pub fn rust_declaration_facts(
         facts
             .identities
             .push((declaration.clone(), identity.clone()));
-        let occurrence_metadata = if let Some(syntax) = prepared.as_ref() {
-            let mut occurrences = crate::graph_support::inspect_rust_named_declaration_nodes_while(
-                analyzer.code_units(),
-                declaration,
-                syntax.tree().root_node(),
-                syntax.source(),
-                keep_going,
-                |node, source| {
-                    (
-                        rust_cfg_condition(node, source),
-                        rust_item_visibility(node, source),
-                        rust_value_constructor_visibilities(node, source),
-                        crate::graph_support::is_rust_macro_export_node(node, source),
-                    )
-                },
-            )?;
-            if occurrences.is_empty() {
-                occurrences.push(None);
+        let macro_export = namespace == RustSymbolNamespace::Macro
+            && crate::graph_support::is_rust_macro_export_declaration(analyzer, declaration)?;
+        let mut has_value_constructor = false;
+        for property in declaration_properties {
+            if !keep_going() {
+                return Ok(None);
             }
-            occurrences
-        } else {
-            vec![None]
-        };
-        let mut recorded_constructor = false;
-        for occurrence in occurrence_metadata {
-            keep_going().then_some(())?;
-            let (
-                declaration_cfg_condition,
-                declaration_visibility,
-                constructor_visibilities,
-                macro_export,
-            ) = match occurrence {
-                Some(metadata) => metadata,
-                None => {
-                    // A declaration whose node this build cannot find proves nothing about
-                    // its guard or visibility. Retain the identity and unknown guard, but
-                    // do not manufacture a private domain for this occurrence.
-                    ordered_cfg_conditions.push((identity.clone(), RustCfgCondition::Unknown));
-                    continue;
-                }
-            };
-            ordered_cfg_conditions.push((identity.clone(), declaration_cfg_condition.clone()));
-            let declaration_domain = if namespace == RustSymbolNamespace::Macro && macro_export {
+            ordered_cfg_conditions.push((identity.clone(), property.cfg_condition.clone()));
+            let declaration_domain = if macro_export {
                 Some(Domain::Public)
             } else {
                 direct_import_scope_for_module(
                     file,
                     &owner.package(),
-                    declaration_visibility,
+                    property.visibility.clone(),
                     is_actual_crate_root,
                 )
             };
             let Some(domain) = declaration_domain else {
                 continue;
             };
-            if let Some(declared_module) = declared_module.as_ref() {
+            if let Some(declared_module) = &declared_module {
                 facts
                     .declared_module_domains
                     .push((declared_module.clone(), domain.clone()));
@@ -236,80 +203,85 @@ pub fn rust_declaration_facts(
             ordered_domain_cfg_occurrences.push((
                 identity.clone(),
                 domain.clone(),
-                declaration_cfg_condition.clone(),
+                property.cfg_condition.clone(),
             ));
             ordered_domains.push((identity.clone(), domain));
-            let constructor_domain = constructor_visibilities.and_then(|visibilities| {
-                visibilities
-                    .into_iter()
+            if let Some(constructor) = &property.value_constructor {
+                let constructor_domain = std::iter::once(&property.visibility)
+                    .chain(constructor.field_visibilities.iter())
+                    .chain(constructor.non_exhaustive.then_some(&RustVisibility::Crate))
                     .map(|visibility| {
                         direct_import_scope_for_module(
                             file,
                             &owner.package(),
-                            visibility,
+                            visibility.clone(),
                             is_actual_crate_root,
                         )
                     })
                     .try_fold(Domain::Public, |effective, domain| {
                         effective.intersect(&domain?)
-                    })
-            });
-            if let Some(constructor_domain) = constructor_domain {
-                let constructor = RustSymbolIdentity {
-                    namespace: RustSymbolNamespace::Value,
-                    ..identity.clone()
-                };
-                ordered_domain_cfg_occurrences.push((
-                    constructor.clone(),
-                    constructor_domain.clone(),
-                    declaration_cfg_condition,
-                ));
-                ordered_domains.push((constructor.clone(), constructor_domain));
-                if !recorded_constructor {
-                    facts
-                        .value_constructors
-                        .push((declaration.clone(), constructor));
-                    recorded_constructor = true;
+                    });
+                if let Some(domain) = constructor_domain {
+                    let constructor_identity = RustSymbolIdentity {
+                        namespace: RustSymbolNamespace::Value,
+                        ..identity.clone()
+                    };
+                    ordered_domain_cfg_occurrences.push((
+                        constructor_identity.clone(),
+                        domain.clone(),
+                        property.cfg_condition.clone(),
+                    ));
+                    ordered_domains.push((constructor_identity.clone(), domain));
+                    if !has_value_constructor {
+                        facts
+                            .value_constructors
+                            .push((declaration.clone(), constructor_identity));
+                        has_value_constructor = true;
+                    }
                 }
             }
         }
     }
-    for (identity, domain) in ordered_domains {
-        keep_going().then_some(())?;
-        match facts
-            .domains
-            .iter_mut()
-            .find(|(existing, _)| *existing == identity)
-        {
-            Some((_, domains)) => domains.push(domain),
-            None => facts.domains.push((identity, vec![domain])),
+    let Some(domains) = group_declaration_alternatives(ordered_domains, keep_going) else {
+        return Ok(None);
+    };
+    let Some(cfg_conditions) = group_declaration_alternatives(ordered_cfg_conditions, keep_going)
+    else {
+        return Ok(None);
+    };
+    facts.domains = domains;
+    facts.cfg_conditions = cfg_conditions;
+    let ordered_domain_cfg_occurrences = ordered_domain_cfg_occurrences
+        .into_iter()
+        .map(|(identity, domain, condition)| (identity, (domain, condition)))
+        .collect();
+    let Some(domain_cfg_occurrences) =
+        group_declaration_alternatives(ordered_domain_cfg_occurrences, keep_going)
+    else {
+        return Ok(None);
+    };
+    facts.domain_cfg_occurrences = domain_cfg_occurrences;
+    Ok(Some(facts))
+}
+
+fn group_declaration_alternatives<T>(
+    values: Vec<(RustSymbolIdentity, T)>,
+    keep_going: &impl Fn() -> bool,
+) -> Option<Vec<(RustSymbolIdentity, Vec<T>)>> {
+    let mut indices = HashMap::default();
+    let mut groups: Vec<(RustSymbolIdentity, Vec<T>)> = Vec::new();
+    for (identity, value) in values {
+        if !keep_going() {
+            return None;
         }
+        let index = *indices.entry(identity.clone()).or_insert_with(|| {
+            let index = groups.len();
+            groups.push((identity, Vec::new()));
+            index
+        });
+        groups[index].1.push(value);
     }
-    for (identity, condition) in ordered_cfg_conditions {
-        keep_going().then_some(())?;
-        match facts
-            .cfg_conditions
-            .iter_mut()
-            .find(|(existing, _)| *existing == identity)
-        {
-            Some((_, conditions)) => conditions.push(condition),
-            None => facts.cfg_conditions.push((identity, vec![condition])),
-        }
-    }
-    for (identity, domain, condition) in ordered_domain_cfg_occurrences {
-        keep_going().then_some(())?;
-        match facts
-            .domain_cfg_occurrences
-            .iter_mut()
-            .find(|(existing, _)| *existing == identity)
-        {
-            Some((_, occurrences)) => occurrences.push((domain, condition)),
-            None => facts
-                .domain_cfg_occurrences
-                .push((identity, vec![(domain, condition)])),
-        }
-    }
-    Some(facts)
+    Some(groups)
 }
 
 /// A query-scoped view over the store, borrowing the analyzer for its store
@@ -370,13 +342,17 @@ impl<'a> RustUsageQueries<'a> {
 
     /// Every persisted fact for `file`, memoized per `(generation, blob)`.
     ///
-    /// `None` when the file has no live blob or its blob has no rows -- a file
-    /// outside the analyzed set, or one whose analysis has not been persisted
-    /// yet. Callers treat that as "no facts", not as an error: the catch-up
-    /// policy that makes it impossible is Milestone 3.
-    pub fn facts_of(&self, file: &ProjectFile) -> Option<Arc<RustUsageFacts>> {
-        let oid = self.oid_of(file)?;
-        self.analyzer.rust_usage_facts_of_blob(oid)
+    /// `Ok(None)` when the file has no live blob. A live blob whose Rust fact
+    /// publication is missing or incomplete is an explicit unavailable error,
+    /// not a successful no-facts answer.
+    pub fn facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Option<Arc<RustUsageFacts>>, RustCargoRouteError> {
+        let Some(oid) = self.oid_of(file) else {
+            return Ok(None);
+        };
+        self.analyzer.rust_usage_facts_of_blob(oid).map(Some)
     }
 
     fn oid_of(&self, file: &ProjectFile) -> Option<Oid> {
@@ -384,7 +360,10 @@ impl<'a> RustUsageQueries<'a> {
     }
 
     /// One file's declaration identities and their domains, memoized.
-    pub fn declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+    pub fn declaration_facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<RustDeclarationFacts>, RustCargoRouteError> {
         self.analyzer.rust_declaration_facts_of(file)
     }
 
@@ -396,13 +375,14 @@ impl<'a> RustUsageQueries<'a> {
         &self,
         file: &ProjectFile,
         name: &str,
-    ) -> Vec<(RustSymbolIdentity, Vec<Domain>)> {
-        self.declaration_facts_of(file)
+    ) -> Result<Vec<(RustSymbolIdentity, Vec<Domain>)>, RustCargoRouteError> {
+        Ok(self
+            .declaration_facts_of(file)?
             .domains
             .iter()
             .filter(|(identity, _)| identity.name == name)
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// Every declaration identity in the workspace named `name`, with its
@@ -417,7 +397,10 @@ impl<'a> RustUsageQueries<'a> {
     /// exists there and what visibility it carries. A candidate whose only
     /// declaration of `name` has no resolvable domain contributes nothing,
     /// exactly as it contributed no `declaration_domains` key in v1.
-    pub fn identities_named(&self, name: &str) -> Vec<(RustSymbolIdentity, Vec<Domain>)> {
+    pub fn identities_named(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(RustSymbolIdentity, Vec<Domain>)>, RustCargoRouteError> {
         let mut candidates: Vec<ProjectFile> = self
             .analyzer
             .lookup_candidates_by_identifier(name)
@@ -427,10 +410,11 @@ impl<'a> RustUsageQueries<'a> {
             .collect();
         candidates.sort();
         candidates.dedup();
-        candidates
-            .iter()
-            .flat_map(|file| self.identities_in_file_named(file, name))
-            .collect()
+        let mut identities = Vec::new();
+        for file in &candidates {
+            identities.extend(self.identities_in_file_named(file, name)?);
+        }
+        Ok(identities)
     }
 
     /// The modules `file` introduces, as `(module, start_byte, end_byte)` with
@@ -440,13 +424,16 @@ impl<'a> RustUsageQueries<'a> {
     /// question this answers is "which module encloses a byte of this file".
     /// A `mod name;` declaration has no body here; resolving it to another file
     /// is a separate, cross-file question.
-    pub fn module_extents_of(&self, file: &ProjectFile) -> Vec<(ModuleKey, usize, usize)> {
-        let Some(facts) = self.facts_of(file) else {
-            return Vec::new();
+    pub fn module_extents_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<(ModuleKey, usize, usize)>, RustCargoRouteError> {
+        let Some(facts) = self.facts_of(file)? else {
+            return Ok(Vec::new());
         };
         let identity = self.path_identity_of(file);
         let package = &identity.package;
-        facts
+        Ok(facts
             .modules
             .iter()
             .filter(|module| module.is_inline)
@@ -460,44 +447,49 @@ impl<'a> RustUsageQueries<'a> {
                     module.end_byte,
                 )
             })
-            .collect()
+            .collect())
     }
 
     /// The narrowest module of `file` whose body contains `byte`.
-    pub fn module_at_byte(&self, file: &ProjectFile, byte: usize) -> Option<ModuleKey> {
-        self.module_extents_of(file)
+    pub fn module_at_byte(
+        &self,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> Result<Option<ModuleKey>, RustCargoRouteError> {
+        Ok(self
+            .module_extents_of(file)?
             .into_iter()
             .filter(|(_, start, end)| *start <= byte && byte < *end)
             .min_by_key(|(_, start, end)| end.saturating_sub(*start))
-            .map(|(module, _, _)| module)
+            .map(|(module, _, _)| module))
     }
 
     /// Every `use` binding of `file`, in source order.
-    pub fn import_bindings_of(&self, file: &ProjectFile) -> Arc<Vec<RustImportBinding>> {
+    pub fn import_bindings_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<Vec<RustImportBinding>>, RustCargoRouteError> {
         if let Some(cached) = self.import_bindings.borrow().get(file).cloned() {
-            return cached;
+            return Ok(cached);
         }
-        let bindings = Arc::new(
-            self.facts_of(file)
-                .map(|facts| {
-                    let identity = self.path_identity_of(file);
-                    let package = &identity.package;
-                    facts
-                        .import_targets
-                        .iter()
-                        .map(|target| {
-                            binding_from_fact(package, &identity.crate_root_package, target)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
+        let bindings = Arc::new(match self.facts_of(file)? {
+            Some(facts) => {
+                let identity = self.path_identity_of(file);
+                let package = &identity.package;
+                facts
+                    .import_targets
+                    .iter()
+                    .map(|target| binding_from_fact(package, &identity.crate_root_package, target))
+                    .collect()
+            }
+            None => Vec::new(),
+        });
         self.import_binding_computations
             .set(self.import_binding_computations.get() + 1);
         self.import_bindings
             .borrow_mut()
             .insert(file.clone(), Arc::clone(&bindings));
-        bindings
+        Ok(bindings)
     }
 
     /// Number of files whose persisted import rows have been decoded by this
@@ -507,10 +499,13 @@ impl<'a> RustUsageQueries<'a> {
     }
 
     /// The names `file` re-exports through a non-private root `use`.
-    pub fn re_exports_of(&self, file: &ProjectFile) -> Vec<RustExportFact> {
-        self.facts_of(file)
-            .map(|facts| facts.exports.clone())
-            .unwrap_or_default()
+    pub fn re_exports_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<RustExportFact>, RustCargoRouteError> {
+        Ok(self
+            .facts_of(file)?
+            .map_or_else(Vec::new, |facts| facts.exports.clone()))
     }
 
     /// Live files that import `module_path`, spelled exactly as they write it.
@@ -519,8 +514,11 @@ impl<'a> RustUsageQueries<'a> {
     /// writes `crate::a` and one that writes `super::a` may name the same
     /// module, and two crates may both write `alpha`. Verification is the
     /// caller's.
-    pub fn files_importing_module_path(&self, module_path: &str) -> Vec<ProjectFile> {
-        self.live_files(self.analyzer.rust_import_target_blobs(module_path))
+    pub fn files_importing_module_path(
+        &self,
+        module_path: &str,
+    ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+        Ok(self.live_files(self.analyzer.rust_import_target_blobs(module_path)?))
     }
 
     /// Live files whose structured imports can name `component` as a module.
@@ -529,8 +527,14 @@ impl<'a> RustUsageQueries<'a> {
     /// component, including globs and named imports below that module. It does
     /// not include ordinary code mentions; callers still verify every returned
     /// file by resolving its forward import edges.
-    pub fn files_importing_module_component(&self, component: &str) -> Vec<ProjectFile> {
-        self.live_files(self.analyzer.rust_module_import_candidate_blobs(component))
+    pub fn files_importing_module_component(
+        &self,
+        component: &str,
+    ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+        Ok(self.live_files(
+            self.analyzer
+                .rust_module_import_candidate_blobs(component)?,
+        ))
     }
 
     /// Live files whose text mentions `identifier` in at least one of the
@@ -540,16 +544,20 @@ impl<'a> RustUsageQueries<'a> {
     /// Pass [`RUST_OCCURRENCE_CODE`](brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE) to
     /// exclude comments and string literals,
     /// which is what a reference search wants.
-    pub fn files_mentioning(&self, identifier: &str, context_mask: u32) -> Vec<ProjectFile> {
+    pub fn files_mentioning(
+        &self,
+        identifier: &str,
+        context_mask: u32,
+    ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
         let snapshot = self.analyzer.live_blobs();
         let mut files = Vec::new();
-        for (oid, mask) in self.analyzer.rust_identifier_occurrence_blobs(identifier) {
+        for (oid, mask) in self.analyzer.rust_identifier_occurrence_blobs(identifier)? {
             if mask & context_mask == 0 {
                 continue;
             }
             files.extend(snapshot.paths_for_oid(oid));
         }
-        dedup_files(files)
+        Ok(dedup_files(files))
     }
 
     /// Live files with an `include!` whose literal ends in `file_name`.
@@ -559,8 +567,11 @@ impl<'a> RustUsageQueries<'a> {
     /// here: two directories can both hold a `table.rs`, and only resolving
     /// each candidate's own literal against its own directory decides which
     /// one it names.
-    pub fn files_with_include_named(&self, file_name: &str) -> Vec<ProjectFile> {
-        self.live_files(self.analyzer.rust_include_blobs(file_name))
+    pub fn files_with_include_named(
+        &self,
+        file_name: &str,
+    ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+        Ok(self.live_files(self.analyzer.rust_include_blobs(file_name)?))
     }
 
     fn live_files(&self, oids: Vec<Oid>) -> Vec<ProjectFile> {
@@ -591,12 +602,7 @@ fn binding_from_fact(
     crate_root_package: &str,
     target: &RustImportTargetFact,
 ) -> RustImportBinding {
-    let mut path: Vec<String> = target
-        .module_path
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut path = target.module_path.clone();
     if let Some(imported_name) = &target.imported_name {
         path.push(imported_name.clone());
     }

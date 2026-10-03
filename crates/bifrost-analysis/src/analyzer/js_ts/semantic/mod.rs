@@ -25,8 +25,8 @@ use brokk_bifrost_js_ts::syntax::{
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v28";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v33";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v30";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v35";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -364,6 +364,7 @@ use inventory::{
     JsTsProcedureInventory, LexicalCallableTarget, NestedProcedureTarget, ProcedureEnumeration,
     ProcedureSpec, enumerate_procedures,
 };
+pub(crate) use syntax::PROCEDURE_SYNTAX_ROLES;
 
 type TsLoweringError = ProcedureLoweringError;
 

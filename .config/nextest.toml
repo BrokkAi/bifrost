@@ -100,18 +100,16 @@ threads-required = "num-cpus"
 # them, and reserving the machine for them would cost more than it protects.
 #
 # c_wide_translation_unit_indexes_in_linear_time    6.2s against a 5s bound.
-# large_rust_file_definition_and_hover_stay_interactive   5s interactive bound.
+# large_rust_file_definition_stays_interactive      5s interactive bound.
 # deeply_nested_javascript_extraction_is_linear     60s super-linearity ceiling;
 #     a starved box can cross a guard meant to catch algorithmic blowup.
 # exact_go_source_set_produces_and_compiles_api_pack   two 5s lookup bounds.
-# bifrost_lsp_server_formatting_shutdown_cancels_active_formatter   5s, against
-#     a stub formatter that sleeps 10s: only a 2x margin.
 # explicit_file_fifo_is_rejected_without_blocking and
 # directory_entries_reject_fifo_replacement_without_blocking   1s, each racing a
 #     peer thread that sleeps 2s; scheduler starvation can spuriously delay the
 #     non-blocking open these discriminate on.
 [[profile.default.overrides]]
-filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class) | test(light_lookup_overtakes_long_usage_scan) | test(c_wide_translation_unit_indexes_in_linear_time) | test(large_rust_file_definition_and_hover_stay_interactive) | test(deeply_nested_javascript_extraction_is_linear) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(bifrost_lsp_server_formatting_shutdown_cancels_active_formatter) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
+filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class) | test(light_lookup_overtakes_long_usage_scan) | test(c_wide_translation_unit_indexes_in_linear_time) | test(large_rust_file_definition_stays_interactive) | test(deeply_nested_javascript_extraction_is_linear) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
 threads-required = "num-cpus"
 
 # issue_3006_release_zero_config runs only under `--cfg scheduled_tests` (the

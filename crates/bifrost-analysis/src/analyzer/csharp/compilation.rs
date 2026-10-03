@@ -9,7 +9,7 @@
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::semantic::ids::StableDigest;
-use crate::analyzer::{CodeUnitIndex, Project, ProjectFile};
+use crate::analyzer::{Project, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -268,9 +268,21 @@ impl CSharpAnalyzer {
     pub(super) fn compilation_index(&self) -> Arc<CSharpCompilationIndex> {
         self.memo_caches
             .compilation_index
-            .get_or_build_on_dedicated_pool(|| {
-                CSharpCompilationIndex::build(self.inner.project(), &self.inner.analyzed_files())
+            .get_or_try_build_on_dedicated_pool(|| {
+                let inventory = crate::analyzer::IAnalyzer::source_file_inventory(&self.inner);
+                let mut index =
+                    CSharpCompilationIndex::build(self.inner.project(), &inventory.rows);
+                if !inventory.complete {
+                    index.complete = false;
+                    index.config_digest = None;
+                }
+                if index.is_complete() {
+                    Ok(index)
+                } else {
+                    Err(index)
+                }
             })
+            .unwrap_or_else(Arc::new)
     }
 }
 

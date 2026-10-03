@@ -621,6 +621,7 @@ pub struct ProcedureSemantics {
     call_result_sites: CallResultSiteIndex,
     source_mappings: Box<[SourceMapping]>,
     statement_entries: Box<[StatementEntrySite]>,
+    loop_sites: Box<[LoopSite]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
@@ -666,6 +667,7 @@ impl ProcedureSemantics {
             call_result_sites,
             source_mappings: parts.source_mappings.into_boxed_slice(),
             statement_entries: parts.statement_entries.into_boxed_slice(),
+            loop_sites: parts.loop_sites.into_boxed_slice(),
             evidence_rows: parts.evidence_rows.into_boxed_slice(),
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
@@ -698,6 +700,7 @@ impl ProcedureSemantics {
         self.call_sites.hash(&mut digest);
         self.source_mappings.hash(&mut digest);
         self.statement_entries.hash(&mut digest);
+        self.loop_sites.hash(&mut digest);
         self.evidence_rows.hash(&mut digest);
         self.gaps.hash(&mut digest);
         self.blocks.hash(&mut digest);
@@ -820,6 +823,12 @@ impl ProcedureSemantics {
     /// cleanup routes for one source statement.
     pub fn statement_entries(&self) -> &[StatementEntrySite] {
         &self.statement_entries
+    }
+
+    /// All producer-attested source loops with their iteration header and
+    /// body entry.
+    pub fn loop_sites(&self) -> &[LoopSite] {
+        &self.loop_sites
     }
 
     pub fn evidence_rows(&self) -> &[Evidence] {
@@ -997,6 +1006,11 @@ impl ProcedureSemantics {
                 if receiver == bound_receiver =>
             {
                 Some(CallerReceiverBinding::Bound(receiver))
+            }
+            (Some(receiver), CallableReferenceKind::ModuleQualified { qualifier }, None)
+                if receiver == qualifier =>
+            {
+                Some(CallerReceiverBinding::ModuleQualified(qualifier))
             }
             (None, CallableReferenceKind::TypeQualifiedMethod { qualifier }, None) => {
                 Some(CallerReceiverBinding::TypeQualified(qualifier))

@@ -1,24 +1,18 @@
 use super::resolver::node_text;
-use crate::adapter::php_signature_return_type_text;
 use crate::aliases::{
-    PhpDeclaredType, PhpFileContext, PhpFileContextIndex, php_dynamic_type_keyword,
-    resolve_php_function_node, resolve_php_type, resolve_php_type_arms,
+    PhpDeclaredType, PhpFileContext, resolve_php_function_node, resolve_php_type,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_direct_declared_class_parent;
-use crate::phpdoc::{
-    parameter_element_type as phpdoc_parameter_element_type,
-    return_element_type as phpdoc_return_element_type,
-    return_nominal_type as phpdoc_return_nominal_type, var_element_type as phpdoc_var_element_type,
-    var_nominal_type as phpdoc_var_nominal_type,
-};
+use crate::phpdoc::parameter_element_type as phpdoc_parameter_element_type;
+use brokk_bifrost_core::analyzer::php_facts::{PhpDeclaredSourceType, PhpFieldWriteKind};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 const LOCAL_SCOPE_NODES: &[&str] = &[
     "function_definition",
@@ -230,11 +224,10 @@ pub fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
 }
 
-/// The type name a `binary_expression` spells on the right of `instanceof`.
-///
-/// `$x instanceof Foo` is a type reference like any other, but the grammar
-/// spells it as a plain `name`/`qualified_name` under the operator rather than
-/// as a `named_type`, so the shape has to be recognized from the operator.
+/// Return the type name a `binary_expression` spells on the right of
+/// `instanceof`. The grammar publishes that operand as a plain `name` or
+/// `qualified_name`, so identify it from the operator field rather than
+/// interpreting source text.
 pub fn instanceof_type_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "binary_expression" {
         return None;
@@ -825,35 +818,32 @@ pub fn declared_field_type_fq_name(
     }
     declared_relative_field_type_fq_name(php, analyzer, field)
         .or_else(|| indexed_declared_type_fq_name(analyzer, field))
-        .or_else(|| signature_declared_type_fq_name(php, analyzer, field))
-        .or_else(|| phpdoc_declared_type_fact_fq_name(php, field, phpdoc_var_nominal_type))
+        .or_else(|| canonical_declared_type_fq_name(php, field))
+        .or_else(|| canonical_doc_nominal_type(php, field))
         .or_else(|| inferred_constructor_field_type_fq_name(php, analyzer, field))
 }
 
 fn declared_relative_field_type_fq_name(
     php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
+    _analyzer: PhpGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<String> {
+    let source = php.php_source_facts(field.source())?;
+    let mut declarations = source.declarations_for(field);
+    let first = &declarations.next()?.declared_type;
+    if declarations.any(|declaration| &declaration.declared_type != first) {
+        return None;
+    }
     let owner = php.parent_of(field).filter(CodeUnit::is_class)?;
-    let source = php.project().read_source(field.source()).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = declaration_node_for_unit(
-        tree.root_node(),
-        &source,
-        field,
-        php.ranges(field).as_slice(),
-        || true,
-    )?;
-    let type_node = declaration.child_by_field_name("type")?;
-    let keyword = relative_declared_type_keyword(type_node, &source, || true)?;
-    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
-    let ctx = contexts.context_at(declaration.start_byte());
-    static_scope_type_fq_name(php, analyzer, keyword, ctx, Some(owner.fq_name().as_str()))
+    match first {
+        PhpDeclaredSourceType::SelfType | PhpDeclaredSourceType::StaticType => {
+            Some(owner.fq_name())
+        }
+        PhpDeclaredSourceType::ParentType => {
+            php_direct_declared_class_parent(php, &owner).map(|parent| parent.fq_name())
+        }
+        _ => None,
+    }
 }
 
 /// Return the single relative class keyword proved by a declared type node.
@@ -910,164 +900,110 @@ pub fn relative_declared_type_keyword<'a>(
 /// structured indexed-write set.
 pub fn declared_field_element_type_fq_name(
     php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
+    _analyzer: PhpGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<String> {
+    canonical_field_element_type(php, field)
+}
+
+pub fn canonical_field_element_type(php: &dyn PhpSource, field: &CodeUnit) -> Option<String> {
     if !field.is_field() {
         return None;
     }
-    let owner = php.parent_of(field)?;
-    if !owner.is_class() {
-        return None;
-    }
-    let source = php.project().read_source(field.source()).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = enclosing_class_declaration_for_field(
-        tree.root_node(),
-        &source,
-        &owner,
-        php.ranges(field).as_slice(),
-        || true,
-    )?;
-    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
-    let ctx = contexts.context_at(declaration.start_byte());
-    infer_indexed_field_element_type(
-        declaration,
-        &source,
-        field.identifier(),
-        || true,
-        |right| {
-            let right = unwrap_parenthesized(right);
-            if right.kind() == "object_creation_expression" {
-                let type_node = object_creation_type(right)?;
-                return static_scope_type_fq_name(
-                    php,
-                    analyzer,
-                    node_text(type_node, &source),
-                    ctx,
-                    Some(owner.fq_name().as_str()),
-                );
-            }
-            let type_node = parameter_type_node(right, &source, || true)?;
-            let mut arms = resolve_php_type_arms(node_text(type_node, &source), ctx);
-            (arms.len() == 1).then(|| arms.remove(0))
-        },
-    )
-    .or_else(|| {
-        let field_declaration = declaration_node_for_unit(
-            tree.root_node(),
-            &source,
-            field,
-            php.ranges(field).as_slice(),
-            || true,
-        )?;
-        let raw = phpdoc_var_element_type(declaration_doc_comment(field_declaration, &source)?)?;
-        resolve_php_type(&raw, ctx)
-    })
-    .or_else(|| {
-        let field_declaration = declaration_node_for_unit(
-            tree.root_node(),
-            &source,
-            field,
-            php.ranges(field).as_slice(),
-            || true,
-        )?;
-        let raw = promoted_property_doc_element_type(field_declaration, &source, || true)?;
-        resolve_php_type(&raw, ctx)
-    })
-    .or_else(|| {
-        infer_constructor_assigned_field_type(
-            declaration,
-            &source,
-            field.identifier(),
-            || true,
-            |right| {
-                let raw = parameter_doc_element_type(right, &source, || true)?;
-                resolve_php_type(&raw, ctx)
-            },
-        )
-    })
+    canonical_field_write_type(php, field, PhpFieldWriteKind::Indexed)
+        .or_else(|| canonical_doc_element_type(php, field))
+        .or_else(|| canonical_constructor_doc_element(php, field))
 }
 
-/// Infer one untyped property's nominal type from direct constructor writes.
-///
-/// This is deliberately narrower than general PHP data flow. Every explicit
-/// `$this->field = ...` write in the declaring class must occur directly in
-/// `__construct`; each right-hand side must be a structured object creation or
-/// a directly declared, singly nominal constructor parameter; and all writes
-/// must name the same class. A setter write, closure write, untyped/union
-/// parameter, unresolved construction, or competing type therefore fails closed.
 fn inferred_constructor_field_type_fq_name(
     php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
+    _analyzer: PhpGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<String> {
-    let owner = php.parent_of(field)?;
-    if !owner.is_class() {
-        return None;
-    }
-    let source = php.project().read_source(field.source()).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = enclosing_class_declaration_for_field(
-        tree.root_node(),
-        &source,
-        &owner,
-        php.ranges(field).as_slice(),
-        || true,
-    )?;
-    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
-    let ctx = contexts.context_at(declaration.start_byte());
-    infer_constructor_assigned_field_type(
-        declaration,
-        &source,
-        field.identifier(),
-        || true,
-        |right| {
-            let right = unwrap_parenthesized(right);
-            if right.kind() == "object_creation_expression" {
-                let type_node = object_creation_type(right)?;
-                return static_scope_type_fq_name(
-                    php,
-                    analyzer,
-                    node_text(type_node, &source),
-                    ctx,
-                    Some(owner.fq_name().as_str()),
-                );
+    canonical_inferred_field_type(php, field)
+}
+
+pub fn canonical_inferred_field_type(php: &dyn PhpSource, field: &CodeUnit) -> Option<String> {
+    canonical_field_write_type(php, field, PhpFieldWriteKind::Instance)
+        .or_else(|| canonical_field_write_type(php, field, PhpFieldWriteKind::Static))
+}
+
+fn canonical_field_write_type(
+    php: &dyn PhpSource,
+    field: &CodeUnit,
+    kind: PhpFieldWriteKind,
+) -> Option<String> {
+    let owner = php.parent_of(field).filter(CodeUnit::is_class)?;
+    let source = php.php_source_facts(field.source())?;
+    let mut result = None;
+    let mut found_owner = false;
+    for class in source.declarations_for(&owner) {
+        found_owner = true;
+        let mut inferred = None;
+        for write in source.facts.writes.iter().filter(|write| {
+            write.class == class.declaration
+                && write.field == field.identifier()
+                && write.kind == kind
+        }) {
+            if kind == PhpFieldWriteKind::Instance && !write.directly_in_constructor {
+                return None;
             }
-            let type_node = constructor_parameter_type_node(right, &source, || true)?;
-            let mut arms = resolve_php_type_arms(node_text(type_node, &source), ctx);
-            (arms.len() == 1).then(|| arms.remove(0))
-        },
-    )
-    .or_else(|| {
-        infer_static_assigned_field_type(
-            declaration,
-            &source,
-            field.identifier(),
-            || true,
-            |right| {
-                let right = unwrap_parenthesized(right);
-                let type_node = (right.kind() == "object_creation_expression")
-                    .then(|| object_creation_type(right))
-                    .flatten()?;
-                static_scope_type_fq_name(
-                    php,
-                    analyzer,
-                    node_text(type_node, &source),
-                    ctx,
-                    Some(owner.fq_name().as_str()),
-                )
-            },
-        )
-    })
+            let value = match &write.value_type {
+                PhpDeclaredSourceType::Nominal(arms) => {
+                    let [value] = arms.as_slice() else {
+                        return None;
+                    };
+                    value.clone()
+                }
+                PhpDeclaredSourceType::SelfType | PhpDeclaredSourceType::StaticType => {
+                    owner.fq_name()
+                }
+                PhpDeclaredSourceType::ParentType => {
+                    php_direct_declared_class_parent(php, &owner)?.fq_name()
+                }
+                _ => return None,
+            };
+            if inferred.as_ref().is_some_and(|known| known != &value) {
+                return None;
+            }
+            inferred = Some(value);
+        }
+        let inferred = inferred?;
+        if result.as_ref().is_some_and(|known| known != &inferred) {
+            return None;
+        }
+        result = Some(inferred);
+    }
+    found_owner.then_some(result).flatten()
+}
+
+fn canonical_constructor_doc_element(php: &dyn PhpSource, field: &CodeUnit) -> Option<String> {
+    let owner = php.parent_of(field).filter(CodeUnit::is_class)?;
+    let source = php.php_source_facts(field.source())?;
+    let mut result = None;
+    for class in source.declarations_for(&owner) {
+        let mut inferred = None;
+        for write in source.facts.writes.iter().filter(|write| {
+            write.class == class.declaration
+                && write.field == field.identifier()
+                && write.kind == PhpFieldWriteKind::Instance
+        }) {
+            if !write.directly_in_constructor {
+                return None;
+            }
+            let value = write.doc_element_type.as_ref()?;
+            if inferred.is_some_and(|known| known != value) {
+                return None;
+            }
+            inferred = Some(value);
+        }
+        let inferred = inferred?;
+        if result.as_ref().is_some_and(|known| known != inferred) {
+            return None;
+        }
+        result = Some(inferred.clone());
+    }
+    result
 }
 
 /// The declared type node for a constructor parameter read. This deliberately
@@ -1220,185 +1156,6 @@ where
     phpdoc_parameter_element_type(declaration_doc_comment(scope, source)?, parameter_name)
 }
 
-/// Locate the declaring class for one field declaration without interpreting
-/// source text. The owner name and indexed field range jointly disambiguate
-/// repeated short class names in the same file.
-pub fn enclosing_class_declaration_for_field<'tree, F>(
-    root: Node<'tree>,
-    source: &str,
-    owner: &CodeUnit,
-    ranges: &[Range],
-    mut step: F,
-) -> Option<Node<'tree>>
-where
-    F: FnMut() -> bool,
-{
-    let mut candidates = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if !step() {
-            return None;
-        }
-        if node.kind() == "class_declaration"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source) == owner.identifier())
-            && ranges.iter().any(|range| {
-                node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
-            })
-        {
-            candidates.push(node);
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    let [candidate] = candidates.as_slice() else {
-        return None;
-    };
-    Some(*candidate)
-}
-
-/// Fold all structured writes to one `$this` field into a single constructor
-/// type. The traversal is iterative because generated PHP classes can be deep.
-pub fn infer_constructor_assigned_field_type<'tree, F, R>(
-    class: Node<'tree>,
-    source: &str,
-    field_name: &str,
-    mut step: F,
-    mut resolve_value: R,
-) -> Option<String>
-where
-    F: FnMut() -> bool,
-    R: FnMut(Node<'tree>) -> Option<String>,
-{
-    let mut inferred = None;
-    let mut stack = vec![class];
-    while let Some(node) = stack.pop() {
-        if !step() {
-            return None;
-        }
-        if let Some((left, right)) = assignment_parts(node)
-            && this_field_name(left, source) == Some(field_name)
-        {
-            if !assignment_is_directly_in_constructor(node, source, class, &mut step) {
-                return None;
-            }
-            let value = resolve_value(right)?;
-            if inferred.as_ref().is_some_and(|known| known != &value) {
-                return None;
-            }
-            inferred = Some(value);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    inferred
-}
-
-/// Fold all structured writes to one `self::$field`/`static::$field` into a
-/// single type. Unlike instance-property recovery, these writes may occur in
-/// any method because a static property's storage is shared; every explicit
-/// write in the class must still be a consistent resolvable construction.
-pub fn infer_static_assigned_field_type<'tree, F, R>(
-    class: Node<'tree>,
-    source: &str,
-    field_name: &str,
-    mut step: F,
-    mut resolve_value: R,
-) -> Option<String>
-where
-    F: FnMut() -> bool,
-    R: FnMut(Node<'tree>) -> Option<String>,
-{
-    let mut inferred = None;
-    let mut stack = vec![class];
-    while let Some(node) = stack.pop() {
-        if !step() {
-            return None;
-        }
-        if let Some((left, right)) = assignment_parts(node)
-            && static_self_field_name(left, source) == Some(field_name)
-        {
-            let value = resolve_value(right)?;
-            if inferred.as_ref().is_some_and(|known| known != &value) {
-                return None;
-            }
-            inferred = Some(value);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    inferred
-}
-
-/// Fold every indexed write to one `$this->field[...]` collection into one
-/// element type. Direct container initialization does not describe an element
-/// and is ignored; each actual element write must have a resolvable value and
-/// all such values must agree. Nested class declarations are separate `$this`
-/// domains and are not traversed.
-pub fn infer_indexed_field_element_type<'tree, F, R>(
-    class: Node<'tree>,
-    source: &str,
-    field_name: &str,
-    mut step: F,
-    mut resolve_value: R,
-) -> Option<String>
-where
-    F: FnMut() -> bool,
-    R: FnMut(Node<'tree>) -> Option<String>,
-{
-    let mut inferred = None;
-    let mut stack = vec![class];
-    while let Some(node) = stack.pop() {
-        if !step() {
-            return None;
-        }
-        if node != class && node.kind() == "class_declaration" {
-            continue;
-        }
-        if let Some((left, right)) = assignment_parts(node)
-            && left.kind() == "subscript_expression"
-            && left
-                .named_child(0)
-                .is_some_and(|collection| this_field_name(collection, source) == Some(field_name))
-        {
-            let value = resolve_value(right)?;
-            if inferred.as_ref().is_some_and(|known| known != &value) {
-                return None;
-            }
-            inferred = Some(value);
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    inferred
-}
-
 pub fn infer_indexed_local_element_type(
     collection: Node<'_>,
     source: &str,
@@ -1455,7 +1212,7 @@ pub fn infer_indexed_local_element_type(
     inferred
 }
 
-fn this_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+pub(crate) fn this_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     if !matches!(
         node.kind(),
         "member_access_expression" | "nullsafe_member_access_expression"
@@ -1469,7 +1226,7 @@ fn this_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
         .flatten()
 }
 
-fn static_self_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+pub(crate) fn static_self_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     if node.kind() != "scoped_property_access_expression" {
         return None;
     }
@@ -1480,7 +1237,7 @@ fn static_self_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str
         .then(|| variable_identifier(name, source))
 }
 
-fn assignment_is_directly_in_constructor<F>(
+pub(crate) fn assignment_is_directly_in_constructor<F>(
     assignment: Node<'_>,
     source: &str,
     class: Node<'_>,
@@ -1516,8 +1273,8 @@ pub fn declared_callable_return_type_fq_name(
         return None;
     }
     indexed_declared_type_fq_name(analyzer, callable)
-        .or_else(|| signature_declared_type_fq_name(php, analyzer, callable))
-        .or_else(|| phpdoc_declared_type_fact_fq_name(php, callable, phpdoc_return_nominal_type))
+        .or_else(|| canonical_declared_type_fq_name(php, callable))
+        .or_else(|| canonical_doc_nominal_type(php, callable))
 }
 
 pub fn declared_callable_return_element_type_fq_name(
@@ -1527,34 +1284,25 @@ pub fn declared_callable_return_element_type_fq_name(
     if !callable.is_function() {
         return None;
     }
-    phpdoc_declared_type_fact_fq_name(php, callable, phpdoc_return_element_type)
+    canonical_doc_element_type(php, callable)
 }
 
-fn phpdoc_declared_type_fact_fq_name<F>(
-    php: &dyn PhpSource,
-    unit: &CodeUnit,
-    fact: F,
-) -> Option<String>
-where
-    F: FnOnce(&str) -> Option<String>,
-{
-    let source = php.project().read_source(unit.source()).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let declaration = declaration_node_for_unit(
-        tree.root_node(),
-        &source,
-        unit,
-        php.ranges(unit).as_slice(),
-        || true,
-    )?;
-    let raw = fact(declaration_doc_comment(declaration, &source)?)?;
-    let contexts = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true)?;
-    let ctx = contexts.context_at(declaration.start_byte());
-    resolve_php_type(&raw, ctx)
+pub fn canonical_doc_nominal_type(php: &dyn PhpSource, unit: &CodeUnit) -> Option<String> {
+    let source = php.php_source_facts(unit.source())?;
+    let mut declarations = source.declarations_for(unit);
+    let first = declarations.next()?.doc_nominal_type.as_ref()?;
+    declarations
+        .all(|declaration| declaration.doc_nominal_type.as_ref() == Some(first))
+        .then(|| first.clone())
+}
+
+pub fn canonical_doc_element_type(php: &dyn PhpSource, unit: &CodeUnit) -> Option<String> {
+    let source = php.php_source_facts(unit.source())?;
+    let mut declarations = source.declarations_for(unit);
+    let first = declarations.next()?.doc_element_type.as_ref()?;
+    declarations
+        .all(|declaration| declaration.doc_element_type.as_ref() == Some(first))
+        .then(|| first.clone())
 }
 
 pub fn collection_element_type_fq_name(
@@ -1648,71 +1396,6 @@ fn collection_element_type_fq_name_inner(
         }
         _ => None,
     }
-}
-
-/// Locate one callable or field declaration using its indexed name ranges.
-pub fn declaration_node_for_unit<'tree, F>(
-    root: Node<'tree>,
-    source: &str,
-    unit: &CodeUnit,
-    ranges: &[Range],
-    mut step: F,
-) -> Option<Node<'tree>>
-where
-    F: FnMut() -> bool,
-{
-    let mut candidates = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if !step() {
-            return None;
-        }
-        let name = match node.kind() {
-            "function_definition" | "method_declaration" if unit.is_function() => {
-                node.child_by_field_name("name")
-            }
-            "property_promotion_parameter" if unit.is_field() => node.child_by_field_name("name"),
-            _ => None,
-        };
-        if let Some(name) = name
-            && variable_identifier(name, source) == unit.identifier()
-            && ranges.iter().any(|range| {
-                node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
-            })
-        {
-            candidates.push(node);
-            continue;
-        }
-        if node.kind() == "property_declaration" && unit.is_field() {
-            let mut cursor = node.walk();
-            let matches = node.named_children(&mut cursor).any(|element| {
-                step()
-                    && element.kind() == "property_element"
-                    && element
-                        .child_by_field_name("name")
-                        .is_some_and(|name| variable_identifier(name, source) == unit.identifier())
-                    && ranges.iter().any(|range| {
-                        node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
-                    })
-            });
-            if matches {
-                candidates.push(node);
-                continue;
-            }
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if !step() {
-                return None;
-            }
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    let [candidate] = candidates.as_slice() else {
-        return None;
-    };
-    Some(*candidate)
 }
 
 /// Resolve the declared object return type of one literal free or scoped PHP
@@ -2206,83 +1889,55 @@ pub fn declared_type_of(
     if let Some(indexed) = indexed_declared_type_fq_name(analyzer, unit) {
         return PhpDeclaredType::Nominal(vec![indexed]);
     }
-    let signature = signature_declared_type(php, analyzer, unit);
+    let signature = canonical_declared_type(php, unit);
     if signature != PhpDeclaredType::Unknown {
         return signature;
     }
     if unit.is_field() {
         return PhpDeclaredType::nominal(
-            phpdoc_declared_type_fact_fq_name(php, unit, phpdoc_var_nominal_type)
-                .into_iter()
-                .collect(),
+            canonical_doc_nominal_type(php, unit).into_iter().collect(),
         );
     }
-    PhpDeclaredType::nominal(
-        phpdoc_declared_type_fact_fq_name(php, unit, phpdoc_return_nominal_type)
-            .into_iter()
-            .collect(),
-    )
+    PhpDeclaredType::nominal(canonical_doc_nominal_type(php, unit).into_iter().collect())
 }
 
-fn signature_declared_type_fq_name(
-    php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
-    unit: &CodeUnit,
-) -> Option<String> {
-    let mut arms = signature_declared_type(php, analyzer, unit).arms();
+fn canonical_declared_type_fq_name(php: &dyn PhpSource, unit: &CodeUnit) -> Option<String> {
+    let mut arms = canonical_declared_type(php, unit).arms();
     (arms.len() == 1).then(|| arms.remove(0))
 }
 
-fn signature_declared_type(
-    php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
-    unit: &CodeUnit,
-) -> PhpDeclaredType {
-    let signatures = analyzer.index.signatures(unit);
-    let Some(raw) = signatures
-        .iter()
-        .find_map(|signature| php_signature_return_type_text(signature))
-    else {
+pub fn canonical_declared_type(php: &dyn PhpSource, unit: &CodeUnit) -> PhpDeclaredType {
+    let Some(source) = php.php_source_facts(unit.source()) else {
         return PhpDeclaredType::Unknown;
     };
-    if let Some(keyword) = php_dynamic_type_keyword(raw) {
-        return PhpDeclaredType::Dynamic(keyword);
+    let mut declarations = source.declarations_for(unit);
+    let Some(first) = declarations.next() else {
+        return PhpDeclaredType::Unknown;
+    };
+    if declarations.any(|declaration| declaration.declared_type != first.declared_type) {
+        return PhpDeclaredType::Unknown;
     }
-    if matches!(raw, "self" | "static") {
-        return PhpDeclaredType::nominal(
+    match &first.declared_type {
+        PhpDeclaredSourceType::Unknown => PhpDeclaredType::Unknown,
+        PhpDeclaredSourceType::Nominal(arms) => PhpDeclaredType::nominal(arms.clone()),
+        PhpDeclaredSourceType::DynamicObject => PhpDeclaredType::Dynamic("object"),
+        PhpDeclaredSourceType::DynamicMixed => PhpDeclaredType::Dynamic("mixed"),
+        PhpDeclaredSourceType::SelfType | PhpDeclaredSourceType::StaticType => {
+            PhpDeclaredType::nominal(
+                php.parent_of(unit)
+                    .map(|owner| owner.fq_name())
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        PhpDeclaredSourceType::ParentType => PhpDeclaredType::nominal(
             php.parent_of(unit)
-                .map(|owner| owner.fq_name())
+                .and_then(|owner| php_direct_declared_class_parent(php, &owner))
+                .map(|parent| parent.fq_name())
                 .into_iter()
                 .collect(),
-        );
+        ),
     }
-    let Ok(source) = unit.source().read_to_string() else {
-        return PhpDeclaredType::Unknown;
-    };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .is_err()
-    {
-        return PhpDeclaredType::Unknown;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return PhpDeclaredType::Unknown;
-    };
-    let Some(contexts) = PhpFileContextIndex::from_tree(tree.root_node(), &source, || true) else {
-        return PhpDeclaredType::Unknown;
-    };
-    let Some(declaration) = declaration_node_for_unit(
-        tree.root_node(),
-        &source,
-        unit,
-        php.ranges(unit).as_slice(),
-        || true,
-    ) else {
-        return PhpDeclaredType::Unknown;
-    };
-    let ctx = contexts.context_at(declaration.start_byte());
-    PhpDeclaredType::nominal(resolve_php_type_arms(raw, ctx))
 }
 
 /// The member surface a PHP reference addresses.
@@ -2314,9 +1969,10 @@ pub fn magic_member_names(surface: PhpMagicSurface) -> &'static [&'static str] {
 #[cfg(test)]
 mod declaration_name_range_tests {
     use super::php_declaration_name_range;
-    use tree_sitter::{Node, Parser};
+    use tree_sitter::Node;
 
     fn parse(source: &str) -> tree_sitter::Tree {
+        use tree_sitter::Parser;
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_php::LANGUAGE_PHP.into())

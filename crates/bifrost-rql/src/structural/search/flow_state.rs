@@ -553,7 +553,7 @@ impl FlowRelationValue {
     }
 }
 
-fn state_event_id(procedure_id: &str, row: &StateEventRow) -> String {
+pub(super) fn state_event_id(procedure_id: &str, row: &StateEventRow) -> String {
     let mut digest = LengthDelimitedDigest::new(STATE_EVENT_ID_DOMAIN);
     digest.push(procedure_id.as_bytes());
     digest.push(rel_path_string(&row.site.file).as_bytes());

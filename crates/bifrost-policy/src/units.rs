@@ -1187,6 +1187,7 @@ pub struct PolicyIncrementalContext<'a> {
     changed: &'a ChangedFacts,
     inputs: WorkspaceUnitInputs,
     base: IncrementalBaseState,
+    reuse_existing: bool,
     verdicts: ArtifactVerdictLog,
     runs: RefCell<Vec<PolicyIncrementalRun>>,
     units: RefCell<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
@@ -1210,11 +1211,36 @@ impl<'a> PolicyIncrementalContext<'a> {
             changed,
             inputs,
             base,
+            reuse_existing: true,
             verdicts: ArtifactVerdictLog::default(),
             runs: RefCell::new(Vec::new()),
             units: RefCell::new(Vec::new()),
             staged: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Publish complete units from a full scan without trusting an earlier
+    /// unit. Comparing this workspace with itself cannot establish that an
+    /// older unit's cross-file dependencies are unchanged.
+    pub fn for_publication(
+        store: &'a RefCell<dyn PolicyUnitStore>,
+        workspace: &'a WorkspaceAnalyzer,
+        changed: &'a ChangedFacts,
+        inputs: WorkspaceUnitInputs,
+    ) -> Self {
+        let mut context = Self::new(
+            store,
+            workspace,
+            changed,
+            inputs,
+            IncrementalBaseState::Evaluated,
+        );
+        context.reuse_existing = false;
+        context
+    }
+
+    pub const fn reuses_existing(&self) -> bool {
+        self.reuse_existing
     }
 
     pub const fn store(&self) -> &'a RefCell<dyn PolicyUnitStore> {

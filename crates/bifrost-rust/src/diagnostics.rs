@@ -21,8 +21,10 @@
 //! production. External facts arrive through [`RustExternalEvidence`], whose
 //! implementations read retained analyzer state only.
 
-use crate::graph::ast::is_rust_declaration_name;
-use crate::graph_support::{RustFactSource, RustReferenceContext};
+use crate::graph_support::is_rust_declaration_name;
+use crate::graph_support::{
+    ReferenceContextError, RustCargoRouteError, RustFactSource, RustReferenceContext,
+};
 use crate::proof::{RustNameProof, RustProofGap, record_rust_name_proof};
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
@@ -32,6 +34,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     contains_node, node_range, node_text, same_node,
 };
+use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
@@ -40,6 +43,7 @@ use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::Node;
 
+use crate::structural::rust_occurrence_role;
 use crate::syntax::{outer_attributes, unwrap_attributes};
 
 /// The upper bound on source a diagnostics scan will look at, and on the number
@@ -404,16 +408,14 @@ impl RustDiagnosticCollector<'_, '_> {
         // context already resolves; everything else may leave the workspace.
         if is_crate_local_path(path_node, self.source) {
             let path = node_text(path_node, self.source).trim();
-            let resolved = self
-                .refs
-                .resolve_scoped(path, name)
-                .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind));
-            let proof = if resolved {
-                RustNameProof::Workspace
-            } else {
-                RustNameProof::Absent {
-                    boundary: BoundaryStatus::WorkspaceLocal,
+            let proof = match self.refs.resolve_scoped(path, name) {
+                Ok(Some(resolved)) if self.fqn_has_matching_declaration(&resolved, kind) => {
+                    RustNameProof::Workspace
                 }
+                Ok(_) => RustNameProof::Absent {
+                    boundary: BoundaryStatus::WorkspaceLocal,
+                },
+                Err(error) => RustNameProof::Incomplete(reference_error_gap(error)),
             };
             let owner = path.to_string();
             let owned = name.to_string();
@@ -430,13 +432,19 @@ impl RustDiagnosticCollector<'_, '_> {
         // A workspace sibling may still answer the path before any dependency
         // pack is consulted.
         let path = node_text(path_node, self.source).trim();
-        if self
-            .refs
-            .resolve_scoped(path, name)
-            .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind))
-        {
-            self.record_resolved(name_node, BoundaryStatus::WorkspaceLocal);
-            return;
+        match self.refs.resolve_scoped(path, name) {
+            Ok(Some(resolved)) if self.fqn_has_matching_declaration(&resolved, kind) => {
+                self.record_resolved(name_node, BoundaryStatus::WorkspaceLocal);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.report.push_incomplete(
+                    Some(node_range(name_node, self.line_starts)),
+                    vec![reference_error_gap(error).into_reason()],
+                );
+                return;
+            }
         }
         let segments = self.dependency_path_segments(node, node.start_byte());
         let proof = self.external_path_proof(&segments);
@@ -502,10 +510,12 @@ impl RustDiagnosticCollector<'_, '_> {
             }
             return Some(RustNameProof::Workspace);
         }
-        if let Some(resolved) = self.refs.resolve_bare(name)
-            && self.fqn_has_matching_declaration(&resolved, kind)
-        {
-            return Some(RustNameProof::Workspace);
+        match self.refs.resolve_bare(name) {
+            Ok(Some(resolved)) if self.fqn_has_matching_declaration(&resolved, kind) => {
+                return Some(RustNameProof::Workspace);
+            }
+            Ok(_) => {}
+            Err(error) => return Some(RustNameProof::Incomplete(reference_error_gap(error))),
         }
         if self
             .support
@@ -677,6 +687,18 @@ impl RustDiagnosticCollector<'_, '_> {
     fn record_resolved(&mut self, node: Node<'_>, boundary: BoundaryStatus) {
         let range = node_range(node, self.line_starts);
         self.report.push_resolved(range, boundary);
+    }
+}
+
+fn reference_error_gap(error: ReferenceContextError) -> RustProofGap {
+    match error {
+        ReferenceContextError::CargoRoutes(RustCargoRouteError::Unavailable) => {
+            RustProofGap::CanonicalFactsUnavailable
+        }
+        ReferenceContextError::Interrupted
+        | ReferenceContextError::CargoRoutes(RustCargoRouteError::Cancelled) => {
+            RustProofGap::Cancelled
+        }
     }
 }
 
@@ -952,21 +974,7 @@ fn subtree_suppression(node: Node<'_>, source: &str) -> Option<RustProofGap> {
 }
 
 fn is_type_reference_identifier(node: Node<'_>) -> bool {
-    if node.kind() != "type_identifier" || is_rust_declaration_name(node) || is_inside_use(node) {
-        return false;
-    }
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    !matches!(
-        parent.kind(),
-        "type_parameters"
-            | "type_parameter"
-            | "struct_item"
-            | "enum_item"
-            | "trait_item"
-            | "type_item"
-    )
+    rust_occurrence_role(node) == Some(OccurrenceRole::TypeOperand)
 }
 
 fn is_scoped_reference(node: Node<'_>) -> bool {

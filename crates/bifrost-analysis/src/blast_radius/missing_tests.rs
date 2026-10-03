@@ -23,6 +23,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "selected_missing_tests.rs"]
+mod selected_missing_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub use selected_missing_tests::{
+    SelectedMissingTestsTelemetry, missing_tests_at_root_with_selected_inverse_index,
+};
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MissingTestsParams {
     #[serde(default)]
@@ -57,6 +65,7 @@ pub struct MissingTestsAnalysis {
 #[serde(rename_all = "snake_case")]
 pub enum MissingTestsMode {
     FileImportsThenExactUsages,
+    FileGraphNarrowedBindingReachability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
@@ -79,6 +88,12 @@ pub enum MissingTestsIncompleteReason {
     UsageAnalysisIncomplete,
     UnprovenReferences,
     UsageSiteWithoutEnclosingDeclaration,
+    UnresolvedChangedTarget,
+    OpenBindingFrontier,
+    UnsupportedBindingBoundary,
+    UnprovenBindingEdge,
+    ReferenceGraphCancelled,
+    ReferenceGraphStale,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -91,6 +106,7 @@ pub struct MissingTestFunction {
     pub incomplete_reasons: Vec<MissingTestsIncompleteReason>,
 }
 
+#[derive(Clone)]
 struct CandidateState {
     record: MissingTestFunction,
     reached: bool,
@@ -102,6 +118,18 @@ struct ExactNodeOutcome {
     reaches_test_context: bool,
     callers: BTreeMap<DeclarationId, CodeUnit>,
     incomplete_reasons: BTreeSet<MissingTestsIncompleteReason>,
+}
+
+struct PreparedMissingTests {
+    prepared: PreparedDiff,
+    endpoints: BlastRadiusEndpoints,
+    paths_outside_file_graph: Vec<String>,
+    candidates: Vec<CandidateState>,
+}
+
+struct CandidateFileGroup {
+    allowed_files: BTreeSet<ProjectFile>,
+    candidate_indices: Vec<usize>,
 }
 
 /// Find introduced or behavior-changed production functions for which the
@@ -119,6 +147,60 @@ pub fn missing_tests_at_root(
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
 ) -> Result<MissingTestsResult, String> {
+    let mut work = prepare_missing_tests_at_root(root, params, options, cancellation)?;
+    if work.candidates.is_empty() {
+        return Ok(finish_missing_tests(
+            work,
+            MissingTestsMode::FileImportsThenExactUsages,
+            false,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    let target_context =
+        build_target_file_dependency_analyzer(&work.prepared, live_target_analyzer)?;
+    let target_analyzer = target_context.analyzer();
+    let target_evidence = collect_target_evidence(
+        target_analyzer,
+        &target_diff_paths(&work.prepared),
+        cancellation,
+    );
+    apply_file_graph_incompleteness(&mut work.candidates, &target_evidence);
+
+    if let Some(graph) = target_evidence.graph.as_ref() {
+        let exact_scope = AnalyzerQueryScope::with_cancellation(target_analyzer, cancellation);
+        let exact_context = ScanUsagesExecutionContext::for_composite_query(cancellation.clone());
+        for group in candidate_file_groups(target_analyzer, graph, &mut work.candidates) {
+            trace_exact_test_reachability(
+                target_analyzer,
+                exact_scope.token(),
+                &exact_context,
+                &group.allowed_files,
+                &group.candidate_indices,
+                &mut work.candidates,
+            );
+        }
+    }
+
+    let graph_cancelled = target_evidence.graph_cancelled;
+    let graph_incomplete = target_evidence.graph_incomplete;
+    let unresolved = target_evidence.unresolved;
+    Ok(finish_missing_tests(
+        work,
+        MissingTestsMode::FileImportsThenExactUsages,
+        graph_cancelled,
+        graph_incomplete,
+        unresolved,
+    ))
+}
+
+fn prepare_missing_tests_at_root(
+    root: &Path,
+    params: MissingTestsParams,
+    options: &DiffAnalysisOptions,
+    cancellation: &CancellationToken,
+) -> Result<PreparedMissingTests, String> {
     let prepared = PreparedDiff::at_root(
         root,
         DiffEndpointParams {
@@ -140,7 +222,6 @@ pub fn missing_tests_at_root(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-
     let symbol_changes = analyze_prepared_symbol_changes(&prepared, false)?.into_symbol_changes();
     let mut candidates = changed_callables(&symbol_changes)
         .into_iter()
@@ -179,88 +260,89 @@ pub fn missing_tests_at_root(
             })
             .then_with(|| left.record.after.fqn.cmp(&right.record.after.fqn))
     });
+    Ok(PreparedMissingTests {
+        prepared,
+        endpoints,
+        paths_outside_file_graph,
+        candidates,
+    })
+}
 
-    if candidates.is_empty() {
-        return Ok(MissingTestsResult {
-            endpoints,
-            analysis: MissingTestsAnalysis {
-                mode: MissingTestsMode::FileImportsThenExactUsages,
-                file_graph_completion: FileGraphCompletion::Complete,
-                exact_usage_completion: FileGraphCompletion::Complete,
-                candidate_function_count: 0,
-                reached_function_count: 0,
-                missing_function_count: 0,
-                indeterminate_function_count: 0,
-                paths_outside_file_graph,
-                unresolved_changed_paths: Vec::new(),
-                incomplete_reasons: Vec::new(),
-            },
-            missing_functions: Vec::new(),
-            indeterminate_functions: Vec::new(),
-        });
-    }
-
-    let target_context = build_target_file_dependency_analyzer(&prepared, live_target_analyzer)?;
-    let target_analyzer = target_context.analyzer();
-    let target_evidence =
-        collect_target_evidence(target_analyzer, &target_diff_paths(&prepared), cancellation);
-    let mut global_reasons = BTreeSet::new();
-    if target_evidence.graph_cancelled {
-        global_reasons.insert(MissingTestsIncompleteReason::TargetGraphCancelled);
-    }
-    if target_evidence.graph_incomplete {
-        global_reasons.insert(MissingTestsIncompleteReason::CompilationScopeUnresolved);
-    }
-    if !target_evidence.unresolved.is_empty() {
-        global_reasons.insert(MissingTestsIncompleteReason::UnresolvedChangedPath);
-    }
-
-    if target_evidence.graph_cancelled || target_evidence.graph_incomplete {
-        let reason = if target_evidence.graph_cancelled {
-            MissingTestsIncompleteReason::TargetGraphCancelled
-        } else {
-            MissingTestsIncompleteReason::CompilationScopeUnresolved
-        };
-        for candidate in &mut candidates {
+fn apply_file_graph_incompleteness(
+    candidates: &mut [CandidateState],
+    target_evidence: &super::TargetEvidence,
+) {
+    let reason = if target_evidence.graph_cancelled {
+        Some(MissingTestsIncompleteReason::TargetGraphCancelled)
+    } else if target_evidence.graph_incomplete {
+        Some(MissingTestsIncompleteReason::CompilationScopeUnresolved)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        for candidate in candidates {
             candidate.incomplete_reasons.insert(reason);
         }
     }
+}
 
-    if let Some(graph) = target_evidence.graph.as_ref() {
-        let exact_scope = AnalyzerQueryScope::with_cancellation(target_analyzer, cancellation);
-        let exact_context = ScanUsagesExecutionContext::with_cancellation(cancellation.clone());
-        let mut groups = BTreeMap::<String, Vec<usize>>::new();
-        for (index, candidate) in candidates.iter().enumerate() {
-            groups
-                .entry(candidate.record.after.path.clone())
-                .or_default()
-                .push(index);
-        }
-        for (path, indices) in groups {
-            let Some(seed_file) = target_analyzer
-                .project()
-                .file_by_rel_path(Path::new(&path))
-                .filter(|file| graph.node_indices_by_file.contains_key(file))
-            else {
-                for index in indices {
-                    candidates[index]
-                        .incomplete_reasons
-                        .insert(MissingTestsIncompleteReason::UnresolvedChangedPath);
-                }
-                continue;
-            };
-            let allowed_files = reverse_reachable_files(graph, std::iter::once(&seed_file));
-            trace_exact_test_reachability(
-                target_analyzer,
-                exact_scope.token(),
-                &exact_context,
-                &allowed_files,
-                &indices,
-                &mut candidates,
-            );
-        }
+fn candidate_file_groups(
+    analyzer: &dyn IAnalyzer,
+    graph: &crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph,
+    candidates: &mut [CandidateState],
+) -> Vec<CandidateFileGroup> {
+    let mut grouped_indices = BTreeMap::<String, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        grouped_indices
+            .entry(candidate.record.after.path.clone())
+            .or_default()
+            .push(index);
     }
+    let mut groups = Vec::with_capacity(grouped_indices.len());
+    for (path, candidate_indices) in grouped_indices {
+        let Some(seed_file) = analyzer
+            .project()
+            .file_by_rel_path(Path::new(&path))
+            .filter(|file| graph.node_indices_by_file.contains_key(file))
+        else {
+            for index in candidate_indices {
+                candidates[index]
+                    .incomplete_reasons
+                    .insert(MissingTestsIncompleteReason::UnresolvedChangedPath);
+            }
+            continue;
+        };
+        groups.push(CandidateFileGroup {
+            allowed_files: reverse_reachable_files(graph, std::iter::once(&seed_file)),
+            candidate_indices,
+        });
+    }
+    groups
+}
 
+fn finish_missing_tests(
+    work: PreparedMissingTests,
+    mode: MissingTestsMode,
+    graph_cancelled: bool,
+    graph_incomplete: bool,
+    unresolved_changed_paths: Vec<String>,
+) -> MissingTestsResult {
+    let PreparedMissingTests {
+        prepared: _,
+        endpoints,
+        paths_outside_file_graph,
+        candidates,
+    } = work;
+    let mut global_reasons = BTreeSet::new();
+    if graph_cancelled {
+        global_reasons.insert(MissingTestsIncompleteReason::TargetGraphCancelled);
+    }
+    if graph_incomplete {
+        global_reasons.insert(MissingTestsIncompleteReason::CompilationScopeUnresolved);
+    }
+    if !unresolved_changed_paths.is_empty() {
+        global_reasons.insert(MissingTestsIncompleteReason::UnresolvedChangedPath);
+    }
     let candidate_function_count = candidates.len();
     let reached_function_count = candidates
         .iter()
@@ -287,24 +369,22 @@ pub fn missing_tests_at_root(
         reached_function_count + missing_function_count + indeterminate_function_count,
         "every missing-tests candidate has exactly one outcome"
     );
-    let file_graph_completion = if target_evidence.graph_cancelled
-        || target_evidence.graph_incomplete
-        || !target_evidence.unresolved.is_empty()
-    {
-        FileGraphCompletion::Incomplete
-    } else {
-        FileGraphCompletion::Complete
-    };
+    let file_graph_completion =
+        if graph_cancelled || graph_incomplete || !unresolved_changed_paths.is_empty() {
+            FileGraphCompletion::Incomplete
+        } else {
+            FileGraphCompletion::Complete
+        };
     let exact_usage_completion = if indeterminate_functions.is_empty() {
         FileGraphCompletion::Complete
     } else {
         FileGraphCompletion::Incomplete
     };
 
-    Ok(MissingTestsResult {
+    MissingTestsResult {
         endpoints,
         analysis: MissingTestsAnalysis {
-            mode: MissingTestsMode::FileImportsThenExactUsages,
+            mode,
             file_graph_completion,
             exact_usage_completion,
             candidate_function_count,
@@ -312,12 +392,12 @@ pub fn missing_tests_at_root(
             missing_function_count,
             indeterminate_function_count,
             paths_outside_file_graph,
-            unresolved_changed_paths: target_evidence.unresolved,
+            unresolved_changed_paths,
             incomplete_reasons: global_reasons.into_iter().collect(),
         },
         missing_functions,
         indeterminate_functions,
-    })
+    }
 }
 
 fn trace_exact_test_reachability(
@@ -558,6 +638,7 @@ fn map_scan_incomplete_reason(reason: ScanUsagesIncompleteReason) -> MissingTest
         // the usage evidence is short without inventing a schema variant for a
         // selector this caller derives from the workspace itself.
         ScanUsagesIncompleteReason::UnmatchedPaths
+        | ScanUsagesIncompleteReason::SemanticAnalysis
         | ScanUsagesIncompleteReason::SourceUnavailable => {
             MissingTestsIncompleteReason::UsageAnalysisIncomplete
         }
@@ -566,11 +647,22 @@ fn map_scan_incomplete_reason(reason: ScanUsagesIncompleteReason) -> MissingTest
 
 impl RenderText for MissingTestsResult {
     fn render_text(&self, options: RenderOptions) -> String {
+        let (heading, description, traversal_label) = match self.analysis.mode {
+            MissingTestsMode::FileImportsThenExactUsages => (
+                "# Missing-test candidates (bounded structured usage evidence)",
+                "The file graph narrows the search; exact static usage paths determine reachability. This is not runtime coverage.",
+                "exact usage traversal",
+            ),
+            MissingTestsMode::FileGraphNarrowedBindingReachability => (
+                "# Missing-test candidates (canonical binding reachability)",
+                "The file graph schedules the search; proven canonical binding edges determine reachability. This is not runtime coverage.",
+                "binding reachability",
+            ),
+        };
         let mut lines = vec![
-            "# Missing-test candidates (bounded structured usage evidence)".to_string(),
+            heading.to_string(),
             String::new(),
-            "The file graph narrows the search; exact static usage paths determine reachability. This is not runtime coverage."
-                .to_string(),
+            description.to_string(),
             String::new(),
             format!(
                 "- Endpoints: `{}` -> `{}`",
@@ -584,8 +676,8 @@ impl RenderText for MissingTestsResult {
                 self.analysis.indeterminate_function_count
             ),
             format!(
-                "- File graph: `{:?}`; exact usage traversal: `{:?}`",
-                self.analysis.file_graph_completion, self.analysis.exact_usage_completion
+                "- File graph: `{:?}`; {traversal_label}: `{:?}`",
+                self.analysis.file_graph_completion, self.analysis.exact_usage_completion,
             ),
         ];
         if !self.analysis.incomplete_reasons.is_empty() {
@@ -725,7 +817,7 @@ mod tests {
         write(
             root,
             "tests/service.rs",
-            "use fixture::covered::direct;\nuse fixture::helper::helper;\n\n#[test]\nfn paths() {\n    assert_eq!(direct(), 1);\n    assert_eq!(helper(), 1);\n}\n",
+            "use fixture::covered::direct;\nuse fixture::helper::helper;\n\n#[test]\nfn paths() {\n    let _ = direct();\n    let _ = helper();\n}\n",
         );
         let repo = Repository::init(root).expect("initialize repository");
         commit_all(&repo, "base");
@@ -750,7 +842,7 @@ mod tests {
         write(
             root,
             "tests/service.rs",
-            "use fixture::covered::direct;\nuse fixture::helper::helper;\n\n#[test]\nfn paths() {\n    assert_eq!(direct(), 2);\n    assert_eq!(helper(), 2);\n}\n",
+            "use fixture::covered::direct;\nuse fixture::helper::helper;\n\n#[test]\nfn paths() {\n    let _ = direct();\n    let _ = helper();\n}\n",
         );
         let target = commit_all(&repo, "target");
 
@@ -794,6 +886,56 @@ mod tests {
                 .all(|function| function.after.name != "deleted"
                     && function.after.name != "moved"
                     && function.after.name != "paths")
+        );
+    }
+
+    #[test]
+    fn missing_tests_preserves_library_target_test_context() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let root = temp.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        write(root, "src/lib.rs", "pub mod changed;\npub mod tests;\n");
+        write(
+            root,
+            "src/changed.rs",
+            "pub fn covered() -> i32 {\n    1\n}\n\npub fn uncovered() -> i32 {\n    1\n}\n",
+        );
+        write(
+            root,
+            "src/tests/mod.rs",
+            "use crate::changed::covered;\n\npub fn witness() -> i32 {\n    covered()\n}\n",
+        );
+        let repo = Repository::init(root).expect("initialize repository");
+        commit_all(&repo, "base");
+        write(
+            root,
+            "src/changed.rs",
+            "pub fn covered() -> i32 {\n    2\n}\n\npub fn uncovered() -> i32 {\n    2\n}\n",
+        );
+        let target = commit_all(&repo, "target");
+
+        let result = missing_tests_at_root(
+            root,
+            None,
+            MissingTestsParams {
+                base: None,
+                target: Some(target.to_string()),
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
+        )
+        .expect("missing tests");
+
+        assert_eq!(2, result.analysis.candidate_function_count, "{result:#?}");
+        assert_eq!(1, result.analysis.reached_function_count, "{result:#?}");
+        assert_eq!(1, result.analysis.missing_function_count, "{result:#?}");
+        assert_eq!(
+            0, result.analysis.indeterminate_function_count,
+            "{result:#?}"
         );
     }
 

@@ -2860,6 +2860,113 @@ impl ExternalSummaryTarget {
             && actual_last.name() == formal_last.name()
             && actual_last.anchor() == formal_last.anchor()
     }
+
+    fn is_mapped_call_shape_alias_of(&self, formal: &Self, mapping: &[u32]) -> bool {
+        if self.mount != formal.mount
+            || self.path != formal.path
+            || self.language != formal.language
+            || !is_full_actual_to_formal_permutation(mapping)
+        {
+            return false;
+        }
+        let Some(actual_last) = self.declaration.segments().last() else {
+            return false;
+        };
+        let Some(formal_last) = formal.declaration.segments().last() else {
+            return false;
+        };
+        let Some(arity) = u32::try_from(mapping.len()).ok() else {
+            return false;
+        };
+        // The opaque Python binding relates an actual locator carrying a
+        // typed call-mapping namespace to its artifact-qualified formal
+        // locator. Their declaration prefixes intentionally differ.
+        actual_last.kind() == formal_last.kind()
+            && actual_last.name() == formal_last.name()
+            && actual_last.anchor() == formal_last.anchor()
+            && actual_last.sibling_ordinal() == arity
+            && formal_last.sibling_ordinal() == arity
+    }
+}
+
+fn is_full_actual_to_formal_permutation(mapping: &[u32]) -> bool {
+    if u32::try_from(mapping.len()).is_err() {
+        return false;
+    }
+    let mut seen = vec![false; mapping.len()];
+    mapping.iter().all(|formal| {
+        let Ok(index) = usize::try_from(*formal) else {
+            return false;
+        };
+        if index >= seen.len() || seen[index] {
+            return false;
+        }
+        seen[index] = true;
+        true
+    })
+}
+
+fn is_identity_actual_to_formal_mapping(mapping: &[u32]) -> bool {
+    mapping
+        .iter()
+        .enumerate()
+        .all(|(actual, formal)| usize::try_from(*formal).ok() == Some(actual))
+}
+
+fn mapped_summary_uses_supported_transfer_ports(
+    summary: &SemanticProcedureSummary,
+    formal_parameter_count: usize,
+) -> bool {
+    summary.effects().is_empty()
+        && summary.transfers().iter().all(|transfer| {
+            [transfer.input(), transfer.exit().port()]
+                .into_iter()
+                .all(|port| match port {
+                    SummaryPort::Parameter(ordinal) => usize::try_from(*ordinal)
+                        .is_ok_and(|ordinal| ordinal < formal_parameter_count),
+                    SummaryPort::Capture(_) | SummaryPort::Heap(_) => false,
+                    SummaryPort::Receiver
+                    | SummaryPort::NormalReturn
+                    | SummaryPort::IndexedNormalReturn(_)
+                    | SummaryPort::ExceptionalReturn => true,
+                })
+        })
+}
+
+fn push_actual_to_formal_fingerprint(bytes: &mut Vec<u8>, mapping: &[u32]) {
+    bytes.extend_from_slice(b"bifrost.external-summary-actual-to-formal.v1\0");
+    bytes.extend_from_slice(
+        &u64::try_from(mapping.len())
+            .expect("mapping length fits the fingerprint format")
+            .to_le_bytes(),
+    );
+    for formal in mapping {
+        bytes.extend_from_slice(&formal.to_le_bytes());
+    }
+}
+
+fn summary_binding_fingerprint(
+    summary_fingerprint: StableDigest,
+    mapping: Option<&[u32]>,
+) -> ExternalSummarySetFingerprint {
+    let mut bytes = summary_fingerprint.as_bytes().to_vec();
+    if let Some(mapping) = mapping {
+        push_actual_to_formal_fingerprint(&mut bytes, mapping);
+    }
+    ExternalSummarySetFingerprint::hash_bytes(&bytes)
+}
+
+#[cfg(test)]
+mod external_summary_mapping_tests {
+    use super::is_identity_actual_to_formal_mapping;
+
+    #[test]
+    fn identity_call_shape_maps_keep_existing_summary_capabilities() {
+        assert!(is_identity_actual_to_formal_mapping(&[]));
+        assert!(is_identity_actual_to_formal_mapping(&[0, 1, 2]));
+        assert!(!is_identity_actual_to_formal_mapping(&[1, 0]));
+        assert!(!is_identity_actual_to_formal_mapping(&[0, 2, 1]));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2890,12 +2997,19 @@ pub(crate) fn canonicalize_semantic_summary_items<T>(
     Ok(items.into_boxed_slice())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalSummaryEntry {
+    target: ExternalSummaryTarget,
+    summary: SemanticProcedureSummary,
+    actual_to_formal: Option<Box<[u32]>>,
+}
+
 /// Canonical query-scoped index for compatible externally supplied procedure
 /// summaries. It resolves boundary locators without fabricating a live
 /// [`crate::analyzer::semantic::ProcedureHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalSemanticSummarySet {
-    entries: Box<[(ExternalSummaryTarget, SemanticProcedureSummary)]>,
+    entries: Box<[ExternalSummaryEntry]>,
     fingerprint: ExternalSummarySetFingerprint,
     compatibility: Option<ExternalSummaryCompatibilityKey>,
 }
@@ -2922,7 +3036,11 @@ impl ExternalSemanticSummarySet {
         let entries = summaries
             .into_vec()
             .into_iter()
-            .map(|summary| (ExternalSummaryTarget::from_summary(&summary), summary))
+            .map(|summary| ExternalSummaryEntry {
+                target: ExternalSummaryTarget::from_summary(&summary),
+                summary,
+                actual_to_formal: None,
+            })
             .collect();
         Self::try_new_entries(entries, compatibility)
     }
@@ -2947,11 +3065,11 @@ impl ExternalSemanticSummarySet {
         compatibility: ExternalSummaryCompatibilityKey,
     ) -> Result<Self, ExternalSummarySetError> {
         let mut entries = Vec::with_capacity(summaries.len().saturating_add(bindings.len()));
-        entries.extend(
-            summaries
-                .into_iter()
-                .map(|summary| (ExternalSummaryTarget::from_summary(&summary), summary)),
-        );
+        entries.extend(summaries.into_iter().map(|summary| ExternalSummaryEntry {
+            target: ExternalSummaryTarget::from_summary(&summary),
+            summary,
+            actual_to_formal: None,
+        }));
         for (binding, summary) in bindings {
             let Some(actual) = ExternalSummaryTarget::from_locator(binding.actual_locator()) else {
                 return Err(ExternalSummarySetError::InvalidTargetAlias);
@@ -2971,7 +3089,21 @@ impl ExternalSemanticSummarySet {
             let Some(internal) = ExternalSummaryTarget::from_locator(&internal_locator) else {
                 return Err(ExternalSummarySetError::InvalidTargetAlias);
             };
-            if !actual.is_call_shape_alias_of(&formal)
+            let actual_to_formal = binding
+                .actual_to_formal()
+                .map(|mapping| mapping.to_vec().into_boxed_slice());
+            let valid_alias = match actual_to_formal.as_deref() {
+                Some(mapping) => {
+                    actual.is_mapped_call_shape_alias_of(&formal, mapping)
+                        && (is_identity_actual_to_formal_mapping(mapping)
+                            || mapped_summary_uses_supported_transfer_ports(
+                                &summary,
+                                mapping.len(),
+                            ))
+                }
+                None => actual.is_call_shape_alias_of(&formal),
+            };
+            if !valid_alias
                 || origin.model().as_str() != binding.model_id()
                 || origin.content().digest() != binding.content()
                 || origin.contract_version() != binding.contract_version()
@@ -2980,16 +3112,20 @@ impl ExternalSemanticSummarySet {
             {
                 return Err(ExternalSummarySetError::InvalidTargetAlias);
             }
-            entries.push((actual, summary));
+            entries.push(ExternalSummaryEntry {
+                target: actual,
+                summary,
+                actual_to_formal,
+            });
         }
         Self::try_new_entries(entries, compatibility)
     }
 
     fn try_new_entries(
-        mut entries: Vec<(ExternalSummaryTarget, SemanticProcedureSummary)>,
+        mut entries: Vec<ExternalSummaryEntry>,
         compatibility: ExternalSummaryCompatibilityKey,
     ) -> Result<Self, ExternalSummarySetError> {
-        for (_, summary) in &entries {
+        for ExternalSummaryEntry { summary, .. } in &entries {
             if !matches!(summary.origin(), SummaryOrigin::External(_)) {
                 return Err(ExternalSummarySetError::InferredSummary);
             }
@@ -2999,38 +3135,54 @@ impl ExternalSemanticSummarySet {
         }
         {
             let mut by_key = entries.iter().collect::<Vec<_>>();
-            by_key.sort_unstable_by(|left, right| left.1.key().cmp(right.1.key()));
-            if by_key
-                .windows(2)
-                .any(|pair| pair[0].1.key() == pair[1].1.key() && pair[0].1 != pair[1].1)
-            {
+            by_key.sort_unstable_by(|left, right| left.summary.key().cmp(right.summary.key()));
+            if by_key.windows(2).any(|pair| {
+                pair[0].summary.key() == pair[1].summary.key() && pair[0].summary != pair[1].summary
+            }) {
                 return Err(ExternalSummarySetError::InconsistentSummaryKey);
             }
         }
         entries.sort_unstable_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.key().cmp(right.1.key()))
+            left.target
+                .cmp(&right.target)
+                .then_with(|| left.summary.key().cmp(right.summary.key()))
         });
-        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].target == pair[1].target)
+        {
             return Err(ExternalSummarySetError::AmbiguousTarget);
         }
 
-        let has_aliases = entries
-            .iter()
-            .any(|(target, summary)| *target != ExternalSummaryTarget::from_summary(summary));
+        let has_aliases = entries.iter().any(
+            |ExternalSummaryEntry {
+                 target,
+                 summary,
+                 actual_to_formal: mapping,
+             }| {
+                *target != ExternalSummaryTarget::from_summary(summary) || mapping.is_some()
+            },
+        );
         let mut bytes = Vec::with_capacity(48usize.saturating_add(entries.len() * 64));
         if has_aliases {
             bytes.extend_from_slice(b"bifrost-external-summary-set/target-bound-v1\0");
-            for (target, summary) in &entries {
+            for ExternalSummaryEntry {
+                target,
+                summary,
+                actual_to_formal: mapping,
+            } in &entries
+            {
                 bytes.extend_from_slice(target.stable_fingerprint().as_bytes());
                 bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
+                if let Some(mapping) = mapping.as_deref() {
+                    push_actual_to_formal_fingerprint(&mut bytes, mapping);
+                }
             }
         } else {
             // Preserve the established fingerprint of ordinary one-target-per-
             // summary sets. Only an actual alias mapping rotates the domain.
             bytes.extend_from_slice(b"bifrost-external-summary-set/v1\0");
-            for (_, summary) in &entries {
+            for ExternalSummaryEntry { summary, .. } in &entries {
                 bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
             }
         }
@@ -3042,13 +3194,24 @@ impl ExternalSemanticSummarySet {
     }
 
     pub fn summary_for(&self, locator: &SemanticLocator) -> Option<&SemanticProcedureSummary> {
+        self.summary_and_actual_to_formal_for(locator)
+            .map(|(summary, _)| summary)
+    }
+
+    pub fn summary_and_actual_to_formal_for(
+        &self,
+        locator: &SemanticLocator,
+    ) -> Option<(&SemanticProcedureSummary, Option<&[u32]>)> {
         if locator.role() != SemanticRole::Procedure {
             return None;
         }
         self.entries
-            .binary_search_by(|(target, _)| target.compare_locator(locator))
+            .binary_search_by(|entry| entry.target.compare_locator(locator))
             .ok()
-            .map(|index| &self.entries[index].1)
+            .map(|index| {
+                let entry = &self.entries[index];
+                (&entry.summary, entry.actual_to_formal.as_deref())
+            })
     }
 
     pub fn entries(
@@ -3056,7 +3219,7 @@ impl ExternalSemanticSummarySet {
     ) -> impl ExactSizeIterator<Item = (&ExternalSummaryTarget, &SemanticProcedureSummary)> {
         self.entries
             .iter()
-            .map(|(target, summary)| (target, summary))
+            .map(|entry| (&entry.target, &entry.summary))
     }
 
     pub const fn fingerprint(&self) -> ExternalSummarySetFingerprint {
@@ -3071,9 +3234,10 @@ impl ExternalSemanticSummarySet {
         &self,
         locator: &SemanticLocator,
     ) -> Option<ExternalSummarySetFingerprint> {
-        self.summary_for(locator).map(|summary| {
-            ExternalSummarySetFingerprint::hash_bytes(summary.key().fingerprint().as_bytes())
-        })
+        self.summary_and_actual_to_formal_for(locator)
+            .map(|(summary, mapping)| {
+                summary_binding_fingerprint(summary.key().fingerprint(), mapping)
+            })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -3086,18 +3250,29 @@ impl ExternalSemanticSummarySet {
         size_of_val(self.entries.as_ref()).saturating_add(
             self.entries
                 .iter()
-                .map(|(target, summary)| {
-                    target
-                        .path
-                        .as_str()
-                        .len()
-                        .saturating_add(declaration_locator_heap_bytes(&target.declaration))
-                        .saturating_add(
-                            summary
-                                .retained_bytes()
-                                .saturating_sub(size_of::<SemanticProcedureSummary>()),
-                        )
-                })
+                .map(
+                    |ExternalSummaryEntry {
+                         target,
+                         summary,
+                         actual_to_formal: mapping,
+                     }| {
+                        target
+                            .path
+                            .as_str()
+                            .len()
+                            .saturating_add(declaration_locator_heap_bytes(&target.declaration))
+                            .saturating_add(
+                                mapping
+                                    .as_ref()
+                                    .map_or(0, |mapping| size_of_val(mapping.as_ref())),
+                            )
+                            .saturating_add(
+                                summary
+                                    .retained_bytes()
+                                    .saturating_sub(size_of::<SemanticProcedureSummary>()),
+                            )
+                    },
+                )
                 .fold(0_usize, usize::saturating_add),
         )
     }

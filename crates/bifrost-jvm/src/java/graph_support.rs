@@ -30,7 +30,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
 };
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
+use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo, JavaTypeConstructorShape};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
@@ -45,10 +45,10 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::java::declarations::{collect_type_identifiers, java_package_fq, parse_tree};
-use crate::java::imports::{import_package, non_static_import_path, static_import_path};
-use crate::java::resolution::{
+use crate::java::import_split::{
     JavaImportInventory, JavaImportSplitGap, prove_java_single_type_import,
 };
+use crate::java::imports::{import_package, non_static_import_path, static_import_path};
 use crate::proof::JvmRetainedExternalIndex;
 
 /// The package whose types every Java file sees without importing them.
@@ -76,6 +76,12 @@ pub enum UniqueClassInFile {
 }
 
 pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+    fn declaration_source_facts(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::java::source_facts::JavaFileSourceFacts>>;
+
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
     fn all_files(&self) -> Vec<ProjectFile>;
 
@@ -524,37 +530,14 @@ pub fn resolve_java_usage_type_components_in(
     file: &ProjectFile,
     components: &[String],
 ) -> Option<CodeUnit> {
-    let terminal = components.last()?;
-    let mut identifier_name = FqName::new();
-    identifier_name.push(segment_interner().intern(terminal, SegmentKind::Type));
-    let question = RelationalDefinitionQuestion {
-        language_scope: DefinitionLanguageScope::Workspace,
-        name: RelationalName::stable(identifier_name),
-        query: RelationalDefinitionQuery::Identifier { file: None },
-    };
-    let RelationalDefinitionValue::Definitions(identifier_candidates) = definitions.ask(&question)
-    else {
-        panic!("a Java identifier question returned the wrong shape")
-    };
-
-    let candidate = |segments: &[String]| {
-        let mut expected = FqName::new();
-        for segment in segments {
-            expected.push(segment_interner().intern(segment, SegmentKind::Type));
-        }
-        identifier_candidates
-            .iter()
-            .find(|unit| unit.is_class() && unit.fq().same_segment_texts(&expected))
-            .cloned()
-    };
-
-    if components.len() > 1
-        && let Some(unit) = candidate(components)
-    {
-        return Some(unit);
+    if components.is_empty() {
+        return None;
     }
 
+    let candidate = |segments: &[String]| java_usage_type_candidates_at(definitions, segments);
+
     let imports = source.import_info_of(token, file);
+    let mut explicit_routes = Vec::new();
     for import in &imports {
         let Some(import_path) = non_static_import_path(import) else {
             continue;
@@ -566,32 +549,24 @@ pub fn resolve_java_usage_type_components_in(
         }
         let mut imported = import_path.segments.clone();
         imported.extend_from_slice(&components[1..]);
-        // A matching explicit import is terminal even when the workspace does
-        // not contain its target.
-        return candidate(&imported);
+        if !explicit_routes.contains(&imported) {
+            explicit_routes.push(imported);
+        }
+    }
+    if !explicit_routes.is_empty() {
+        // Two written single-type imports that bind the same simple name stay
+        // ambiguous even if only one route currently has an indexed target.
+        if explicit_routes.len() != 1 {
+            return None;
+        }
+        return java_single_usage_type_candidate(candidate(&explicit_routes[0]));
     }
 
-    let mut wildcard_candidates = Vec::new();
-    for import in &imports {
-        let Some(import_path) = non_static_import_path(import) else {
-            continue;
-        };
-        if !import.is_wildcard {
-            continue;
+    if components.len() > 1 {
+        let qualified = candidate(components);
+        if !qualified.is_empty() {
+            return java_single_usage_type_candidate(qualified);
         }
-        let mut imported = import_path.segments.clone();
-        imported.extend_from_slice(components);
-        if let Some(unit) = candidate(&imported)
-            && !wildcard_candidates.contains(&unit)
-        {
-            wildcard_candidates.push(unit);
-        }
-    }
-    if wildcard_candidates.len() == 1 {
-        return wildcard_candidates.pop();
-    }
-    if !wildcard_candidates.is_empty() {
-        return None;
     }
 
     let package_name = source
@@ -608,10 +583,243 @@ pub fn resolve_java_usage_type_components_in(
         };
         same_package.push(interner.intern(component, kind));
     }
-    identifier_candidates
+    let same_package_segments = same_package
+        .segments()
         .iter()
-        .find(|unit| unit.is_class() && unit.fq().same_segment_texts(&same_package))
-        .cloned()
+        .map(|&segment| interner.resolve(segment).0.to_owned())
+        .collect::<Vec<_>>();
+    let same_package = candidate(&same_package_segments);
+    if !same_package.is_empty() {
+        return java_single_usage_type_candidate(same_package);
+    }
+
+    let mut wildcard_routes = Vec::new();
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if !import.is_wildcard {
+            continue;
+        }
+        let mut imported = import_path.segments.clone();
+        imported.extend_from_slice(components);
+        if !wildcard_routes.contains(&imported) {
+            wildcard_routes.push(imported);
+        }
+    }
+    let mut wildcard_candidates = Vec::new();
+    for route in wildcard_routes {
+        let route_candidates = candidate(&route);
+        if route_candidates.is_empty() {
+            continue;
+        }
+        let route_candidate = java_single_usage_type_candidate(route_candidates)?;
+        if wildcard_candidates
+            .iter()
+            .any(|candidate: &CodeUnit| candidate.fq() != route_candidate.fq())
+        {
+            return None;
+        }
+        if !wildcard_candidates.contains(&route_candidate) {
+            wildcard_candidates.push(route_candidate);
+        }
+    }
+    java_single_usage_type_candidate(wildcard_candidates)
+}
+
+/// Read every declaration indexed under the terminal type identifier, then
+/// retain only classes whose structured components match the requested route.
+/// This bounded frontier operation is shared by ordinary usage resolution and
+/// the stricter annotation candidate resolver.
+fn java_usage_type_candidates_at(
+    definitions: &dyn RelationalDefinitionFrontier,
+    segments: &[String],
+) -> Vec<CodeUnit> {
+    let Some(terminal) = segments.last() else {
+        return Vec::new();
+    };
+    let mut identifier_name = FqName::new();
+    identifier_name.push(segment_interner().intern(terminal, SegmentKind::Type));
+    let question = RelationalDefinitionQuestion {
+        language_scope: DefinitionLanguageScope::Workspace,
+        name: RelationalName::stable(identifier_name),
+        query: RelationalDefinitionQuery::Identifier { file: None },
+    };
+    let RelationalDefinitionValue::Definitions(identifier_candidates) = definitions.ask(&question)
+    else {
+        panic!("a Java identifier question returned the wrong shape")
+    };
+
+    let mut expected = FqName::new();
+    for segment in segments {
+        expected.push(segment_interner().intern(segment, SegmentKind::Type));
+    }
+    identifier_candidates
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq().same_segment_texts(&expected))
+        .collect()
+}
+
+/// Select an ordinary usage representative only when every source candidate
+/// belongs to the same exact structured FQ name. Physical source copies remain
+/// separate declarations, but one FQ reference is visible from each target
+/// copy; distinct package/type readings stay ambiguous.
+fn java_single_usage_type_candidate(candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+    let first = candidates.first()?.clone();
+    candidates
+        .iter()
+        .all(|candidate| candidate.fq() == first.fq())
+        .then_some(first)
+}
+
+/// The deciding type tier retains peers and missing dependency routes.
+pub enum JavaSourceTypeCandidates {
+    Resolved(CodeUnit),
+    Ambiguous(Vec<CodeUnit>),
+    Incomplete(Vec<CodeUnit>),
+    Unresolved,
+}
+
+pub fn resolve_java_usage_type_component_candidates_in(
+    source: &dyn JavaSource,
+    token: QueryToken<'_>,
+    definitions: &dyn RelationalDefinitionFrontier,
+    file: &ProjectFile,
+    components: &[String],
+) -> JavaSourceTypeCandidates {
+    if components.is_empty() {
+        return JavaSourceTypeCandidates::Unresolved;
+    }
+    let candidate = |segments: &[String]| java_usage_type_candidates_at(definitions, segments);
+    let proven_route = |segments: &[String]| {
+        // The shared proof asks only for the full route and structured
+        // prefixes of that route. Render those existing components to match
+        // its inventory API; never parse a dotted spelling back into syntax.
+        let classes_at = |rendered: &str| {
+            let prefix_len = (1..=segments.len())
+                .find(|length| segments[..*length].join(".") == rendered)
+                .expect("the import proof asks only for structured route prefixes");
+            candidate(&segments[..prefix_len])
+        };
+        match prove_java_single_type_import(segments, java_import_inventory(source, &classes_at)) {
+            crate::java::import_split::JavaSingleTypeImportProof::Proven(unit) => {
+                JavaSourceTypeCandidates::Resolved(unit)
+            }
+            crate::java::import_split::JavaSingleTypeImportProof::Open { targets, .. } => {
+                if targets.len() > 1 {
+                    JavaSourceTypeCandidates::Ambiguous(targets)
+                } else {
+                    JavaSourceTypeCandidates::Incomplete(targets)
+                }
+            }
+        }
+    };
+
+    let imports = source.import_info_of(token, file);
+    let mut explicit_routes = Vec::new();
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard
+            || import.identifier.as_deref() != components.first().map(String::as_str)
+        {
+            continue;
+        }
+        let mut imported = import_path.segments.clone();
+        imported.extend_from_slice(&components[1..]);
+        if !explicit_routes.contains(&imported) {
+            explicit_routes.push(imported);
+        }
+    }
+    if !explicit_routes.is_empty() {
+        let mut targets = Vec::new();
+        for route in &explicit_routes {
+            for unit in candidate(route) {
+                if !targets.contains(&unit) {
+                    targets.push(unit);
+                }
+            }
+        }
+        if explicit_routes.len() > 1 {
+            return JavaSourceTypeCandidates::Ambiguous(targets);
+        }
+        return proven_route(&explicit_routes[0]);
+    }
+
+    if components.len() > 1 {
+        let qualified = candidate(components);
+        if !qualified.is_empty() {
+            return proven_route(components);
+        }
+    }
+
+    let package_name = source
+        .cached_package_name(file)
+        .unwrap_or_else(|| Arc::from(""));
+    let package = java_package_fq(&package_name);
+    let interner = segment_interner();
+    let mut same_package = package;
+    for (ordinal, component) in components.iter().enumerate() {
+        let kind = if ordinal == 0 {
+            SegmentKind::Type
+        } else {
+            SegmentKind::Nested
+        };
+        same_package.push(interner.intern(component, kind));
+    }
+    let same_package_segments = same_package
+        .segments()
+        .iter()
+        .map(|&segment| interner.resolve(segment).0.to_owned())
+        .collect::<Vec<_>>();
+    let same_package = candidate(&same_package_segments);
+    if !same_package.is_empty() {
+        return java_source_type_candidates(same_package);
+    }
+
+    let mut wildcard_candidates = Vec::new();
+    let mut missing_route = false;
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if !import.is_wildcard {
+            continue;
+        }
+        let mut imported = import_path.segments.clone();
+        imported.extend_from_slice(components);
+        let targets = candidate(&imported);
+        missing_route |= targets.is_empty();
+        for unit in targets {
+            if !wildcard_candidates.contains(&unit) {
+                wildcard_candidates.push(unit);
+            }
+        }
+    }
+    if !wildcard_candidates.is_empty() {
+        if wildcard_candidates.len() == 1 {
+            // java.lang is an implicit peer in this tier. The source-only
+            // frontier cannot prove the selected JDK's absence, so one
+            // workspace hit is not a unique annotation-type proof.
+            return JavaSourceTypeCandidates::Incomplete(wildcard_candidates);
+        }
+        return java_source_type_candidates(wildcard_candidates);
+    }
+
+    if missing_route {
+        JavaSourceTypeCandidates::Incomplete(same_package)
+    } else {
+        java_source_type_candidates(same_package)
+    }
+}
+
+fn java_source_type_candidates(mut candidates: Vec<CodeUnit>) -> JavaSourceTypeCandidates {
+    match candidates.len() {
+        0 => JavaSourceTypeCandidates::Unresolved,
+        1 => JavaSourceTypeCandidates::Resolved(candidates.remove(0)),
+        _ => JavaSourceTypeCandidates::Ambiguous(candidates),
+    }
 }
 
 /// Every candidate the deciding type-name tier produced for `raw_name`,
@@ -1320,65 +1528,111 @@ pub fn compute_java_same_package_reference_index(
 // Constructors
 // ---------------------------------------------------------------------------
 
+/// The callable facts a Java consumer may use to distinguish overloads and
+/// constructors. A unit can have several persisted metadata alternatives (for
+/// example, repeated metadata alternatives for one CodeUnit), so this value is
+/// returned only when every alternative agrees. In particular, an unrecorded
+/// modifier is not a proof that a callable is an instance method or an ordinary
+/// method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaCallableFacts {
+    pub arity: CallableArity,
+    pub parameter_types: Option<Vec<String>>,
+    pub is_static: bool,
+    pub is_constructor: bool,
+}
+
+/// Read the complete canonical callable metadata for `unit`.
+pub fn java_callable_facts(source: &dyn JavaSource, unit: &CodeUnit) -> Option<JavaCallableFacts> {
+    let alternatives = source.signature_metadata(unit);
+    let metadata = alternatives.first()?;
+    let arity = metadata.callable_arity()?;
+    if !metadata.callable_modifiers_recorded() {
+        return None;
+    }
+    let parameter_types = metadata.callable_parameter_types().map(<[String]>::to_vec);
+    let is_static = metadata.callable_is_static();
+    let is_constructor = metadata.callable_is_constructor();
+    if alternatives.iter().any(|alternative| {
+        !alternative.callable_modifiers_recorded()
+            || alternative.callable_arity() != Some(arity)
+            || alternative.callable_parameter_types() != metadata.callable_parameter_types()
+            || alternative.callable_is_static() != is_static
+            || alternative.callable_is_constructor() != is_constructor
+    }) {
+        return None;
+    }
+    Some(JavaCallableFacts {
+        arity,
+        parameter_types,
+        is_static,
+        is_constructor,
+    })
+}
+
+fn java_constructor_shape(
+    source: &dyn JavaSource,
+    owner: &CodeUnit,
+) -> Option<JavaTypeConstructorShape> {
+    let alternatives = source.signature_metadata(owner);
+    let shape = alternatives.first()?.java_type_constructor_shape()?;
+    alternatives
+        .iter()
+        .all(|metadata| metadata.java_type_constructor_shape() == Some(shape))
+        .then_some(shape)
+}
+
+/// The direct explicit constructors and source-owned fallback shape for a
+/// Java type. `None` means that canonical source facts were absent or
+/// conflicting; it is deliberately different from a known shape that rejects
+/// a call, so callers do not turn an unavailable read into a false negative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaConstructorContext {
+    pub constructors: Vec<CodeUnit>,
+    pub owner_shape_accepts: bool,
+}
+
 /// Classify exact-FQN callable candidates and the source-level constructor
-/// shape from one coherent parser snapshot.
+/// shape from canonical indexed facts.
 ///
 /// Java permits an ordinary method to have the same simple name as its
 /// enclosing class, so FQN and arity alone cannot distinguish the two.
 pub fn java_constructor_context(
     source: &dyn JavaSource,
-    token: QueryToken<'_>,
     owner: &CodeUnit,
     candidates: Vec<CodeUnit>,
-    call_arity: usize,
-) -> (Vec<CodeUnit>, bool) {
-    let Some(prepared) = source.prepared_syntax(token, owner.source()) else {
-        return (Vec::new(), false);
-    };
-    let owner_children = prepared.direct_children(owner);
-    let has_explicit_constructor = owner_children.iter().any(|child| {
-        prepared.declaration_node(child).is_some_and(|node| {
-            matches!(
-                node.kind(),
-                "constructor_declaration" | "compact_constructor_declaration"
-            )
-        })
-    });
+    call_arity: Option<usize>,
+) -> Option<JavaConstructorContext> {
+    let owner_children = source.direct_children(owner);
+    let mut has_explicit_constructor = false;
+    let mut constructor_children = HashSet::default();
+    for child in &owner_children {
+        if !child.is_function() {
+            continue;
+        }
+        let facts = java_callable_facts(source, child)?;
+        if facts.is_constructor {
+            has_explicit_constructor = true;
+            constructor_children.insert(child.clone());
+        }
+    }
     let direct_children = owner_children.iter().collect::<HashSet<_>>();
     let constructors = candidates
         .into_iter()
         .filter(|candidate| direct_children.contains(candidate))
-        .filter(|candidate| {
-            prepared.declaration_node(candidate).is_some_and(|node| {
-                matches!(
-                    node.kind(),
-                    "constructor_declaration" | "compact_constructor_declaration"
-                )
-            })
-        })
+        .filter(|candidate| constructor_children.contains(candidate))
         .collect::<Vec<_>>();
-    let owner_shape_accepts = match prepared.declaration_node(owner) {
-        Some(node) if node.kind() == "class_declaration" => {
-            !has_explicit_constructor && call_arity == 0
+    let owner_shape_accepts = match java_constructor_shape(source, owner)? {
+        JavaTypeConstructorShape::NoImplicit => false,
+        JavaTypeConstructorShape::Default => {
+            !has_explicit_constructor && call_arity.is_none_or(|arity| arity == 0)
         }
-        Some(node) if node.kind() == "record_declaration" => {
-            let Some(parameters) = node.child_by_field_name("parameters") else {
-                return (constructors, false);
-            };
-            let mut cursor = parameters.walk();
-            let mut required = 0;
-            let mut repeated = false;
-            for parameter in parameters.named_children(&mut cursor) {
-                match parameter.kind() {
-                    "formal_parameter" => required += 1,
-                    "spread_parameter" => repeated = true,
-                    _ => {}
-                }
-            }
-            CallableArity::new(required, required + usize::from(repeated), repeated)
-                .accepts(call_arity)
+        JavaTypeConstructorShape::RecordCanonical(arity) => {
+            call_arity.is_none_or(|call_arity| arity.accepts(call_arity))
         }
-        _ => false,
     };
-    (constructors, owner_shape_accepts)
+    Some(JavaConstructorContext {
+        constructors,
+        owner_shape_accepts,
+    })
 }

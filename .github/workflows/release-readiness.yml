@@ -308,255 +308,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  semantic-pack-jvm:
-    name: generate JVM semantic-pack partial bundle
-    if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Download exact semantic-pack tool
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: semantic-pack-tool-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/semantic-pack-tool
-      - name: Verify exact semantic-pack tool
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
-          chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
-          echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Restore JVM semantic-pack source inputs
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/semantic-pack-source-cache/jvm
-          key: semantic-pack-source-jvm-${{ runner.os }}-kotlin-27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26-scala-c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5-jdk-59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261
-      - name: Generate JVM partial bundle
-        env:
-          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/jvm
-        run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-jvm" "${RUNNER_TEMP}"
-      - name: Verify JVM partial bundle
-        run: >-
-          "$BIFROST_SEMANTIC_PACK_BIN" verify "${RUNNER_TEMP}/bifrost-semantic-packs-jvm"
-      - name: Upload JVM partial bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs-jvm
-          path: ${{ runner.temp }}/bifrost-semantic-packs-jvm
-          if-no-files-found: error
-          retention-days: 14
-
-  semantic-pack-python:
-    name: generate Python semantic-pack partial bundle
-    if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Download exact semantic-pack tool
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: semantic-pack-tool-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/semantic-pack-tool
-      - name: Verify exact semantic-pack tool
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
-          chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
-          echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Restore Python semantic-pack source inputs
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/semantic-pack-source-cache/python
-          key: semantic-pack-source-python-${{ runner.os }}-typeshed-e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626
-      - name: Generate Python partial bundle
-        env:
-          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/python
-        run: bash scripts/public/build-pinned-python-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-python" "${RUNNER_TEMP}"
-      - name: Verify Python partial bundle
-        run: >-
-          "$BIFROST_SEMANTIC_PACK_BIN" verify "${RUNNER_TEMP}/bifrost-semantic-packs-python"
-      - name: Upload Python partial bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs-python
-          path: ${{ runner.temp }}/bifrost-semantic-packs-python
-          if-no-files-found: error
-          retention-days: 14
-
-  semantic-pack-typescript:
-    name: generate TypeScript semantic-pack partial bundle
-    if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Download exact semantic-pack tool
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: semantic-pack-tool-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/semantic-pack-tool
-      - name: Verify exact semantic-pack tool
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
-          chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
-          echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Restore TypeScript semantic-pack source inputs
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/semantic-pack-source-cache/typescript
-          key: semantic-pack-source-typescript-${{ runner.os }}-compiler-da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08-library-7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
-      - name: Generate TypeScript partial bundle
-        env:
-          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/typescript
-        run: bash scripts/public/build-pinned-typescript-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-typescript" "${RUNNER_TEMP}"
-      - name: Verify TypeScript partial bundle
-        run: >-
-          "$BIFROST_SEMANTIC_PACK_BIN" verify "${RUNNER_TEMP}/bifrost-semantic-packs-typescript"
-      - name: Upload TypeScript partial bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs-typescript
-          path: ${{ runner.temp }}/bifrost-semantic-packs-typescript
-          if-no-files-found: error
-          retention-days: 14
-
-  semantic-pack-rust:
-    name: generate Rust semantic-pack partial bundle
-    if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Download exact semantic-pack tool
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: semantic-pack-tool-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/semantic-pack-tool
-      - name: Verify exact semantic-pack tool
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
-          chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
-          echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Restore Rust semantic-pack source inputs
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/semantic-pack-source-cache/rust
-          key: semantic-pack-source-rust-${{ runner.os }}-rust-docs-json-nightly-x86_64-unknown-linux-gnu-0b18d55b97cee6756745744c0c169402ab6d3d506bb30267067b2438b3b5e000
-      - name: Generate Rust partial bundle
-        env:
-          SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/rust
-        run: bash scripts/public/build-pinned-rust-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-rust" "${RUNNER_TEMP}"
-      - name: Verify Rust partial bundle
-        run: >-
-          "$BIFROST_SEMANTIC_PACK_BIN" verify "${RUNNER_TEMP}/bifrost-semantic-packs-rust"
-      - name: Upload Rust partial bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs-rust
-          path: ${{ runner.temp }}/bifrost-semantic-packs-rust
-          if-no-files-found: error
-          retention-days: 14
-
-  semantic-pack-bundle:
-    name: assemble semantic-pack bundle
-    if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout qualified source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.preflight.outputs.commit }}
-      - name: Download exact semantic-pack tool
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: semantic-pack-tool-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/semantic-pack-tool
-      - name: Verify exact semantic-pack tool
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
-          chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
-          echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Download all semantic-pack partial bundles
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          pattern: bifrost-semantic-packs-*
-          path: ${{ runner.temp }}/semantic-pack-parts
-      - name: Merge and verify semantic-pack bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$BIFROST_SEMANTIC_PACK_BIN" merge \
-            "${RUNNER_TEMP}/bifrost-semantic-packs" \
-            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-jvm" \
-            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-python" \
-            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-typescript" \
-            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-rust"
-          "$BIFROST_SEMANTIC_PACK_BIN" verify \
-            "${RUNNER_TEMP}/bifrost-semantic-packs"
-      - name: Package semantic-pack bundle
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" "dist/bifrost-semantic-packs-${RELEASE_TAG}-measurements.json"
-          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-            -C "${RUNNER_TEMP}" -cf - bifrost-semantic-packs | gzip -n > "dist/bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"
-          (cd dist && sha256sum "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" > "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256")
-      - name: Upload semantic-pack bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-            dist/*-measurements.json
-          if-no-files-found: error
-          retention-days: 14
-
   build-linux-x86-64:
     name: build binary (x86_64-unknown-linux-gnu)
     needs: [preflight, notices]
@@ -1131,13 +882,11 @@ jobs:
           --binary-path "${{ steps.staged.outputs.binary }}"
 
   policy-scan-smoke:
-    name: smoke policy scan with staged binary
+    name: smoke policy scan with staged binary and verified open packs
     # Metadata-only requalification reuses the prior qualification bundle and
-    # skips all source-dependent jobs, including the semantic-pack producers.
-    # Keep this explicit so the new artifact dependency does not change that
-    # release path into a rebuild.
+    # skips source-dependent jobs, including this external-pack acceptance.
     if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, semantic-pack-tool, semantic-pack-bundle, build-linux-x86-64]
+    needs: [preflight, semantic-pack-tool, build-linux-x86-64]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -1146,6 +895,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
       - name: Download exact Linux binary
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -1163,25 +917,8 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
-      - name: Download exact merged semantic-pack bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: bifrost-semantic-packs
-          path: ${{ runner.temp }}/bifrost-semantic-pack-release
-      - name: Stage exact merged semantic-pack bundle
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -euo pipefail
-          archive="${RUNNER_TEMP}/bifrost-semantic-pack-release/bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"
-          sidecar="${archive}.sha256"
-          (cd "$(dirname "$archive")" && sha256sum --check "$(basename "$sidecar")")
-          tar -C "${RUNNER_TEMP}/bifrost-semantic-pack-release" -xzf "$archive"
-      # Keep this after the Cargo cache restore and installer build: restoring
-      # target/release before this point could replace the exact qualified
-      # binary with a cached build.
       - name: Stage exact binary
+        id: staged-binary
         shell: bash
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/bifrost-linux-release
@@ -1193,9 +930,62 @@ jobs:
           binary="$(find "$ARTIFACT_DIR" -type f -name "$BIN_NAME" -print -quit)"
           test -n "$binary"
           mkdir -p target/release
-          cp "$binary" target/release/$BIN_NAME
-          chmod +x target/release/$BIN_NAME
+          cp "$binary" "target/release/$BIN_NAME"
+          chmod +x "target/release/$BIN_NAME"
           echo "STAGED_BIFROST=$PWD/target/release/$BIN_NAME" >> "$GITHUB_ENV"
+      - name: Identify exact pack-consumer profile
+        id: pack-profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$STAGED_BIFROST" pack-engine-profile > "${RUNNER_TEMP}/pack-engine-profile.json"
+          profile_sha256="$(sha256sum "${RUNNER_TEMP}/pack-engine-profile.json" | awk '{print $1}')"
+          [[ "$profile_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$profile_sha256" >> "$GITHUB_OUTPUT"
+      - name: Restore verified open-pack cache for this engine profile
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/open-packs-cache
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-receipt-pending
+          restore-keys: |
+            bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-
+      - name: Acquire eligible integrity-verified Bifrost-packs release
+        id: open-packs
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/open-packs-receipt.json"
+          env_file="${RUNNER_TEMP}/open-packs.env.json"
+          rm -f "$receipt" "$env_file"
+          node scripts/public/prepare-open-packs.mjs \
+            --binary "$STAGED_BIFROST" \
+            --cache-dir "${RUNNER_TEMP}/open-packs-cache" \
+            --receipt-path "$receipt" \
+            --env-path "$env_file"
+          jq -e '
+            type == "object" and
+            (keys | sort) == [
+              "BIFROST_OPEN_POLICY_PACK_ROOT",
+              "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE",
+              "BIFROST_SEMANTIC_PACK_CACHE_ROOT"
+            ] and
+            all(.[]; type == "string" and length > 0)
+          ' "$env_file" >/dev/null
+          mkdir -p "$(jq -er '.BIFROST_SEMANTIC_PACK_CACHE_ROOT' "$env_file")"
+          for name in \
+            BIFROST_OPEN_POLICY_PACK_ROOT \
+            BIFROST_OPEN_SEMANTIC_PACK_BUNDLE \
+            BIFROST_SEMANTIC_PACK_CACHE_ROOT; do
+            value="$(jq -er --arg name "$name" '.[$name]' "$env_file")"
+            [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]]
+            test -d "$value"
+            printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+          done
+          test -s "$receipt"
+          receipt_sha256="$(sha256sum "$receipt" | awk '{print $1}')"
+          [[ "$receipt_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "receipt_sha256=$receipt_sha256" >> "$GITHUB_OUTPUT"
+          echo "OPEN_PACKS_RECEIPT=$receipt" >> "$GITHUB_ENV"
       - name: Download pinned Linux JDK acceptance input
         shell: bash
         run: |
@@ -1207,38 +997,49 @@ jobs:
           echo 'f2dc5418092c43003db8f9005c4a286e1c0104fea96ccdd49e8ebd037cac9219  '"$archive" | sha256sum --check
           mkdir -p "${RUNNER_TEMP}/jdk"
           tar -C "${RUNNER_TEMP}/jdk" --strip-components 1 -xzf "$archive"
-      - name: Verify offline installer and classify typed policy smoke
+      - name: Run exact installer and full offline policy acceptance
         shell: bash
         env:
-          BUNDLE_DIR: ${{ runner.temp }}/bifrost-semantic-pack-release/bifrost-semantic-packs
           JAVA_HOME: ${{ runner.temp }}/jdk
           SCRATCH_ROOT: ${{ runner.temp }}/offline-semantic-pack-acceptance
         run: >-
           bash scripts/public/accept-offline-semantic-pack-install.sh
           "$STAGED_BIFROST"
           "$BIFROST_SEMANTIC_PACK_BIN"
-          "$BUNDLE_DIR"
+          "$BIFROST_OPEN_SEMANTIC_PACK_BUNDLE"
+          "$BIFROST_OPEN_POLICY_PACK_ROOT"
+          "$BIFROST_SEMANTIC_PACK_CACHE_ROOT"
+          "$OPEN_PACKS_RECEIPT"
           "$JAVA_HOME"
           "$SCRATCH_ROOT"
+      - name: Cache acquired open packs by exact profile and selection receipt
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/open-packs-cache
+          key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-${{ steps.open-packs.outputs.receipt_sha256 }}
       - name: Record typed policy smoke status
         shell: bash
         env:
-          STATUS_FILE: ${{ runner.temp }}/offline-semantic-pack-acceptance/policy-smoke-status.json
+          STATUS_DIR: ${{ runner.temp }}/offline-semantic-pack-acceptance
         run: |
           set -euo pipefail
-          test -s "$STATUS_FILE"
-          verdict="$(jq -r '.verdict' "$STATUS_FILE")"
+          test -s "$STATUS_DIR/policy-smoke-status.json"
+          test -s "$STATUS_DIR/open-packs-receipt.json"
+          verdict="$(jq -r '.verdict' "$STATUS_DIR/policy-smoke-status.json")"
           {
             echo "### Staged policy smoke"
             echo
             echo "- Verdict: \`$verdict\`"
+            echo "- Exact pack selection receipt: \`open-packs-receipt.json\`"
             echo "- Evidence: \`policy-smoke-status.json\` in the qualification bundle"
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload typed policy smoke status
+      - name: Upload typed policy smoke status and pack selection receipt
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: policy-smoke-status-${{ needs.preflight.outputs.commit }}
-          path: ${{ runner.temp }}/offline-semantic-pack-acceptance/policy-smoke-status.json
+          path: |
+            ${{ runner.temp }}/offline-semantic-pack-acceptance/policy-smoke-status.json
+            ${{ runner.temp }}/offline-semantic-pack-acceptance/open-packs-receipt.json
           if-no-files-found: error
           retention-days: 14
 
@@ -1464,7 +1265,7 @@ jobs:
       - preflight
       - notices
       - crate-package
-      - semantic-pack-bundle
+      - semantic-pack-tool
       - build-linux-x86-64
       - build
       - python-wheels

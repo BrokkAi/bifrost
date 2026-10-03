@@ -22,25 +22,41 @@
 
 pub mod adapter;
 pub mod cache;
+pub mod cargo_manifest;
 pub mod cargo_routes;
 pub mod crate_naming;
+mod declaration_properties;
+pub mod declaration_types;
 pub mod declarations;
 pub mod diagnostics;
 pub mod facts;
 pub mod field_roles;
-pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;
+pub mod hierarchy_source_context;
 pub mod imports;
+mod item_sources;
 pub mod lexical_scope;
 pub mod macro_matcher;
+mod macro_source_capture;
 pub mod ownership;
+pub mod prelude;
 pub mod proof;
 pub mod queries;
+mod resolution;
+#[cfg(any(test, feature = "test-support"))]
+pub mod resolution_spike_fixture;
+pub mod selected_context;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;
+mod type_syntax;
 pub mod usage;
 pub mod usage_includes;
 pub mod usage_queries;
 pub mod usage_walks;
+
+pub mod cfg;
+
+#[cfg(test)]
+mod producer_smoke_tests;

@@ -95,6 +95,8 @@ const CALL_RESULT_OBLIGATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_result
 const RESULT_CONTRACT_USE_ID_DOMAIN: &[u8] = b"bifrost.code_query.result_contract_use.v1";
 const RESULT_CONTRACT_FAILURE_USE_ID_DOMAIN: &[u8] =
     b"bifrost.code_query.result_contract_failure_use.v1";
+const RESULT_SUBJECT_USE_ID_DOMAIN: &[u8] = b"bifrost.code_query.result_subject_use.v1";
+const RESULT_SUBJECT_ID_DOMAIN: &[u8] = b"bifrost.code_query.result_subject.v1";
 const NILNESS_OPERATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.nilness_operation.v1";
 const SWITCH_COVERAGE_ID_DOMAIN: &[u8] = b"bifrost.code_query.switch_coverage.v1";
 const DETACHED_TASK_TRANSFER_ID_DOMAIN: &[u8] = b"bifrost.code_query.detached_task_transfer.v1";
@@ -591,6 +593,10 @@ pub(super) struct EffectTraversalCache {
     result_member_call_shapes: Option<ResultMemberCallShapeWindow>,
     result_use_indexes: Option<ResultUseIndexWindow>,
     java_result_use_indexes: HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseIndex>,
+    java_lambda_result_uses: HashMap<
+        (ProjectFile, ContentIdentity, Range),
+        Result<JavaCallResultUse, JavaCallResultUseOpen>,
+    >,
     result_assignment_conversion_proofs:
         std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
     exact_sources: HashMap<ProjectFile, Option<Arc<str>>>,
@@ -685,6 +691,444 @@ struct ResultUseIndex {
         HashMap<crate::analyzer::semantic::ValueId, Vec<crate::analyzer::semantic::CallSiteId>>,
     call_argument_uses_by_value:
         HashMap<crate::analyzer::semantic::ValueId, Vec<IndexedCallArgumentUse>>,
+}
+
+/// One receiver observation and all typed assignment proofs supporting it.
+#[derive(Debug, Clone)]
+pub(super) struct NormalResultSubjectUse {
+    pub(super) row: CodeQueryResultSubjectUse,
+    pub(super) assignment_conversions: Vec<crate::analyzer::JavaLocalAssignmentEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct NormalResultSubjectUses {
+    pub(super) uses: Vec<NormalResultSubjectUse>,
+}
+
+fn open_result_subject_use(
+    result: &SemanticCallResultValue,
+    outcome: CodeQueryResultSubjectOutcome,
+    reason: &'static str,
+) -> NormalResultSubjectUse {
+    let origin = result.public();
+    let mut digest = LengthDelimitedDigest::new(RESULT_SUBJECT_USE_ID_DOMAIN);
+    digest.push(origin.id.as_bytes());
+    digest.push(outcome.label().as_bytes());
+    digest.push(reason.as_bytes());
+    NormalResultSubjectUse {
+        row: CodeQueryResultSubjectUse {
+            id: digest.finish().to_string(),
+            artifact_id: Some(
+                result
+                    .handle
+                    .procedure()
+                    .artifact()
+                    .key()
+                    .public_fingerprint()
+                    .to_string(),
+            ),
+            procedure_id: Some(origin.procedure_id.clone()),
+            path: origin.path.clone(),
+            language: origin.language,
+            origin: Some(origin),
+            subject_id: None,
+            receiver_call_id: None,
+            receiver_site_id: None,
+            receiver_site_ast_id: None,
+            receiver_point_id: None,
+            receiver_range: None,
+            proof: "unproven",
+            completeness: "partial",
+            outcome,
+            reason: Some(reason),
+            witness_event_ids: Vec::new(),
+            conversion_witnesses: Vec::new(),
+        },
+        assignment_conversions: Vec::new(),
+    }
+}
+
+/// Trace one ordinary result using the same alias closure as result contracts.
+/// Every establishment additionally needs Java reference-conversion evidence.
+/// This relation identifies a returned reference, never an allocation.
+pub(super) fn result_subject_use_expansions(
+    workspace: &WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    model_cache: &mut EffectTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    result: &SemanticCallResultValue,
+) -> NormalResultSubjectUses {
+    use crate::analyzer::semantic::cfg_algorithms::{
+        CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, loop_regions,
+    };
+    use crate::analyzer::usages::call_conversion::ConversionUnknown;
+    use crate::structural::flow_state::FlowSubject;
+    use CodeQueryResultSubjectOutcome as Outcome;
+
+    let open = |outcome, reason| NormalResultSubjectUses {
+        uses: vec![open_result_subject_use(result, outcome, reason)],
+    };
+    let stopped = || {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Outcome::Cancelled
+        } else {
+            Outcome::BudgetExhausted
+        }
+    };
+    let analyzer = workspace.analyzer();
+    let file = result.file();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return open(Outcome::Cancelled, "result_subject_cancelled");
+    }
+    if !result.source_mapping_exact() {
+        return open(Outcome::Incomplete, "result_subject_origin_mapping_inexact");
+    }
+    if file.language() != Language::Java {
+        return open(
+            Outcome::Unsupported,
+            "result_subject_reference_conversion_unsupported",
+        );
+    }
+    let procedure = result.handle.procedure();
+    let semantics = procedure.semantics();
+    let call = semantics
+        .call_site(result.handle.id())
+        .expect("validated call result");
+    let Some(materialized) = semantic.materialized_outcome(file) else {
+        return open(
+            Outcome::Incomplete,
+            "result_subject_semantic_state_unavailable",
+        );
+    };
+    let state = flow_state_cache.for_materialized_procedure(
+        workspace,
+        file,
+        materialized,
+        procedure,
+        cancellation,
+    );
+    let Some(derivation) = state
+        .procedures
+        .iter()
+        .find(|row| row.procedure == procedure.id())
+    else {
+        return open(Outcome::Incomplete, "result_subject_flow_state_unavailable");
+    };
+    let Some(index) = model_cache.result_use_index(semantic, file, procedure, derivation) else {
+        return open(stopped(), "result_subject_use_index_unavailable");
+    };
+    let Some(source) = model_cache.exact_source(analyzer, file) else {
+        return open(Outcome::Incomplete, "result_subject_source_unavailable");
+    };
+    // Reserve conservative query-local work before parser, CFG or witness walks.
+    // The source is not retained outside this expansion. Final rows are charged
+    // by the ordinary pipeline publication path.
+    let events = derivation.events.len();
+    let graph_size = semantics
+        .points()
+        .len()
+        .saturating_add(semantics.control_edges().len());
+    let walk_work = graph_size
+        .saturating_add(events)
+        .saturating_add(1)
+        .saturating_mul(events.saturating_add(1))
+        .saturating_mul(events.saturating_add(1));
+    let retained_bound = source
+        .len()
+        .saturating_mul(32)
+        .saturating_add(graph_size.saturating_mul(128))
+        .saturating_add(events.saturating_mul(events).saturating_mul(256));
+    if source.len() > limits.semantic.max_source_bytes
+        || retained_bound > limits.semantic.max_retained_bytes
+        || !semantic.charge_consumer_traversal(
+            file,
+            source.len().saturating_add(walk_work),
+            "normal-result subject proof",
+        )
+    {
+        return open(stopped(), "result_subject_proof_budget_exhausted");
+    }
+    if ContentIdentity::hash_bytes(source.as_bytes())
+        != procedure.artifact().key().revision().content()
+    {
+        return open(
+            Outcome::Incomplete,
+            "result_subject_source_generation_changed",
+        );
+    }
+    if !derivation.result_occurrence_control_is_complete(procedure) {
+        return open(
+            Outcome::Incomplete,
+            "result_subject_control_coverage_incomplete",
+        );
+    }
+    let uncancelled = CancellationToken::new();
+    let mut cfg_budget = CfgAlgorithmBudget::uniform(walk_work);
+    let mut cfg_request =
+        CfgAlgorithmRequest::new(&mut cfg_budget, cancellation.unwrap_or(&uncancelled));
+    match loop_regions(semantics, &mut cfg_request) {
+        Ok(regions)
+            if regions
+                .regions
+                .iter()
+                .any(|region| region.members.contains(&call.point)) =>
+        {
+            return open(
+                Outcome::RepeatableOrigin,
+                "result_subject_origin_can_repeat",
+            );
+        }
+        Ok(_) => {}
+        Err(CfgAlgorithmError::Cancelled { .. }) => {
+            return open(Outcome::Cancelled, "result_subject_cancelled");
+        }
+        Err(CfgAlgorithmError::ExceededBudget(_)) => {
+            return open(
+                Outcome::BudgetExhausted,
+                "result_subject_cfg_budget_exhausted",
+            );
+        }
+        Err(_) => return open(Outcome::Incomplete, "result_subject_cfg_unavailable"),
+    }
+    let aliases =
+        exact_local_result_alias_expansion(procedure, derivation, &index, result.value, &[]);
+    if aliases.establishments.is_empty() {
+        return open(
+            Outcome::Unsupported,
+            "result_subject_local_establishment_missing",
+        );
+    }
+    let prover =
+        match crate::analyzer::JavaLocalAssignmentConversionProver::new(analyzer, file, &source) {
+            Ok(prover) => prover,
+            Err(_) => {
+                return open(
+                    Outcome::Incomplete,
+                    "result_subject_assignment_source_unavailable",
+                );
+            }
+        };
+    let shapes = failure_use_call_shapes(workspace, semantic, model_cache, file);
+    let reads = aliases
+        .closure
+        .reads
+        .iter()
+        .chain(&aliases.closure.uncertain_reads)
+        .copied()
+        .map(|event| derivation.event(event))
+        .collect::<Vec<_>>();
+    let relevant_values = aliases
+        .closure
+        .establishments
+        .iter()
+        .flat_map(|event| {
+            let row = derivation.event(*event);
+            [row.value, row.subject.value()]
+        })
+        .chain(reads.iter().map(|read| read.value))
+        .chain([result.value])
+        .collect::<Vec<_>>();
+    // A captured alias can be observed in a different procedure. Retain local
+    // receiver proofs, but do not claim exhaustive discovery across that boundary.
+    let captured_alias = semantics
+        .captures()
+        .iter()
+        .any(|capture| match capture.captured {
+            crate::analyzer::semantic::CaptureSource::Value(value) => {
+                relevant_values.contains(&value)
+            }
+            crate::analyzer::semantic::CaptureSource::Location(_) => false,
+        });
+    let complete = !captured_alias
+        && !aliases.closure.proof_open
+        && aliases.closure.uncertain_reads.is_empty()
+        && aliases.closure.uncertain_transfers.is_empty()
+        && aliases.closure.unclosed_transfers.is_empty()
+        && shapes.is_some()
+        && derivation.result_observation_enumeration_is_complete(
+            procedure,
+            &[call.point],
+            &relevant_values,
+        );
+    let mut candidate_calls = reads
+        .iter()
+        .flat_map(|read| {
+            index
+                .receiver_call_ids_by_value
+                .get(&read.value)
+                .into_iter()
+                .flatten()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    candidate_calls.sort_unstable();
+    candidate_calls.dedup();
+    let mut uses = Vec::new();
+    let mut partition_complete = complete;
+    let origin = result.public();
+    let mut subject_digest = LengthDelimitedDigest::new(RESULT_SUBJECT_ID_DOMAIN);
+    subject_digest.push(origin.id.as_bytes());
+    let subject_id = subject_digest.finish().to_string();
+    let line_starts = compute_line_starts(&source);
+    for call_id in candidate_calls {
+        if !semantic.charge_consumer_traversal(file, 1, "normal-result receiver projection") {
+            uses.push(open_result_subject_use(
+                result,
+                stopped(),
+                "result_subject_projection_stopped",
+            ));
+            partition_complete = false;
+            break;
+        }
+        let receiver_call = semantics.call_site(call_id).expect("indexed call exists");
+        let shape = exact_result_member_call_shape(semantics, receiver_call, shapes.as_deref());
+        let exact_read = exact_result_member_receiver_read(receiver_call, shape, &reads);
+        let mut observation = open_result_subject_use(
+            result,
+            Outcome::UncertainReceiver,
+            "result_subject_receiver_identity_open",
+        );
+        let handle = procedure
+            .call_site_handle(call_id)
+            .expect("indexed call has a handle");
+        let receiver_call_id = super::semantic::call_site_wire_id(&handle);
+        let mut digest = LengthDelimitedDigest::new(RESULT_SUBJECT_USE_ID_DOMAIN);
+        digest.push(origin.id.as_bytes());
+        digest.push(receiver_call_id.as_bytes());
+        observation.row.id = digest.finish().to_string();
+        observation.row.receiver_call_id = Some(receiver_call_id);
+        observation.row.receiver_point_id =
+            Some(crate::structural::flow_state::program_point_wire_id(
+                &procedure
+                    .point_handle(receiver_call.point)
+                    .expect("validated receiver point"),
+            ));
+        if let Some(shape) = shape {
+            observation.row.receiver_site_id = Some(shape.outcome.site_id.clone());
+            observation.row.receiver_site_ast_id = Some(shape.outcome.site_ast_id.clone());
+            observation.row.receiver_range = shape.outcome.receiver_range.map(|range| {
+                range_for_offsets(&source, &line_starts, range.start_byte, range.end_byte)
+            });
+        }
+        if let Some(read) = exact_read
+            && let Some(witness) = derivation.exact_local_alias_read_identity_witness(
+                procedure,
+                &aliases.closure,
+                read.event,
+            )
+        {
+            let mut proven = true;
+            for event in witness {
+                let row = derivation.event(event);
+                observation
+                    .row
+                    .witness_event_ids
+                    .push(super::flow_state::state_event_id(&origin.procedure_id, row));
+                if row.event_class != StateEventClass::Establish {
+                    continue;
+                }
+                let FlowSubject::Binding { value: target } = &row.subject else {
+                    proven = false;
+                    break;
+                };
+                let target_range = semantics
+                    .value(*target)
+                    .and_then(|value| semantics.source_mapping(value.source))
+                    .filter(|mapping| {
+                        mapping.kind == crate::analyzer::semantic::SourceMappingKind::Exact
+                    })
+                    .map(|mapping| {
+                        let span = mapping.locator.anchor().span();
+                        Range {
+                            start_byte: span.start_byte() as usize,
+                            end_byte: span.end_byte() as usize,
+                            start_line: span.start().line() as usize + 1,
+                            end_line: span.end().line() as usize + 1,
+                        }
+                    });
+                let Some(target_range) = target_range else {
+                    proven = false;
+                    break;
+                };
+                if !semantic.charge_consumer_traversal(
+                    file,
+                    source.len(),
+                    "Java result-subject assignment typing",
+                ) {
+                    observation.row.outcome = stopped();
+                    observation.row.reason = Some("result_subject_assignment_budget_exhausted");
+                    proven = false;
+                    break;
+                }
+                match prover.prove(row.site.range, target_range) {
+                    Ok(certificate) if certificate.preserves_reference_identity() => {
+                        observation.assignment_conversions.push(certificate);
+                    }
+                    Ok(_) => {
+                        observation.row.outcome = Outcome::Unsupported;
+                        observation.row.reason =
+                            Some("result_subject_conversion_changes_reference_domain");
+                        proven = false;
+                        break;
+                    }
+                    Err(reason) => {
+                        observation.row.outcome = match reason {
+                            ConversionUnknown::Cancelled => Outcome::Cancelled,
+                            ConversionUnknown::BudgetExhausted => Outcome::BudgetExhausted,
+                            ConversionUnknown::AmbiguousBinding => Outcome::Ambiguous,
+                            ConversionUnknown::UnsupportedLanguage
+                            | ConversionUnknown::UnsupportedConversion
+                            | ConversionUnknown::UnsupportedExpression => Outcome::Unsupported,
+                            ConversionUnknown::GenericSubstitution => Outcome::Incomplete,
+                            ConversionUnknown::UnresolvedSignature
+                            | ConversionUnknown::UnresolvedSourceType
+                            | ConversionUnknown::UnresolvedTargetType
+                            | ConversionUnknown::IncompleteHierarchy
+                            | ConversionUnknown::SignatureApplicability => Outcome::Incomplete,
+                        };
+                        observation.row.reason = Some(reason.label());
+                        proven = false;
+                        break;
+                    }
+                }
+            }
+            if proven && !observation.assignment_conversions.is_empty() {
+                observation.row.proof = "proven";
+                observation.row.outcome = Outcome::Proven;
+                observation.row.reason = None;
+                observation.row.subject_id = Some(subject_id.clone());
+            }
+        }
+        if observation.row.outcome != Outcome::Proven {
+            partition_complete = false;
+        }
+        uses.push(observation);
+    }
+    if !semantic.charge_consumer_traversal(file, 0, "normal-result proof publication") {
+        uses.push(open_result_subject_use(
+            result,
+            stopped(),
+            "result_subject_publication_stopped",
+        ));
+        partition_complete = false;
+    }
+    if !partition_complete {
+        uses.push(open_result_subject_use(
+            result,
+            Outcome::Incomplete,
+            "result_subject_use_discovery_incomplete",
+        ));
+    }
+    for observation in &mut uses {
+        observation.row.completeness = if partition_complete {
+            "complete"
+        } else {
+            "partial"
+        };
+    }
+    NormalResultSubjectUses { uses }
 }
 
 impl ResultUseIndex {
@@ -1620,6 +2064,8 @@ impl EffectTraversalCache {
     /// identity, so several candidate calls do not repeatedly parse a file.
     fn java_result_use_for_shape(
         &mut self,
+        analyzer: &dyn IAnalyzer,
+        semantic: &mut SemanticQueryContext<'_>,
         shape: &CallShapeValue,
     ) -> Result<JavaCallResultUse, JavaCallResultUseOpen> {
         let source = shape
@@ -1644,10 +2090,23 @@ impl EffectTraversalCache {
             self.java_result_use_indexes
                 .insert(key.clone(), JavaCallResultUseIndex::new(tree.root_node()));
         }
-        self.java_result_use_indexes
+        let syntactic = self
+            .java_result_use_indexes
             .get(&key)
             .expect("the source index was just installed")
-            .at_span(outcome.range.start_byte, outcome.range.end_byte)
+            .at_span(outcome.range.start_byte, outcome.range.end_byte);
+        if syntactic != Err(JavaCallResultUseOpen::UnclassifiedSyntax) {
+            return syntactic;
+        }
+        let lambda_key = (key.0, key.1, outcome.range);
+        if let Some(result) = self.java_lambda_result_uses.get(&lambda_key) {
+            return *result;
+        }
+        let result = semantic
+            .java_expression_lambda_result_use(analyzer, &outcome.file, source, outcome.range)
+            .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax);
+        self.java_lambda_result_uses.insert(lambda_key, result);
+        result
     }
 
     /// The canonical identity of one workspace callable, cached per unit.
@@ -2597,7 +3056,8 @@ pub(super) fn call_result_contract_expansions(
 }
 
 /// A result-use obligation is a positive only when the exact Java call is an
-/// expression statement and every feasible dispatch arm binds the same
+/// discarded expression or adapts to a void functional method, and every
+/// feasible dispatch arm binds the same
 /// reviewed obligation from that arm's selected JDK artifact.
 pub(super) fn call_result_obligation_expansions(
     analyzer: &dyn IAnalyzer,
@@ -2631,7 +3091,7 @@ pub(super) fn call_result_obligation_expansions(
         row.coverage = EffectCoverage::Unsupported;
         row.reason = Some("unsupported_language");
     } else {
-        match cache.java_result_use_for_shape(shape) {
+        match cache.java_result_use_for_shape(analyzer, semantic, shape) {
             Ok(JavaCallResultUse::OtherContext) => {
                 row.result_use = "other_context";
                 row.coverage = EffectCoverage::Exhaustive;
@@ -3108,7 +3568,7 @@ pub(super) fn nilness_operation_expansions(
                 continue;
             };
             let Some((true_edge, false_edge)) =
-                direct_opaque_guard_edges(&procedure.handle, result)
+                direct_boolean_guard_edges(&procedure.handle, result)
             else {
                 continue;
             };
@@ -3953,7 +4413,8 @@ fn failure_use_origin(
                         MemoryAccessKind::Field
                         | MemoryAccessKind::Property
                         | MemoryAccessKind::Static
-                        | MemoryAccessKind::Index => needs_property_events = true,
+                        | MemoryAccessKind::Index
+                        | MemoryAccessKind::Dereference => needs_property_events = true,
                         MemoryAccessKind::LexicalCell | MemoryAccessKind::Capture => {
                             needs_binding_events = true;
                         }
@@ -5965,6 +6426,44 @@ fn exact_result_member_receiver_read<'a>(
     )
 }
 
+struct ExactLocalResultAliasExpansion {
+    establishments: Vec<usize>,
+    closure: crate::structural::flow_state::ExactLocalValueAliasClosure,
+}
+
+/// The contract-independent half of an exact normal-result use proof.
+/// Normal call-result establishments come from ResultUseIndex; callers may
+/// append independently proven conversion establishments without changing the
+/// alias semantics. Both contract validation and subject projection use this
+/// one boundary around the flow layer's exact local-copy closure.
+fn exact_local_result_alias_expansion(
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    derivation: &crate::structural::flow_state::FlowStateDerivation,
+    result_use_index: &ResultUseIndex,
+    result_value: crate::analyzer::semantic::ValueId,
+    additional_establishments: &[usize],
+) -> ExactLocalResultAliasExpansion {
+    let mut establishments = result_use_index
+        .establishment_events_by_value
+        .get(&result_value)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|event| {
+            let row = derivation.event(*event);
+            row.event_class == StateEventClass::Establish && row.value == result_value
+        })
+        .collect::<Vec<_>>();
+    establishments.extend_from_slice(additional_establishments);
+    establishments.sort_unstable();
+    establishments.dedup();
+    let closure = derivation.exact_local_value_alias_closure(procedure, &establishments);
+    ExactLocalResultAliasExpansion {
+        establishments,
+        closure,
+    }
+}
+
 fn result_member_use_for_call(
     procedure: &crate::analyzer::semantic::ProcedureHandle,
     call: &crate::analyzer::semantic::SemanticCallSite,
@@ -6214,6 +6713,16 @@ fn normalized_success_guard_edges(
                 // edges retain which successor observes true and false. More
                 // complex expressions name their own temporary value and do
                 // not join the reviewed result identity above.
+                (CompiledResultPredicate::True, GuardPredicate::Truthy { value })
+                    if guard.subject == Some(value) =>
+                {
+                    true
+                }
+                (CompiledResultPredicate::False, GuardPredicate::Truthy { value })
+                    if guard.subject == Some(value) =>
+                {
+                    false
+                }
                 (CompiledResultPredicate::True, GuardPredicate::Opaque { .. }) => true,
                 (CompiledResultPredicate::False, GuardPredicate::Opaque { .. }) => false,
                 (
@@ -6822,7 +7331,7 @@ fn conditional_summary_for_call(
     }
 }
 
-fn direct_opaque_guard_edges(
+fn direct_boolean_guard_edges(
     procedure: &crate::analyzer::semantic::ProcedureHandle,
     result: crate::analyzer::semantic::ValueId,
 ) -> Option<(
@@ -6834,7 +7343,11 @@ fn direct_opaque_guard_edges(
         .guard_facts()
         .iter()
         .filter(|guard| guard.subject == Some(result))
-        .filter(|guard| matches!(guard.predicate, GuardPredicate::Opaque { .. }))
+        .filter(|guard| match guard.predicate {
+            GuardPredicate::Truthy { value } => value == result,
+            GuardPredicate::Opaque { .. } => true,
+            _ => false,
+        })
         .collect::<Vec<_>>();
     let [guard] = guards.as_slice() else {
         return None;
@@ -6850,7 +7363,7 @@ fn conditional_result_consumption(
     call: &crate::analyzer::semantic::SemanticCallSite,
     result: crate::analyzer::semantic::ValueId,
 ) -> ConditionalResultConsumption {
-    if let Some((true_edge, false_edge)) = direct_opaque_guard_edges(procedure, result) {
+    if let Some((true_edge, false_edge)) = direct_boolean_guard_edges(procedure, result) {
         return ConditionalResultConsumption::DirectGuard {
             true_edge,
             false_edge,
@@ -7583,19 +8096,14 @@ fn validate_result_contract_uses(
         contract.result_ordinal,
         assignment_conversion_proof,
     );
-    let mut result_establishments = derivation
-        .events
-        .iter()
-        .filter(|event| {
-            event.event_class == StateEventClass::Establish && event.value == result.value
-        })
-        .map(|event| event.event)
-        .collect::<Vec<_>>();
-    result_establishments.extend(result_conversion.establishments.iter().copied());
-    result_establishments.sort_unstable();
-    result_establishments.dedup();
-    let result_aliases =
-        derivation.exact_local_value_alias_closure(procedure, &result_establishments);
+    let result_aliases = exact_local_result_alias_expansion(
+        procedure,
+        derivation,
+        &result_use_index,
+        result.value,
+        &result_conversion.establishments,
+    )
+    .closure;
     let mut result_establishment_points = result_aliases
         .establishments
         .iter()
@@ -9905,7 +10413,9 @@ func inspect(ok bool) {
         let [guard] = procedure.semantics().guard_facts() else {
             panic!("one direct Boolean guard: {:#?}", procedure.semantics());
         };
-        assert!(matches!(guard.predicate, GuardPredicate::Opaque { .. }));
+        assert!(
+            matches!(guard.predicate, GuardPredicate::Truthy { value } if guard.subject == Some(value))
+        );
         let subject = guard
             .subject
             .expect("a direct guard names its Boolean value");

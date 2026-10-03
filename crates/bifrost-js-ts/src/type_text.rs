@@ -65,21 +65,13 @@ pub fn jsts_unit_is_type_only(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
     if host.is_type_alias(unit) {
         return true;
     }
-    unit.signature().is_some_and(jsts_signature_is_type_only)
-        || host
-            .signatures(unit)
-            .iter()
-            .any(|signature| jsts_signature_is_type_only(signature))
-}
-
-fn jsts_signature_is_type_only(signature: &str) -> bool {
-    let signature = signature.trim_start();
-    signature.starts_with("interface ")
-        || signature.starts_with("export interface ")
-        || signature.starts_with("declare interface ")
-        || signature.starts_with("export declare interface ")
-        || signature.starts_with("type ")
-        || signature.starts_with("export type ")
-        || signature.starts_with("declare type ")
-        || signature.starts_with("export declare type ")
+    host.source_facts(unit.source()).is_some_and(|source| {
+        source.facts.declarations.iter().any(|declaration| {
+            declaration.is_interface
+                && source
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.contains(unit))
+        })
+    })
 }

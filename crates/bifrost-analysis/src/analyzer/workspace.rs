@@ -2,16 +2,16 @@ use crate::analyzer::cpp::external::{
     CppDependencyPackAdapter, resolve_cpp_semantic_pack_dependencies,
 };
 use crate::analyzer::jvm::external::{jdk_home_for_dependency, resolve_path};
-use crate::analyzer::languages::language_support;
 use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
     DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
-    DependencyResolverBounds, PendingDependencyPackAcquisition, SemanticModelActivationEvidence,
-    SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelRuntimeOutcome, SemanticPackCatalog, SubprocessPolicy,
-    acquire_active_semantic_models_with_jdk_artifacts, prepare_compatible_installed_semantic_packs,
-    prepare_dependency_semantic_packs, prepare_installed_dependency_packs,
+    DependencyResolverBounds, PendingDependencyPackAcquisition, RuntimeArtifactPublication,
+    SemanticModelActivationEvidence, SemanticModelActivationPersistence,
+    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    SubprocessPolicy, acquire_active_semantic_models_with_runtime_artifacts,
+    prepare_compatible_installed_semantic_packs, prepare_dependency_semantic_packs,
+    prepare_installed_dependency_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
@@ -871,6 +871,8 @@ pub struct DependencyPackActivationOutcome {
 struct DependencyPackPublicationEvidence {
     dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
     jdk_artifacts: Option<HashMap<PathBuf, SemanticModelActivationEvidence>>,
+    python_runtime:
+        Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
 }
 
 /// Correlate a configured source toolchain with the exact pack produced from
@@ -949,6 +951,238 @@ impl PythonSemanticModelActivationOutcome {
     }
 }
 
+fn python_runtime_publication(
+    workspace: &WorkspaceAnalyzer,
+    config: &AnalyzerConfig,
+    activation: &mut SemanticModelActivationRequest,
+    context: &DependencyPackWorkspaceContext<'_>,
+) -> Result<
+    Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
+    StoreError,
+> {
+    use crate::analyzer::python::runtime_artifact as verified;
+    use crate::analyzer::store::python_runtime as stored;
+    if config.python.runtime_environments.is_empty() {
+        return Ok(None);
+    }
+    let python =
+        crate::analyzer::resolve_analyzer::<crate::analyzer::PythonAnalyzer>(workspace.analyzer())
+            .ok_or_else(|| {
+                StoreError::new("Python runtime configuration has no Python analyzer")
+            })?;
+    let (store, snapshot) = python.python_runtime_store_snapshot().ok_or_else(|| {
+        StoreError::stale_generation("Python runtime configuration has no selected snapshot")
+    })?;
+    let report = verified::verify_python_runtime_artifacts(
+        workspace.analyzer().project().root(),
+        &config.python.runtime_environments,
+        &context.limits,
+        Some(context.cancellation),
+    );
+    if report.cancelled {
+        return Err(StoreError::new("Python runtime verification cancelled"));
+    }
+    let configuration = serde_json::to_vec(&config.python.runtime_environments)
+        .map_err(|error| StoreError::new(error.to_string()))?;
+    let mut environments = Vec::new();
+    for (index, environment) in config.python.runtime_environments.iter().enumerate() {
+        let mut artifacts = Vec::new();
+        for artifact in report
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.environment_index == index)
+        {
+            let mut providers = Vec::new();
+            let members = artifact
+                .modules
+                .iter()
+                .enumerate()
+                .map(|(member_index, module)| {
+                    if let Some(name) = &module.import_name {
+                        providers.push(stored::PythonRuntimeProviderInput {
+                            import_name: name.clone(),
+                            member_index: Some(member_index),
+                            status: match module.import_status {
+                                verified::PythonRuntimeImportStatus::Unresolved => {
+                                    stored::PythonRuntimeBindingStatus::Unresolved
+                                }
+                                verified::PythonRuntimeImportStatus::Conflict => {
+                                    stored::PythonRuntimeBindingStatus::Conflict
+                                }
+                            },
+                        });
+                    }
+                    stored::PythonRuntimeMemberInput {
+                        archive_member_path: module.archive_member_path.clone(),
+                        installed_path: module.installed_path.clone(),
+                        member_sha256: module.member_sha256.clone(),
+                        installed_sha256: module.installed_sha256.clone(),
+                        installed_bytes_match: module.installed_bytes_match,
+                        role: match (module.runtime, module.stub) {
+                            (true, false) => stored::PythonRuntimeMemberRole::Runtime,
+                            (false, true) => stored::PythonRuntimeMemberRole::Stub,
+                            (true, true) => stored::PythonRuntimeMemberRole::RuntimeAndStub,
+                            (false, false) => stored::PythonRuntimeMemberRole::Other,
+                        },
+                        status: match module.status {
+                            verified::PythonRuntimeModuleStatus::BytesMatched => {
+                                stored::PythonRuntimeStatus::BytesMatched
+                            }
+                            verified::PythonRuntimeModuleStatus::StubOnly => {
+                                stored::PythonRuntimeStatus::StubOnly
+                            }
+                            verified::PythonRuntimeModuleStatus::MissingInstalled => {
+                                stored::PythonRuntimeStatus::MissingInstalled
+                            }
+                            verified::PythonRuntimeModuleStatus::ContentMismatch => {
+                                stored::PythonRuntimeStatus::ContentMismatch
+                            }
+                            verified::PythonRuntimeModuleStatus::Unsupported => {
+                                stored::PythonRuntimeStatus::Unsupported
+                            }
+                            verified::PythonRuntimeModuleStatus::Unresolved => {
+                                stored::PythonRuntimeStatus::Unresolved
+                            }
+                        },
+                        diagnostic: None,
+                    }
+                })
+                .collect();
+            if let Some(identity) = &artifact.identity {
+                activation.evidence.push(SemanticModelActivationEvidence {
+                    language: "python".into(),
+                    ecosystem: "python".into(),
+                    package: Some(crate::analyzer::semantic_model::CatalogCoordinate {
+                        name: identity.purl().to_owned(),
+                        version: None,
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(identity.archive_sha256().to_owned()),
+                });
+            }
+            artifacts.push(stored::PythonRuntimeArtifactInput {
+                purl: artifact.coordinate.clone(),
+                raw_version: artifact.raw_version.clone(),
+                archive_sha256: artifact.archive_sha256.clone(),
+                archive_path: artifact.archive_path.clone(),
+                installed_root: artifact.installed_root.clone(),
+                status: match artifact.status {
+                    verified::PythonRuntimeArtifactStatus::ArchiveVerified => {
+                        stored::PythonRuntimeStatus::ArchiveVerified
+                    }
+                    verified::PythonRuntimeArtifactStatus::Incomplete => {
+                        stored::PythonRuntimeStatus::Incomplete
+                    }
+                    verified::PythonRuntimeArtifactStatus::Unresolved => {
+                        stored::PythonRuntimeStatus::Unresolved
+                    }
+                    verified::PythonRuntimeArtifactStatus::Conflicting => {
+                        stored::PythonRuntimeStatus::Conflicting
+                    }
+                    verified::PythonRuntimeArtifactStatus::Cancelled => {
+                        stored::PythonRuntimeStatus::Cancelled
+                    }
+                },
+                diagnostic: None,
+                members,
+                providers,
+            });
+        }
+        let frontiers = report
+            .frontiers
+            .iter()
+            .filter(|frontier| frontier.environment_index == index)
+            .map(|frontier| stored::PythonRuntimeFrontierInput {
+                kind: match frontier.kind {
+                    verified::PythonRuntimeFrontierKind::ExtraInstalledCandidate => {
+                        stored::PythonRuntimeFrontierKind::ExtraInstalledCandidate
+                    }
+                    verified::PythonRuntimeFrontierKind::SourceShadowCandidate => {
+                        stored::PythonRuntimeFrontierKind::SourceShadowCandidate
+                    }
+                    verified::PythonRuntimeFrontierKind::CompetingRuntimeProvider => {
+                        stored::PythonRuntimeFrontierKind::CompetingRuntimeProvider
+                    }
+                    verified::PythonRuntimeFrontierKind::NamespaceContributor => {
+                        stored::PythonRuntimeFrontierKind::NamespaceContributor
+                    }
+                    verified::PythonRuntimeFrontierKind::PackageInitializerEffects => {
+                        stored::PythonRuntimeFrontierKind::PackageInitializerEffects
+                    }
+                    verified::PythonRuntimeFrontierKind::CandidatePathCollision => {
+                        stored::PythonRuntimeFrontierKind::CandidatePathCollision
+                    }
+                    verified::PythonRuntimeFrontierKind::CandidateIdentityUnknown => {
+                        stored::PythonRuntimeFrontierKind::CandidateIdentityUnknown
+                    }
+                    verified::PythonRuntimeFrontierKind::MissingInstalledCandidate => {
+                        stored::PythonRuntimeFrontierKind::MissingInstalledCandidate
+                    }
+                    verified::PythonRuntimeFrontierKind::SymlinkSkipped => {
+                        stored::PythonRuntimeFrontierKind::SymlinkSkipped
+                    }
+                    verified::PythonRuntimeFrontierKind::PathUnreadable => {
+                        stored::PythonRuntimeFrontierKind::PathUnreadable
+                    }
+                    verified::PythonRuntimeFrontierKind::ScanLimit => {
+                        stored::PythonRuntimeFrontierKind::ScanLimit
+                    }
+                    verified::PythonRuntimeFrontierKind::ScanDepthLimit => {
+                        stored::PythonRuntimeFrontierKind::ScanDepthLimit
+                    }
+                    verified::PythonRuntimeFrontierKind::ImportPathOrderUnknown => {
+                        stored::PythonRuntimeFrontierKind::ImportPathOrderUnknown
+                    }
+                    verified::PythonRuntimeFrontierKind::ImportHookSemanticsUnknown => {
+                        stored::PythonRuntimeFrontierKind::ImportHookSemanticsUnknown
+                    }
+                },
+                root: frontier.root.clone(),
+                path: frontier.path.clone(),
+                import_name: frontier.import_name.clone(),
+                message: frontier.message.clone(),
+            })
+            .collect();
+        let declared = report
+            .declared_environments
+            .get(index)
+            .and_then(Option::as_ref);
+        environments.push(stored::PythonRuntimeEnvironmentInput {
+            declared_environment: declared.and(environment.declared_environment.clone()),
+            project_config: declared.map(|proof| proof.project_config().clone()),
+            source_scope: environment.source_root.clone(),
+            status: if report.scope_complete {
+                stored::PythonRuntimeStatus::ArchiveVerified
+            } else {
+                stored::PythonRuntimeStatus::Incomplete
+            },
+            diagnostic: None,
+            artifacts,
+            frontiers,
+        });
+    }
+    // Diagnostic formatting is SQL-independent, deterministic input evidence;
+    // this aggregate never substitutes for a raw wheel artifact digest.
+    let mut digest_input = configuration.clone();
+    digest_input.extend(format!("{environments:?}").as_bytes());
+    let evidence_digest = crate::analyzer::canonical_hash::sha256_bytes(&digest_input);
+    let publication = store.publish_python_runtime_providers(
+        &snapshot,
+        Some(crate::analyzer::store::WorkspaceConfigurationInput::new(
+            ".bifrost/python-runtime-selection.json".into(),
+            configuration.into_boxed_slice(),
+        )),
+        evidence_digest,
+        environments,
+        context.cancellation,
+    )?;
+    python.install_python_runtime_snapshot(&snapshot, publication.snapshot.clone())?;
+    Ok(Some(publication))
+}
+
 impl WorkspaceAnalyzer {
     fn from_updated_multi(analyzer: MultiAnalyzer) -> Self {
         if analyzer.delegates().is_empty()
@@ -957,6 +1191,178 @@ impl WorkspaceAnalyzer {
             return Self::Empty(EmptyAnalyzer::new_for_workspace(build_context));
         }
         Self::Multi(Box::new(analyzer))
+    }
+
+    fn resolve_dependency_discovery(
+        &self,
+        ecosystem: DependencyPackEcosystem,
+        config: &AnalyzerConfig,
+        limits: &DependencyPackLimits,
+        cancellation: &crate::CancellationToken,
+    ) -> DependencyDiscoveryOutcome {
+        if ecosystem != DependencyPackEcosystem::Go
+            || config.go.dependency_discovery.mode == GoDependencyDiscoveryMode::Disabled
+        {
+            return ecosystem.resolver().resolve(
+                config,
+                self.analyzer().project(),
+                limits,
+                Some(cancellation),
+            );
+        }
+        match self.resolve_selected_go_dependencies(config, limits, cancellation) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+                outcome.complete = false;
+                outcome.cancelled = cancellation.is_cancelled();
+                outcome.diagnostics.push(crate::analyzer::semantic_model::DependencyPackDiagnostic {
+                    severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Error,
+                    code: "go.native_context_store_failure".into(), dependency_id: None, location: None,
+                    message: error.to_string(),
+                });
+                outcome
+            }
+        }
+    }
+
+    fn resolve_selected_go_dependencies(
+        &self,
+        config: &AnalyzerConfig,
+        limits: &DependencyPackLimits,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<DependencyDiscoveryOutcome> {
+        use crate::analyzer::store::go_package_context::{
+            GoContextPublicationOutcome, GoInputObservationOutcome, profile_digest,
+        };
+        use rusqlite::OptionalExtension;
+        let project = self.analyzer().project();
+        let Some(store) = self.store() else {
+            return Ok(
+                crate::analyzer::go::dependency_discovery::discover_go_packages(
+                    &config.go,
+                    project,
+                    limits,
+                    Some(cancellation),
+                )
+                .semantic_packs,
+            );
+        };
+        let workspace_id = crate::analyzer::store::WorkspaceId::for_root(project.root());
+        let snapshot = {
+            let conn = store.read_conn()?;
+            conn.query_row(
+                "SELECT h.workspace_id,h.generation,h.revision FROM workspace_heads h
+                 JOIN analysis_epochs e ON e.lang=h.lang AND e.generation=h.generation
+                 WHERE h.workspace_id=?1 AND h.lang='go'",
+                [workspace_id.as_str()],
+                |row| {
+                    Ok(crate::analyzer::store::WorkspaceSnapshotId {
+                        workspace_id: workspace_id.clone(),
+                        lang: "go".into(),
+                        generation: crate::analyzer::store::GenerationId::from_persisted(
+                            row.get(1)?,
+                        ),
+                        revision: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+        };
+        let before = snapshot
+            .as_ref()
+            .map(|snapshot| store.observe_go_context_inputs(snapshot, project, cancellation))
+            .transpose()?;
+        // Keep only this query's result through discovery: the canonical profile
+        // is known after go env, but CAS must use the head before go list ran.
+        let prior_heads = if let Some(snapshot) = snapshot.as_ref() {
+            let conn = store.read_conn()?;
+            let mut query =
+                conn.prepare_cached(crate::analyzer::store::go_package_context::PRIOR_HEADS_SQL)?;
+            query.query_map(rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,
+                crate::analyzer::store::go_package_context::DERIVATION_VERSION], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?.try_into().expect("schema checks profile digest width"),
+                        crate::analyzer::store::GoContextIdentity {
+                            selection_id:row.get(1)?,context_id:row.get(2)?,
+                            publication_digest:row.get::<_, Vec<u8>>(3)?.try_into().expect("schema checks publication digest width"),
+                        }))
+                })?.collect::<std::result::Result<Vec<([u8;32],crate::analyzer::store::GoContextIdentity)>,_>>()?
+        } else {
+            Vec::new()
+        };
+        let mut discovered = crate::analyzer::go::dependency_discovery::discover_go_packages(
+            &config.go,
+            project,
+            limits,
+            Some(cancellation),
+        );
+        let Some(canonical) = discovered.canonical.take() else {
+            return Ok(discovered.semantic_packs);
+        };
+        let selected_snapshot = snapshot.clone();
+        let profile = profile_digest(&canonical);
+        let publication = match (snapshot, before) {
+            (Some(snapshot), Some(GoInputObservationOutcome::Ready(before))) => {
+                let expected = prior_heads
+                    .into_iter()
+                    .find_map(|(prior_profile, identity)| {
+                        (prior_profile == profile).then_some(identity)
+                    });
+                match store.observe_go_context_inputs(&snapshot, project, cancellation)? {
+                    GoInputObservationOutcome::Ready(after) => store.publish_go_package_context(
+                        snapshot,
+                        project.root().to_path_buf(),
+                        expected,
+                        &before,
+                        &after,
+                        canonical,
+                        cancellation,
+                    )?,
+                    GoInputObservationOutcome::InputsChanged => {
+                        GoContextPublicationOutcome::InputsChanged
+                    }
+                    GoInputObservationOutcome::Cancelled => GoContextPublicationOutcome::Cancelled,
+                }
+            }
+            (_, Some(GoInputObservationOutcome::Cancelled)) => {
+                GoContextPublicationOutcome::Cancelled
+            }
+            _ => GoContextPublicationOutcome::InputsChanged,
+        };
+        let publication = match publication {
+            GoContextPublicationOutcome::Published(identity) => {
+                let activated = selected_snapshot.as_ref().is_some_and(|snapshot| {
+                    crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(
+                        self.analyzer(),
+                    )
+                    .is_some_and(|go| go.activate_native_context_profile(snapshot, profile))
+                });
+                if activated {
+                    GoContextPublicationOutcome::Published(identity)
+                } else {
+                    GoContextPublicationOutcome::InputsChanged
+                }
+            }
+            other => other,
+        };
+        match publication {
+            GoContextPublicationOutcome::Published(identity) => {
+                crate::profiling::note_with(|| format!("go.native_context published={identity:?}"));
+            }
+            GoContextPublicationOutcome::Cancelled => {
+                discovered.semantic_packs.cancelled = true;
+                discovered.semantic_packs.complete = false;
+            }
+            GoContextPublicationOutcome::InputsChanged => {
+                discovered.semantic_packs.complete = false;
+                discovered.semantic_packs.diagnostics.push(crate::analyzer::semantic_model::DependencyPackDiagnostic {
+                    severity: crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
+                    code: "go.native_context_inputs_changed".into(), dependency_id:None, location:None,
+                    message:"Go source or configuration no longer matches the selected revision; native package context was not published".into(),
+                });
+            }
+        }
+        Ok(discovered.semantic_packs)
     }
 
     /// Discover, prepare, and publish exact local dependency packs as one
@@ -1010,12 +1416,7 @@ impl WorkspaceAnalyzer {
                 let _scope = crate::profiling::scope_with(|| {
                     format!("semantic_pack.discover[{}]", ecosystem.label())
                 });
-                resolver.resolve(
-                    config,
-                    self.analyzer().project(),
-                    &limits,
-                    Some(context.cancellation),
-                )
+                self.resolve_dependency_discovery(ecosystem, config, &limits, context.cancellation)
             };
             if discovery.cancelled {
                 cancelled = true;
@@ -1072,11 +1473,31 @@ impl WorkspaceAnalyzer {
             self.analyzer().project().root(),
             &outcomes,
         );
+        let python_runtime = match python_runtime_publication(
+            self,
+            config,
+            &mut activation,
+            &context,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
+                return DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(crate::analyzer::semantic_model::SemanticModelActivationReport {
+                        explanations: vec![crate::analyzer::semantic_model::SemanticModelActivationExplanation { manifest_digest: String::new(), pack_id: None, shard_id: String::new(), source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded, source_id: String::new(), status: crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable, reason: format!("Python runtime provider publication failed: {error}") }],
+                        ..Default::default()
+                    })),
+                    diagnostic_refresh_required: false,
+                };
+            }
+        };
         self.publish_dependency_pack_activation(
             activation,
             DependencyPackPublicationEvidence {
                 dependencies: publication_evidence,
                 jdk_artifacts,
+                python_runtime,
             },
             outcomes,
             cancelled,
@@ -1118,12 +1539,7 @@ impl WorkspaceAnalyzer {
                 let _scope = crate::profiling::scope_with(|| {
                     format!("semantic_pack.discover[{}]", ecosystem.label())
                 });
-                resolver.resolve(
-                    config,
-                    self.analyzer().project(),
-                    &limits,
-                    Some(context.cancellation),
-                )
+                self.resolve_dependency_discovery(ecosystem, config, &limits, context.cancellation)
             };
             if discovery.cancelled {
                 cancelled = true;
@@ -1186,11 +1602,33 @@ impl WorkspaceAnalyzer {
             self.analyzer().project().root(),
             &outcomes,
         );
+        let python_runtime = match python_runtime_publication(
+            self,
+            config,
+            &mut activation,
+            &context,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
+                return InstalledDependencyPackActivationOutcome { pending, outcome: DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(crate::analyzer::semantic_model::SemanticModelActivationReport {
+                        explanations: vec![crate::analyzer::semantic_model::SemanticModelActivationExplanation {
+                            manifest_digest: String::new(), pack_id: None, shard_id: String::new(), source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded,
+                            source_id: String::new(), status: crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable,
+                            reason: format!("Python runtime provider publication failed: {error}"),
+                        }], ..Default::default()
+                    })), diagnostic_refresh_required: false,
+                }};
+            }
+        };
         let outcome = self.publish_dependency_pack_activation(
             activation,
             DependencyPackPublicationEvidence {
                 dependencies: publication_evidence,
                 jdk_artifacts,
+                python_runtime,
             },
             outcomes,
             cancelled,
@@ -1229,13 +1667,16 @@ impl WorkspaceAnalyzer {
         activation.evidence.dedup();
         let runtime = {
             let _scope = crate::profiling::scope("semantic_pack.acquire_active");
-            acquire_active_semantic_models_with_jdk_artifacts(
+            acquire_active_semantic_models_with_runtime_artifacts(
                 self.analyzer(),
                 context.catalog,
                 context.persistence,
                 &activation,
                 Some(&publication.dependencies),
-                publication.jdk_artifacts.as_ref(),
+                RuntimeArtifactPublication {
+                    jdk_artifacts_by_configured_home: publication.jdk_artifacts.as_ref(),
+                    python_runtime: publication.python_runtime.as_ref(),
+                },
                 context.cancellation,
             )
         };
@@ -1731,12 +2172,36 @@ impl WorkspaceAnalyzer {
 
         store_context.workspace_snapshot = None;
 
+        if delegates.contains_key(&Language::Rust) {
+            let snapshot = {
+                use rusqlite::OptionalExtension;
+                let conn = store_context.store.read_conn()?;
+                conn.query_row(
+                    "SELECT heads.generation, heads.revision FROM workspace_heads AS heads
+                     JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang AND epochs.generation = heads.generation
+                     WHERE heads.workspace_id = ?1 AND heads.lang = 'rust'",
+                    [store_context.workspace_id.as_str()],
+                    |row| Ok(crate::analyzer::store::WorkspaceSnapshotId {
+                        workspace_id: store_context.workspace_id.clone(), lang: "rust".into(),
+                        generation: crate::analyzer::store::GenerationId::from_persisted(row.get(0)?), revision: row.get(1)?,
+                    }),
+                ).optional()?
+            };
+            if let Some(snapshot) = snapshot {
+                store_context
+                    .store
+                    .reconcile_rust_crates_unless_current(&snapshot)?;
+            }
+        }
+
         // Give SQLite's query planner real cardinalities for what this build
         // just persisted, while the build lock still holds every other
         // worktree off this cache (issue #3016). Only the elected builder of a
         // persisted cache reaches here with a lock, and the store skips the
         // work when nothing was persisted or collected since the last refresh,
-        // so a repeated no-op build costs one indexed query.
+        // so a repeated no-op build costs one indexed query. Blob cardinality
+        // provides a cheap staleness proxy that avoids refreshing every no-op
+        // build.
         if build_lock.is_some()
             && brokk_bifrost_core::cache_gc::planner_statistics_enabled()
             && let Some(evidence) = store_context.store.refresh_planner_statistics_if_stale()?
@@ -1920,24 +2385,21 @@ impl WorkspaceAnalyzer {
             .unwrap_or(0)
     }
 
-    /// Pre-build whatever lazily constructed usage indexes each language wants
-    /// warmed ahead of demand. Languages that need none inherit the trait's
-    /// no-op, so this stays a no-op for the workspaces they make up.
-    pub fn warm_usage_analysis(&self) {
-        for language in Language::ANALYZABLE {
-            language_support(language)
-                .expect("analyzable languages are registered")
-                .warm_usage_analysis(self.analyzer());
-        }
-    }
-
     /// Bring the persisted per-file Rust usage facts up to date ahead of the
     /// first query that reads them.
     ///
-    /// This replaced a workspace-wide index build (issues #1416, #1757, #1758):
-    /// under usage v2 there is nothing to build, and the warm's only job is to
-    /// find the live blobs analysis did not persist rows for and repair them
-    /// off the request path. A no-op for workspaces without Rust.
+    /// This is the whole of the startup usage warm. It replaced a
+    /// workspace-wide index build (issues #1416, #1757, #1758): under usage v2
+    /// there is nothing to build, and the warm's only job is to find the live
+    /// blobs analysis did not persist rows for and repair them off the request
+    /// path. A no-op for workspaces without Rust.
+    ///
+    /// The per-language `warm_usage_analysis` dispatch beside it is gone. It
+    /// had one implementor, the Rust incumbent, and the native engine builds no
+    /// whole-workspace index to warm, so the dispatch became twelve calls to an
+    /// empty default. The repair below is what still earns the startup thread:
+    /// an unpublished live blob is exactly what makes a native graph report
+    /// `unavailable_canonical_facts`.
     pub fn warm_rust_usage_facts(&self) {
         if let Some(rust) =
             crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
@@ -2270,6 +2732,47 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn go_native_activation_disabled_never_invokes_configured_tool() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/root\n")
+            .file("main.go", "package main\nfunc main() {}\n")
+            .build();
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.go_executable = Some(fixture.root().join("absent-go-tool"));
+        assert_eq!(
+            config.go.dependency_discovery.mode,
+            GoDependencyDiscoveryMode::Disabled
+        );
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), config.clone())
+                .unwrap();
+        let outcome = workspace.resolve_dependency_discovery(
+            DependencyPackEcosystem::Go,
+            &config,
+            &DependencyPackLimits::default(),
+            &crate::CancellationToken::new(),
+        );
+        assert!(outcome.complete);
+        assert!(outcome.diagnostics.is_empty());
+        let conn = workspace.store().unwrap().read_conn().unwrap();
+        let contexts: i64 = conn
+            .query_row("SELECT count(*) FROM go_context_publications", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(contexts, 1);
+        let (complete, gaps): (bool, String) = conn
+            .query_row(
+                "SELECT complete,json(gaps) FROM go_context_publications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!complete);
+        assert!(gaps.contains("build_selection_unavailable"));
+    }
 
     #[test]
     fn scoped_cache_projections_are_isolated_and_retained_by_analyzer_clones() {
@@ -2805,6 +3308,8 @@ mod tests {
         );
     }
 
+    /// Rust readiness requires verified publication, not just the absence of a
+    /// scheduled repair. Warmth additionally requires the catch-up to settle.
     /// The two Rust usage predicates a caller can ask a workspace, and the
     /// distinction ExecPlan Milestone 3 introduced between them: readiness is
     /// "would a query wait", which a healthy workspace answers `true` even
@@ -2825,7 +3330,7 @@ mod tests {
         let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
         let rust = WorkspaceAnalyzer::build_ephemeral_footgun(rust, AnalyzerConfig::default())
             .expect("ephemeral workspace should build");
-        assert!(rust.rust_usage_facts_ready());
+        assert!(!rust.rust_usage_facts_ready());
         assert!(!rust.rust_usage_facts_warm());
         rust.warm_rust_usage_facts();
         assert!(rust.rust_usage_facts_ready());
@@ -2944,21 +3449,19 @@ mod tests {
 
         let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
             .expect("hash committed source");
-        let committed_fact_manifests = Connection::open(
-            root.join(".bifrost/cache")
-                .join(crate::cache_db::cache_db_file_name()),
-        )
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM structural_fact_manifests
+        let committed_fact_manifests =
+            Connection::open(crate::analyzer::store::analyzer_db_path(&root))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM structural_source_manifests
                  WHERE blob_id = (
                    SELECT id FROM blobs
                    WHERE blob_oid = ?1 AND lang = 'typescript:ts'
                  )",
-            [disk_oid.to_string()],
-            |row| row.get::<_, usize>(0),
-        )
-        .unwrap();
+                    [disk_oid.to_string()],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap();
         assert_eq!(
             committed_fact_manifests, 1,
             "overlay analysis must not replace the committed source facts"

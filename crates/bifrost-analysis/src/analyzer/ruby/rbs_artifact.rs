@@ -406,6 +406,7 @@ fn project_constant(
             visibility: Visibility::Public,
             is_abstract: false,
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
@@ -428,6 +429,7 @@ fn project_constant(
         returns: Some(return_type.clone()),
     };
     members.push(MemberFact {
+        non_overridable: None,
         ambient_use: None,
         id: member_declaration_id(MemberIdentity {
             owner_id: &owner_id,
@@ -733,6 +735,7 @@ fn project_type(
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters,
         type_parameter_constraints: Vec::new(),
@@ -800,6 +803,7 @@ fn project_attribute(
         returns: Some(property_type),
     };
     Ok(MemberFact {
+        non_overridable: None,
         ambient_use: None,
         id: member_declaration_id(MemberIdentity {
             owner_id,
@@ -927,6 +931,7 @@ fn project_method(
             return_type: signature.returns.as_ref(),
         });
         projected.push(MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id,
             owner: owner_id.to_owned(),

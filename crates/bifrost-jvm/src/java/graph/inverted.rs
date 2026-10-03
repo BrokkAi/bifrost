@@ -31,7 +31,7 @@ use super::return_type::{
     method_return_type_for_owner_fqn,
 };
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
-use crate::java::hierarchy::java_nearest_declaring_ancestors;
+use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -210,7 +210,9 @@ impl JavaReturnTypeContext for JavaScan<'_> {
             .structural_members(owner.fq(), name)
             .into_iter()
             .filter(|unit| {
-                unit.is_function() && java_callable_arity(self.java, unit).accepts(arity)
+                unit.is_function()
+                    && java_callable_arity(self.java, unit)
+                        .is_none_or(|declared| declared.accepts(arity))
             })
             .collect()
     }
@@ -385,7 +387,9 @@ fn record_reference(
                             MethodCallee::Undeclared => {
                                 ctx.record(format!("{owner}.{name}"), name_node)
                             }
-                            MethodCallee::Ambiguous => ctx.record_unproven(name, name_node),
+                            MethodCallee::Ambiguous | MethodCallee::Unresolved => {
+                                ctx.record_unproven(name, name_node)
+                            }
                         },
                         None => ctx.record_unproven(name, name_node),
                     }
@@ -487,6 +491,9 @@ enum MethodCallee {
     /// No declaration in this workspace answers the member. The receiver's
     /// type resolved; the method it names did not.
     Undeclared,
+    /// Canonical owner metadata was missing or conflicting, so hierarchy
+    /// preference could not establish a safe callee.
+    Unresolved,
 }
 
 /// Java binds a member to the nearest declaration the receiver's static type
@@ -502,26 +509,33 @@ enum MethodCallee {
 /// ships `com.google.common.base.Supplier` under both `guava/` and
 /// `android/guava/`) is one callee, not an ambiguity.
 fn method_callee(owner_fq_name: &str, member: &str, ctx: &JavaScan<'_>) -> MethodCallee {
-    let (Some(owner), Some(provider)) = (
-        ctx.graph.index.definitions(owner_fq_name).next(),
-        ctx.graph.hierarchy,
-    ) else {
+    let Some(owner) = ctx.graph.index.definitions(owner_fq_name).next() else {
         return MethodCallee::Undeclared;
     };
-    let declares = |scope: &CodeUnit| {
-        ctx.graph
-            .structural_members(scope.fq(), member)
-            .iter()
-            .any(CodeUnit::is_function)
-    };
-    if declares(&owner) {
+    if ctx
+        .graph
+        .structural_members(owner.fq(), member)
+        .iter()
+        .any(CodeUnit::is_function)
+    {
         return MethodCallee::Resolved(format!("{owner_fq_name}.{member}"));
     }
-    let Some(declaring) =
-        java_nearest_declaring_ancestors(ctx.graph.index, provider, &owner, declares)
-    else {
-        return MethodCallee::Undeclared;
+    let Some(provider) = ctx.graph.hierarchy else {
+        return MethodCallee::Unresolved;
     };
+    let declares = |scope: &CodeUnit| {
+        Ok(ctx
+            .graph
+            .structural_members(scope.fq(), member)
+            .iter()
+            .any(CodeUnit::is_function))
+    };
+    let declaring =
+        match java_nearest_declaring_ancestors(ctx.graph.index, provider, &owner, declares) {
+            Ok(Some(declaring)) => declaring,
+            Ok(None) => return MethodCallee::Undeclared,
+            Err(JavaHierarchyFactError::MetadataUnavailable) => return MethodCallee::Unresolved,
+        };
     let mut owners: Vec<String> = declaring.iter().map(CodeUnit::fq_name).collect();
     owners.sort();
     owners.dedup();

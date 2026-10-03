@@ -21,6 +21,14 @@ use tree_sitter::Tree;
 pub struct PythonAdapter;
 
 impl LanguageAdapter for PythonAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::python::source_publication::SOURCE_STORAGE)
+    }
+
+    fn python_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::python_facts::PYTHON_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::Python
     }
@@ -123,6 +131,14 @@ impl LanguageAdapter for PythonAdapter {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         python_extract_call_receiver(reference)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
     }
 
     fn parse_file(

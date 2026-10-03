@@ -112,6 +112,28 @@ pub trait CodeUnitIndex: Send + Sync {
         BTreeSet::new()
     }
 
+    /// Whether `unit` is one of [`CodeUnitIndex::declarations`] of `file`.
+    ///
+    /// The same question as `declarations(file).contains(unit)`, which builds
+    /// and sorts the whole file's set to answer it. An index that holds a
+    /// file's declarations in a hash set answers it without the copy.
+    fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
+        self.declarations(file).contains(unit)
+    }
+
+    /// The units of [`CodeUnitIndex::declarations`] of `file` whose identifier
+    /// is `identifier`, in no particular order.
+    ///
+    /// The same answer as filtering `declarations(file)`, which builds and
+    /// sorts the whole file's set first. An index that holds a file's
+    /// declarations answers it by walking them once without the copy.
+    fn declarations_named(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.declarations(file)
+            .into_iter()
+            .filter(|unit| unit.identifier() == identifier)
+            .collect()
+    }
+
     fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.declarations(file)
     }

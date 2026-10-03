@@ -18,9 +18,9 @@ use super::correlations::{
 };
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CancellationToken, GuardFact, GuardPredicate, ProcedureHandle, ProcedureSemantics,
-    ProgramPoint, ProgramPointId, SemanticBudget, SemanticEffect, SemanticValueKind, SemanticWork,
-    TypeFlowAdapter, ValueFlowKind, ValueId,
+    BindingOriginIndex, CancellationToken, GuardFact, GuardPredicate, ProcedureHandle,
+    ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticBudget, SemanticEffect,
+    SemanticValueKind, SemanticWork, TypeFlowAdapter, ValueFlowKind, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -182,6 +182,7 @@ pub(super) fn derive(
 ) -> Result<GuardBindings, CorrelationError> {
     check_cancelled(cancellation)?;
     let semantics = procedure.semantics();
+    let binding_origins = BindingOriginIndex::new(procedure);
     let bindings = semantics
         .values()
         .iter()
@@ -223,6 +224,14 @@ pub(super) fn derive(
     check_cancelled(cancellation)?;
     charge_entries(budget, 1)?;
     let mut worklist = VecDeque::from([entry]);
+    let transfer = TransferContext {
+        semantics,
+        bindings: &bindings,
+        tracked: &tracked,
+        open: &open,
+        binding_origins: &binding_origins,
+        cancellation,
+    };
 
     while let Some(point_id) = worklist.pop_front() {
         check_cancelled(cancellation)?;
@@ -233,15 +242,7 @@ pub(super) fn derive(
             .as_ref()
             .expect("a scheduled binding-refinement point is reachable")
             .clone();
-        transfer_point(
-            semantics,
-            point_id,
-            &bindings,
-            &tracked,
-            &open,
-            &mut state,
-            cancellation,
-        )?;
+        transfer_point(&transfer, point_id, &mut state)?;
         if retained.contains(&point_id) {
             let previous = exits.get(&point_id).map_or(0, State::size);
             charge_entries(budget, state.size().saturating_sub(previous))?;
@@ -296,15 +297,29 @@ pub(super) fn derive(
     })
 }
 
+#[derive(Clone, Copy)]
+struct TransferContext<'a> {
+    semantics: &'a ProcedureSemantics,
+    bindings: &'a HashSet<ValueId>,
+    tracked: &'a HashSet<ValueId>,
+    open: &'a HashSet<ValueId>,
+    binding_origins: &'a BindingOriginIndex,
+    cancellation: &'a CancellationToken,
+}
+
 fn transfer_point(
-    semantics: &ProcedureSemantics,
+    context: &TransferContext<'_>,
     point_id: ProgramPointId,
-    bindings: &HashSet<ValueId>,
-    tracked: &HashSet<ValueId>,
-    open: &HashSet<ValueId>,
     state: &mut State,
-    cancellation: &CancellationToken,
 ) -> Result<(), CorrelationError> {
+    let TransferContext {
+        semantics,
+        bindings,
+        tracked,
+        open,
+        binding_origins,
+        cancellation,
+    } = *context;
     let point = semantics
         .point(point_id)
         .expect("a validated binding-refinement point remains live");
@@ -334,8 +349,50 @@ fn transfer_point(
                     state.clear_value(*target);
                 }
             }
+            SemanticEffect::MemoryStore {
+                location, value, ..
+            } if semantics
+                .memory_location(*location)
+                .is_some_and(|location| {
+                    matches!(
+                        location.kind,
+                        crate::analyzer::semantic::MemoryLocationKind::Dereference { .. }
+                    )
+                }) =>
+            {
+                let address = match semantics.memory_location(*location).map(|row| &row.kind) {
+                    Some(crate::analyzer::semantic::MemoryLocationKind::Dereference {
+                        address,
+                    }) => *address,
+                    _ => unreachable!("the guard above selected a dereference store"),
+                };
+                let origins = binding_origins.addressed_binding_origins(address);
+                if let Some(binding) = origins.unique_binding() {
+                    if bindings.contains(&binding) {
+                        state.invalidate_binding(binding, tracked);
+                        state.copy(*value, binding, tracked);
+                    }
+                } else {
+                    for binding in
+                        unknown_write_bindings(&event.effect, semantics, open, binding_origins)
+                    {
+                        if bindings.contains(&binding) {
+                            state.invalidate_binding(binding, tracked);
+                        } else {
+                            state.clear_value(binding);
+                        }
+                    }
+                }
+                if let Some(result) = produced_value(&event.effect) {
+                    if bindings.contains(&result) {
+                        state.invalidate_binding(result, tracked);
+                    } else {
+                        state.clear_value(result);
+                    }
+                }
+            }
             effect => {
-                for value in unknown_write_bindings(effect, semantics, open) {
+                for value in unknown_write_bindings(effect, semantics, open, binding_origins) {
                     if bindings.contains(&value) {
                         state.invalidate_binding(value, tracked);
                     } else {

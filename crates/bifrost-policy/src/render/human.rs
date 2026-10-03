@@ -3,8 +3,8 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::PolicyIncrementalReview;
 use crate::display_path::TaintDisplayPath;
+use crate::{PolicyDiffReview, PolicyIncrementalReview};
 
 use super::super::{
     BoundedWitness, CategoryPredicate, CertaintyReason, ClassificationProvenance, CvssAssessment,
@@ -333,7 +333,6 @@ fn write_concise_report<W: Write>(
     report: &PolicyReportDocument,
     color: HumanRenderColor,
 ) -> Result<(), PolicyRenderError> {
-    let diff_hides_persisting = report.diff().is_some_and(|review| !review.degraded());
     let visible_findings = report
         .runs()
         .iter()
@@ -342,10 +341,12 @@ fn write_concise_report<W: Write>(
             finding.suppression().is_none()
                 && finding.scope().is_none()
                 && finding.baseline().is_none()
-                && !(diff_hides_persisting
-                    && finding.diff().is_some_and(|diff| {
-                        diff.disposition() == FindingDiffDisposition::Persisting
-                    }))
+                && !(report.diff().is_some_and(|review| {
+                    review.policy_is_qualified(finding.policy_id())
+                        && finding.diff().is_some_and(|diff| {
+                            diff.disposition() == FindingDiffDisposition::Persisting
+                        })
+                }))
         })
         .collect::<Vec<_>>();
     let analysis_complete = report_analysis_complete(report);
@@ -428,21 +429,22 @@ fn write_concise_report<W: Write>(
         if diff.degraded() {
             writeln!(
                 output,
-                "  Diff base {} is unreliable; full gating applied.",
-                escape_terminal_text(diff.base_revision()),
-            )
-            .map_err(map_io_error)?;
-        } else {
-            writeln!(
-                output,
-                "  Diff: {} new, {} persisting, {} fixed against {}.",
-                diff.new_count(),
-                diff.persisting_count(),
-                diff.fixed_count(),
+                "  Diff base {} has an unreliable aggregate verdict; qualified policy comparisons are retained and unqualified policies use full gating.",
                 escape_terminal_text(diff.base_revision()),
             )
             .map_err(map_io_error)?;
         }
+        writeln!(
+            output,
+            "  Diff: {} new, {} persisting, {} fixed against {}; {} unqualified policies.",
+            diff.new_count(),
+            diff.persisting_count(),
+            diff.fixed_count(),
+            escape_terminal_text(diff.base_revision()),
+            diff.unqualified_policies().len(),
+        )
+        .map_err(map_io_error)?;
+        write_diff_unqualified_policies(output, diff)?;
     }
 
     writeln!(output, "\nAnalysis warnings").map_err(map_io_error)?;
@@ -3493,10 +3495,28 @@ fn write_summary<W: Write>(
     let retained_finding_count = report.runs().iter().fold(0_usize, |total, run| {
         total.saturating_add(run.findings().len())
     });
+    let persisting_finding_count = report
+        .diff()
+        .into_iter()
+        .flat_map(|review| {
+            report.runs().iter().flat_map(move |run| {
+                run.findings().iter().filter(move |finding| {
+                    review.policy_is_qualified(finding.policy_id())
+                        && finding.suppression().is_none()
+                        && finding.scope().is_none()
+                        && finding.baseline().is_none()
+                        && finding.diff().is_some_and(|diff| {
+                            diff.disposition() == FindingDiffDisposition::Persisting
+                        })
+                })
+            })
+        })
+        .count();
     let active_finding_count = retained_finding_count
         .saturating_sub(retained_suppressed_count)
         .saturating_sub(retained_scoped_count)
-        .saturating_sub(retained_baselined_count);
+        .saturating_sub(retained_baselined_count)
+        .saturating_sub(persisting_finding_count);
     let suppressed_finding_count = report
         .suppressions()
         .iter()
@@ -3627,21 +3647,22 @@ fn write_summary<W: Write>(
         if review.degraded() {
             write!(
                 output,
-                "; diff base {} unreliable: full gating applied",
-                escape_terminal_text(review.base_revision()),
-            )
-            .map_err(map_io_error)?;
-        } else {
-            write!(
-                output,
-                "; diff: {} new, {} persisting, {} fixed against {}",
-                review.new_count(),
-                review.persisting_count(),
-                review.fixed_count(),
+                "; diff base {} aggregate verdict unreliable; unqualified policies use full gating",
                 escape_terminal_text(review.base_revision()),
             )
             .map_err(map_io_error)?;
         }
+        write!(
+            output,
+            "; diff: {} new, {} persisting, {} fixed against {}; {} unqualified policies",
+            review.new_count(),
+            review.persisting_count(),
+            review.fixed_count(),
+            escape_terminal_text(review.base_revision()),
+            review.unqualified_policies().len(),
+        )
+        .map_err(map_io_error)?;
+        write_diff_unqualified_policies(output, review)?;
     }
     if let Some(review) = report.packs() {
         write_dependency_pack_summary(output, review)?;
@@ -3711,6 +3732,31 @@ fn write_dependency_pack_summary<W: Write>(
         }
         if review.decisions_truncated() {
             write!(output, ", ... (decisions truncated)").map_err(map_io_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_diff_unqualified_policies<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &PolicyDiffReview,
+) -> Result<(), PolicyRenderError> {
+    for policy in review.unqualified_policies() {
+        writeln!(
+            output,
+            "  Diff evidence unqualified for {} ({}): {}",
+            escape_terminal_text(policy.policy_id().as_str()),
+            escape_terminal_text(policy.completion()),
+            escape_terminal_text(policy.completion_detail()),
+        )
+        .map_err(map_io_error)?;
+        for diagnostic in policy.diagnostics() {
+            writeln!(
+                output,
+                "    Diagnostic: {}",
+                escape_terminal_text(diagnostic),
+            )
+            .map_err(map_io_error)?;
         }
     }
     Ok(())
@@ -3982,6 +4028,7 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::CallTarget => "call_target",
         PolicyLocationRelationship::Subject => "subject",
         PolicyLocationRelationship::ExpectedOccurrence => "expected_occurrence",
+        PolicyLocationRelationship::AlsoFailsAt => "also_fails_at",
         PolicyLocationRelationship::SelectedCandidate => "selected_candidate",
         PolicyLocationRelationship::ConsideredCandidate => "considered_candidate",
         PolicyLocationRelationship::BindingOf => "binding_of",
@@ -4044,6 +4091,7 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::WorkspaceSnapshotDeadlineExceeded => "workspace-snapshot-deadline-exceeded",
         Code::DiffBaseDeadlineExceeded => "diff-base-deadline-exceeded",
         Code::DiffBaseUnreliable => "diff-base-unreliable",
+        Code::DiffBasePolicyUnqualified => "diff-base-policy-unqualified",
         Code::SuppressionLoadFailed => "suppression-load-failed",
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::ScopeLoadFailed => "scope-load-failed",

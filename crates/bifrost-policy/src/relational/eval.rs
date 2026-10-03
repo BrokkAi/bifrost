@@ -1452,6 +1452,7 @@ fn scalar_matches_literal(actual: &RowScalar, expected: &RowLiteral) -> bool {
         | (RowScalar::ConstrainedEnum(actual), RowLiteral::ConstrainedEnum(expected)) => {
             actual == expected
         }
+        (RowScalar::StringList(actual), RowLiteral::StringList(expected)) => actual == expected,
         (RowScalar::Integer(actual), RowLiteral::Integer(expected)) => actual == expected,
         (RowScalar::Boolean(actual), RowLiteral::Boolean(expected)) => actual == expected,
         _ => false,

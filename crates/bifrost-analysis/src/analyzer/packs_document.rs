@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use brokk_bifrost_core::analyzer::config::PythonRuntimeEnvironmentConfig;
 use semver::Version;
 use serde::Deserialize;
 
@@ -288,6 +289,7 @@ pub struct WorkspacePacksConfig {
     catalog: Option<PathBuf>,
     ecosystems: Vec<DependencyPackEcosystem>,
     enable: Vec<String>,
+    python_runtime_environments: Vec<PythonRuntimeEnvironmentConfig>,
 }
 
 impl WorkspacePacksConfig {
@@ -313,6 +315,10 @@ impl WorkspacePacksConfig {
     pub fn enable(&self) -> &[String] {
         &self.enable
     }
+
+    pub fn python_runtime_environments(&self) -> &[PythonRuntimeEnvironmentConfig] {
+        &self.python_runtime_environments
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +330,8 @@ struct WirePacksDocument {
     ecosystems: Vec<String>,
     #[serde(default)]
     enable: Vec<String>,
+    #[serde(default)]
+    python_runtime_environments: Vec<PythonRuntimeEnvironmentConfig>,
 }
 
 /// Parse and validate one pack-activation document from its JSON source.
@@ -381,11 +389,42 @@ fn normalize_packs_document(
         ecosystems.push(ecosystem);
     }
     ecosystems.sort();
+    let mut python_runtime_environments = wire.python_runtime_environments;
+    for environment in &mut python_runtime_environments {
+        // A component-normalized current directory explicitly covers the workspace.
+        if environment
+            .source_root
+            .components()
+            .all(|component| matches!(component, std::path::Component::CurDir))
+            && !environment.source_root.as_os_str().is_empty()
+        {
+            environment.source_root = PathBuf::from(".");
+        } else {
+            environment.source_root = normalize_python_runtime_path(&environment.source_root)?;
+        }
+        for artifact in &mut environment.artifacts {
+            artifact.archive_path = normalize_python_runtime_path(&artifact.archive_path)?;
+            artifact.installed_root = normalize_python_runtime_path(&artifact.installed_root)?;
+        }
+    }
     Ok(WorkspacePacksConfig {
         schema_version: WORKSPACE_PACKS_SCHEMA_VERSION,
         catalog,
         ecosystems,
         enable: wire.enable,
+        python_runtime_environments,
+    })
+}
+
+fn normalize_python_runtime_path(path: &Path) -> Result<PathBuf, WorkspacePacksValidationError> {
+    validate_workspace_relative_path(path).map_err(|error| {
+        let WorkspaceDocumentError::InvalidPath { reason, .. } = error else {
+            unreachable!("path validation only reports invalid paths");
+        };
+        WorkspacePacksValidationError::InvalidPythonRuntimePath {
+            path: path.to_path_buf(),
+            reason,
+        }
     })
 }
 
@@ -630,19 +669,31 @@ pub fn open_ambient_semantic_pack_catalog(
 fn activation_config_with_source_toolchains<'a>(
     workspace: &WorkspaceAnalyzer,
     activation_config: &'a AnalyzerConfig,
+    packs_config: Option<&WorkspacePacksConfig>,
 ) -> Cow<'a, AnalyzerConfig> {
-    let Some(build_config) = workspace.config() else {
-        return Cow::Borrowed(activation_config);
-    };
-    let bindings = &build_config
-        .jvm
-        .standard_library_discovery
-        .source_toolchains;
+    let bindings = workspace
+        .config()
+        .map(|config| {
+            config
+                .jvm
+                .standard_library_discovery
+                .source_toolchains
+                .as_slice()
+        })
+        .unwrap_or_default();
+    let python_bindings = packs_config
+        .map(WorkspacePacksConfig::python_runtime_environments)
+        .unwrap_or_default();
     if bindings.iter().all(|binding| {
         activation_config
             .jvm
             .standard_library_discovery
             .source_toolchains
+            .contains(binding)
+    }) && python_bindings.iter().all(|binding| {
+        activation_config
+            .python
+            .runtime_environments
             .contains(binding)
     }) {
         return Cow::Borrowed(activation_config);
@@ -652,6 +703,11 @@ fn activation_config_with_source_toolchains<'a>(
     for binding in bindings {
         if !merged.contains(binding) {
             merged.push(binding.clone());
+        }
+    }
+    for binding in python_bindings {
+        if !config.python.runtime_environments.contains(binding) {
+            config.python.runtime_environments.push(binding.clone());
         }
     }
     Cow::Owned(config)
@@ -687,7 +743,7 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     // nothing to discover, and the request's workspace evidence is what
     // selects. That keeps one code path for all routes.
     let outcome = workspace.activate_dependency_packs(
-        &activation_config_with_source_toolchains(workspace, analyzer_config),
+        &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &prelude.ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
@@ -742,7 +798,7 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
         limits: SemanticModelRuntimeLimits::default(),
     };
     let installed = workspace.activate_installed_dependency_packs(
-        &activation_config_with_source_toolchains(workspace, analyzer_config),
+        &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &prelude.ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
@@ -949,11 +1005,25 @@ impl std::error::Error for WorkspacePacksDocumentError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePacksValidationError {
-    UnsupportedSchemaVersion { observed: u64 },
-    UnknownEcosystem { label: String },
-    DuplicateEcosystem { ecosystem: DependencyPackEcosystem },
-    CatalogPathTooLong { max_bytes: usize },
-    InvalidCatalogPath { reason: WorkspacePathError },
+    UnsupportedSchemaVersion {
+        observed: u64,
+    },
+    UnknownEcosystem {
+        label: String,
+    },
+    DuplicateEcosystem {
+        ecosystem: DependencyPackEcosystem,
+    },
+    CatalogPathTooLong {
+        max_bytes: usize,
+    },
+    InvalidCatalogPath {
+        reason: WorkspacePathError,
+    },
+    InvalidPythonRuntimePath {
+        path: PathBuf,
+        reason: WorkspacePathError,
+    },
 }
 
 impl fmt::Display for WorkspacePacksValidationError {
@@ -983,6 +1053,10 @@ impl fmt::Display for WorkspacePacksValidationError {
                 formatter,
                 "packs document catalog path exceeds {max_bytes} bytes"
             ),
+            Self::InvalidPythonRuntimePath { path, reason } => write!(
+                formatter,
+                "packs document Python runtime path {path:?} is invalid: {reason}"
+            ),
             Self::InvalidCatalogPath { reason } => {
                 write!(
                     formatter,
@@ -1001,6 +1075,43 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn python_runtime_scopes_accept_root_and_reject_portable_path_escapes() {
+        let source = |scope: &str| {
+            serde_json::json!({
+            "schema_version": 1,
+            "ecosystems": ["python"],
+            "python_runtime_environments": [{
+                "source_root": scope,
+                "artifacts": [{ "archive_path": "wheels/example.whl", "installed_root": "venv/site-packages" }]
+            }]
+        }).to_string()
+        };
+        let config = parse_workspace_packs_config(&source(".")).unwrap();
+        assert_eq!(
+            config.python_runtime_environments()[0].source_root,
+            PathBuf::from(".")
+        );
+        for scope in [
+            "../outside",
+            "/absolute",
+            "C:outside",
+            "C:\\outside",
+            "\\server\\share",
+            "",
+        ] {
+            assert!(
+                parse_workspace_packs_config(&source(scope)).is_err(),
+                "{scope:?}"
+            );
+        }
+        let config = parse_workspace_packs_config(&source("src/./application")).unwrap();
+        assert_eq!(
+            config.python_runtime_environments()[0].source_root,
+            PathBuf::from("src/application")
+        );
+    }
 
     #[test]
     fn activation_keeps_host_discovery_and_workspace_source_toolchains() {

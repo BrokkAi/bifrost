@@ -33,7 +33,6 @@ const RQL_COMPONENTS = new Set([
 ]);
 const FLOW_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_COMPONENTS = new Set(["rql_runtime", "mcp_contract"]);
-const LSP_COMPONENTS = new Set(["rql_runtime", "lsp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
 const ZED_EDITOR_COMPONENTS = new Set(["rust"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
@@ -206,10 +205,6 @@ function isExternalFixturePath(path) {
   );
 }
 
-function isLspPath(path) {
-  return startsWithAny(path, ["crates/bifrost-lsp/"]);
-}
-
 function isPluginPath(path) {
   return (
     startsWithAny(path, [
@@ -342,9 +337,6 @@ function classifyPath(path) {
   }
   if (path === "tests/suite_mcp_cli/bifrost_tool_cli.rs") {
     return { components: MCP_TEST_COMPONENTS, reason: "MCP integration test surface" };
-  }
-  if (isLspPath(path)) {
-    return { components: LSP_COMPONENTS, reason: "LSP host contract" };
   }
   if (isExternalFixturePath(path)) {
     return {

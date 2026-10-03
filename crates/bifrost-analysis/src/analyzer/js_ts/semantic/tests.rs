@@ -2718,3 +2718,79 @@ fn js_ts_update_conversion_stays_open_unless_the_binding_holds_only_primitives()
         );
     }
 }
+
+#[test]
+fn module_await_has_valid_async_contract_in_both_dialects() {
+    for language in [Language::JavaScript, Language::TypeScript] {
+        for (source, module_async) in [
+            ("const result = await load();", true),
+            ("if (enabled) { await load(); }", true),
+            ("const C = class extends (await load()) {};", true),
+            ("const C = class { [await load()]() {} };", true),
+            ("const task = async () => await load(); use(task);", false),
+            ("async function task() { await load(); } use(task);", false),
+            ("const result = load();", false),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            let grammar = match language {
+                Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+                Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                _ => unreachable!(),
+            };
+            parser.set_language(&grammar).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let dialect = LanguageDialect::Standard(language);
+            let prepared = PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Exact(Arc::from(source)),
+                tree,
+                crate::text_utils::compute_line_starts(source),
+                dialect,
+                PreparedSourceOrigin::Disk,
+                None,
+            );
+            let file = ProjectFile::new(std::env::temp_dir(), "module-await.js");
+            let lowerer = match language {
+                Language::JavaScript => JsTsSemanticLowerer::javascript(),
+                Language::TypeScript => JsTsSemanticLowerer::typescript(),
+                _ => unreachable!(),
+            };
+            let outcome = lowerer
+                .lower(
+                    &file,
+                    &prepared,
+                    &SemanticBudget::default(),
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+            let SemanticOutcome::Complete { value, .. } = outcome else {
+                panic!("fixture lowering must complete");
+            };
+            let identity = lowerer.identity();
+            let key = SemanticArtifactKey::new(
+                WorkspaceMountId::from_root(file.root()),
+                WorkspaceRelativePath::try_from_path(file.rel_path()).unwrap(),
+                dialect,
+                SourceRevision::Disk {
+                    content: ContentIdentity::hash_bytes(source.as_bytes()),
+                },
+                identity.adapter,
+                SemanticIrVersion::current(),
+                identity.configuration,
+                identity.dependencies,
+            );
+            let artifact = SemanticArtifact::try_new(key, lowerer.capabilities(), value)
+                .unwrap_or_else(|error| panic!("{language:?}: {source}: {error}"));
+            let module = artifact
+                .procedures()
+                .iter()
+                .find(|p| p.properties().is_synthetic)
+                .unwrap();
+            assert_eq!(
+                module.properties().is_async,
+                module_async,
+                "{language:?}: {source}"
+            );
+        }
+    }
+}

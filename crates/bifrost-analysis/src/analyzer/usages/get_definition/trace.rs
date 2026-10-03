@@ -58,6 +58,8 @@ use std::sync::Arc;
 pub enum TraceCandidateRef {
     /// An indexed workspace declaration.
     Unit(CodeUnit),
+    /// An exact declaration published by an activated semantic model.
+    Modeled { symbol_id: String, name: String },
     /// A binder in the referencing file itself, as the resolver reports it.
     Lexical(LexicalDefinition),
     /// A binding row of the file's lexical environment, addressed by the
@@ -292,6 +294,14 @@ pub fn debug_assert_selection_agrees(rows: &[TraceCandidate], outcome: &Definiti
                 "trace selected {unit:?} which the outcome does not report: {:?}",
                 outcome.definitions
             ),
+            TraceCandidateRef::Modeled { symbol_id, .. } => debug_assert!(
+                outcome
+                    .modeled_definitions
+                    .iter()
+                    .any(|symbol| symbol.id == *symbol_id),
+                "trace selected modeled {symbol_id:?} which the outcome does not report: {:?}",
+                outcome.modeled_definitions
+            ),
             TraceCandidateRef::Lexical(definition) => debug_assert!(
                 outcome.lexical_definition.as_ref() == Some(definition),
                 "trace selected lexical {definition:?} which the outcome does not report: {:?}",
@@ -522,7 +532,7 @@ impl Drop for TraceSession {
 /// Ambiguity stays explicit: every reported definition becomes its own
 /// `Selected` row, and the outcome's `Ambiguous` status is what says they are
 /// peers rather than a single answer.
-pub(super) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
+pub(crate) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
     if !recording() || outcome.definitions.is_empty() {
         return;
     }
@@ -553,9 +563,31 @@ pub(super) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
     record_all(rows);
 }
 
+/// Preserve the explicit model declaration identity selected by the resolver.
+pub(crate) fn record_selected_modeled(outcome: &DefinitionLookupOutcome) {
+    if !recording() {
+        return;
+    }
+    let rows = outcome
+        .modeled_definitions
+        .iter()
+        .map(|symbol| {
+            TraceCandidate::selected(
+                TraceCandidateRef::Modeled {
+                    symbol_id: symbol.id.clone(),
+                    name: symbol.qualified_name.clone(),
+                },
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    debug_assert_selection_agrees(&rows, outcome);
+    record_all(rows);
+}
+
 /// The row the shared seam records for a lexical selection. The tier is not
 /// staged and never guessed: a lexical binding *is* the strongest tier.
-pub(super) fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
+pub(crate) fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
     if !recording() {
         return;
     }
@@ -657,8 +689,7 @@ pub fn resolve_definition_batch_with_trace(
     let session = TraceSession::install();
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    let mut context =
-        super::DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
+    let mut context = super::DefinitionBatchContext::new(analyzer, scope.token());
     context.sources.insert(file.clone(), Ok(source));
     let mut per_request = Vec::with_capacity(requests.len());
     let resolutions = resolve_definition_resolutions(
@@ -668,7 +699,6 @@ pub fn resolve_definition_batch_with_trace(
         requests,
         Some(cancellation),
         None,
-        true,
         Some(&session),
         &mut per_request,
     );
@@ -700,6 +730,13 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
     use crate::analyzer::common::language_for_file;
     use crate::analyzer::structural::resolution::EnvironmentAxis;
     use crate::analyzer::structural_spec_for;
+
+    // The native Rust adapter projects selected bindings, but does not record
+    // the rejected paths of the selected operation. The structural adapter's
+    // legacy rejection capability is not evidence for this route.
+    if language_for_file(file) == crate::analyzer::Language::Rust {
+        return TraceCompleteness::SelectionOnly;
+    }
 
     let instrumented = structural_spec_for(language_for_file(file)).is_some_and(|spec| {
         spec.lexical_environment_support()
@@ -1069,10 +1106,15 @@ pub fn dispatch_quality_for_status(
         }
         Some(
             DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::Unavailable
             | DefinitionLookupStatus::InvalidLocation
             | DefinitionLookupStatus::NotFound,
         )
         | None => DispatchQuality::Unknown,
+        Some(DefinitionLookupStatus::Incomplete | DefinitionLookupStatus::ExceededBudget(_)) => {
+            DispatchQuality::Truncated
+        }
+        Some(DefinitionLookupStatus::Cancelled) => DispatchQuality::Cancelled,
         // A boundary outcome is complete only when the refined evidence
         // (#1474) actually names the external target. A declared-but-
         // unindexed dependency leaves the answer partial, and an unknown
@@ -1120,6 +1162,23 @@ mod dispatch_quality_tests {
                 DispatchQuality::Unknown
             );
         }
+        assert_eq!(
+            dispatch_quality_for_status(Some(DefinitionLookupStatus::Incomplete), None),
+            DispatchQuality::Truncated
+        );
+        assert_eq!(
+            dispatch_quality_for_status(
+                Some(DefinitionLookupStatus::ExceededBudget(
+                    crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::ScopeNodes,
+                )),
+                None,
+            ),
+            DispatchQuality::Truncated
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(DefinitionLookupStatus::Cancelled), None),
+            DispatchQuality::Cancelled
+        );
         assert_eq!(
             dispatch_quality_for_status(None, None),
             DispatchQuality::Unknown
@@ -1256,6 +1315,7 @@ mod tests {
 
     fn empty_outcome() -> DefinitionLookupOutcome {
         DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
             reference: None,
             definitions: Vec::new(),

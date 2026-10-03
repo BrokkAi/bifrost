@@ -1908,6 +1908,7 @@ fn evaluation_relations(
                         MemoryLocationKind::Field { base, .. }
                         | MemoryLocationKind::Property { base, .. }
                         | MemoryLocationKind::Index { base, .. } => Some((base, result)),
+                        MemoryLocationKind::Dereference { address } => Some((address, result)),
                         MemoryLocationKind::LexicalCell { binding }
                         | MemoryLocationKind::Capture {
                             binding: Some(binding),

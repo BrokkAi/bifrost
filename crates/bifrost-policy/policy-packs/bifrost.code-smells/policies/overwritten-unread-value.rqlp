@@ -1,4 +1,5 @@
-; An ordinary Java, JavaScript, or TypeScript local value replaced before
+; An ordinary Java, JavaScript, TypeScript, Python, Go, C# or Kotlin local value
+; replaced before
 ; any read. The RHS has already run at the selected establishment; no fix is
 ; offered because removing it could remove side effects.
 (policy
@@ -19,7 +20,7 @@
                         (verdict eq overwritten_unread)
                         (proof eq exact)
                         (coverage eq exhaustive))
-          (language java javascript typescript
+          (language java javascript typescript python go csharp kotlin rust
             (assignment-relations :relation [overwritten-unread]
               (procedure-of
                 (callable)))))))

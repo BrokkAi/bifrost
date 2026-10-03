@@ -12,6 +12,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget<'tree>>,
+    structural_node_index: &'targets StructuralNodeIndex,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), JavaLoweringError> {
@@ -35,6 +36,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     let declaration_inventory = java_declaration_inventory(prepared);
     let mut context = LoweringContext {
         prepared,
+        structural_node_index,
         session,
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
@@ -82,11 +84,11 @@ pub(super) fn lower_procedure<'tree, 'targets>(
             "initializer scheduling and source-order composition across initializer fragments are not yet modeled",
         )?;
     }
-    if spec.kind == ProcedureKind::Constructor
+    let implicit_super = spec.kind == ProcedureKind::Constructor
         && !named_children(spec.body)
             .into_iter()
-            .any(|child| child.kind() == "explicit_constructor_invocation")
-    {
+            .any(|child| child.kind() == "explicit_constructor_invocation");
+    if implicit_super {
         context.add_gap(
             &mut builder,
             entry,
@@ -94,14 +96,6 @@ pub(super) fn lower_procedure<'tree, 'targets>(
             SemanticCapability::Calls,
             SemanticGapKind::Unsupported,
             "implicit super-constructor invocation is not yet represented as a call site",
-        )?;
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            "implicit super-constructor invocation can complete exceptionally",
         )?;
     }
 
@@ -152,10 +146,23 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         }
     };
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    let mut pending = vec![initial];
+    // The implicit `super()` runs before the body, outside every handler the
+    // body declares, so its exception leaves the constructor.
+    if implicit_super {
+        context.implicit_abort_edge(
+            &mut builder,
+            spec.callable,
+            entry,
+            function_scope,
+            None,
+            &mut pending,
+        )?;
+    }
 
     drive_and_finish_procedure(
         builder,
-        [initial],
+        pending,
         entry,
         normal_exit,
         exceptional_exit,
@@ -686,7 +693,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 next,
                 scope,
             } => {
-                self.record_statement_entry(builder, node, entry)?;
+                self.session.record_statement_entry(builder, node, entry)?;
                 self.statement(builder, node, entry, next, scope, None, stack)
             }
             Work::LabeledStatement {
@@ -696,7 +703,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 next,
                 scope,
             } => {
-                self.record_statement_entry(builder, node, entry)?;
+                self.session.record_statement_entry(builder, node, entry)?;
                 self.statement(builder, node, entry, next, scope, Some(label), stack)
             }
             Work::Expression {
@@ -713,34 +720,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 scope,
             } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
         }
-    }
-
-    fn record_statement_entry(
-        &mut self,
-        builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
-        entry: ProgramPointId,
-    ) -> Result<(), JavaLoweringError> {
-        let point_metadata = self.session.metadata(entry)?;
-        let mapping = builder.source_mapping(point_metadata.source);
-        let span = mapping.locator.anchor().span();
-        let source = if mapping.kind == SourceMappingKind::Exact
-            && span.start_byte() as usize == node.start_byte()
-            && span.end_byte() as usize == node.end_byte()
-        {
-            point_metadata
-        } else {
-            // A do-loop body enters at the loop's own point. Cleanup may also
-            // specialize one statement for several completion paths. In both
-            // cases the producer, not a range search, attests the entry.
-            self.mapping(builder, node)?
-        };
-        builder.add_statement_entry(StatementEntrySite {
-            source: source.source,
-            evidence: source.evidence,
-            point: entry,
-        })?;
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1541,6 +1520,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let body = required_field(node, "body")?;
                 let body_entry = self.point(builder, body, Vec::new())?;
+                self.session
+                    .record_loop_site(builder, node, entry, body_entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -1579,6 +1560,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let body = required_field(node, "body")?;
                 let condition = required_field(node, "condition")?;
                 let condition_entry = self.point(builder, condition, Vec::new())?;
+                // A do body starts every iteration, so it is its own header.
+                self.session.record_loop_site(builder, node, entry, entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -1969,6 +1952,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             target: result,
                         },
                     )?;
+                    // Parentheses preserve the evaluated value without a conversion.
+                    // Publish the same identity transfer used by local-copy proofs.
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: inner,
+                        },
+                    )?;
                     self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
@@ -2279,6 +2272,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
+        // Updates run before the condition, which starts every iteration.
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let initial_condition_target = condition
             .filter(|condition| self.for_condition_starts_true(&initializers, *condition))
             .map_or(EdgeTarget::normal(condition_entry), |_| {

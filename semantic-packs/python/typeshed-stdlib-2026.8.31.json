@@ -68,7 +68,6 @@
     "container": null
   },
   "compatibility": {
-    "bifrost": ">=0.8.24, <1.0.0",
     "toolchains": [
       {
         "name": "cpython",

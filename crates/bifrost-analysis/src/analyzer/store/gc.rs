@@ -10,23 +10,14 @@ use crate::gitblob;
 /// Best-effort GC: drop cache entries no longer reachable from git refs or held
 /// by any worktree's uncommitted working set.
 ///
-/// Runs against the workspace's own live store rather than a second handle on
-/// the same file. Collection itself needs only the database path, but a
-/// collection that dropped rows also refreshed the planner statistics, and the
-/// readers that must be recycled for that belong to this store (issue #3029).
+/// Use the workspace's live store so the shared collection entry point can
+/// reload statistics and recycle its pooled readers after collection.
 fn run_gc(
     store: &AnalyzerStore,
     repo: &git2::Repository,
     workspace_root: &Path,
 ) -> Result<crate::cache_gc::GcOutcome, String> {
-    let outcome = crate::cache_gc::maybe_gc_for_analyzer(store, repo, workspace_root)?;
-    // The refresh ran on the collection's own connection, so every reader this
-    // store has already planned with is holding statistics that describe rows
-    // the collection deleted.
-    if outcome.analyzer_dropped > 0 && crate::cache_gc::planner_statistics_enabled() {
-        store.recycle_readers_for_new_statistics();
-    }
-    Ok(outcome)
+    crate::cache_gc::maybe_gc_for_analyzer(store, repo, workspace_root)
 }
 
 /// Owns best-effort analyzer cache GC tasks for one workspace lifetime.
@@ -127,7 +118,7 @@ impl AnalyzerGcCoordinator {
         let mut running = Vec::with_capacity(tasks.len());
         for task in std::mem::take(&mut *tasks) {
             if task.is_finished() {
-                join_task(task);
+                report_gc_join(task);
             } else {
                 running.push(task);
             }
@@ -136,17 +127,13 @@ impl AnalyzerGcCoordinator {
     }
 }
 
-/// Wait for a worker. A collection that panicked has already been reported by
-/// the panic hook; this names the task so the report is attributable, and it
-/// keeps the panic off the closing thread, which may be unwinding already.
-fn join_task(task: JoinHandle<()>) {
-    if let Err(payload) = task.join() {
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
-        eprintln!("Bifrost cache GC task panicked: {message}");
+fn report_gc_join(task: JoinHandle<()>) {
+    if let Err(panic) = task.join() {
+        // The payload's own `Debug` is `Any { .. }`, which says nothing about
+        // what failed; the message is the whole point of the report.
+        let reported =
+            brokk_bifrost_core::panic_report::reported_panic("analyzer cache GC thread", panic);
+        eprintln!("{reported}");
     }
 }
 
@@ -158,7 +145,7 @@ impl Drop for AnalyzerGcCoordinator {
                 .expect("analyzer GC task lock poisoned"),
         );
         for task in tasks {
-            join_task(task);
+            report_gc_join(task);
         }
     }
 }

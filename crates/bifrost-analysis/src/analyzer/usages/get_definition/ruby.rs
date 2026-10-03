@@ -214,6 +214,12 @@ pub(crate) fn resolve_ruby_bounded(
             "Ruby source could not be parsed",
         ));
     };
+    if !session.observe_cancellation() || !ruby.canonical_sources_ready() {
+        return session.finish(no_definition(
+            "ruby_source_facts_unavailable",
+            "Canonical Ruby source facts are unavailable",
+        ));
+    }
     let provider = RubyDefinitionProvider::new(ruby, &session);
     let outcome = resolve_ruby_bounded_in_session(&provider, file, source, tree.root_node(), site);
     session.finish(outcome)
@@ -1629,6 +1635,12 @@ pub(super) fn resolve_ruby(
     let Some(tree) = tree else {
         return no_definition("ruby_parse_failed", "Ruby source could not be parsed");
     };
+    if !ruby.canonical_sources_ready() {
+        return no_definition(
+            "ruby_source_facts_unavailable",
+            "Canonical Ruby source facts are unavailable",
+        );
+    }
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -1654,7 +1666,12 @@ pub(super) fn resolve_ruby(
         },
         ruby,
     );
-    let visible_files = semantic.visible_files_from(file);
+    let Some(visible_files) = semantic.visible_files_from(file) else {
+        return no_definition(
+            "ruby_source_facts_unavailable",
+            "Canonical Ruby load closure is unavailable",
+        );
+    };
     let context = RubyLookupContext::build(
         analyzer,
         &semantic,

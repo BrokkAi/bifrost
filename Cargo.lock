@@ -131,12 +131,6 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
@@ -171,7 +165,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -179,12 +173,12 @@ dependencies = [
  "brokk-bifrost-flow",
  "brokk-bifrost-js-ts",
  "brokk-bifrost-jvm",
- "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
  "brokk-bifrost-policy",
  "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
  "brokk-bifrost-semantic-packs",
+ "brokk-tree-sitter-cpp",
  "chrono",
  "csv",
  "filetime",
@@ -192,7 +186,6 @@ dependencies = [
  "git2",
  "jsonschema",
  "libc",
- "lsp-types",
  "nu-ansi-term",
  "pretty_assertions",
  "proc-macro2",
@@ -211,9 +204,9 @@ dependencies = [
  "syn 2.0.118",
  "tar",
  "tempfile",
+ "tikv-jemallocator",
  "toml",
  "tree-sitter",
- "tree-sitter-cpp",
  "tree-sitter-python",
  "url",
  "walkdir",
@@ -222,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -237,6 +230,7 @@ dependencies = [
  "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
  "brokk-tree-sitter-c-sharp",
+ "brokk-tree-sitter-cpp",
  "brokk-tree-sitter-javascript",
  "brokk-tree-sitter-json",
  "brokk-tree-sitter-rust",
@@ -274,7 +268,6 @@ dependencies = [
  "toml",
  "toml_edit",
  "tree-sitter",
- "tree-sitter-cpp",
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-php",
@@ -292,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "bincode",
  "git2",
@@ -317,9 +310,10 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
+ "brokk-tree-sitter-cpp",
  "proptest",
  "regex",
  "serde",
@@ -327,12 +321,11 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "tree-sitter",
- "tree-sitter-cpp",
 ]
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-c-sharp",
@@ -342,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-flow"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -355,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -367,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-javascript",
@@ -381,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-kotlin",
@@ -395,33 +388,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-bifrost-lsp"
-version = "0.12.0"
-dependencies = [
- "brokk-bifrost-analysis",
- "brokk-bifrost-flow",
- "brokk-bifrost-policy",
- "brokk-bifrost-rql",
- "brokk-bifrost-runtime",
- "crossbeam-channel",
- "glob",
- "libc",
- "lsp-server",
- "lsp-types",
- "proptest",
- "regex",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "tree-sitter",
- "tree-sitter-python",
-]
-
-[[package]]
 name = "brokk-bifrost-mcp"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -450,13 +418,12 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "mago-allocator",
  "mago-database",
  "mago-phpdoc-syntax",
- "moka",
  "regex",
  "serde_json",
  "tree-sitter",
@@ -465,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -486,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -499,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rql"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -522,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "serde_json",
@@ -532,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -547,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-rust",
@@ -564,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -585,6 +552,16 @@ name = "brokk-tree-sitter-c-sharp"
 version = "0.23.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02f541882a165967f27a2bd0b62ddd7192c59ea81a39d1db1659239e469ec880"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "brokk-tree-sitter-cpp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85bbdac0ae2322a2d5b1cd13289006047f96b18df83179b8f7ee8738c5172c2d"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -819,7 +796,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "crossterm_winapi",
  "derive_more",
  "document-features",
@@ -1087,15 +1064,6 @@ dependencies = [
 
 [[package]]
 name = "fluent-uri"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17c704e9dbe1ddd863da1e6ff3567795087b1eb201ce80d8fa81162e1516500d"
-dependencies = [
- "bitflags 1.3.2",
-]
-
-[[package]]
-name = "fluent-uri"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e"
@@ -1307,7 +1275,7 @@ version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "libc",
  "libgit2-sys",
  "log",
@@ -1569,7 +1537,7 @@ version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "inotify-sys",
  "libc",
 ]
@@ -1632,7 +1600,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fe249f0ba6da1f55ca5db5204b79a52d6c62aaddffebbf7fb4752c0b5efa9dc"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "cesu8",
  "derive-new",
  "getset",
@@ -1712,7 +1680,7 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "libc",
 ]
 
@@ -1795,32 +1763,6 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
-
-[[package]]
-name = "lsp-server"
-version = "0.7.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d6ada348dbc2703cbe7637b2dda05cff84d3da2819c24abcb305dd613e0ba2e"
-dependencies = [
- "crossbeam-channel",
- "log",
- "serde",
- "serde_derive",
- "serde_json",
-]
-
-[[package]]
-name = "lsp-types"
-version = "0.97.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53353550a17c04ac46c585feb189c2db82154fc84b79c7a66c96c2c644f66071"
-dependencies = [
- "bitflags 1.3.2",
- "fluent-uri 0.1.4",
- "serde",
- "serde_json",
- "serde_repr",
-]
 
 [[package]]
 name = "mago-allocator"
@@ -1948,7 +1890,7 @@ version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "fsevent-sys",
  "inotify",
  "kqueue",
@@ -1966,7 +1908,7 @@ version = "9.0.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7768eb7201a1964d8eb10224e850df046ab584ee3c3d26e340a993d81f748148"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "inotify",
  "kqueue",
  "libc",
@@ -1986,7 +1928,7 @@ version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
 ]
 
 [[package]]
@@ -2083,7 +2025,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
 ]
 
 [[package]]
@@ -2222,7 +2164,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set",
  "bit-vec",
- "bitflags 2.13.0",
+ "bitflags",
  "num-traits",
  "rand 0.9.5",
  "rand_chacha",
@@ -2414,7 +2356,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
 ]
 
 [[package]]
@@ -2464,7 +2406,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df843f41f0cb459649f64a8b6b10579cf454f7a7420dc702767c81a26f23d780"
 dependencies = [
  "ahash",
- "fluent-uri 0.4.1",
+ "fluent-uri",
  "getrandom 0.3.4",
  "hashbrown",
  "itoa",
@@ -2550,7 +2492,7 @@ version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
@@ -2589,7 +2531,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -2828,17 +2770,6 @@ dependencies = [
  "ryu-js",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "serde_repr"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -3113,6 +3044,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3252,16 +3203,6 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-cpp"
-version = "0.23.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
-dependencies = [
- "cc",
  "tree-sitter-language",
 ]
 
@@ -3858,7 +3799,7 @@ version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "windows-sys 0.59.0",
 ]
 

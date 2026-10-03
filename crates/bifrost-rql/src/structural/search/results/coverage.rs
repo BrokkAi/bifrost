@@ -136,6 +136,52 @@ impl CodeQueryResultValue {
                     ])
                 },
             }),
+            Self::ResultSubjectUse { value } => {
+                let partition = value
+                    .origin
+                    .as_ref()
+                    .map_or(value.id.as_str(), |origin| origin.id.as_str());
+                let extent = match value.outcome {
+                    CodeQueryResultSubjectOutcome::Unsupported => {
+                        CodeQueryRowCoverageExtent::Unsupported {
+                            capability: Box::from(RESULT_SUBJECT_USE_CAPABILITY),
+                        }
+                    }
+                    CodeQueryResultSubjectOutcome::Cancelled => {
+                        CodeQueryRowCoverageExtent::incomplete(vec![
+                            CodeQueryDiagnosticCode::Cancelled,
+                        ])
+                    }
+                    CodeQueryResultSubjectOutcome::BudgetExhausted => {
+                        CodeQueryRowCoverageExtent::incomplete(vec![
+                            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                        ])
+                    }
+                    CodeQueryResultSubjectOutcome::MissingOrigin
+                    | CodeQueryResultSubjectOutcome::RepeatableOrigin
+                    | CodeQueryResultSubjectOutcome::Ambiguous
+                    | CodeQueryResultSubjectOutcome::UncertainReceiver
+                    | CodeQueryResultSubjectOutcome::Incomplete => {
+                        CodeQueryRowCoverageExtent::incomplete(vec![
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        ])
+                    }
+                    CodeQueryResultSubjectOutcome::Proven
+                        if value.origin.is_some() && value.completeness == "complete" =>
+                    {
+                        CodeQueryRowCoverageExtent::Exhaustive
+                    }
+                    CodeQueryResultSubjectOutcome::Proven => {
+                        CodeQueryRowCoverageExtent::incomplete(vec![
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        ])
+                    }
+                };
+                Some(CodeQueryRowCoverage {
+                    partition: Box::from(partition),
+                    extent,
+                })
+            }
             // A shape the lowering could not read suppresses every row family
             // derived from it; no larger budget recovers those rows, which is
             // why this is unsupported rather than incomplete (#1949).
@@ -231,6 +277,7 @@ impl CodeQueryResultValue {
 /// The capability a consumer names when a producer refused to describe a row
 /// set rather than describing part of it.
 pub const SUPPRESSED_ROW_SET_CAPABILITY: &str = "suppressed_row_set";
+pub const RESULT_SUBJECT_USE_CAPABILITY: &str = "normal_result_subject_uses";
 
 /// The capability a consumer names when a value-flow solve could not run at all
 /// for the selected input.

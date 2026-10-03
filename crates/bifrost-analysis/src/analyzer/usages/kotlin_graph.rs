@@ -560,8 +560,19 @@ mod tests {
         );
     }
 
+    /// An empty selected file is scanned, not omitted.
+    ///
+    /// An empty source parses to a childless root and contributes no edges,
+    /// which is an exact per-file result rather than a missing one. This test
+    /// used to assert the opposite -- that `Empty.kt` made the graph
+    /// uncacheable -- because the on-demand parse refused an empty source. Every
+    /// language on the completeness-tracking driver then refused its whole graph
+    /// over an empty file, which is how `usage_graph` came to fail on any Python
+    /// package with an empty `__init__.py`. The driver's genuine fail-closed
+    /// behavior, on a file whose scan really did produce nothing, is pinned by
+    /// `inverted_edges::tests::incomplete_file_results_are_observable_and_never_published`.
     #[test]
-    fn kotlin_inbound_bulk_build_fails_closed_on_selected_parse_miss() {
+    fn kotlin_inbound_bulk_build_scans_an_empty_selected_file() {
         let fixture = inline_project::InlineTestProject::with_language(Language::Kotlin)
             .file(
                 "Service.kt",
@@ -581,15 +592,10 @@ mod tests {
         let result =
             build_inbound_kotlin_usage_edges_with_completeness(&analyzer, scope.token(), &callees)
                 .expect("active query cancellation should permit the Kotlin bulk build");
-        let UsageEdgeBuildResult::Uncacheable {
-            output,
-            omitted_files,
-        } = result
-        else {
-            panic!("an empty selected file must make the graph uncacheable");
+        let UsageEdgeBuildResult::Complete(edges) = result else {
+            panic!("an empty selected file must not make the graph uncacheable");
         };
-        assert_eq!(omitted_files, vec![fixture.file("Empty.kt")]);
-        assert!(output.edges.contains_key(&(
+        assert!(edges.edges.contains_key(&(
             "app.Consumer.call".to_string(),
             "api.Service.run".to_string()
         )));
@@ -627,11 +633,11 @@ mod tests {
             ))
             .unwrap();
         }
-
         let project = TestProject::new(root, Language::Kotlin);
-        let analyzer = KotlinAnalyzer::new(Arc::new(project.clone()));
+        let mut analyzer = KotlinAnalyzer::new(Arc::new(project.clone()));
         let warm_file = ProjectFile::new(project.root().to_path_buf(), "C0.kt");
 
+        analyzer.clear_retained_file_states_for_test();
         analyzer.reset_full_hydration_count_for_test();
         assert!(!analyzer.declarations(&warm_file).is_empty());
         let lru_after_warm = analyzer.full_hydration_count_for_test();

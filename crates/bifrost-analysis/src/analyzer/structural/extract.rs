@@ -5,14 +5,14 @@
 //! returning — only the flat fact arena survives, mirroring how the usage
 //! inverted-edge builders treat their per-file trees.
 
-use super::facts::{FileFacts, NormalizedNode};
-use super::kinds::NormalizedKind;
-use super::occurrences::OccurrenceRole;
-use super::spec::{CompiledKinds, RoleSink, RoleSinkStop, StructuralSpec};
+use super::facts::FileFacts;
+use super::spec::{CompiledKinds, StructuralSpec};
 use crate::cancellation::CancellationToken;
-use crate::compact_graph::CompactRowsBuilder;
 use crate::hash::HashMap;
-use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
+use brokk_bifrost_core::analyzer::structural::collector::{
+    StructuralFactCollector, StructuralFactCollectorStop,
+};
 use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser};
 
 #[derive(Debug)]
@@ -31,15 +31,6 @@ pub(crate) enum LimitedFileFacts {
     },
     Cancelled,
     Unavailable,
-}
-
-fn node_range(node: Node<'_>) -> crate::analyzer::Range {
-    crate::analyzer::Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
 }
 
 /// Parse `source` with `grammar` and extract normalized facts through `spec`.
@@ -174,13 +165,20 @@ fn extract_file_facts_limited_with_tree(
     // call shapes depend on file-wide facts (C/C++ function-like macros) reads
     // the whole tree once here instead of once per call.
     let call_site_context = spec.call_site_context(tree.root_node(), source);
+    let mut source_facts = PrimarySourceFactCollector::new(source);
 
-    // Pass 1: create facts in pre-order with parent links, and remember which
-    // tree-sitter node produced each fact so pass 2 can resolve role targets.
-    let mut nodes: Vec<NormalizedNode> = Vec::new();
-    let mut fact_by_ts_node: HashMap<usize, u32> = HashMap::default();
-    let mut fact_sources: Vec<Option<Node<'_>>> = Vec::new();
-    let mut embedded_occurrence_roles = Vec::new();
+    // The parser and the iterative walk remain language-owned. The collector
+    // assembles rows at each event and retains exact AST node keys for role
+    // targets until the walk is complete.
+    let mut collector = StructuralFactCollector::new(
+        spec,
+        source,
+        &call_site_context,
+        brokk_bifrost_core::analyzer::tree_walk::ParentIndex::unindexed(),
+        max_fact_nodes,
+        cancellation,
+    );
+    let mut node_ids = include_node_index.then(HashMap::default);
 
     enum ExtractionFrame<'tree> {
         Enter(Node<'tree>, Option<u32>),
@@ -193,101 +191,47 @@ fn extract_file_facts_limited_with_tree(
         }
         match frame {
             ExtractionFrame::Enter(node, enclosing) => {
+                collector.record_children(node);
                 let mut parent_for_children = enclosing;
                 if node.is_named()
                     && let Some(kind) = compiled.kind_of(&node)
                     && spec.should_extract(node, kind)
                 {
-                    if nodes.len() == max_fact_nodes {
-                        return LimitedFileFacts::Exceeded {
-                            minimum_fact_nodes: max_fact_nodes.saturating_add(1),
-                        };
-                    }
                     let kind = spec.refine_kind(
                         node,
                         kind,
-                        enclosing.map(|id| nodes[id as usize].kind),
+                        enclosing.map(|id| collector.normalized_kind(id)),
                         source,
                         &call_site_context,
                     );
-                    let fact_id = nodes.len() as u32;
-                    let boolean_value = if kind == NormalizedKind::BooleanLiteral {
-                        let value = spec.boolean_literal_value(node);
-                        assert!(
-                            !spec.supports_boolean_literal_value() || value.is_some(),
-                            "{} structural adapter declares boolean-literal value support but grammar node {} has no exact value",
-                            spec.language().config_label(),
-                            node.grammar_name()
-                        );
-                        value
-                    } else {
-                        None
-                    };
-                    nodes.push(NormalizedNode {
-                        kind,
-                        boolean_value,
-                        construct: spec.generator_construct(node, kind).map(str::to_owned),
-                        range: node_range(node),
-                        parent: enclosing,
-                        name: None,
-                        subtree_end: fact_id + 1,
-                        call_site: (kind == NormalizedKind::Call)
-                            .then(|| spec.call_site_facts(node, source, &call_site_context))
-                            .flatten(),
-                    });
-                    fact_by_ts_node.insert(node.id(), fact_id);
-                    fact_sources.push(Some(node));
-                    parent_for_children = Some(fact_id);
-
-                    let embedded = spec.embedded_leaf_facts(node, kind, source, cancellation);
-                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                        return LimitedFileFacts::Cancelled;
-                    }
-                    let anchor = node_range(node);
-                    let mut previous_end = anchor.start_byte;
-                    for fact in embedded {
-                        assert!(
-                            fact.range.start_byte < fact.range.end_byte
-                                && anchor.start_byte <= fact.range.start_byte
-                                && fact.range.end_byte <= anchor.end_byte
-                                && (anchor.start_byte < fact.range.start_byte
-                                    || fact.range.end_byte < anchor.end_byte),
-                            "embedded fact range {:?} must be nonempty and contained by anchor {:?}",
-                            fact.range,
-                            anchor
-                        );
-                        assert!(
-                            fact.range.start_byte >= previous_end,
-                            "embedded facts must be ordered and non-overlapping: previous end {previous_end}, next {:?}",
-                            fact.range
-                        );
-                        assert!(
-                            source.is_char_boundary(fact.range.start_byte)
-                                && source.is_char_boundary(fact.range.end_byte),
-                            "embedded fact range {:?} must use UTF-8 boundaries",
-                            fact.range
-                        );
-                        if nodes.len() == max_fact_nodes {
+                    let fact_id = match collector.enter(node, kind, enclosing, &mut source_facts) {
+                        Ok(fact_id) => fact_id,
+                        Err(StructuralFactCollectorStop::Exceeded) => {
                             return LimitedFileFacts::Exceeded {
                                 minimum_fact_nodes: max_fact_nodes.saturating_add(1),
                             };
                         }
-                        let embedded_id = nodes.len() as u32;
-                        nodes.push(NormalizedNode {
-                            kind: fact.kind,
-                            boolean_value: None,
-                            construct: None,
-                            range: fact.range,
-                            parent: Some(fact_id),
-                            name: None,
-                            subtree_end: embedded_id + 1,
-                            // An embedded leaf fact is never a call site.
-                            call_site: None,
-                        });
-                        fact_sources.push(None);
-                        embedded_occurrence_roles.push((embedded_id, fact.occurrence_role));
-                        previous_end = fact.range.end_byte;
+                        Err(StructuralFactCollectorStop::Cancelled) => {
+                            return LimitedFileFacts::Cancelled;
+                        }
+                    };
+                    if let Some(node_ids) = node_ids.as_mut() {
+                        assert!(node_ids.insert(node.id(), fact_id).is_none());
                     }
+                    let mut sink = collector.role_sink(&mut source_facts);
+                    spec.extract(node, kind, &mut sink);
+                    match collector.accept_roles(fact_id, sink.into_parts()) {
+                        Ok(()) => {}
+                        Err(StructuralFactCollectorStop::Exceeded) => {
+                            return LimitedFileFacts::Exceeded {
+                                minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+                            };
+                        }
+                        Err(StructuralFactCollectorStop::Cancelled) => {
+                            return LimitedFileFacts::Cancelled;
+                        }
+                    }
+                    parent_for_children = Some(fact_id);
                 }
                 // Push the children through one cursor rather than indexing
                 // them. `Node::named_child(i)` walks the child list from the
@@ -305,94 +249,19 @@ fn extract_file_facts_limited_with_tree(
         }
     }
 
-    for fact_id in (0..nodes.len()).rev() {
-        if let Some(parent) = nodes[fact_id].parent {
-            let subtree_end = nodes[fact_id].subtree_end;
-            let parent = &mut nodes[parent as usize];
-            parent.subtree_end = parent.subtree_end.max(subtree_end);
+    let rows = match collector.finish() {
+        Ok(rows) => rows,
+        Err(StructuralFactCollectorStop::Exceeded) => {
+            return LimitedFileFacts::Exceeded {
+                minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+            };
         }
-    }
+        Err(StructuralFactCollectorStop::Cancelled) => return LimitedFileFacts::Cancelled,
+    };
 
-    // Pass 2: role extraction, now that every normalized node has a fact id.
-    // Nodes and roles share one admission limit because both are durable facts
-    // scanned by later CodeQuery steps.
-    let max_roles = max_fact_nodes.saturating_sub(nodes.len());
-    let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), 0);
-    // Occurrence roles are addressed by the classified node, which is not
-    // necessarily the fact currently being extracted. Embedded leaf facts
-    // already carry their classifications because their secondary parse trees
-    // do not survive pass one. All classifications are gathered flat and
-    // bucketed below.
-    let mut occurrence_roles: Vec<(u32, OccurrenceRole)> = embedded_occurrence_roles;
-    // One parent index for the whole file. Specs ask what encloses a node on
-    // essentially every fact, and `Node::parent` re-descends from the root each
-    // time, which is quadratic over a large file.
-    let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
-    for (fact_id, source_node) in fact_sources.into_iter().enumerate() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return LimitedFileFacts::Cancelled;
-        }
-        debug_assert_eq!(fact_id, roles.rows());
-        if let Some(node) = source_node {
-            let kind = nodes[fact_id].kind;
-            let mut sink = RoleSink::new(
-                &fact_by_ts_node,
-                roles.values_mut(),
-                &mut occurrence_roles,
-                max_roles,
-                cancellation,
-                &parents,
-            );
-            spec.extract(node, kind, &mut sink);
-            let (name, stop) = sink.into_parts();
-            match stop {
-                Some(RoleSinkStop::Exceeded) => {
-                    return LimitedFileFacts::Exceeded {
-                        minimum_fact_nodes: max_fact_nodes.saturating_add(1),
-                    };
-                }
-                Some(RoleSinkStop::Cancelled) => return LimitedFileFacts::Cancelled,
-                None => {}
-            }
-            nodes[fact_id].name = name;
-        }
-        roles.finish_row();
-    }
-
-    // Bucket the flat classifications into one row per node. Adapters classify
-    // a node from its own extraction call in the common case, so this is
-    // already sorted and the sort is near-free; a parent classifying a child is
-    // equally admissible and lands in the right row either way.
-    occurrence_roles.sort_unstable();
-    occurrence_roles.dedup();
-    let mut occurrence_rows =
-        CompactRowsBuilder::with_capacity(nodes.len(), occurrence_roles.len());
-    let mut next = 0usize;
-    for fact_id in 0..nodes.len() as u32 {
-        while occurrence_roles
-            .get(next)
-            .is_some_and(|&(node, _)| node == fact_id)
-        {
-            occurrence_rows.values_mut().push(occurrence_roles[next].1);
-            next += 1;
-        }
-        occurrence_rows.finish_row();
-    }
-    debug_assert_eq!(next, occurrence_roles.len());
-
-    let line_starts = compute_line_starts(source);
-    let facts = FileFacts::new(
-        source.to_string(),
-        line_starts,
-        nodes,
-        roles.finish(),
-        occurrence_rows.finish(),
-    );
-    if include_node_index {
-        LimitedFileFacts::CompleteWithNodeIndex {
-            facts,
-            node_ids: fact_by_ts_node,
-        }
+    let facts = FileFacts::from_source_and_rows(source.to_string(), source_facts.finish(), rows);
+    if let Some(node_ids) = node_ids {
+        LimitedFileFacts::CompleteWithNodeIndex { facts, node_ids }
     } else {
         LimitedFileFacts::Complete(facts)
     }
@@ -400,6 +269,7 @@ fn extract_file_facts_limited_with_tree(
 
 #[cfg(test)]
 mod tests {
+    use super::super::occurrences::OccurrenceRole;
     use super::*;
 
     /// #1459: an empty file is a legitimate workspace member with zero facts
@@ -419,6 +289,34 @@ mod tests {
         let decoded = FileFacts::from_persisted_rows(String::new(), rows)
             .expect("empty relational facts hydrate");
         assert_eq!(decoded.work_item_count(), 0);
+    }
+
+    #[test]
+    fn role_target_to_forward_child_resolves_after_one_collection_walk() {
+        use super::super::kinds::{NormalizedKind, Role};
+
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let source = "def call(value):\n    return target(value)\n";
+        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
+        let call_id = facts
+            .nodes()
+            .iter()
+            .position(|node| node.kind == NormalizedKind::Call)
+            .expect("call fact") as u32;
+        let callee = facts
+            .role_targets(call_id, Role::Callee)
+            .next()
+            .expect("callee role");
+        let target_id = callee.node.expect("callee identifier is normalized");
+
+        assert!(target_id > call_id, "callee is a forward child fact");
+        assert_eq!(facts.node(target_id).kind, NormalizedKind::Identifier);
+        assert_eq!(callee.span.text(source), "target");
+        assert_eq!(
+            facts.node(call_id).name.map(|span| span.text(source)),
+            Some("target")
+        );
     }
 
     /// An adapter must emit only the occurrence roles its table declares: a

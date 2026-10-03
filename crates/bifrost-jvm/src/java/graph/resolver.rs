@@ -9,10 +9,14 @@ use super::return_type::{
     method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
 use crate::java::graph_support::{
-    JavaSource, normalize_java_type_text, resolve_java_usage_type_components_in,
+    JavaSource, java_callable_facts, normalize_java_type_text,
+    resolve_java_usage_type_components_in,
 };
-use crate::java::hierarchy::java_nearest_declaring_ancestors;
-use brokk_bifrost_core::analyzer::model::{CallableArity, CodeUnit, Language, ProjectFile};
+use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
+use crate::java::imports::static_import_path;
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CodeUnit, Language, ProjectFile, SignatureMetadata,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -52,24 +56,33 @@ impl TargetSpec {
             return Some(TargetKind::Type);
         }
         let owner = analyzer.parent_of(target)?;
-        Some(if target.is_field() {
-            TargetKind::Field
-        } else if target.identifier() == owner.identifier() {
-            TargetKind::Constructor
+        let kind = if target.is_field() {
+            Some(TargetKind::Field)
         } else {
-            TargetKind::Method
-        })
+            let facts = java_callable_facts(analyzer, target)?;
+            Some(if facts.is_constructor {
+                TargetKind::Constructor
+            } else {
+                TargetKind::Method
+            })
+        };
+        kind.filter(|_| owner.is_class())
     }
 
     pub fn from_targets(analyzer: &dyn JavaSource, targets: &[CodeUnit]) -> Option<Self> {
         let mut spec = Self::from_target(analyzer, targets.first()?)?;
-        spec.targets.extend(targets.iter().cloned());
         if let Some(arities) = spec.callable_arities.as_mut() {
             for target in &targets[1..] {
                 if target.fq_name() == spec.target.fq_name() && target.is_function() {
-                    arities.insert(java_callable_arity(analyzer, target));
+                    let facts = java_callable_facts(analyzer, target)?;
+                    if facts.is_constructor == (spec.kind == TargetKind::Constructor) {
+                        spec.targets.insert(target.clone());
+                        arities.insert(facts.arity);
+                    }
                 }
             }
+        } else {
+            spec.targets.extend(targets.iter().cloned());
         }
         Some(spec)
     }
@@ -96,8 +109,11 @@ impl TargetSpec {
             receiver_owner_fq_names: HashSet::from_iter([owner.fq_name()]),
             owner,
             member_name: target.identifier().to_string(),
-            callable_arities: (kind == TargetKind::Method || kind == TargetKind::Constructor)
-                .then(|| HashSet::from_iter([java_callable_arity(analyzer, target)])),
+            callable_arities: if kind == TargetKind::Method || kind == TargetKind::Constructor {
+                Some(HashSet::from_iter([java_callable_arity(analyzer, target)?]))
+            } else {
+                None
+            },
         })
     }
 }
@@ -134,39 +150,51 @@ pub fn java_method_signatures_match(
     target: &CodeUnit,
     candidate: &CodeUnit,
 ) -> bool {
+    let Some(target_facts) = java_callable_facts(analyzer, target) else {
+        return false;
+    };
+    let Some(candidate_facts) = java_callable_facts(analyzer, candidate) else {
+        return false;
+    };
+    if target_facts.is_constructor != candidate_facts.is_constructor
+        || target_facts.is_static != candidate_facts.is_static
+    {
+        return false;
+    }
     match (target.signature(), candidate.signature()) {
         (Some(target), Some(candidate)) => {
             normalize_java_signature(target) == normalize_java_signature(candidate)
         }
-        _ => java_callable_arity(analyzer, target) == java_callable_arity(analyzer, candidate),
+        _ => {
+            target_facts.arity == candidate_facts.arity
+                && match (
+                    &target_facts.parameter_types,
+                    &candidate_facts.parameter_types,
+                ) {
+                    (Some(target), Some(candidate)) => target == candidate,
+                    _ => true,
+                }
+        }
     }
 }
 
-pub fn java_callable_arity(analyzer: &dyn JavaSource, unit: &CodeUnit) -> CallableArity {
-    analyzer
-        .signature_metadata(unit)
-        .first()
-        .and_then(|metadata| metadata.callable_arity())
-        .unwrap_or_else(|| CallableArity::exact(signature_arity(unit.signature())))
+pub fn java_callable_arity(analyzer: &dyn JavaSource, unit: &CodeUnit) -> Option<CallableArity> {
+    java_callable_facts(analyzer, unit).map(|facts| facts.arity)
+}
+
+/// The declared type of a field, when every canonical metadata alternative
+/// agrees on the source-owned value. Missing or disagreeing alternatives are
+/// unavailable; callers must not recover the type from a rendered signature.
+pub fn java_field_type_text_from_metadata(metadata: &[SignatureMetadata]) -> Option<String> {
+    let first = metadata.first()?.return_type_text()?;
+    metadata
+        .iter()
+        .all(|alternative| alternative.return_type_text() == Some(first))
+        .then(|| first.to_owned())
 }
 
 fn normalize_java_signature(signature: &str) -> String {
     signature.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-
-pub fn signature_arity(signature: Option<&str>) -> usize {
-    let Some(signature) = signature else {
-        return 0;
-    };
-    let inner = signature
-        .strip_prefix('(')
-        .and_then(|rest| rest.strip_suffix(')'))
-        .unwrap_or(signature)
-        .trim();
-    if inner.is_empty() {
-        return 0;
-    }
-    inner.split(',').count()
 }
 
 pub fn seed_class_binding(
@@ -211,7 +239,9 @@ impl JavaReturnTypeContext for ScanCtx<'_> {
             .structural_members(owner.fq(), name)
             .into_iter()
             .filter(|unit| {
-                unit.is_function() && java_callable_arity(self.java, unit).accepts(arity)
+                unit.is_function()
+                    && java_callable_arity(self.java, unit)
+                        .is_none_or(|declared| declared.accepts(arity))
             })
             .collect()
     }
@@ -367,7 +397,9 @@ fn java_field_declared_type(
 ) -> Option<CodeUnit> {
     match field_type_in_member_scope(owner, token, field, ctx) {
         FieldTypeResolution::Resolved(resolved) => Some(resolved),
-        FieldTypeResolution::NotDeclared | FieldTypeResolution::Unresolved => None,
+        FieldTypeResolution::NotDeclared
+        | FieldTypeResolution::Unresolved
+        | FieldTypeResolution::Unavailable => None,
     }
 }
 
@@ -379,6 +411,7 @@ enum FieldTypeResolution {
     NotDeclared,
     Resolved(CodeUnit),
     Unresolved,
+    Unavailable,
 }
 
 fn directly_declared_field_type(
@@ -391,13 +424,9 @@ fn directly_declared_field_type(
     let Some(unit) = candidates.iter().find(|unit| unit.is_field()) else {
         return FieldTypeResolution::NotDeclared;
     };
-    let Some(declared) = ctx
-        .java
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|metadata| metadata.return_type_text().map(str::to_owned))
-    else {
-        return FieldTypeResolution::Unresolved;
+    let metadata = ctx.java.signature_metadata(unit);
+    let Some(declared) = java_field_type_text_from_metadata(&metadata) else {
+        return FieldTypeResolution::Unavailable;
     };
     let spelled = normalize_java_type_text(&declared);
     // The declaration's own lexical chain binds a simple name first -- a
@@ -436,15 +465,20 @@ fn field_type_in_member_scope(
         return direct;
     }
     let Some(provider) = ctx.graph.hierarchy else {
-        return FieldTypeResolution::NotDeclared;
+        return FieldTypeResolution::Unavailable;
     };
-    let Some(declaring) = java_nearest_declaring_ancestors(ctx.java, provider, owner, |ancestor| {
-        matches!(
-            directly_declared_field_type(ancestor, token, field, ctx),
-            FieldTypeResolution::Resolved(_) | FieldTypeResolution::Unresolved
-        )
-    }) else {
-        return FieldTypeResolution::NotDeclared;
+    let declaring = match java_nearest_declaring_ancestors(ctx.java, provider, owner, |ancestor| {
+        match directly_declared_field_type(ancestor, token, field, ctx) {
+            FieldTypeResolution::NotDeclared => Ok(false),
+            FieldTypeResolution::Resolved(_) | FieldTypeResolution::Unresolved => Ok(true),
+            FieldTypeResolution::Unavailable => Err(JavaHierarchyFactError::MetadataUnavailable),
+        }
+    }) {
+        Ok(Some(declaring)) => declaring,
+        Ok(None) => return FieldTypeResolution::NotDeclared,
+        Err(JavaHierarchyFactError::MetadataUnavailable) => {
+            return FieldTypeResolution::Unavailable;
+        }
     };
     let [declaring] = declaring.as_slice() else {
         return FieldTypeResolution::Unresolved;
@@ -476,7 +510,7 @@ fn implicit_field_value_type(
         match field_type_in_member_scope(&owner, token, field, ctx) {
             FieldTypeResolution::NotDeclared => {}
             FieldTypeResolution::Resolved(resolved) => return Some(resolved),
-            FieldTypeResolution::Unresolved => return None,
+            FieldTypeResolution::Unresolved | FieldTypeResolution::Unavailable => return None,
         }
     }
     None
@@ -564,12 +598,14 @@ fn receiver_type_matches_target_uncached(
         {
             return ReceiverTargetMatch::Unresolved;
         }
-        if nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
+        match nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
             java_owner_declares_matching_method(ctx, ancestor, &ctx.spec.target)
-        })
-        .unwrap_or(false)
-        {
-            return ReceiverTargetMatch::Matched;
+        }) {
+            Ok(Some(true)) => return ReceiverTargetMatch::Matched,
+            Ok(Some(false)) | Ok(None) => {}
+            Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                return ReceiverTargetMatch::Unresolved;
+            }
         }
     }
     if ctx.spec.kind == TargetKind::Field {
@@ -577,13 +613,16 @@ fn receiver_type_matches_target_uncached(
         // `shared` its nearest declaring supertype declares. A field the
         // receiver's own type declares hides that one (JLS 8.3), so it is a
         // different field with the same spelling.
-        if !owner_declares_target_field(receiver_type, token, ctx)
-            && nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
+        if !owner_declares_target_field(receiver_type, token, ctx) {
+            match nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
                 owner_declares_target_field(ancestor, token, ctx)
-            })
-            .unwrap_or(false)
-        {
-            return ReceiverTargetMatch::Matched;
+            }) {
+                Ok(Some(true)) => return ReceiverTargetMatch::Matched,
+                Ok(Some(false)) | Ok(None) => {}
+                Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                    return ReceiverTargetMatch::Unresolved;
+                }
+            }
         }
     }
     ReceiverTargetMatch::Incompatible
@@ -594,15 +633,24 @@ fn java_owner_declares_same_arity_overload(
     owner: &CodeUnit,
     target: &CodeUnit,
 ) -> bool {
-    let target_arity = java_callable_arity(ctx.java, target);
-    ctx.graph
-        .structural_members(owner.fq(), target.identifier())
-        .iter()
-        .any(|unit| {
-            unit.is_function()
-                && java_callable_arity(ctx.java, unit) == target_arity
-                && !java_method_signatures_match(ctx.java, target, unit)
-        })
+    let members = ctx
+        .graph
+        .structural_members(owner.fq(), target.identifier());
+    let Some(target_arity) = java_callable_arity(ctx.java, target) else {
+        // A same-named callable whose canonical arity is unavailable keeps
+        // the receiver decision structured-but-unproven instead of claiming
+        // that no overload exists.
+        return members.iter().any(CodeUnit::is_function);
+    };
+    members.iter().any(|unit| {
+        if !unit.is_function() {
+            return false;
+        }
+        let Some(candidate_arity) = java_callable_arity(ctx.java, unit) else {
+            return true;
+        };
+        candidate_arity == target_arity && !java_method_signatures_match(ctx.java, target, unit)
+    })
 }
 
 fn method_invocation_anonymous_return_match(
@@ -665,33 +713,22 @@ pub fn has_proven_static_import(token: QueryToken<'_>, ctx: &ScanCtx<'_>) -> boo
     let target_fq_name = ctx.spec.owner.fq_name();
     let mut target_visible = false;
 
-    for import in (ctx.graph.import_statements)(ctx.file) {
-        let trimmed = import.trim();
-        if !trimmed.starts_with("import static ") {
+    for import in ctx.java.import_info_of(token, ctx.file) {
+        let Some(path) = static_import_path(&import) else {
             continue;
-        }
-        let path = trimmed
-            .strip_prefix("import static ")
-            .unwrap_or(trimmed)
-            .trim_end_matches(';')
-            .trim();
+        };
 
-        if let Some(owner) = path.strip_suffix(".*") {
+        if import.is_wildcard {
+            let owner = path.render_segments(".");
             if owner == target_fq_name {
                 target_visible = true;
-            } else if java_static_import_owner_matches_target(owner, token, ctx) {
+            } else if java_static_import_owner_matches_target(&owner, token, ctx) {
                 return false;
             }
             continue;
         }
 
-        // `path` is a raw `import static a.b.C.member;` statement's dotted
-        // target text; Java identifiers never contain a literal `.`, so
-        // re-tokenizing with the shared structured splitter and rejoining
-        // every part but the last with the same `.` reproduces
-        // `rsplit_once('.')`'s (owner, member) split exactly.
-        let segments = parse_symbol_path(Language::Java, path);
-        let Some((member, owner_parts)) = segments.split_last() else {
+        let Some((member, owner_parts)) = path.segments.split_last() else {
             continue;
         };
         if owner_parts.is_empty() {
@@ -742,29 +779,34 @@ fn java_static_import_callable_matches_target(candidate: &CodeUnit, ctx: &ScanCt
     let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
         return false;
     };
-    let candidate_arity = java_callable_arity(ctx.java, candidate);
-    expected_arities.contains(&candidate_arity)
+    java_callable_arity(ctx.java, candidate)
+        .is_none_or(|candidate_arity| expected_arities.contains(&candidate_arity))
 }
 
 pub fn bare_method_context_matches_target(
     node: Node<'_>,
     _token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
-) -> bool {
+) -> ReceiverTargetMatch {
     let context = enclosing_context(node, ctx);
     let Some(owner) = context.owner.as_ref() else {
-        return false;
+        return ReceiverTargetMatch::Unresolved;
     };
     if owner.fq_name() == ctx.spec.owner.fq_name() {
-        return true;
+        return ReceiverTargetMatch::Matched;
     }
     if java_owner_declares_matching_method(ctx, owner, &ctx.spec.target) {
-        return false;
+        return ReceiverTargetMatch::Incompatible;
     }
-    nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
+    match nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
         java_owner_declares_matching_method(ctx, ancestor, &ctx.spec.target)
-    })
-    .unwrap_or(false)
+    }) {
+        Ok(Some(true)) => ReceiverTargetMatch::Matched,
+        Ok(Some(false)) => ReceiverTargetMatch::Incompatible,
+        Ok(None) | Err(JavaHierarchyFactError::MetadataUnavailable) => {
+            ReceiverTargetMatch::Unresolved
+        }
+    }
 }
 
 /// Whether a bare (simple-name) field read at `node` binds to the target field.
@@ -785,13 +827,16 @@ pub fn bare_field_context_matches_target(
     node: Node<'_>,
     token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
-) -> bool {
+) -> ReceiverTargetMatch {
     let context = enclosing_context(node, ctx);
     let mut scope = context.owner.clone();
+    if scope.is_none() {
+        return ReceiverTargetMatch::Unresolved;
+    }
     let mut visited = HashSet::default();
     while let Some(owner) = scope {
         if !visited.insert(owner.fq_name()) {
-            return false;
+            return ReceiverTargetMatch::Unresolved;
         }
         scope = ctx.java.parent_of(&owner);
         // An anonymous or local class is indexed under the method that writes
@@ -801,18 +846,26 @@ pub fn bare_field_context_matches_target(
             continue;
         }
         if owner.fq_name() == ctx.spec.owner.fq_name() {
-            return true;
+            return ReceiverTargetMatch::Matched;
         }
         if owner_declares_target_field(&owner, token, ctx) {
-            return false;
+            return ReceiverTargetMatch::Incompatible;
         }
-        if let Some(matched) = nearest_declaring_ancestor_matches_target(ctx, &owner, |ancestor| {
+        match nearest_declaring_ancestor_matches_target(ctx, &owner, |ancestor| {
             owner_declares_target_field(ancestor, token, ctx)
         }) {
-            return matched;
+            Ok(Some(true)) => return ReceiverTargetMatch::Matched,
+            Ok(Some(false)) => return ReceiverTargetMatch::Incompatible,
+            Ok(None) => {}
+            Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                return ReceiverTargetMatch::Unresolved;
+            }
         }
     }
-    false
+    // Every known lexical member scope was exhausted. This is a negative
+    // lexical result, distinct from unavailable hierarchy evidence above;
+    // a caller can still establish the field through a static import.
+    ReceiverTargetMatch::Incompatible
 }
 
 fn owner_declares_target_field(
@@ -831,16 +884,23 @@ fn owner_declares_target_field(
 /// `Some(false)` when that level declares something else, and `None` when no
 /// ancestor declares the name at all. The caller distinguishes the last case
 /// because a lexical search continues outward only when the whole member scope
-/// -- inherited members included -- says nothing.
+/// -- inherited members included -- says nothing. A missing hierarchy provider
+/// is unavailable rather than `None`: without that provider, an inner scope
+/// might hide the target through an inherited declaration that cannot be read.
 fn nearest_declaring_ancestor_matches_target(
     ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
-    declares_target_member: impl FnMut(&CodeUnit) -> bool,
-) -> Option<bool> {
-    let provider = ctx.graph.hierarchy?;
-    let preferred =
-        java_nearest_declaring_ancestors(ctx.java, provider, owner, declares_target_member)?;
-    Some(preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name())
+    mut declares_target_member: impl FnMut(&CodeUnit) -> bool,
+) -> Result<Option<bool>, JavaHierarchyFactError> {
+    let Some(provider) = ctx.graph.hierarchy else {
+        return Err(JavaHierarchyFactError::MetadataUnavailable);
+    };
+    let preferred = java_nearest_declaring_ancestors(ctx.java, provider, owner, |ancestor| {
+        Ok(declares_target_member(ancestor))
+    })?;
+    Ok(preferred.map(|preferred| {
+        preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name()
+    }))
 }
 
 pub fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
@@ -1329,22 +1389,37 @@ fn method_return_type_for_call(
         {
             vec![cache_key.owner_fqn.clone()]
         } else {
-            ctx.graph
-                .hierarchy
-                .and_then(|provider| {
-                    java_nearest_declaring_ancestors(ctx.java, provider, owner, |ancestor| {
-                        !java_call_answering_units(
-                            &ancestor.fq_name(),
-                            token,
-                            method_name,
-                            arity,
-                            ctx,
-                        )
-                        .is_empty()
-                    })
-                })
-                .map(|declaring| declaring.iter().map(CodeUnit::fq_name).collect())
-                .unwrap_or_default()
+            match ctx.graph.hierarchy {
+                None => Vec::new(),
+                Some(provider) => {
+                    let declaring = match java_nearest_declaring_ancestors(
+                        ctx.java,
+                        provider,
+                        owner,
+                        |ancestor| {
+                            Ok(!java_call_answering_units(
+                                &ancestor.fq_name(),
+                                token,
+                                method_name,
+                                arity,
+                                ctx,
+                            )
+                            .is_empty())
+                        },
+                    ) {
+                        Ok(Some(declaring)) => declaring,
+                        Ok(None) => Vec::new(),
+                        Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                            let outcome = ReceiverAnalysisOutcome::Unknown;
+                            ctx.method_call_return_cache
+                                .borrow_mut()
+                                .insert(cache_key, outcome);
+                            return None;
+                        }
+                    };
+                    declaring.iter().map(CodeUnit::fq_name).collect()
+                }
+            }
         };
     let outcome = method_return_type_for_owner_fqns(
         declaring_owners.iter().map(String::as_str),

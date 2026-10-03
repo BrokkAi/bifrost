@@ -158,6 +158,9 @@ impl<'a> UnitReuse<'a> {
     /// store that cannot answer has said nothing about what was published, so
     /// the policy widens instead of reading its silence as absence.
     pub(crate) fn prefetch(&self, keys: &[PolicyUnitKey]) -> Result<(), WidenReason> {
+        if !self.incremental.reuses_existing() {
+            return Ok(());
+        }
         if let Err(error) = self
             .incremental
             .store()
@@ -184,6 +187,9 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
+        if !self.incremental.reuses_existing() {
+            return Ok(None);
+        }
         let store = self.incremental.store().borrow();
         let Some(unit) = store.lookup(key) else {
             return Ok(None);

@@ -7,8 +7,10 @@ prebuilt semantic-model packs. Most applications should depend on
 The generic pack model, compiler, catalog, activation logic, and analyzer
 overlays live in
 [`brokk-bifrost-analysis`](https://crates.io/crates/brokk-bifrost-analysis).
-This crate is reserved for reviewed content shipped by Bifrost and the tooling
-used to build and distribute that content. Analyzer consumers can omit it and
+Open semantic packs and policy rules are authored, generated, and released in
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). This crate retains
+engine-side compilation, verification, installation, and authoring tooling,
+plus existing embedded content during the v0.13.0 transition. Analyzer consumers can omit it and
 register their own packs.
 
 Semantic-model packs describe API facts that are unavailable from workspace
@@ -16,31 +18,28 @@ source, declarative facts produced by frameworks or generators, and reviewed
 external procedure behavior. They are versioned data artifacts: packs do not
 contain executable code, and installing one does not implicitly select the
 newest available content. Generic analysis, explicit catalog activation, and
-direct consumers of this crate remain network-free; the released
-`brokk-bifrost` facade has a separate exact-production acquisition path.
+direct consumers of this crate remain network-free. Host plugins acquire
+compatible qualified releases into a persistent cache before runtime activation.
 
 See the
 [semantic-model pack documentation](https://github.com/BrokkAi/bifrost/blob/master/docs/src/content/docs/semantic-model-packs.md)
 for the format, lifecycle, compatibility rules, and security boundaries.
 
-## Facade release-bundle acquisition
+## Cached open content
 
-The published `brokk-bifrost` facade opts into an acquisition provider for an
-exact generated dependency production. After a locked catalog miss, it checks
-only the matching public release for the running Bifrost version: the
-`bifrost-semantic-packs-vX.Y.Z.tar.gz` asset and its `.sha256` sidecar from the
-`BrokkAi/bifrost` release tagged `vX.Y.Z`. It verifies the archive checksum,
-safely extracts it, verifies the release index and inner manifest and shard
-checksums, and installs the requested production only when its exact
-`GeneratedProductionKey` matches (input digest, producer name and version,
-semantic schema version, and generated-production cache version).
+Engine releases retain semantic-pack tooling and no longer generate or publish
+native semantic-pack content. Open content uses the independent rules and packs
+streams in Bifrost-packs; its `pack-release.json` records exact source, artifact
+hashes, compatibility, and qualification. A release version alone does not prove
+that a pack applies to this engine or workspace.
 
-It does not consult a mutable branch, package index, or third-party source. A
-missing or invalid bundle, or any provider failure, becomes a warning and the
-normal local generation path remains the fallback. Set
-`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable this facade acquisition path;
-the unset/default value enables it. Dependency discovery still does not
-download package artifacts.
+The facade imports `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` into the host's catalog
+through the existing native verifier and installer. Set
+`BIFROST_SEMANTIC_PACK_CACHE_ROOT` to the host's persistent directory. Explicit
+bundle configuration replaces embedded semantic registration, and a malformed
+or incompatible installation fails explicitly. Embedded defaults remain when
+no external bundle is configured. The facade no longer registers the legacy
+engine-release downloader; hosts own public pack acquisition and offline reuse.
 
 ## Version 0.8.18
 

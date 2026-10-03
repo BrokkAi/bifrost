@@ -6,25 +6,50 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${script_dir}/../lib/bifrost-tmp.sh"
 
 usage() {
-  echo "Usage: scripts/public/with-isolated-cargo-target.sh COMMAND [ARG ...]" >&2
+  echo "Usage: scripts/public/with-isolated-cargo-target.sh [--persistent-target DIR] COMMAND [ARG ...]" >&2
 }
+
+target_dir=""
+persistent_target=0
+if [ "${1:-}" = "--persistent-target" ]; then
+  if [ "$#" -lt 3 ] || [ -z "${2:-}" ]; then
+    usage
+    exit 2
+  fi
+  target_dir="$2"
+  persistent_target=1
+  shift 2
+fi
 
 if [ "$#" -eq 0 ]; then
   usage
   exit 2
 fi
 
-tmp_root="$(bifrost_tmp_root)"
-bifrost_require_tmp_root "${tmp_root}" || exit 1
+if [ "${persistent_target}" -eq 1 ]; then
+  case "${target_dir}" in
+    /*) ;;
+    *)
+      echo "Persistent Cargo target must be an absolute path: ${target_dir}" >&2
+      exit 2
+      ;;
+  esac
+  mkdir -p "${target_dir}" || exit 1
+  active_marker=""
+  keep_marker=""
+else
+  tmp_root="$(bifrost_tmp_root)"
+  bifrost_require_tmp_root "${tmp_root}" || exit 1
 
-target_dir="$(mktemp -d "${tmp_root%/}/bifrost-cargo-target.XXXXXX")" || exit 1
-active_marker="${target_dir}/.bifrost-active-pid"
-keep_marker="${target_dir}/.bifrost-keep"
-managed_marker="${target_dir}/.bifrost-managed-target"
-target_name="$(basename "${target_dir}")"
-current_uid="$(id -u)"
-printf 'version=1\nuid=%s\nname=%s\n' "${current_uid}" "${target_name}" > "${managed_marker}"
-printf '%s\n' "$$" > "${active_marker}"
+  target_dir="$(mktemp -d "${tmp_root%/}/bifrost-cargo-target.XXXXXX")" || exit 1
+  active_marker="${target_dir}/.bifrost-active-pid"
+  keep_marker="${target_dir}/.bifrost-keep"
+  managed_marker="${target_dir}/.bifrost-managed-target"
+  target_name="$(basename "${target_dir}")"
+  current_uid="$(id -u)"
+  printf 'version=1\nuid=%s\nname=%s\n' "${current_uid}" "${target_name}" > "${managed_marker}"
+  printf '%s\n' "$$" > "${active_marker}"
+fi
 export CARGO_TARGET_DIR="${target_dir}"
 
 child_pid=""
@@ -77,7 +102,12 @@ stop_process_group() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
-  if [ "${cleanup_safe}" -ne 1 ]; then
+  if [ "${persistent_target}" -eq 1 ]; then
+    if [ "${cleanup_safe}" -ne 1 ]; then
+      echo "Persistent Cargo target still has an active process group: ${target_dir}" >&2
+      [ "${status}" -ne 0 ] || status=1
+    fi
+  elif [ "${cleanup_safe}" -ne 1 ]; then
     : > "${keep_marker}"
     echo "Retained isolated Cargo target because its process group is still active: ${target_dir}" >&2
     [ "${status}" -ne 0 ] || status=1
@@ -118,14 +148,20 @@ trap 'forward_signal HUP 129' HUP
 trap 'forward_signal INT 130' INT
 trap 'forward_signal TERM 143' TERM
 
-echo "Using isolated Cargo target: ${target_dir}" >&2
+if [ "${persistent_target}" -eq 1 ]; then
+  echo "Using persistent Cargo target: ${target_dir}" >&2
+else
+  echo "Using isolated Cargo target: ${target_dir}" >&2
+fi
 set -m
 "$@" &
 child_pid=$!
 process_group="$(ps -o pgid= -p "${child_pid}" 2>/dev/null | tr -d ' ')"
 process_group="${process_group:-${child_pid}}"
 set +m
-printf '%s\n%s\n' "$$" "${child_pid}" > "${active_marker}"
+if [ "${persistent_target}" -eq 0 ]; then
+  printf '%s\n%s\n' "$$" "${child_pid}" > "${active_marker}"
+fi
 wait "${child_pid}"
 status=$?
 if process_group_active && ! stop_process_group TERM; then

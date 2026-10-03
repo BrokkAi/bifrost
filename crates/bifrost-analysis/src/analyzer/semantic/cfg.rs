@@ -5,10 +5,10 @@ use crate::hash::{HashMap, HashSet};
 use super::{
     AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CaptureBinding, CaptureId,
     CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, GuardFactParts, GuardId,
-    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint,
-    ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent,
-    SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
-    StatementEntrySite, SwitchFactId, SwitchFactParts,
+    LoopSite, MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts,
+    ProgramPoint, ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticEvent, SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping,
+    SourceMappingId, StatementEntrySite, SwitchFactId, SwitchFactParts,
 };
 
 #[derive(Debug, Clone)]
@@ -52,7 +52,8 @@ impl ProcedureCfgBuilder {
                 && parts.captures.is_empty()
                 && parts.call_sites.is_empty()
                 && parts.gaps.is_empty()
-                && parts.statement_entries.is_empty(),
+                && parts.statement_entries.is_empty()
+                && parts.loop_sites.is_empty(),
             "CFG builder requires side-table rows to be allocated through the builder"
         );
         let prospective_work = initial_procedure_cfg_work(
@@ -111,6 +112,23 @@ impl ProcedureCfgBuilder {
             .source_mappings
             .get(id.index())
             .expect("a point's registered source mapping exists")
+    }
+
+    pub(crate) fn add_loop_site(&mut self, site: LoopSite) -> Result<(), SemanticBudgetExceeded> {
+        assert!(
+            site.header.index() < self.points.len() && site.body.index() < self.points.len(),
+            "loop site points exist"
+        );
+        assert!(
+            site.source.index() < self.parts.source_mappings.len(),
+            "loop site source exists"
+        );
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        self.parts.loop_sites.push(site);
+        Ok(())
     }
 
     pub(crate) fn add_statement_entry(
@@ -245,6 +263,7 @@ impl ProcedureCfgBuilder {
                 ..SemanticWork::default()
             },
             MemoryLocationKind::Index { .. }
+            | MemoryLocationKind::Dereference { .. }
             | MemoryLocationKind::LexicalCell { .. }
             | MemoryLocationKind::Capture { .. } => SemanticWork::default(),
         };

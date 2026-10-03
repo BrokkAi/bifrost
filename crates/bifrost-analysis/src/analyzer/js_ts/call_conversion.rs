@@ -115,6 +115,7 @@ pub(super) fn prove_argument(
         }
     };
     Ok(ArgumentTypeConversion {
+        hierarchy: None,
         source: source_type.resolved(),
         target: target_type.resolved(),
         kind,

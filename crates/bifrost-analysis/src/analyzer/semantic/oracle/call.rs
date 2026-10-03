@@ -486,7 +486,14 @@ pub(crate) fn constructor_call_result(
     call: &SemanticCallSite,
     callee: &ProcedureSemantics,
 ) -> Option<ValueId> {
-    if callee.kind() != ProcedureKind::Constructor || call.receiver.is_some() {
+    let caller_receiver_binding = caller.proven_caller_receiver_binding(call.id);
+    let module_qualified = matches!(
+        (call.receiver, caller_receiver_binding),
+        (Some(receiver), Some(CallerReceiverBinding::ModuleQualified(qualifier)))
+            if receiver == qualifier
+    );
+    if callee.kind() != ProcedureKind::Constructor || (call.receiver.is_some() && !module_qualified)
+    {
         return None;
     }
     let result = call.result?;
@@ -494,10 +501,11 @@ pub(crate) fn constructor_call_result(
         .allocations()
         .iter()
         .any(|allocation| allocation.result == result);
-    let receiverless = matches!(
-        caller.proven_caller_receiver_binding(call.id),
-        None | Some(CallerReceiverBinding::Absent)
-    );
+    let receiverless = module_qualified
+        || matches!(
+            caller_receiver_binding,
+            None | Some(CallerReceiverBinding::Absent)
+        );
     (has_allocation || receiverless).then_some(result)
 }
 
@@ -592,15 +600,28 @@ impl CallBindings {
                     // receiver syntax at all -- the exact object this call's
                     // own `result` allocated (#2574: the constructor's own
                     // `this` can only ever be the object being constructed).
-                    let receiver_actual_matches = match call_row.receiver {
-                        Some(receiver) => receiver == actual.id(),
-                        None if caller_receiver_binding.is_some_and(|binding| {
-                            binding.passes_receiver_as_argument(callee.semantics())
-                        }) =>
+                    let receiver_actual_matches = match (call_row.receiver, caller_receiver_binding)
+                    {
+                        (
+                            Some(receiver),
+                            Some(CallerReceiverBinding::ModuleQualified(qualifier)),
+                        ) if receiver == qualifier => {
+                            constructor_call_result(
+                                caller.semantics(),
+                                call_row,
+                                callee.semantics(),
+                            ) == Some(actual.id())
+                        }
+                        (Some(_), Some(CallerReceiverBinding::ModuleQualified(_))) => false,
+                        (Some(receiver), _) => receiver == actual.id(),
+                        (None, _)
+                            if caller_receiver_binding.is_some_and(|binding| {
+                                binding.passes_receiver_as_argument(callee.semantics())
+                            }) =>
                         {
                             false
                         }
-                        None => {
+                        (None, _) => {
                             (matches!(caller_receiver_binding,
                                 Some(CallerReceiverBinding::TypeQualified(qualifier))
                                     if qualifier == actual.id())

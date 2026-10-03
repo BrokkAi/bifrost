@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v78";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v81";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -190,11 +190,9 @@ fn go_capabilities() -> SemanticCapabilities {
         SemanticCapability::ParameterFlow,
         SemanticCapability::ReceiverFlow,
         SemanticCapability::ReturnFlow,
-        // Partial: a struct-field or element store and load is lowered into a
-        // real memory row whenever the target shape is a single selector or a
-        // single index over a value this procedure can name. A store through
-        // a pointer dereference, a multi-target assignment, and a dynamic
-        // index still publish their own gaps instead.
+        // Partial: field, index, and pointer-dereference stores are represented
+        // as memory rows. Dynamic indices and assignment targets whose address
+        // cannot be identified still publish their own gaps.
         SemanticCapability::FieldMemory,
         SemanticCapability::IndexMemory,
         SemanticCapability::StaticMemory,
@@ -7099,11 +7097,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         Ok(Some(location))
     }
 
-    /// Materialize the structured location named by one selector or index
-    /// place without claiming that the place is accessed. Address-of, loads,
-    /// stores, compound updates, range bindings, and multi-result assignments
-    /// must share this interpretation so the same source-level place never
-    /// acquires incompatible location identities.
+    /// Materialize the structured location named by one selector, index, or
+    /// dereference place without claiming that the place is accessed.
+    /// Address-of, loads, stores, compound updates, range bindings, and
+    /// multi-result assignments share this interpretation so the same
+    /// source-level place never acquires incompatible location identities.
     fn memory_place_location(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -7186,6 +7184,17 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     location,
                     Some((index, constant_index.is_some())),
                 )))
+            }
+            "unary_expression" if unary_operator_kind(place) == Some("*") => {
+                let operand = required_field(place, "operand")?;
+                let address =
+                    self.expression_value(builder, operand, self.expression_value_kind(operand))?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Dereference { address },
+                )?;
+                Ok(Some((MemoryAccessKind::Dereference, location, None)))
             }
             _ => Ok(None),
         }
@@ -7701,7 +7710,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 next,
                 scope,
                 label,
-            } => self.statement(builder, node, entry, next, scope, label, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, label, stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -7883,19 +7895,14 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 };
                 let (predicate, subject) = match normalized {
                     Some(normalized) => normalized,
-                    None => (
-                        GuardPredicate::Opaque {
-                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                        },
-                        // The condition's own value is the one thing an
-                        // unnormalized guard can honestly name: the decision
-                        // tested it, whatever it means.
-                        Some(self.expression_value(
-                            builder,
-                            node,
-                            self.expression_value_kind(node),
-                        )?),
-                    ),
+                    None => {
+                        // A Go condition tests this expression's Boolean value.
+                        // Unknown expression semantics remain unknown in value
+                        // flow, without discarding the decision's exact subject.
+                        let value =
+                            self.expression_value(builder, node, self.expression_value_kind(node))?;
+                        (GuardPredicate::Truthy { value }, Some(value))
+                    }
                 };
                 self.record_guard(
                     builder,
@@ -8708,25 +8715,15 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let multi_result_values = multi_result_call
             .then(|| self.multi_result_values(builder, right_items[0], left_items.len()))
             .transpose()?;
-        let indirect_target_address = if node.kind() == "assignment_statement"
-            && left_items.len() == 1
-            && right_items.len() == 1
-        {
-            let target = transparent_parenthesized_expression(left_items[0]);
-            if target.kind() == "unary_expression" && unary_operator_kind(target) == Some("*") {
-                let operand = required_field(target, "operand")?;
-                let operand = transparent_parenthesized_expression(operand);
-                Some(self.expression_value(
-                    builder,
-                    operand,
-                    self.expression_value_kind(operand),
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let tuple_has_memory_target = operator_is_simple
+            && left_items.len() > 1
+            && left_items.len() == right_items.len()
+            && left_items.iter().any(|target| {
+                matches!(
+                    transparent_parenthesized_expression(*target).kind(),
+                    "selector_expression" | "index_expression" | "unary_expression"
+                )
+            });
         let compound_target = (!operator_is_simple
             && node.kind() == "assignment_statement"
             && left_items.len() == 1
@@ -8754,9 +8751,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             None
         };
         // The single memory place this statement writes, when it writes one:
-        // `holder.field = v` or `values[0] = v`, with any redundant
-        // parentheses removed. Simple and compound updates share this place
-        // identity; a dereference or multi-target assignment does not.
+        // `holder.field = v`, `values[0] = v`, or `*pointer = v`, with any
+        // redundant parentheses removed. Simple and compound updates share
+        // this place identity; tuple assignments are handled independently.
         let single_target = (node.kind() == "assignment_statement"
             && left_items.len() == 1
             && right_items.len() == 1)
@@ -8768,6 +8765,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     "index_expression" => target
                         .child_by_field_name("index")
                         .is_some_and(|index| !is_go_type_syntax(index.kind())),
+                    "unary_expression" => unary_operator_kind(*target) == Some("*"),
                     _ => false,
                 }
         });
@@ -8903,7 +8901,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             )?;
                         }
                     }
-                    "selector_expression" | "index_expression" => {
+                    "selector_expression" | "index_expression" | "unary_expression" => {
                         if let Some((kind, location)) =
                             self.memory_access_location(builder, boundary, *name_node)?
                         {
@@ -8930,7 +8928,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                                 SemanticCapability::Assignments,
                                 SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
                                 SemanticGapKind::Unsupported,
-                                "Go multi-result memory target is not a lowered field or index place",
+                                "Go multi-result memory target is not a lowered field, index, or dereference place",
                             )?;
                         }
                     }
@@ -8955,6 +8953,138 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticCapability::Assignments,
                     SemanticGapKind::Unsupported,
                     "Go multi-result value has an identifier assignment target that is not a lowered local, parameter, receiver, or capture binding",
+                )?;
+            }
+        } else if tuple_has_memory_target {
+            // Assignment places are evaluated before the RHS. Materialize
+            // every supported destination while visiting the LHS targets in
+            // order, then read every RHS value before appending any stores.
+            let target_locations = left_items
+                .iter()
+                .map(|target| {
+                    let target = transparent_parenthesized_expression(*target);
+                    matches!(
+                        target.kind(),
+                        "selector_expression" | "index_expression" | "unary_expression"
+                    )
+                    .then(|| self.memory_access_location(builder, boundary, target))
+                    .transpose()
+                    .map(Option::flatten)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let right_values = right_items
+                .iter()
+                .map(|source| {
+                    self.expression_value(builder, *source, self.expression_value_kind(*source))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut unsupported_memory_targets = Vec::new();
+            let mut unsupported_assignment_targets = Vec::new();
+            for (((target_node, source_node), value), target_location) in left_items
+                .iter()
+                .zip(right_items.iter())
+                .zip(right_values.iter().copied())
+                .zip(target_locations)
+            {
+                let target_node = transparent_parenthesized_expression(*target_node);
+                match target_node.kind() {
+                    "identifier" | "true" | "false" | "nil" | "iota" => {
+                        let name =
+                            node_text(self.prepared.source(), target_node).ok_or_else(|| {
+                                GoLoweringError::Invalid(
+                                    "Go tuple assignment has invalid identifier range".into(),
+                                )
+                            })?;
+                        if name == "_" {
+                            continue;
+                        }
+                        let target = if node.kind() == "short_var_declaration" {
+                            self.local_declaration_value(name, target_node.start_byte())
+                                .or_else(|| self.binding_value(name, node.start_byte()))
+                        } else {
+                            self.binding_value(name, node.start_byte())
+                        };
+                        let Some(target) = target else {
+                            unsupported_assignment_targets.push(name.to_owned());
+                            continue;
+                        };
+                        // Keep the existing conservative local-target lowering
+                        // for general tuples. Heap targets use their positional
+                        // RHS value below.
+                        let opaque_source =
+                            self.source_value(builder, target_node, SemanticValueKind::Temporary)?;
+                        let kind = self.binding_flow_kind(name, target, node.end_byte());
+                        self.append_converted_binding_assignment(
+                            builder,
+                            boundary,
+                            target_node,
+                            opaque_source,
+                            target,
+                            kind,
+                        )?;
+                    }
+                    "selector_expression" | "index_expression" | "unary_expression" => {
+                        let Some((kind, location)) = target_location else {
+                            unsupported_memory_targets.push(
+                                node_text(self.prepared.source(), target_node)
+                                    .expect("Go assignment target has source text")
+                                    .to_owned(),
+                            );
+                            continue;
+                        };
+                        let stored =
+                            if self.place_has_exact_reference_type(target_node, *source_node) {
+                                value
+                            } else {
+                                self.assignment_conversion_value(
+                                    builder,
+                                    boundary,
+                                    *source_node,
+                                    value,
+                                )?
+                            };
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::MemoryStore {
+                                kind,
+                                location,
+                                value: stored,
+                            },
+                        )?;
+                    }
+                    _ => unsupported_assignment_targets.push(
+                        node_text(self.prepared.source(), target_node)
+                            .expect("Go assignment target has source text")
+                            .to_owned(),
+                    ),
+                }
+            }
+            if !unsupported_memory_targets.is_empty() {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                        .with(SemanticGapImpact::HeapWrite)
+                        .with(SemanticGapImpact::Aliasing),
+                    SemanticGapKind::Unsupported,
+                    format!(
+                        "Go tuple assignment memory targets are not lowered: {unsupported_memory_targets:?}"
+                    ),
+                )?;
+            }
+            if !unsupported_assignment_targets.is_empty() {
+                self.add_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    &format!(
+                        "Go tuple assignment targets are not lowered: {unsupported_assignment_targets:?}"
+                    ),
                 )?;
             }
         } else if let Some((name, target)) = compound_target {
@@ -9070,7 +9200,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             )?;
             order_evaluations = vec![place, source_node];
         } else if let Some(place) = place_target {
-            // A single selector or index target is a real store into memory.
+            // A single selector, index, or dereference target is a real store into memory.
             // The target's own operand is still evaluated, but the target node
             // itself must not be scheduled as an expression: reading it would
             // publish a load of the location this statement writes.
@@ -9104,27 +9234,6 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 evaluations.push(index);
             }
             evaluations.push(source_node);
-        } else if let Some(address) = indirect_target_address {
-            // The adapter does not yet model the heap write performed through
-            // this pointer. Preserve the exact dereferenced value as the gap
-            // subject so alias consumers can relate the write to one address
-            // without treating every unsupported assignment in the procedure
-            // as a write to every binding.
-            let impacts = SemanticGapImpacts::single(SemanticGapImpact::HeapWrite);
-            let impacts = if operator_is_simple {
-                impacts
-            } else {
-                impacts.with(SemanticGapImpact::HeapRead)
-            };
-            self.session.add_gap_with_impacts(
-                builder,
-                boundary,
-                SemanticGapSubject::Value(address),
-                SemanticCapability::Assignments,
-                impacts,
-                SemanticGapKind::Unsupported,
-                "Go indirect assignment write is not yet lowered",
-            )?;
         } else if !left_items.is_empty() || !right_items.is_empty() {
             // A type assertion or another unsupported RHS can still have a
             // definite overwrite for identifier destinations. Preserve that
@@ -10458,6 +10567,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), GoLoweringError> {
         let body_entry = self.point(builder, body, Vec::new())?;
+        // An infinite loop re-enters its body.
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            body_entry,
+            body_entry,
+        )?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -10496,6 +10612,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     ) -> Result<(), GoLoweringError> {
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            condition_entry,
+            body_entry,
+        )?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -10556,6 +10678,14 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             .map(|update| self.point(builder, update, Vec::new()))
             .transpose()?;
         let loop_head = condition_entry.unwrap_or(body_entry);
+        // The post statement runs before the condition, which (or, without
+        // one, the body) starts every iteration.
+        self.session.record_loop_site(
+            builder,
+            body.parent().expect("a for body has its for statement"),
+            loop_head,
+            body_entry,
+        )?;
         let initial_target = if go_for_clause_has_first_iteration(
             self.prepared.source(),
             initializer,
@@ -11903,12 +12033,18 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         value: source,
                     },
                 )?;
+                let Some((kind, location)) =
+                    self.memory_access_location(builder, terminal, node)?
+                else {
+                    unreachable!("a pointer dereference has a dereference memory location");
+                };
                 self.append_effect(
                     builder,
                     terminal,
-                    SemanticEffect::Assignment {
-                        target: result,
-                        value: source,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
                     },
                 )?;
                 self.add_non_rejoining_exceptional_exit_gap(
@@ -14460,11 +14596,10 @@ fn control_label_node(node: Node<'_>) -> Option<Node<'_>> {
 /// Whether this expression is written by the statement that contains it.
 ///
 /// A write target is not a read. The lowered single-target store replaces its
-/// evaluation list so the target node is never scheduled, but the shapes this
-/// adapter does not lower -- a multi-target assignment, a range clause's
-/// assignment form -- still schedule the place itself so its operands are
-/// evaluated. Minting a `MemoryLoad` there would publish a read of the very
-/// location the statement overwrites.
+/// evaluation list so the target node is never scheduled, but an unsupported
+/// target or a range clause's assignment form still schedules the place so its
+/// operands are evaluated. Minting a `MemoryLoad` there would publish a read of
+/// the very location the statement overwrites.
 fn is_assignment_target(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -15119,6 +15254,82 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Continue => "continue",
         _ => "unsupported completion",
     }
+}
+
+/// Procedure syntax roles for the Go lowering. `for … range` iterates and is
+/// not a conditional loop; a condition-only `for` is a while loop.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: go_statement_kind,
+        loop_site: go_loop_site,
+        procedure_matches: |_, node| {
+            matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            )
+        },
+        nested_procedure: |node| node.kind() == "func_literal",
+    };
+
+fn go_loop_site(node: Node<'_>) -> Option<crate::analyzer::loop_facts::LoopSyntax<'_>> {
+    use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+    if node.kind() != "for_statement" {
+        return None;
+    }
+    let body = node.child_by_field_name("body");
+    let control = named_children(node)
+        .into_iter()
+        .find(|child| body.is_none_or(|body| child.id() != body.id()));
+    match control {
+        None => Some(LoopSyntax {
+            kind: LoopKind::For,
+            body,
+            condition: None,
+        }),
+        Some(clause) if clause.kind() == "for_clause" => Some(LoopSyntax {
+            kind: LoopKind::For,
+            body,
+            condition: clause.child_by_field_name("condition"),
+        }),
+        Some(clause) if clause.kind() == "range_clause" => None,
+        Some(condition) => Some(LoopSyntax {
+            kind: LoopKind::While,
+            body,
+            condition: Some(condition),
+        }),
+    }
+}
+
+/// Classify an executable Go statement. Constant and type declarations act
+/// at compile time; a `for` header's init and post statements are not
+/// statements of the body.
+fn go_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "for_clause")
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "block" => "block",
+        "expression_statement" | "send_statement" | "inc_statement" | "dec_statement" => {
+            "expression"
+        }
+        "assignment_statement" | "short_var_declaration" | "var_declaration" => "local_declaration",
+        "return_statement" => "return",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "goto_statement" => "goto",
+        "fallthrough_statement" => "fallthrough",
+        "labeled_statement" => "labeled",
+        "if_statement" => "if",
+        "for_statement" => "for",
+        "expression_switch_statement" | "type_switch_statement" | "select_statement" => "switch",
+        "defer_statement" => "defer",
+        "go_statement" => "go",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -16440,7 +16651,7 @@ func unsupported(left, right int) int {
         assert!(matches!(
             unsupported.guard_facts.as_slice(),
             [GuardFactParts {
-                predicate: GuardPredicate::Opaque { .. },
+                predicate: GuardPredicate::Truthy { .. },
                 ..
             }]
         ));
@@ -16505,7 +16716,7 @@ func negated() bool {
             "predicate()",
             "the decision point belongs to the grammar-native operand"
         );
-        assert!(matches!(guard.predicate, GuardPredicate::Opaque { .. }));
+        assert!(matches!(guard.predicate, GuardPredicate::Truthy { .. }));
         assert_eq!(
             guard.true_arm.map(|arm| arm.kind),
             Some(ControlEdgeKind::ConditionalFalse)
@@ -16740,7 +16951,7 @@ func rebound() bool {
         );
         assert!(matches!(
             rebound_guard.predicate,
-            GuardPredicate::Opaque { .. }
+            GuardPredicate::Truthy { .. }
         ));
         assert_eq!(
             rebound_guard.true_arm.map(|arm| arm.kind),
@@ -18356,7 +18567,7 @@ func observe() any { return &http.DefaultClient }
     }
 
     #[test]
-    fn indirect_assignment_gap_names_the_dereferenced_semantic_value() {
+    fn indirect_assignment_lowers_a_dereference_store() {
         let procedures = lower_fixture(
             r#"package main
 func replace(pointer **int, replacement *int) {
@@ -18374,19 +18585,28 @@ func replace(pointer **int, replacement *int) {
             .filter(|gap| gap.capability == SemanticCapability::Assignments)
             .collect::<Vec<_>>();
 
-        assert_eq!(assignment_gaps.len(), 1, "{procedure:#?}");
-        let SemanticGapSubject::Value(address) = assignment_gaps[0].subject else {
-            panic!("an indirect write must be scoped to its dereferenced value: {procedure:#?}");
+        assert!(assignment_gaps.is_empty(), "{procedure:#?}");
+        let store = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Dereference,
+                    location,
+                    ..
+                } => Some(location),
+                _ => None,
+            })
+            .expect("the indirect assignment has one dereference store");
+        let MemoryLocationKind::Dereference { address } =
+            &procedure.memory_locations[store.index()].kind
+        else {
+            panic!("the indirect store retains its dereference location: {procedure:#?}");
         };
         assert!(
-            assignment_gaps[0]
-                .impacts
-                .contains(SemanticGapImpact::HeapWrite),
-            "an omitted indirect write must retain its heap-write impact: {procedure:#?}"
-        );
-        assert!(
-            procedure.values.iter().any(|value| value.id == address),
-            "the gap subject must name a published semantic value: {procedure:#?}"
+            procedure.values.iter().any(|value| value.id == *address),
+            "the dereference location retains its evaluated address value: {procedure:#?}"
         );
     }
 
@@ -20783,10 +21003,10 @@ func pointerMulti(target *Holder) {
             gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder
                 && gap.capability == SemanticCapability::NormalControlFlow
         }));
-        assert!(procedure.gaps.iter().any(|gap| {
-            gap.subject == SemanticGapSubject::Point
-                && gap.capability == SemanticCapability::Assignments
-                && gap.impacts.contains(SemanticGapImpact::HeapWrite)
+        assert!(procedure.gaps.iter().all(|gap| {
+            gap.subject != SemanticGapSubject::Point
+                || gap.capability != SemanticCapability::Assignments
+                || !gap.impacts.contains(SemanticGapImpact::HeapWrite)
         }));
 
         let addressed_places = procedure
@@ -20869,7 +21089,7 @@ func pointerMulti(target *Holder) {
     }
 
     #[test]
-    fn dereference_read_modify_write_gaps_retain_heap_reads() {
+    fn dereference_read_modify_write_lowers_heap_reads_and_writes() {
         let procedures = lower_fixture(
             r#"package main
 func update(pointer *int, replacement int) {
@@ -20883,23 +21103,44 @@ func update(pointer *int, replacement int) {
             .iter()
             .find(|procedure| procedure.lexical_parent.is_none())
             .expect("update procedure");
-        let gaps = procedure
-            .gaps
+        let effects = procedure
+            .points
             .iter()
-            .filter(|gap| {
-                gap.capability == SemanticCapability::Assignments
-                    && matches!(gap.subject, SemanticGapSubject::Value(_))
-                    && gap.impacts.contains(SemanticGapImpact::HeapWrite)
-            })
+            .flat_map(|point| &point.events)
+            .map(|event| &event.effect)
             .collect::<Vec<_>>();
-        assert_eq!(gaps.len(), 3, "{procedure:#?}");
         assert_eq!(
-            gaps.iter()
-                .filter(|gap| gap.impacts.contains(SemanticGapImpact::HeapRead))
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Dereference,
+                        ..
+                    }
+                ))
+                .count(),
+            3,
+            "assignment, compound assignment, and increment each store"
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Dereference,
+                        ..
+                    }
+                ))
                 .count(),
             2,
             "only compound assignment and increment read before writing"
         );
+        assert!(procedure.gaps.iter().all(|gap| {
+            gap.capability != SemanticCapability::Assignments
+                || !gap.impacts.contains(SemanticGapImpact::HeapWrite)
+        }));
     }
 
     #[test]
@@ -21555,7 +21796,7 @@ func reboundNil() {
         assert_eq!(rebound_child.guard_facts.len(), 1, "{rebound_child:#?}");
         assert!(matches!(
             rebound_child.guard_facts[0].predicate,
-            GuardPredicate::Opaque { .. }
+            GuardPredicate::Truthy { .. }
         ));
     }
 
@@ -22471,15 +22712,21 @@ func outer() {
     }
 
     #[test]
-    fn unsupported_multi_target_assignments_replace_bindings_with_conversions() {
+    fn unsupported_receive_tuple_assignments_keep_their_assignment_gap() {
         let procedures = lower_fixture(
             r#"package main
 type cell struct{}
-func receive(ch chan *cell, pointer *cell, ok bool) {
-    pointer, ok = <-ch
-    _ = pointer
-    _ = ok
-}
+    func receive(ch chan *cell, pointer *cell, ok bool) {
+        pointer, ok = <-ch
+        _ = pointer
+        _ = ok
+    }
+    func receiveMemory(ch chan int, target map[int]int, ok bool) {
+        target[0], ok = <-ch
+    }
+    func mapCommaOk(source, target map[int]int, ok bool) {
+        target[0], ok = source[1]
+    }
 "#,
         );
         for procedure_name in ["receive"] {
@@ -22545,6 +22792,212 @@ func receive(ch chan *cell, pointer *cell, ok bool) {
                 "the unsupported multi-target relation remains an explicit gap: {procedure:#?}"
             );
         }
+        for procedure_name in ["receiveMemory", "mapCommaOk"] {
+            let procedure = named_procedure(&procedures, procedure_name);
+            assert!(
+                procedure.gaps.iter().any(|gap| {
+                    gap.capability == SemanticCapability::Assignments
+                        && gap.kind == SemanticGapKind::Unsupported
+                        && gap.impacts.contains(SemanticGapImpact::HeapWrite)
+                }),
+                "the unsupported multi-value RHS keeps its heap write visible: {procedure:#?}"
+            );
+            assert!(
+                procedure.points.iter().all(|point| {
+                    point.events.iter().all(|event| {
+                        !matches!(
+                            event.effect,
+                            SemanticEffect::MemoryStore {
+                                kind: MemoryAccessKind::Index,
+                                ..
+                            }
+                        )
+                    })
+                }),
+                "an unknown result-to-target relation is not fabricated: {procedure:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_memory_assignments_store_after_rhs_reads_in_target_order() {
+        const SOURCE: &str = r#"package main
+type pair struct { first int; second int }
+func pairValues() (int, int) { return 1, 2 }
+func mapValue() (int, bool) { return 3, true }
+func assign(target, source *pair) {
+    target.first, target.second = source.second, source.first
+}
+func swap(target *pair) {
+    target.first, target.second = target.second, target.first
+}
+func dereference(target *int, value int) {
+    *target, value = 1, 2
+}
+func fieldResults(target *pair) {
+    target.first, target.second = pairValues()
+}
+func mapResult(target map[int]int, ok bool) {
+    target[0], ok = mapValue()
+}
+"#;
+        fn reaches(
+            procedure: &ProcedureSemanticsParts,
+            start: ProgramPointId,
+            target: ProgramPointId,
+        ) -> bool {
+            let mut pending = vec![start];
+            let mut visited = std::collections::HashSet::new();
+            while let Some(point) = pending.pop() {
+                if point == target {
+                    return true;
+                }
+                if !visited.insert(point) {
+                    continue;
+                }
+                pending.extend(
+                    procedure
+                        .control_edges
+                        .iter()
+                        .filter(|edge| edge.source_point == point)
+                        .map(|edge| edge.target_point),
+                );
+            }
+            false
+        }
+
+        fn member_name(location: &MemoryLocation) -> Option<&str> {
+            match &location.kind {
+                MemoryLocationKind::Field { member, .. } => {
+                    Some(source_text(SOURCE, member.anchor().span()))
+                }
+                _ => None,
+            }
+        }
+
+        fn assert_tuple(
+            procedure: &ProcedureSemanticsParts,
+            statement: &str,
+            rhs_reads: &[&str],
+            expected_targets: &[&str],
+        ) {
+            let assignment_point = procedure
+                .points
+                .iter()
+                .find(|point| {
+                    source_text(SOURCE, mapping_source_span(procedure, point.source)) == statement
+                        && point
+                            .events
+                            .iter()
+                            .any(|event| matches!(event.effect, SemanticEffect::MemoryStore { .. }))
+                })
+                .expect("tuple stores share the whole-statement source span");
+            let stored_targets = assignment_point
+                .events
+                .iter()
+                .filter_map(|event| match event.effect {
+                    SemanticEffect::MemoryStore { location, .. } => {
+                        member_name(&procedure.memory_locations[location.index()])
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stored_targets, expected_targets, "{procedure:#?}");
+
+            let read_points = procedure
+                .points
+                .iter()
+                .filter(|point| {
+                    point
+                        .events
+                        .iter()
+                        .any(|event| matches!(event.effect, SemanticEffect::MemoryLoad { .. }))
+                        && rhs_reads.contains(&source_text(
+                            SOURCE,
+                            mapping_source_span(procedure, point.source),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(read_points.len(), rhs_reads.len(), "{procedure:#?}");
+            for read in read_points {
+                assert!(
+                    reaches(procedure, read.id, assignment_point.id),
+                    "every RHS memory read reaches the store point: {procedure:#?}"
+                );
+            }
+        }
+
+        let procedures = lower_fixture(SOURCE);
+        let assign = named_procedure(&procedures, "assign");
+        assert_tuple(
+            assign,
+            "target.first, target.second = source.second, source.first",
+            &["source.second", "source.first"],
+            &["first", "second"],
+        );
+        let swap = named_procedure(&procedures, "swap");
+        assert_tuple(
+            swap,
+            "target.first, target.second = target.second, target.first",
+            &["target.second", "target.first"],
+            &["first", "second"],
+        );
+
+        let dereference = named_procedure(&procedures, "dereference");
+        assert!(dereference.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Dereference,
+                        location,
+                        ..
+                    } if matches!(
+                        dereference.memory_locations[location.index()].kind,
+                        MemoryLocationKind::Dereference { .. }
+                    )
+                )
+            })
+        }));
+
+        let field_results = named_procedure(&procedures, "fieldResults");
+        let result_stores = field_results
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryStore { location, .. } => {
+                    member_name(&field_results.memory_locations[location.index()])
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result_stores, ["first", "second"]);
+        assert!(
+            field_results
+                .gaps
+                .iter()
+                .all(|gap| { gap.capability != SemanticCapability::Assignments })
+        );
+
+        let map_result = named_procedure(&procedures, "mapResult");
+        assert!(map_result.points.iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        ..
+                    }
+                )
+            })
+        }));
+        assert!(
+            map_result
+                .gaps
+                .iter()
+                .all(|gap| { gap.capability != SemanticCapability::Assignments })
+        );
     }
 
     #[test]

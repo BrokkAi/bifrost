@@ -30,7 +30,6 @@ RELEASE_CRATES=(
   brokk-bifrost-policy
   brokk-bifrost-runtime
   brokk-bifrost-mcp
-  brokk-bifrost-lsp
   brokk-bifrost
 )
 

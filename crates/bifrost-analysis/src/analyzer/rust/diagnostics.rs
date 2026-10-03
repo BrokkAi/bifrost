@@ -146,6 +146,35 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_canonical_routes_do_not_prove_a_symbol_absent() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"diagnostics\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod part;\nfn run() { crate::part::missing(); }\n",
+            )
+            .file("src/part.rs", "pub fn target() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let report = report_for(&analyzer, "src/lib.rs");
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+        assert!(report.outcomes().iter().any(|outcome| matches!(outcome,
+            SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                if reasons.iter().any(|reason| matches!(reason,
+                    crate::analyzer::SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable { .. }
+                ))
+        )), "{:?}", report.outcomes());
+        assert!(report.into_diagnostics().is_empty());
+        assert!(scope.store_error().is_some());
+        assert!(!analyzer.cargo_routes_ready_for_test());
+    }
+
+    #[test]
     fn rust_semantic_diagnostics_report_unknown_type_and_value_references() {
         let (_temp, analyzer) = rust_project(&[(
             "src/main.rs",

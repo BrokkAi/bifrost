@@ -807,6 +807,7 @@ fn produce_document(
             visibility: semantic_visibility(&item.visibility),
             is_abstract: matches!(item.inner, ItemEnum::Trait(_)),
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters: generic_names(generics),
             type_parameter_constraints: Vec::new(),
@@ -1000,6 +1001,7 @@ fn produce_document(
         }
         member_position.insert(item.id, members.len());
         members.push(MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id: member_id.clone(),
             owner: owner_item_id,
@@ -3018,7 +3020,7 @@ mod tests {
             pack_version: env!("CARGO_PKG_VERSION").to_owned(),
             ecosystem: "cargo".to_owned(),
             compatibility: Compatibility {
-                bifrost: "*".to_owned(),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {

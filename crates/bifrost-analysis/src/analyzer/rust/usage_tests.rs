@@ -47,10 +47,14 @@ mod tests {
 
     #[test]
     fn fallback_binding_identity_remains_an_exact_root() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let analyzer = analyzer_for(&root);
-        let source = ProjectFile::new(root, "src/db.rs");
+        // The caller-supplied root lacks an indexed identity, but its file
+        // still needs a real canonical publication. A nonexistent source is
+        // unavailable, not proof that the file has no declaration identities.
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/db.rs", "")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let source = fixture.file("src/db.rs");
         let target = CodeUnit::new(
             source.clone(),
             CodeUnitType::Function,
@@ -59,9 +63,11 @@ mod tests {
         );
         let roots = BTreeSet::from([target.clone()]);
         let scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, scope.token());
+        let walks = RustUsageWalks::new(&analyzer, scope.token())
+            .expect("Cargo routes available for the fixture");
         let seeds = walks
-            .binding_seeds_while(&roots, &|| true)
+            .binding_seeds_while(&analyzer, &roots, &|| true)
+            .expect("available fixture binding facts")
             .expect("an uncancelled walk answers");
         let resolution = RustReferenceResolution::Exact(RustSymbolIdentity {
             file: source,
@@ -125,7 +131,11 @@ mod tests {
 
         let mut rendered: Vec<String> = ["Shared", "helper", "worker", "util", "inner"]
             .into_iter()
-            .flat_map(|name| queries.identities_named(name))
+            .flat_map(|name| {
+                queries
+                    .identities_named(name)
+                    .expect("uncancelled fixture identity lookup")
+            })
             .map(|(identity, domains)| render_identity(&identity, &domains))
             .collect();
         rendered.sort();
@@ -190,13 +200,16 @@ mod tests {
             .expect("write util.rs");
         let analyzer = analyzer_for(&root);
         let util = ProjectFile::new(root.clone(), "src/util.rs");
+        let properties = analyzer
+            .declaration_source_properties(&util, &|| true)
+            .expect("canonical declaration properties");
         for d in analyzer.declarations(&util) {
-            let scope = AnalyzerQueryScope::new(&analyzer);
-            let vis = brokk_bifrost_rust::graph_support::rust_declaration_visibility(
-                &analyzer,
-                scope.token(),
-                &d,
-            );
+            let vis = properties
+                .get(&d)
+                .expect("declaration source bridge")
+                .iter()
+                .map(|property| &property.visibility)
+                .collect::<Vec<_>>();
             println!(
                 "DBG {} kind={:?} vis={:?} parent={:?}",
                 d.fq_name(),

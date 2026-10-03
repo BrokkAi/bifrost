@@ -9,6 +9,8 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { roundTrip, waitForSpawn, writeMessage } from "./mcp-smoke-transport.mjs";
+
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_REPOSITORY = "BrokkAi/bifrost";
@@ -352,7 +354,7 @@ async function callListPolicies(launch, env, workspace) {
         capabilities: { roots: { listChanged: true } },
         clientInfo: { name: "bifrost-post-release-smoke", version: "1" },
       },
-    });
+    }, (method) => `Timed out waiting for MCP ${method} response`);
     assert.ok(initialize.result, "MCP initialize did not return a result");
     writeMessage(child, { jsonrpc: "2.0", method: "notifications/initialized" });
     return await roundTrip(child, reader, {
@@ -360,7 +362,7 @@ async function callListPolicies(launch, env, workspace) {
       id: 2,
       method: "tools/call",
       params: { name: "list_policies", arguments: {} },
-    });
+    }, (method) => `Timed out waiting for MCP ${method} response`);
   } catch (error) {
     const logs = stderr.join("").trim();
     throw new Error(`${error.message}${logs ? `\nMCP stderr:\n${logs}` : ""}`, { cause: error });
@@ -370,55 +372,6 @@ async function callListPolicies(launch, env, workspace) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     reader.close();
   }
-}
-
-function waitForSpawn(child) {
-  return new Promise((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  });
-}
-
-function writeMessage(child, message) {
-  child.stdin.write(`${JSON.stringify(message)}\n`);
-}
-
-function roundTrip(child, reader, message) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for MCP ${message.method} response`));
-    }, 90_000);
-    const onLine = (line) => {
-      let response;
-      try {
-        response = JSON.parse(line);
-      } catch (error) {
-        cleanup();
-        reject(new Error(`MCP emitted non-JSON stdout: ${error.message}`));
-        return;
-      }
-      if (response.id !== message.id) return;
-      cleanup();
-      if (response.error) {
-        reject(new Error(`MCP ${message.method} failed: ${JSON.stringify(response.error)}`));
-        return;
-      }
-      resolve(response);
-    };
-    const onError = (error) => {
-      cleanup();
-      reject(error);
-    };
-    const cleanup = () => {
-      clearTimeout(timeout);
-      reader.off("line", onLine);
-      child.off("error", onError);
-    };
-    reader.on("line", onLine);
-    child.on("error", onError);
-    writeMessage(child, message);
-  });
 }
 
 async function readJson(filePath) {

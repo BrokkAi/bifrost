@@ -1125,6 +1125,7 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
     };
     let grouped = group_outbound_lookup_candidates(vec![
         DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Ambiguous,
             reference: None,
             definitions: vec![definition],
@@ -1132,6 +1133,7 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
             diagnostics: Vec::new(),
         },
         DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Ambiguous,
             reference: Some(reference),
             definitions: Vec::new(),

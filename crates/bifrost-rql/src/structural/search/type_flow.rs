@@ -22,8 +22,8 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
     ClassIdentity, DeclarationSegmentKind, IcfgProvider, IcfgProviderBehaviorIdentity,
     LengthDelimitedDigest, ProcedureHandle, SemanticBudget, SemanticBudgetDimension,
-    SemanticBudgetScopeSnapshot, SemanticIrVersion, SemanticWork, SourceSpan, StableDigest,
-    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
+    SemanticBudgetScopeSnapshot, SemanticIrVersion, SemanticWork, SourceSiteKind, SourceSpan,
+    StableDigest, TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
     type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
@@ -42,10 +42,11 @@ use brokk_bifrost_flow::dataflow::{
 };
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
-    ClassSetStatus, FeedbackLimits, FieldSlotIndex, FieldSlotIndexAcquisitionKind,
-    FieldSlotIndexMissReason, ProcedureRefinements, RootExhaustedLane, RootIncompleteEvidence,
-    TypeFlowError, TypeFlowPlanError, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
-    active_semantic_model_pack_digest, solve_type_flow_for_root_with_refinements,
+    AbsentMemberProof, ClassSetStatus, FeedbackLimits, FieldSlotIndex,
+    FieldSlotIndexAcquisitionKind, FieldSlotIndexMissReason, ProcedureRefinements,
+    RootExhaustedLane, RootIncompleteEvidence, TypeFlowError, TypeFlowPlanError,
+    TypeFlowRootPersistenceStatus, TypeFlowRootResult, active_semantic_model_pack_digest,
+    solve_type_flow_for_root_with_refinements, sort_unknown_reasons,
 };
 use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
@@ -207,6 +208,10 @@ pub(super) struct AbsentMemberFindingValue {
     pub(super) range: Range,
     pub(super) member: String,
     pub(super) class: String,
+    /// The strongest tier any root established. `roots` holds only the roots
+    /// that established this tier; a Conditional tier carries the sorted
+    /// union of those roots' remainders.
+    pub(super) proof: AbsentMemberProof,
     /// Sorted by root identity, with one coherent evidence record per root.
     pub(super) roots: Vec<AbsentMemberRootEvidence>,
 }
@@ -216,6 +221,11 @@ pub(super) struct AbsentMemberRootEvidence {
     pub(super) root_procedure_id: String,
     pub(super) origin_file: ProjectFile,
     pub(super) origin_range: Range,
+    pub(super) origin_span: SourceSpan,
+    pub(super) also_fails_at: Vec<(ProjectFile, SourceSpan)>,
+    /// Whether a narrowing guard, rather than value-producing syntax,
+    /// introduced the class.
+    pub(super) origin_is_guard: bool,
     pub(super) caller: String,
     pub(super) witness: Result<SummaryWitness, SummaryWitnessError>,
 }
@@ -245,15 +255,53 @@ impl AbsentMemberFindingValue {
             .unwrap_or_else(|| self.roots.first().expect("a finding has root evidence"))
     }
 
+    /// Merge another root set's evidence for the same finding. A Proven tier
+    /// replaces a Conditional one with its own evidence, a Conditional tier
+    /// never weakens a Proven one, and two Conditional tiers union their
+    /// remainders.
     pub(super) fn merge_evidence(&mut self, other: Self) {
         debug_assert_eq!(self.id, other.id);
+        match (&mut self.proof, other.proof) {
+            (AbsentMemberProof::Proven, AbsentMemberProof::Conditional { .. }) => return,
+            (AbsentMemberProof::Conditional { .. }, AbsentMemberProof::Proven) => {
+                self.proof = AbsentMemberProof::Proven;
+                self.roots = other.roots;
+                return;
+            }
+            (AbsentMemberProof::Proven, AbsentMemberProof::Proven) => {}
+            (
+                AbsentMemberProof::Conditional { remainders },
+                AbsentMemberProof::Conditional {
+                    remainders: other_remainders,
+                },
+            ) => {
+                for reason in other_remainders {
+                    if !remainders.contains(&reason) {
+                        remainders.push(reason);
+                    }
+                }
+                sort_unknown_reasons(remainders);
+            }
+        }
         for root in other.roots {
             match self.roots.binary_search_by(|existing| {
                 existing.root_procedure_id.cmp(&root.root_procedure_id)
             }) {
                 Ok(index) => {
-                    if self.roots[index].witness.is_err() && root.witness.is_ok() {
-                        self.roots[index] = root;
+                    let existing = &mut self.roots[index];
+                    if existing.origin_span == root.origin_span {
+                        existing
+                            .also_fails_at
+                            .extend(root.also_fails_at.iter().cloned());
+                        existing.also_fails_at.sort_unstable();
+                        existing.also_fails_at.dedup();
+                    }
+                    if existing.witness.is_err() && root.witness.is_ok() {
+                        let also_fails_at = std::mem::take(&mut existing.also_fails_at);
+                        *existing = root;
+                        existing.also_fails_at.extend(also_fails_at);
+                        existing.also_fails_at.sort_unstable();
+                        existing.also_fails_at.dedup();
                     }
                 }
                 Err(index) => self.roots.insert(index, root),
@@ -322,6 +370,7 @@ impl TypeFlowQueryState {
         rows
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn absent_member_findings(
         &mut self,
         workspace: &WorkspaceAnalyzer,
@@ -372,10 +421,14 @@ impl TypeFlowQueryState {
                 range: source_range(finding.site.span),
                 member: finding.site.member.to_string(),
                 class: finding.class.qualified_name().to_string(),
+                proof: finding.proof.clone(),
                 roots: vec![AbsentMemberRootEvidence {
                     root_procedure_id: super::semantic::procedure_wire_id(&finding.root),
                     origin_file: finding.origin.file.clone(),
                     origin_range: source_range(finding.origin.span),
+                    origin_span: finding.origin.span,
+                    also_fails_at: finding.also_fails_at.clone(),
+                    origin_is_guard: finding.origin.kind == SourceSiteKind::NarrowingGuard,
                     caller: caller.clone(),
                     witness: finding.witness.clone(),
                 }],
@@ -1162,7 +1215,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v11";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v14";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1436,7 +1489,7 @@ fn persisted_class_set_rows(
         .collect()
 }
 
-fn source_range(span: SourceSpan) -> Range {
+pub(super) fn source_range(span: SourceSpan) -> Range {
     Range {
         start_byte: span.start_byte() as usize,
         end_byte: span.end_byte() as usize,
@@ -1504,7 +1557,7 @@ fn exhausted_root_entries<'lane>(
 
 /// The procedure's declaration path, rendered the way a reader spells it:
 /// named segments joined, file segments dropped.
-fn procedure_name(root: &ProcedureHandle) -> String {
+pub(super) fn procedure_name(root: &ProcedureHandle) -> String {
     root.semantics()
         .locator()
         .declaration()
@@ -1562,11 +1615,13 @@ fn absent_member_finding_id(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbsentMemberFindingValue, AbsentMemberRootEvidence, ROOT_RESULT_ALGORITHM_ID,
-        TypeFlowQueryState, field_slot_semantic_limits, root_result_semantics_digest,
+        AbsentMemberFindingValue, AbsentMemberProof, AbsentMemberRootEvidence,
+        ROOT_RESULT_ALGORITHM_ID, TypeFlowQueryState, field_slot_semantic_limits,
+        root_result_semantics_digest,
     };
     use crate::analyzer::semantic::{
-        ProcedureHandle, SemanticBudget, SemanticRequest, SemanticWork, type_flow_adapter,
+        ProcedureHandle, SemanticBudget, SemanticRequest, SemanticWork, SourcePosition, SourceSpan,
+        type_flow_adapter,
     };
     use crate::analyzer::{AnalyzerConfig, Language, Range, WorkspaceAnalyzer};
     use crate::cancellation::CancellationToken;
@@ -1746,10 +1801,18 @@ mod tests {
             range,
             member: "missing".to_owned(),
             class: "app.Missing".to_owned(),
+            proof: AbsentMemberProof::Proven,
             roots: vec![AbsentMemberRootEvidence {
                 root_procedure_id: "root".to_owned(),
                 origin_file: file,
                 origin_range: range,
+                origin_span: SourceSpan::new(
+                    SourcePosition::new(0, 0, 0),
+                    SourcePosition::new(1, 0, 1),
+                )
+                .expect("ordered test span"),
+                also_fails_at: Vec::new(),
+                origin_is_guard: false,
                 caller: "root".to_owned(),
                 witness,
             }],
@@ -1784,8 +1847,8 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v11",
-            "unsupported callee returns must not reuse falsely complete root results"
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v14",
+            "a root cached as finding-free before the conditional absent-member tier may now carry a conditional finding"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
         let limits = CodeQueryValueFlowLimits::default();

@@ -81,11 +81,11 @@ for package in "${packages[@]}"; do
 done
 
 require_archive_file brokk-bifrost-core src/lib.rs
-# The unified cache DB's migrations moved down with cache_db.rs. The baseline
-# is named for the schema version it creates, which is 18: migrations 1..18
-# were folded into it.
-require_archive_file brokk-bifrost-core migrations/cache/0018-current-baseline.sql
-require_archive_file brokk-bifrost-core migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql
+# The unified cache DB ships one baseline at the compatibility floor. Forward
+# migrations resume at 0125 when the schema changes again. The baseline was
+# renumbered 0117 -> 0124 by `273b5ce2c` (lane PK) and this line still named
+# the old file, so every packaging run failed on it.
+require_archive_file brokk-bifrost-core migrations/cache/0125-baseline.sql
 # The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
 # assets moved down with their language crates; the epoch salt hashes them from
 # there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
@@ -130,6 +130,7 @@ require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/imports.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/definitions.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
+require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0011-native-compatibility.sql
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-policy src/lib.rs
 for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifest.json; do
@@ -213,6 +214,7 @@ require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v3.schema.json
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v4.schema.json
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v5.schema.json
+require_archive_file brokk-bifrost schemas/semantic-model-pack-v8.schema.json
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)
@@ -263,15 +265,59 @@ brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
 brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
 brokk-bifrost-mcp = { path = "$unpacked/brokk-bifrost-mcp-$version" }
-brokk-bifrost-lsp = { path = "$unpacked/brokk-bifrost-lsp-$version" }
 EOF
 cat > "$consumer/src/main.rs" <<'EOF'
+use brokk_bifrost::analyzer::usages::get_definition::{
+    DefinitionLookupStatus, navigation_declaration_site_at_offset,
+};
+use brokk_bifrost::analyzer::usages::{
+    CallRelationResult, FuzzyResult, QueryResult, UsageHit, UsageProofAuthority,
+};
+use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
+
+// Compile the embedding contracts used by the standalone host from unpacked
+// archives. These signatures preserve typed partial results and Rust errors.
 fn main() {
-    let _ = brokk_bifrost::NavigationOperation::Definition;
+    assert!(DefinitionLookupStatus::Incomplete.carries_definitions());
+    assert!(!DefinitionLookupStatus::Unavailable.carries_definitions());
+    let incomplete = FuzzyResult::Incomplete {
+        hits_by_overload: Default::default(),
+        unproven_by_overload: Default::default(),
+        unproven_total_by_overload: Default::default(),
+        diagnostics: Vec::new(),
+    };
+    assert!(matches!(incomplete, FuzzyResult::Incomplete { .. }));
+    let _: fn(&QueryResult) -> UsageProofAuthority = |answer| answer.proof_authority;
+    let _: fn(&CallRelationResult) -> UsageProofAuthority = |answer| answer.proof_authority;
+    let _: fn(&UsageHit) -> bool = UsageHit::is_lsp_reference_site;
+    let _: fn(&dyn IAnalyzer, &ProjectFile, &str, usize) -> Option<CodeUnit> =
+        navigation_declaration_site_at_offset;
+    let _: fn(&RustAnalyzer, &CodeUnit) -> Result<bool, _> =
+        RustAnalyzer::is_rust_trait_declaration;
+    let _: fn(&RustAnalyzer, &CodeUnit) -> Result<Option<Vec<CodeUnit>>, _> =
+        RustAnalyzer::rust_trait_member_implementations;
+    let profile = brokk_bifrost::open_pack_engine_profile();
+    assert_eq!(profile["engine_version"], brokk_bifrost::BIFROST_VERSION);
+    assert_eq!(
+        profile["build_identity"],
+        brokk_bifrost::BIFROST_BUILD_IDENTITY
+    );
 }
 EOF
 
-CARGO_TARGET_DIR="$consumer_target" cargo check --quiet --manifest-path "$consumer/Cargo.toml"
+# This is a package rehearsal with local archive patches, not registry-only
+# publication evidence. Resolve the full closure, then keep the lock fixed.
+CARGO_TARGET_DIR="$consumer_target" cargo metadata --format-version 1 \
+  --manifest-path "$consumer/Cargo.toml" > "$temporary/consumer-metadata.json"
+node --input-type=module - "$temporary/consumer-metadata.json" <<'EOF'
+import { readFileSync } from "node:fs";
+const graph = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const retired = graph.packages.filter((pkg) => pkg.name === "brokk-bifrost-lsp");
+if (retired.length > 0) {
+  throw new Error(`Packaged engine resolves the retired upstream LSP: ${JSON.stringify(retired)}`);
+}
+EOF
+CARGO_TARGET_DIR="$consumer_target" cargo run --quiet --locked --manifest-path "$consumer/Cargo.toml"
 PYO3_PYTHON="${PYO3_PYTHON:-python3}" CARGO_TARGET_DIR="$consumer_target" \
   cargo check --quiet --manifest-path "$consumer/Cargo.toml" --features full
 

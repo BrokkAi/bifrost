@@ -634,6 +634,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::CallEffect(id) => key("call_effect").text(id).finish(),
         PipelineKey::CallResultContract(id) => key("call_result_contract").text(id).finish(),
         PipelineKey::CallResultObligation(id) => key("call_result_obligation").text(id).finish(),
+        PipelineKey::ResultSubjectUse(id) => key("result_subject_use").text(id).finish(),
         PipelineKey::ResultContractUse(id) => key("result_contract_use").text(id).finish(),
         PipelineKey::ResultContractFailureUse(id) => {
             key("result_contract_failure_use").text(id).finish()
@@ -1203,6 +1204,7 @@ pub struct UnitRowField {
 pub enum UnitRowScalar {
     StableId(Box<str>),
     String(Box<str>),
+    StringList(Vec<String>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(Box<str>),
@@ -1214,6 +1216,7 @@ impl UnitRowScalar {
         match value {
             CodeQueryRowScalarRef::StableId(value) => Self::StableId(boxed(value)),
             CodeQueryRowScalarRef::String(value) => Self::String(boxed(value)),
+            CodeQueryRowScalarRef::StringList(value) => Self::StringList(value.to_vec()),
             CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
             CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
             CodeQueryRowScalarRef::ConstrainedEnum(value) => Self::ConstrainedEnum(boxed(value)),
@@ -1227,6 +1230,7 @@ impl UnitRowScalar {
         match self {
             Self::StableId(value) => CodeQueryRowScalarRef::StableId(value),
             Self::String(value) => CodeQueryRowScalarRef::String(value),
+            Self::StringList(value) => CodeQueryRowScalarRef::StringList(value),
             Self::Integer(value) => CodeQueryRowScalarRef::Integer(*value),
             Self::Boolean(value) => CodeQueryRowScalarRef::Boolean(*value),
             Self::ConstrainedEnum(value) => CodeQueryRowScalarRef::ConstrainedEnum(value),
@@ -1304,6 +1308,23 @@ pub enum UnitRowItemTerminal {
     CallResult {
         proof: Box<str>,
     },
+    ResultSubjectUse {
+        proof: Box<str>,
+        completeness: Box<str>,
+        outcome: Box<str>,
+    },
+    AbsentMemberFinding {
+        also_fails_at: Vec<UnitRowLocation>,
+    },
+}
+
+/// Exact source location retained with an absent-member policy row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRowLocation {
+    pub path: Box<str>,
+    pub range: CodeQueryRange,
+    pub start_byte: u64,
+    pub end_byte: u64,
 }
 
 /// One capture of a structural match, projected onto the fields a policy joins
@@ -1405,6 +1426,29 @@ impl UnitRowItemTerminal {
             CodeQueryResultValue::CallResult { value } => UnitRowItemTerminal::CallResult {
                 proof: boxed(value.proof),
             },
+            CodeQueryResultValue::ResultSubjectUse { value } => {
+                UnitRowItemTerminal::ResultSubjectUse {
+                    proof: boxed(value.proof),
+                    completeness: boxed(value.completeness),
+                    outcome: boxed(value.outcome.label()),
+                }
+            }
+            CodeQueryResultValue::AbsentMemberFinding { value } => {
+                UnitRowItemTerminal::AbsentMemberFinding {
+                    also_fails_at: value
+                        .also_fails_at_locations
+                        .iter()
+                        .map(|location| UnitRowLocation {
+                            path: boxed(&location.path),
+                            range: location.range,
+                            start_byte: u64::try_from(location.start_byte)
+                                .expect("source byte offsets fit in u64"),
+                            end_byte: u64::try_from(location.end_byte)
+                                .expect("source byte offsets fit in u64"),
+                        })
+                        .collect(),
+                }
+            }
             CodeQueryResultValue::Occurrence { .. }
             | CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::Binding { .. }
@@ -1439,7 +1483,6 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::TaintFinding { .. }
             | CodeQueryResultValue::ConcurrentAccessConflict { .. }
             | CodeQueryResultValue::ClassSetRow { .. }
-            | CodeQueryResultValue::AbsentMemberFinding { .. }
             | CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::MemberTargetAnalysis { .. }
             | CodeQueryResultValue::ReceiverOutcome { .. }
@@ -1538,6 +1581,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::CallEffect { value } => &value.path,
         CodeQueryResultValue::CallResultContract { value } => &value.path,
         CodeQueryResultValue::CallResultObligation { value } => &value.path,
+        CodeQueryResultValue::ResultSubjectUse { value } => &value.path,
         CodeQueryResultValue::ResultContractUse { value } => &value.path,
         CodeQueryResultValue::ResultContractFailureUse { value } => &value.path,
         CodeQueryResultValue::NilnessOperation { value } => &value.path,

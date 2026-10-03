@@ -3,7 +3,7 @@
 use crate::hash::HashMap;
 use std::hash::Hash;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactRows<T> {
     offsets: Box<[u32]>,
     values: Box<[T]>,

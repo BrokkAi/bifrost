@@ -31,7 +31,13 @@ pub fn maybe_gc_for_analyzer(
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    maybe_gc(db_path, repo, workspace_root)
+    let outcome = maybe_gc(db_path, repo, workspace_root)?;
+    if outcome.analyzer_dropped > 0 && brokk_bifrost_core::cache_gc::planner_statistics_enabled() {
+        store
+            .reload_planner_statistics()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(outcome)
 }
 
 pub fn force_gc_for_analyzer(
@@ -43,8 +49,19 @@ pub fn force_gc_for_analyzer(
         return Ok(GcOutcome::skipped(0));
     };
     let outcome = force_gc(db_path, repo, workspace_root)?;
-    store
+    let reclaimed = store
         .reclaim_stale_generations(i64::MAX as usize)
         .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?;
+    if brokk_bifrost_core::cache_gc::planner_statistics_enabled() {
+        if reclaimed > 0 {
+            store
+                .refresh_planner_statistics()
+                .map_err(|error| error.to_string())?;
+        } else if outcome.analyzer_dropped > 0 {
+            store
+                .reload_planner_statistics()
+                .map_err(|error| error.to_string())?;
+        }
+    }
     Ok(outcome)
 }

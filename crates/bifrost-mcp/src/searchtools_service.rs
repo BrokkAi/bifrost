@@ -41,6 +41,7 @@ use crate::{
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
     diff_scoring::{DiffScoringSession, ScoreDiffParams},
     file_tools::{find_files_containing, get_file_contents, search_file_contents},
+    panic_report::reported_panic,
     path_normalization::NormalizePath,
     policy::{
         BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationGeneration,
@@ -65,7 +66,7 @@ use crate::{
         most_relevant_files_with_cancellation, refresh_result, rename_symbol,
         scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
         search_symbols_with_cancellation, session_subset, symbol_source_candidate_files,
-        usage_graph,
+        usage_graph_with_cancellation,
     },
     searchtools_render::{RenderOptions, RenderText},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
@@ -983,10 +984,9 @@ struct RunPolicyParams {
     #[serde(default)]
     fail_on: RunPolicyFailOn,
     diff_base: Option<String>,
-    /// Whether this run may reuse per-unit results an earlier run published
-    /// (`.agents/plans/impact-sliced-diff-base.md`). Absent means yes, which
-    /// is the same findings for less work; `false` forces the full evaluation
-    /// a caller compares against when diagnosing a difference.
+    /// Whether this run may publish complete units and reuse verified ones.
+    /// Absent means yes. `false` forces full evaluation without policy-unit
+    /// cache access when diagnosing a difference.
     incremental: Option<bool>,
     /// Opt-in wall-clock stage attribution (#2611). When set, the result
     /// carries a `stage_timings` sibling next to the canonical report; the
@@ -1333,6 +1333,7 @@ enum StartupIndexWarm {
 struct SemanticPackWarm {
     state: Mutex<PackWarmState>,
     settled: Condvar,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     started_at: Instant,
     settled_ns: AtomicU64,
     /// Parks the worker before it touches the catalog, so a test can prove the
@@ -1371,6 +1372,7 @@ impl SemanticPackWarm {
         Self {
             state: Mutex::new(PackWarmState::Settled(state)),
             settled: Condvar::new(),
+            worker: Mutex::new(None),
             started_at: Instant::now(),
             settled_ns: AtomicU64::new(0),
             #[cfg(test)]
@@ -1382,6 +1384,7 @@ impl SemanticPackWarm {
         Self {
             state: Mutex::new(PackWarmState::Pending),
             settled: Condvar::new(),
+            worker: Mutex::new(None),
             started_at: Instant::now(),
             settled_ns: AtomicU64::new(0),
             #[cfg(test)]
@@ -1393,7 +1396,11 @@ impl SemanticPackWarm {
     /// returns.
     fn spawn(project_root: PathBuf, analyzer: WorkspaceAnalyzer) -> Result<Arc<Self>, String> {
         let warm = Arc::new(Self::pending());
-        start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        let worker = start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        *warm
+            .worker
+            .lock()
+            .expect("semantic-pack warm mutex poisoned") = Some(worker);
         Ok(warm)
     }
 
@@ -1410,8 +1417,32 @@ impl SemanticPackWarm {
             hold: Some(hold),
             ..Self::pending()
         });
-        start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        let worker = start_pack_warm_worker(Arc::clone(&warm), project_root, analyzer)?;
+        *warm
+            .worker
+            .lock()
+            .expect("semantic-pack warm mutex poisoned") = Some(worker);
         Ok(warm)
+    }
+
+    /// Join activation before the session releases its analyzer snapshot.
+    /// The worker owns an analyzer clone, so waiting only for publication would
+    /// not prove that its SQLite store handles have been dropped.
+    fn wait_for_worker(&self) {
+        let worker = self
+            .worker
+            .lock()
+            .expect("semantic-pack warm worker mutex poisoned")
+            .take();
+        if let Some(worker) = worker {
+            #[cfg(test)]
+            if let Some(hold) = &self.hold {
+                hold.mark_teardown_waiting();
+            }
+            if let Err(panic) = worker.join() {
+                eprintln!("{}", reported_panic("semantic-pack warm thread", panic));
+            }
+        }
     }
 
     /// The activation as a query snapshot observes it right now.
@@ -1543,13 +1574,16 @@ fn start_pack_warm_worker(
     warm: Arc<SemanticPackWarm>,
     project_root: PathBuf,
     analyzer: WorkspaceAnalyzer,
-) -> Result<(), String> {
+) -> Result<std::thread::JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("bifrost-semantic-pack-warm".to_string())
         .spawn(move || {
             #[cfg(test)]
             if let Some(hold) = &warm.hold {
                 hold.park_until_released();
+                if hold.panic_after_release {
+                    panic!("injected semantic-pack warm failure");
+                }
             }
             // The installed stage is what the query path awaits: catalog open
             // and the packs already installed for this workspace, with nothing
@@ -1571,8 +1605,7 @@ fn start_pack_warm_worker(
                 }
             }
         })
-        .map_err(|error| format!("Failed to spawn semantic-pack warm thread: {error}"))?;
-    Ok(())
+        .map_err(|error| format!("Failed to spawn semantic-pack warm thread: {error}"))
 }
 
 /// Test-only latch that parks a semantic-pack warm before it starts.
@@ -1580,6 +1613,11 @@ fn start_pack_warm_worker(
 struct PackWarmHold {
     released: Mutex<bool>,
     progress: Condvar,
+    worker_parked: Mutex<bool>,
+    worker_parked_changed: Condvar,
+    teardown_waiting: Mutex<bool>,
+    teardown_waiting_changed: Condvar,
+    panic_after_release: bool,
     /// When set, parks the warm again between its installed stage and the
     /// expensive acquisition stage, so a test can observe a query answered
     /// against the interim activation with production still outstanding.
@@ -1630,21 +1668,37 @@ impl PackWarmHold {
         Self {
             released: Mutex::new(false),
             progress: Condvar::new(),
+            worker_parked: Mutex::new(false),
+            worker_parked_changed: Condvar::new(),
+            teardown_waiting: Mutex::new(false),
+            teardown_waiting_changed: Condvar::new(),
+            panic_after_release: false,
             expensive_stage: None,
+        }
+    }
+
+    fn new_panicking() -> Self {
+        Self {
+            panic_after_release: true,
+            ..Self::new()
         }
     }
 
     fn new_holding_expensive_stage() -> (Self, Arc<ExpensiveStageHold>) {
         let expensive_stage = Arc::new(ExpensiveStageHold::new());
         let hold = Self {
-            released: Mutex::new(false),
-            progress: Condvar::new(),
             expensive_stage: Some(Arc::clone(&expensive_stage)),
+            ..Self::new()
         };
         (hold, expensive_stage)
     }
 
     fn park_until_released(&self) {
+        *self
+            .worker_parked
+            .lock()
+            .expect("pack warm parked mutex poisoned") = true;
+        self.worker_parked_changed.notify_all();
         let mut released = self.released.lock().expect("pack warm hold mutex poisoned");
         while !*released {
             released = self
@@ -1663,6 +1717,58 @@ impl PackWarmHold {
     fn release(&self) {
         *self.released.lock().expect("pack warm hold mutex poisoned") = true;
         self.progress.notify_all();
+    }
+
+    fn release_all(&self) {
+        self.release();
+        if let Some(expensive_stage) = &self.expensive_stage {
+            expensive_stage.release();
+        }
+    }
+
+    fn mark_teardown_waiting(&self) {
+        *self
+            .teardown_waiting
+            .lock()
+            .expect("pack warm teardown mutex poisoned") = true;
+        self.teardown_waiting_changed.notify_all();
+    }
+
+    fn wait_for_worker_parked(&self) {
+        let state = self
+            .worker_parked
+            .lock()
+            .expect("pack warm parked mutex poisoned");
+        let (state, _) = self
+            .worker_parked_changed
+            .wait_timeout_while(state, Duration::from_secs(30), |state| !*state)
+            .expect("pack warm parked mutex poisoned while waiting");
+        assert!(*state, "semantic-pack warm worker did not reach its hold");
+    }
+
+    fn wait_for_teardown_waiting(&self) {
+        let state = self
+            .teardown_waiting
+            .lock()
+            .expect("pack warm teardown mutex poisoned");
+        let (state, _) = self
+            .teardown_waiting_changed
+            .wait_timeout_while(state, Duration::from_secs(30), |state| !*state)
+            .expect("pack warm teardown mutex poisoned while waiting");
+        assert!(
+            *state,
+            "session teardown did not wait for semantic-pack warm"
+        );
+    }
+}
+
+#[cfg(test)]
+struct ReleasePackWarmOnDrop(Arc<PackWarmHold>);
+
+#[cfg(test)]
+impl Drop for ReleasePackWarmOnDrop {
+    fn drop(&mut self) {
+        self.0.release_all();
     }
 }
 
@@ -3202,16 +3308,47 @@ fn changed_files_invalidate_pack_activation(changed_files: &BTreeSet<ProjectFile
     })
 }
 
+#[cfg(test)]
+mod pack_input_change_tests {
+    use super::*;
+
+    /// `Cargo.lock` and `rust-toolchain.toml` reach Rust analysis only through
+    /// dependency and standard-library packs, so this refresh is what keeps
+    /// them current: the Rust delegate is not routed either file (#3756).
+    /// `.cargo/config.toml` is read by nothing (#3768).
+    #[test]
+    fn rust_pack_inputs_refresh_pack_activation_and_cargo_config_does_not() {
+        let root = std::env::temp_dir();
+        let refreshes = |path: &str| {
+            changed_files_invalidate_pack_activation(&BTreeSet::from([ProjectFile::new(
+                root.clone(),
+                path,
+            )]))
+        };
+        assert!(refreshes("Cargo.lock"));
+        assert!(refreshes("rust-toolchain.toml"));
+        assert!(refreshes("crates/member/Cargo.toml"));
+        assert!(!refreshes(".cargo/config.toml"));
+        assert!(!refreshes("src/lib.rs"));
+    }
+}
+
 impl Drop for WorkspaceSession {
     fn drop(&mut self) {
         // The warmer owns the snapshot while its thread runs. Wait for it
         // before the session drops the project and its SQLite connections.
         self.index_warmer.wait_until_idle();
-        let Some(handle) = self.usage_index_warm.take() else {
-            return;
-        };
-        if let Err(panic) = handle.join() {
-            eprintln!("bifrost usage-index warm thread panicked: {panic:?}");
+        // Semantic-pack activation owns a cloned analyzer until its worker
+        // exits, so joining state publication alone would still let its SQLite
+        // handles outlive the session.
+        self.semantic_packs.wait_for_worker();
+        if let Some(handle) = self.usage_index_warm.take()
+            && let Err(panic) = handle.join()
+        {
+            // The payload's own `Debug` is `Any { .. }`. A warm that failed
+            // leaves its index unpublished and the next query rebuilds it,
+            // so this is a diagnostic rather than a request failure.
+            eprintln!("{}", reported_panic("usage-index warm thread", panic));
         }
     }
 }
@@ -4206,7 +4343,13 @@ impl SearchToolsService {
             // its budget, instead of blocking through the whole build and then
             // reporting a misleading zero-result "cancelled/partial" payload
             // (#1199).
-            self.snapshot_for_query_with_cancellation(cancellation)?
+            let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
+            let named = crate::tool_arguments::tool_named_files(name, &arguments);
+            if self.apply_stale_named_files(&named)? {
+                self.snapshot_for_query_with_cancellation(cancellation)?
+            } else {
+                snapshot
+            }
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled)
             && !matches!(
@@ -4399,7 +4542,13 @@ impl SearchToolsService {
                 &snapshot,
                 arguments,
                 render_options,
-                |workspace, params| usage_graph(workspace.analyzer(), params),
+                |workspace, params| {
+                    usage_graph_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation.cloned().unwrap_or_default(),
+                    )
+                },
             ),
             "get_file_contents" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
@@ -5398,9 +5547,22 @@ impl SearchToolsService {
             .lock()
             .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?;
         if let Some(handle) = pending.take() {
-            let built = handle
-                .join()
-                .map_err(|_| SearchToolsServiceError::internal("index build thread panicked"))?;
+            // A panicked build is this request's failure, and the panic's own
+            // message is the only description of it the caller will get: the
+            // build thread is gone and nothing else knows why it stopped.
+            // Record it the way a returned build error is recorded so a later
+            // request reports the same failure instead of querying a workspace
+            // that was never installed (issue #2771).
+            let built = match handle.join() {
+                Ok(built) => built,
+                Err(payload) => {
+                    let reported = reported_panic("index build thread", payload).to_string();
+                    *self.build_error.lock().map_err(|_| {
+                        SearchToolsServiceError::internal("index build lock poisoned")
+                    })? = Some(reported.clone());
+                    return Err(SearchToolsServiceError::internal(reported));
+                }
+            };
             match built {
                 Ok((generation, root, session)) => {
                     if generation != self.workspace_generation()
@@ -6105,6 +6267,45 @@ impl SearchToolsService {
             "get_symbol_sources exceeded the {}-byte response budget while resolving source; re-call with fewer or narrower symbols",
             exceeded.max_source_bytes()
         ))
+    }
+
+    /// Bring the files a request names up to date when the watcher has not
+    /// delivered their change yet, and report whether the snapshot moved.
+    ///
+    /// A request must observe the current content of every file it names, and
+    /// an editor's request routinely arrives before the watcher's event for
+    /// the save it follows. Checking the named files directly (a read and a
+    /// comparison with the indexed source each) costs what the request names,
+    /// not what the worktree holds. Other files stay as fresh as the watcher
+    /// has made them, exactly as before.
+    fn apply_stale_named_files(&self, named: &[String]) -> Result<bool, SearchToolsServiceError> {
+        if self.update_strategy != UpdateStrategy::WatchFiles || named.is_empty() {
+            return Ok(false);
+        }
+        let _scope = profiling::scope("SearchToolsService::apply_stale_named_files");
+        let peek_snapshot = {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            Arc::clone(&session.snapshot)
+        };
+        let root = peek_snapshot.analyzer().project().root().to_path_buf();
+        let candidates = named
+            .iter()
+            .map(|path| ProjectFile::new(root.clone(), PathBuf::from(path)))
+            .filter(|file| file.abs_path().is_file())
+            .collect::<BTreeSet<_>>();
+        let stale = stale_symbol_source_files(peek_snapshot.analyzer(), candidates)?;
+        if stale.is_empty() {
+            return Ok(false);
+        }
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        Self::apply_watcher_delta(session);
+        // Another thread may have applied the change between the peek and the
+        // write lock; recompute against the now-current snapshot.
+        let stale = stale_symbol_source_files(session.snapshot.analyzer(), stale)?;
+        Self::apply_changed_files(session, stale);
+        Ok(true)
     }
 
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
@@ -7052,17 +7253,20 @@ fn assemble_session_with_warm(
         watcher_starter,
     )?;
     let snapshot = Arc::new(workspace);
-    // Pre-build the lazy per-language usage indexes off the request path (issue
-    // #1416): warmed here in the background, the first `scan_usages` call no
-    // longer pays whole-workspace index construction inside its wall-clock
-    // budget. The PoolSafeMemo backing the index keeps a failed build
-    // unpublished, so any panic here resurfaces on the first query that needs it.
+    // Bring the persisted per-file Rust usage facts up to date off the request
+    // path (issue #1416). Under the native engine there is no whole-workspace
+    // index left to build, so what this buys is repair: a live blob whose
+    // canonical facts were never published makes every native Rust graph and
+    // reference answer report `unavailable_canonical_facts` until the catch-up
+    // persists it, and doing that inside the first query's wall-clock budget is
+    // the latency #1416 exists to avoid. A panic here resurfaces on the first
+    // query that needs the facts.
     //
-    // Opt-out, because the warm is a whole-workspace fan-out and a session that
-    // will never ask a usage question should not pay for it: a large C++
-    // workspace with a vendored Rust tree paid the Rust build for work it never
-    // queried (d8920a38). `StartupIndexWarm::OnDemand` leaves the build to the
-    // first query that needs it, which is the same build under the same memo.
+    // Opt-out, because the catch-up is a whole-workspace fan-out and a session
+    // that will never ask a usage question should not pay for it: a large C++
+    // workspace with a vendored Rust tree paid it for work it never queried
+    // (d8920a38). `StartupIndexWarm::OnDemand` leaves the repair to the first
+    // query that needs it.
     let usage_index_warm = if startup_index_warm == StartupIndexWarm::AtStartup {
         let snapshot = Arc::clone(&snapshot);
         Some(
@@ -7070,7 +7274,7 @@ fn assemble_session_with_warm(
                 .name("bifrost-usage-index-warm".to_string())
                 .spawn(move || {
                     let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                    snapshot.warm_usage_analysis();
+                    snapshot.warm_rust_usage_facts();
                 })
                 .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?,
         )
@@ -7744,6 +7948,22 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    fn run_policy_uses_the_coordinator_cache_default_and_full_override() {
+        let arguments = json!({
+            "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+            "evaluation_date": "2026-09-29",
+            "fail_on": "warning"
+        });
+        let default = decode_run_policy_arguments(arguments.clone()).expect("default request");
+        assert!(default.options.incremental());
+
+        let mut full = arguments;
+        full["incremental"] = json!(false);
+        let full = decode_run_policy_arguments(full).expect("full-evaluation request");
+        assert!(!full.options.incremental());
+    }
+
+    #[test]
     fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -8278,18 +8498,13 @@ mod watcher_startup_tests {
             "lib.rs",
             "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
         );
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
-            root,
-            UpdateStrategy::Manual,
-            failing_starter(Arc::clone(&calls)),
-        )
-        .unwrap();
+        let hold = Arc::new(PackWarmHold::new());
+        let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
 
-        // A complete base snapshot is ready for ordinary code-intelligence
-        // queries before the optional Rust hierarchy and usage accelerators
-        // are warm (#1448). Join the finished build directly so the background
-        // warmer cannot race this assertion.
+        // Pack activation can read and warm Rust facts itself. Hold that
+        // independent worker so this assertion observes only the deferred
+        // snapshot build, whose readiness does not require optional indexes.
         service.wait_workspace_ready(&|| false).unwrap();
         let handle = service
             .pending_build
@@ -8298,6 +8513,8 @@ mod watcher_startup_tests {
             .take()
             .expect("deferred build should remain pending installation");
         let (_, _, session) = handle.join().unwrap().unwrap();
+        let _release_session_warm_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        hold.wait_for_worker_parked();
 
         assert!(!session.snapshot.query_indexes_warm());
     }
@@ -8305,19 +8522,22 @@ mod watcher_startup_tests {
     #[test]
     fn deferred_build_defers_background_query_index_warm_until_first_tool_call() {
         let (_temp, root) = workspace(
-            "lib.rs",
-            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+            "Warm.java",
+            "class Runnable {}\nclass Worker extends Runnable {}\n",
         );
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
-            root,
-            UpdateStrategy::Manual,
-            failing_starter(Arc::clone(&calls)),
-        )
-        .unwrap();
+        let hold = Arc::new(PackWarmHold::new());
+        let mut service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        // The held helper avoids an unrelated startup usage warm; retain the
+        // long-lived service's first-tool IndexWarmer scheduling contract. The
+        // Java fixture keeps query_indexes_warm tied to its lazy external
+        // declaration index, rather than the Rust facts that pack activation
+        // can warm independently.
+        service.startup_index_warm = StartupIndexWarm::AtStartup;
 
         service.wait_workspace_ready(&|| false).unwrap();
         service.ensure_ready().unwrap();
+        hold.wait_for_worker_parked();
 
         let (snapshot, warmer) = {
             let guard = service.session.read().unwrap();
@@ -8327,6 +8547,8 @@ mod watcher_startup_tests {
                 Arc::clone(&session.index_warmer),
             )
         };
+        // Keep semantic-pack activation parked: its independent work must not
+        // satisfy the Java query-index sentinel before the first tool call.
         assert!(!snapshot.query_indexes_warm());
 
         service
@@ -8441,6 +8663,7 @@ mod watcher_startup_tests {
         let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
         let hold = Arc::new(PackWarmHold::new());
         let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
 
         let deadline = Some(Instant::now() + Duration::from_secs(30));
         service
@@ -8468,6 +8691,88 @@ mod watcher_startup_tests {
         assert!(
             session.semantic_packs.duration().is_some(),
             "a settled warm reports how long it ran, so a profile can name it"
+        );
+    }
+
+    #[test]
+    fn closing_workspace_joins_semantic_pack_worker_before_releasing_store() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new());
+        let service = Arc::new(service_with_held_warm(root, Arc::clone(&hold)));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        service.ensure_ready().unwrap();
+        let store = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            Arc::downgrade(
+                session
+                    .snapshot
+                    .store()
+                    .expect("persisted workspace has a store"),
+            )
+        };
+        hold.wait_for_worker_parked();
+
+        std::thread::scope(|scope| {
+            let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let closing_service = Arc::clone(&service);
+            let closer = scope.spawn(move || {
+                closed_tx.send(closing_service.close()).unwrap();
+            });
+            hold.wait_for_teardown_waiting();
+            assert!(
+                matches!(
+                    closed_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "close must stay blocked while the semantic-pack worker owns its analyzer clone"
+            );
+
+            hold.release_all();
+            closed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            closer.join().unwrap();
+        });
+        assert!(
+            store.upgrade().is_none(),
+            "close must return after the worker has released its analyzer store"
+        );
+    }
+
+    #[test]
+    fn closing_workspace_joins_panicked_semantic_pack_worker() {
+        let (_temp, root) = workspace("Warm.java", "class Warm {}\n");
+        let hold = Arc::new(PackWarmHold::new_panicking());
+        let service = Arc::new(service_with_held_warm(root, Arc::clone(&hold)));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+        service.ensure_ready().unwrap();
+        let store = {
+            let guard = service.session.read().unwrap();
+            Arc::downgrade(
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .store()
+                    .expect("persisted workspace has a store"),
+            )
+        };
+        hold.wait_for_worker_parked();
+
+        std::thread::scope(|scope| {
+            let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
+            let closing_service = Arc::clone(&service);
+            let closer = scope.spawn(move || closing_service.close());
+            hold.wait_for_teardown_waiting();
+            hold.release_all();
+            closer.join().unwrap().unwrap();
+        });
+        assert!(
+            store.upgrade().is_none(),
+            "close must release the store even when the warm worker panics"
         );
     }
 
@@ -8537,6 +8842,7 @@ mod watcher_startup_tests {
         let (hold, expensive_stage) = PackWarmHold::new_holding_expensive_stage();
         let hold = Arc::new(hold);
         let service = service_with_held_warm(root, Arc::clone(&hold));
+        let _release_hold_on_drop = ReleasePackWarmOnDrop(Arc::clone(&hold));
 
         hold.release();
         // Preparation waits for the installed stage, so when it returns the
@@ -8861,6 +9167,76 @@ mod watcher_startup_tests {
             "Git bookkeeping must not replace the session snapshot"
         );
         after.finish("source_snapshot_pin", Ok(())).unwrap();
+    }
+
+    /// A member manifest whose directory holds no source file is outside every
+    /// recursive source root. Adding a path dependency there must still reach
+    /// the next query through the watcher (#3755).
+    #[test]
+    fn a_member_manifest_edit_reaches_the_next_query() {
+        const APP_MANIFEST: &str =
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        for (path, contents) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/app\", \"crates/dep\"]\nresolver = \"2\"\n",
+            ),
+            ("crates/app/Cargo.toml", APP_MANIFEST),
+            (
+                "crates/dep/Cargo.toml",
+                "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "crates/app/src/lib.rs",
+                "use dep::target;\npub fn caller() { target(); }\n",
+            ),
+            ("crates/dep/src/lib.rs", "pub fn target() {}\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let starter: WatcherStarter = Arc::new(|project, claimed_files| {
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
+        });
+        let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
+            root.clone(),
+            UpdateStrategy::WatchFiles,
+            starter,
+        )
+        .unwrap();
+        let resolves_the_call = || {
+            let graph = service
+                .call_tool_value("usage_graph", json!({"include_tests": true, "depth": 1}))
+                .unwrap();
+            let edges = graph["edges"].as_array().expect("usage graph edges");
+            edges.iter().any(|edge| {
+                edge["from"]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("caller"))
+                    && edge["to"].as_str().is_some_and(|to| to.ends_with("target"))
+            })
+        };
+        assert!(
+            !resolves_the_call(),
+            "without the dependency the cross-crate call is unresolved"
+        );
+
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            format!("{APP_MANIFEST}[dependencies]\ndep = {{ path = \"../dep\" }}\n"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !resolves_the_call() {
+            assert!(
+                Instant::now() < deadline,
+                "the query after the manifest edit must resolve the new dependency"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -9231,6 +9607,31 @@ public partial class MudDialogContainer
             .iter()
             .map(|source| source["text"].as_str().unwrap())
             .collect()
+    }
+
+    /// A location request names its file, so it must observe that file's
+    /// current content even when the watcher has not delivered the save yet.
+    /// `watching_service_without_watcher` is a watching session whose watcher
+    /// never delivers, which makes the race deterministic (gate 13 defect 3).
+    #[test]
+    fn a_location_request_observes_its_own_file_before_the_watcher_delivers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("app.py"), "def alpha():\n    pass\n").unwrap();
+        let service = watching_service_without_watcher(root.clone());
+        let edited = "def alpha():\n    pass\n\ndef beta():\n    pass\n\nbeta()\n";
+        fs::write(root.join("app.py"), edited).unwrap();
+
+        let arguments = serde_json::json!({
+            "references": [{"path": "app.py", "line": 7, "column": 1}]
+        });
+        let payload = service
+            .call_tool_json("get_definitions_by_location", &arguments.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], "app.beta", "{value}");
     }
 
     #[test]
@@ -9824,7 +10225,7 @@ mod search_symbols_cancellation_tests {
     }
 
     #[test]
-    fn issue_1304_cancelled_graph_returns_explicit_history_import_fallback() {
+    fn issue_1304_shared_request_cancellation_publishes_no_ranked_prefix() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("A.java"),
@@ -9863,8 +10264,10 @@ mod search_symbols_cancellation_tests {
         assert_eq!(result["complete"], false, "{result:#}");
         assert_eq!(result["ranking_mode_used"], "history_imports", "{result:#}");
         assert_eq!(result["incomplete_reason"], "cancelled", "{result:#}");
+        assert_eq!(result["files"], json!([]), "{result:#}");
         assert!(
-            rendered.contains("returned deterministic history/import ranking instead"),
+            rendered
+                .contains("the request was cancelled before a complete result could be published"),
             "{rendered}"
         );
     }

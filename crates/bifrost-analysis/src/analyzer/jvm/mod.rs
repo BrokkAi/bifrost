@@ -24,6 +24,13 @@ use external::JvmExternalDeclarationIndex;
 
 pub(crate) use dependency_discovery::MAX_BUILD_METADATA_BYTES;
 
+/// The build inputs every JVM language captures as selected configuration:
+/// dependency-discovery build files and the toolchain declaration.
+pub(crate) fn is_jvm_configuration_input_path(path: &std::path::Path) -> bool {
+    dependency_discovery::is_jvm_dependency_input_path(path)
+        || path == std::path::Path::new(".bifrost/jvm-toolchains.json")
+}
+
 /// Classify a peeked `OnceLock<JvmExternalDeclarationIndex>` cell for the
 /// proof-gated diagnostic ladder (#1619).
 ///

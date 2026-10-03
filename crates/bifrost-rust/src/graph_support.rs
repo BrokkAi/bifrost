@@ -1,9 +1,13 @@
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
-use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_MACRO;
+use brokk_bifrost_core::analyzer::rust_facts::{
+    RustDeclarationBoundary, RustDeclarationKind, RustSourceContextKind,
+    RustValueConstructorProperties,
+};
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     ALIAS_SUBSTITUTION_RULE, RewriteOutcome, RewriteStep, RewriteTrace,
 };
@@ -24,17 +28,200 @@ use tree_sitter::Node;
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use crate::crate_naming;
 use crate::declarations::{rust_node_text, rust_package_name};
-use crate::imports::{
-    RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
-    rust_imports_with_visibility_from_use_declaration, rust_item_has_attribute,
-    rust_item_visibility, rust_target_kind_root_alternative,
+use crate::hierarchy::{
+    RustHierarchySourceFacts, resolve_rust_hierarchy_source_ref, source_type_identifier,
 };
-use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
-use crate::syntax::unwrap_attributes;
-use crate::usage::exported_targets_from_files;
-use crate::usage_queries::RustDeclarationFacts;
+use crate::hierarchy_source_context::RustSourceContextIndex;
+use crate::imports::{
+    RustVisibility, resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
+    rust_crate_root_package, rust_item_has_attribute, rust_target_kind_root_alternative,
+};
+use crate::usage::{
+    RustReferenceNamespace, exported_targets_from_files, exported_targets_from_files_while,
+};
+use crate::usage_queries::{RustDeclarationFacts, RustUsageQueries};
 use crate::usage_walks::RustWalkCaches;
-use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
+use brokk_bifrost_core::analyzer::rust_facts::{RustDeclarationPropertyFact, RustUsageFacts};
+use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceId};
+use brokk_bifrost_core::analyzer::usages::common::same_node;
+
+/// Whether this node is the name token of a Rust declaration head.
+///
+/// Moved here with the R6.5 legacy deletion: the reference-candidate
+/// classifier is its only caller now that the legacy Rust usage graph is gone.
+pub fn is_rust_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(
+        parent.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            | "mod_item"
+            | "field_declaration"
+            | "enum_variant"
+            | "function_signature_item"
+    ) && parent.child_by_field_name("name") == Some(node)
+}
+
+/// Which Rust namespace a reference token names.
+///
+/// A macro path names the macro namespace whatever the token's own kind is; a
+/// type identifier in call position names a value (a tuple-struct or variant
+/// constructor); the qualifier of a scoped identifier names a path prefix.
+pub fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
+    let mut ancestor = Some(node);
+    while let Some(current) = ancestor {
+        if current.kind() == "macro_invocation"
+            && current
+                .child_by_field_name("macro")
+                .is_some_and(|macro_path| {
+                    macro_path.start_byte() <= node.start_byte()
+                        && node.end_byte() <= macro_path.end_byte()
+                })
+        {
+            return RustReferenceNamespace::Macro;
+        }
+        ancestor = current.parent();
+    }
+
+    if node.kind() == "type_identifier" && rust_type_identifier_is_call_target(node) {
+        return RustReferenceNamespace::Value;
+    }
+    if matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
+        return RustReferenceNamespace::Type;
+    }
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "scoped_type_identifier" {
+            return RustReferenceNamespace::Type;
+        }
+        if parent.kind() == "scoped_identifier"
+            && parent
+                .child_by_field_name("path")
+                .is_some_and(|path| same_node(path, node))
+        {
+            return RustReferenceNamespace::PathPrefix;
+        }
+    }
+    RustReferenceNamespace::Value
+}
+
+fn rust_type_identifier_is_call_target(node: Node<'_>) -> bool {
+    let mut expression = node;
+    while let Some(parent) = expression.parent()
+        && matches!(parent.kind(), "generic_function" | "generic_type")
+    {
+        expression = parent;
+    }
+    expression.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == expression.id())
+    })
+}
+
+/// The identifier nodes of a Rust path, outermost qualifier first.
+///
+/// `None` for a node shape that is not a path: a caller must not fall back to
+/// splitting the source text. A leading `::` ends the walk with the segments
+/// gathered so far, because the absolute root has no node of its own.
+pub fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut reversed = Vec::new();
+    loop {
+        match node.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {
+                reversed.push(node.child_by_field_name("name")?);
+                let Some(path) = node.child_by_field_name("path") else {
+                    if node.child(0).is_some_and(|child| child.kind() == "::") {
+                        break;
+                    }
+                    return None;
+                };
+                node = path;
+            }
+            "generic_type" => node = node.child_by_field_name("type")?,
+            "generic_function" => node = node.child_by_field_name("function")?,
+            "identifier" | "type_identifier" | "self" | "super" | "crate" => {
+                reversed.push(node);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+/// Whether the path containing `node` is rooted at a leading `::`.
+pub fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent()
+        && matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier" | "generic_type" | "generic_function"
+        )
+    {
+        node = parent;
+    }
+    loop {
+        match node.kind() {
+            "generic_type" => {
+                let Some(inner) = node.child_by_field_name("type") else {
+                    return false;
+                };
+                node = inner;
+            }
+            "generic_function" => {
+                let Some(inner) = node.child_by_field_name("function") else {
+                    return false;
+                };
+                node = inner;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(path) = node.child_by_field_name("path") {
+                    node = path;
+                } else {
+                    return node.child(0).is_some_and(|child| child.kind() == "::");
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `owner` is a trait declared in this workspace.
+///
+/// A declaration from outside the analyzed sources cannot be shown to be a
+/// trait, so an owner the file's own declaration list does not contain answers
+/// false rather than consulting a name-shaped guess.
+pub fn is_trait_owner(
+    rust: &dyn RustSource,
+    owner: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    let local = rust
+        .declarations(owner.source())
+        .into_iter()
+        .any(|declaration| &declaration == owner);
+    if !local {
+        return Ok(false);
+    }
+    is_rust_trait_declaration(rust, owner)
+}
+
+/// Mounted declarations retain every exact source declaration's properties.
+/// Repeated declarations sharing a CodeUnit are alternatives, not one row.
+pub type RustDeclarationSourceProperties = HashMap<CodeUnit, Vec<RustDeclarationPropertyFact>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustCargoRouteError {
+    Unavailable,
+    Cancelled,
+}
 
 /// The bounded indexes Rust's language logic resolves through, plus the core
 /// capability traits it reads declarations with. The analyzer implements this
@@ -57,6 +244,26 @@ pub trait RustSource:
     /// [`CodeUnitIndex::parent_of`] never falls back to a definition-row lookup.
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit>;
 
+    /// Exact declaration candidates before display-oriented module deduplication.
+    /// Cargo targets may share a module name and must be disambiguated afterward.
+    fn declaration_candidates_by_fqn_while(
+        &self,
+        fq_name: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> ReferenceContextResult<Vec<CodeUnit>>;
+
+    /// Route-free canonical source properties, with no syntax reconstruction.
+    fn declaration_source_properties(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError>;
+
+    /// Direct hierarchy edges from the canonical Rust hierarchy index. The
+    /// index is a fallible published product: an unavailable Cargo route must
+    /// not be represented as an empty ancestor set.
+    fn direct_ancestors(&self, code_unit: &CodeUnit) -> Result<Vec<CodeUnit>, RustCargoRouteError>;
+
     /// The parsed tree and its source backing for `file`.
     ///
     /// The [`QueryToken`] is proof that a request scope is open, so the cache
@@ -67,7 +274,7 @@ pub trait RustSource:
         file: &ProjectFile,
     ) -> Option<Arc<PreparedSyntaxTree>>;
 
-    fn cargo_routes(&self) -> Arc<RustCargoRouteIndex>;
+    fn cargo_routes(&self) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError>;
 
     /// [`Self::cargo_routes`], abandoning a cold build when `keep_going` stops
     /// permitting it. The usage-index build pays for this index on the same
@@ -75,14 +282,23 @@ pub trait RustSource:
     /// `dyn` rather than a generic so the trait stays object-safe.
     fn cargo_routes_while(
         &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Arc<RustCargoRouteIndex>>;
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError>;
 
     fn package_file_index(&self) -> Arc<RustPackageFileIndex>;
 
     fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder;
 
-    fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex>;
+    fn export_index_of(&self, file: &ProjectFile) -> ReferenceContextResult<Arc<ExportIndex>>;
+
+    /// Progress-aware export-index lookup for bounded reference walks. The
+    /// implementation must pass the predicate through any lazy parent/Cargo
+    /// resolution instead of loading an unbounded route index first.
+    fn export_index_of_while(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> ReferenceContextResult<Arc<ExportIndex>>;
 
     fn note_module_file_resolution(&self);
 
@@ -103,6 +319,91 @@ pub trait RustLiveBlobs: Send + Sync {
     fn paths_for_oid(&self, oid: git2::Oid) -> Vec<ProjectFile>;
 }
 
+/// One declaration as the crate rows place it: the file a crate places it in,
+/// the blob that file held when the rows were derived, and the declaration's
+/// id in that blob.
+///
+/// `(blob, declaration)` alone is content-addressed, so two byte-identical
+/// files declare the same pair; the file is what tells their declarations
+/// apart, as a resolution mount does. `rel_path` is spelled the way
+/// `rust_crate_container_sources` spells it, `path_utils::rel_path_string`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustPlacedDeclaration {
+    pub rel_path: String,
+    pub blob: git2::Oid,
+    pub declaration: u32,
+}
+
+/// One impl of a trait as a crate row states it: the file the impl is placed
+/// in and that file's blob, the impl item's source declaration there, and the
+/// placed declaration of its subject. The declaration and the subject are
+/// `None` when the derivation could not bridge them; the reader then resolves
+/// that impl's header itself.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustTraitImplRow {
+    pub impl_blob: git2::Oid,
+    pub impl_rel_path: String,
+    pub impl_declaration: Option<u32>,
+    pub subject: Option<RustPlacedDeclaration>,
+}
+
+/// One item-position macro invocation a file writes: its invocation, its
+/// unqualified name when it has one, and what crate derivation decided about
+/// its expansion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustItemMacroDecision {
+    pub invocation: SourceOccurrenceId,
+    pub name: Option<String>,
+    pub decided: RustItemMacroDecided,
+}
+
+/// What the crates that place a file decided about one of its item-position
+/// macro invocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustItemMacroDecided {
+    /// Some such crate did not decide it, so its expansion is unknown.
+    Undecided,
+    /// Every such crate decided it a passthrough: the expansion is the
+    /// arguments' items and nothing else, each under the definition's `cfg`
+    /// decoration. `compiled` is false only when that decoration is inactive
+    /// in every such crate.
+    Passthrough { compiled: bool },
+}
+
+/// One blob whose item macros could expand to an item that names an asked
+/// name: it writes the name inside a macro token tree (`via` is `None`), or it
+/// writes the name of a macro defined in such a blob (`via` names the macro and
+/// its defining blob).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustMacroExpansionBlob {
+    pub blob: git2::Oid,
+    pub via: Option<(String, git2::Oid)>,
+}
+
+/// One impl that named a trait spelling and did not become a relation row:
+/// its file, that file's blob, and its source declaration when the derivation
+/// could bridge it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustUnresolvedImpl {
+    pub impl_blob: git2::Oid,
+    pub impl_rel_path: String,
+    pub impl_declaration: Option<u32>,
+}
+
+/// The live file a placed row names: the file at `rel_path`, provided it
+/// still holds `blob`. A file edited since the rows were derived holds another
+/// blob, and the row's declaration ids do not describe it, so it names nothing.
+pub fn live_file_at(
+    rust: &dyn RustFactSource,
+    blob: git2::Oid,
+    rel_path: &str,
+) -> Option<ProjectFile> {
+    rust.live_blobs()
+        .paths_for_oid(blob)
+        .into_iter()
+        .find(|file| brokk_bifrost_core::path_utils::rel_path_string(file) == rel_path)
+}
+
 /// [`RustSource`] plus the persisted per-file Rust usage facts, the bounded
 /// caches the cross-file walks memoize into, and the facts query-scoped
 /// reference contexts resolve lazily.
@@ -114,47 +415,157 @@ pub trait RustLiveBlobs: Send + Sync {
 /// exists -- the Cargo route composition, the declaration walk -- takes
 /// [`RustSource`] instead, so it cannot re-enter what it is filling.
 pub trait RustFactSource: RustSource {
-    /// One blob's persisted facts, memoized per `(generation, blob)`.
+    /// One published blob's persisted facts.
     ///
-    /// `None` when the blob has no rows, which a caller treats as "no facts"
-    /// rather than as an error; the catch-up is what makes that state narrow.
-    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>>;
+    /// A known blob with no fact rows is unavailable, not a successful
+    /// no-facts answer: the Rust producer always writes the file-root module
+    /// witness. Explicit warming may repair that state before a retry.
+    fn rust_usage_facts_of_blob(
+        &self,
+        oid: git2::Oid,
+    ) -> Result<Arc<RustUsageFacts>, RustCargoRouteError>;
 
     /// Blobs that import `module_path`, spelled exactly as written. Candidates,
-    /// never answers -- see `usage_queries.rs` for the contract.
-    fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid>;
+    /// never answers -- see `usage_queries.rs` for the contract. An empty
+    /// successful result means no candidates; a failed indexed read is
+    /// unavailable.
+    fn rust_import_target_blobs(
+        &self,
+        module_path: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError>;
 
     /// Blobs whose structured imports name `component` as an imported module
-    /// or as the last component of the module path. Candidates, never answers.
-    fn rust_module_import_candidate_blobs(&self, component: &str) -> Vec<git2::Oid>;
+    /// or as the last component of the module path. Candidates, never answers;
+    /// an empty successful result is distinct from an unavailable read.
+    fn rust_module_import_candidate_blobs(
+        &self,
+        component: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError>;
 
-    /// Blobs that re-export `exported_name`.
-    fn rust_export_blobs(&self, exported_name: &str) -> Vec<git2::Oid>;
+    /// Blobs that re-export `exported_name`. An empty successful result is
+    /// distinct from an unavailable read.
+    fn rust_export_blobs(&self, exported_name: &str)
+    -> Result<Vec<git2::Oid>, RustCargoRouteError>;
+
+    /// The traits one placed type declaration implements, as placed
+    /// declarations. Crate derivation bound both ends of every reachable
+    /// `impl Trait for Type`, so this is an index seek rather than a walk of
+    /// the workspace's impls.
+    fn rust_traits_implemented_by(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError>;
+
+    /// The types that implement one placed trait declaration. The reverse
+    /// direction of [`RustFactSource::rust_traits_implemented_by`].
+    fn rust_types_implementing(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError>;
+
+    /// Every impl of one placed trait declaration as the crate rows state it.
+    ///
+    /// The bound on every member-level walk across a trait: without it the walk
+    /// reads every analyzed file to find the handful that implement the trait,
+    /// and resolves every impl header in them to find which are this trait's.
+    fn rust_trait_impl_rows(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustTraitImplRow>, RustCargoRouteError>;
+
+    /// The placed traits the crate rows say one placed impl item states: the
+    /// impl's blob, its file, and its source declaration there.
+    fn rust_traits_of_impl(
+        &self,
+        impl_item: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError>;
+
+    /// Every item-position macro invocation one live file writes, with what
+    /// crate derivation decided about it.
+    fn rust_item_macro_decisions(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<RustItemMacroDecision>, RustCargoRouteError>;
+
+    /// The blobs whose item macros could expand to an item that names one of
+    /// `names`: each writes a name inside a macro token tree, or writes the
+    /// name of a macro defined in such a blob. File granularity; see
+    /// [`RustMacroExpansionBlob`].
+    fn rust_macro_expansion_blobs(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<RustMacroExpansionBlob>, RustCargoRouteError>;
+
+    /// The names the impl rows of one placed trait declaration spelled it
+    /// with: its identifier, and any name an import or re-export renamed it
+    /// to. A header spelled any other way cannot name the trait.
+    fn rust_trait_impl_spellings(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<String>, RustCargoRouteError>;
+
+    /// Blobs that both declare a Rust type alias and mention `identifier`.
+    ///
+    /// The candidate set for "which alias denotes this type", which the
+    /// ancestor direction needs because the trait-implementation rows name
+    /// whichever spelling the `impl` wrote.
+    fn rust_alias_blobs_mentioning(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError>;
+
+    /// The placed files holding `impl`s that named this trait spelling and did
+    /// not become a trait-implementation row, as `(blob, rel_path)`.
+    ///
+    /// An impl whose trait reference never bound has no declaration to be
+    /// sought by, so the relation cannot point at it, yet it still decides
+    /// whether that trait's implementations are exhaustively known. This is how
+    /// a reader is told where those impls are, so that it can judge them with
+    /// the same resolver the rest of the walk uses rather than refusing the
+    /// question on the strength of a spelling.
+    fn rust_unresolved_trait_impl_files(
+        &self,
+        spelling: &str,
+    ) -> Result<Vec<RustUnresolvedImpl>, RustCargoRouteError>;
 
     /// Blobs whose text mentions `identifier`, with the occurrence-context
-    /// bitmask each one carries.
-    fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(git2::Oid, u32)>;
+    /// bitmask each one carries. An empty successful result is distinct from
+    /// an unavailable read.
+    fn rust_identifier_occurrence_blobs(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<(git2::Oid, u32)>, RustCargoRouteError>;
 
     /// Blobs with an `include!` whose literal's last path component is
     /// `file_name`. The inverted direction of `rust_include_edges`, and the
-    /// seed of an include-route walk.
-    fn rust_include_blobs(&self, file_name: &str) -> Vec<git2::Oid>;
+    /// seed of an include-route walk. An empty successful result is distinct
+    /// from an unavailable read.
+    fn rust_include_blobs(&self, file_name: &str) -> Result<Vec<git2::Oid>, RustCargoRouteError>;
 
     /// Every blob that writes at least one `include!`. Bounded by the number of
-    /// files that use the macro, not by the workspace.
-    fn rust_include_host_blobs(&self) -> Vec<git2::Oid>;
+    /// files that use the macro, not by the workspace. An empty successful
+    /// result is distinct from an unavailable read.
+    fn rust_include_host_blobs(&self) -> Result<Vec<git2::Oid>, RustCargoRouteError>;
 
     /// One file's declaration identities and their visibility domains, derived
     /// once per file and then served from the analyzer's bounded cache.
-    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts>;
+    fn rust_declaration_facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<RustDeclarationFacts>, RustCargoRouteError>;
+
+    /// One mounted file's complete canonical hierarchy input. The source rows
+    /// are published facts; the declaration-to-`CodeUnit` bridge is retained
+    /// with every link because one source declaration may have alternatives.
+    fn canonical_rust_hierarchy_source_facts(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustHierarchySourceFacts>, RustCargoRouteError>;
 
     fn live_blobs(&self) -> Arc<dyn RustLiveBlobs>;
 
     fn walk_caches(&self) -> &Arc<RustWalkCaches>;
-
-    /// Ensure every live Rust file's blob carries fact rows before a walk reads
-    /// them. Runs at most once per analyzer generation.
-    fn ensure_rust_facts_caught_up(&self);
 
     fn reference_context_of<'a>(
         &'a self,
@@ -183,13 +594,65 @@ pub trait RustFactSource: RustSource {
     ) -> Option<RustReferenceContext<'a>>;
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ReferenceContextInterrupted;
+/// Read the canonical import binder for the mounted file root.
+///
+/// Target-file import walks need the module-level binder, not a binder guessed
+/// from a source byte offset. The primary parentless `FileRoot` is the
+/// canonical anchor; embedded roots are intentionally excluded.
+pub fn canonical_rust_file_import_binder(
+    rust: &dyn RustFactSource,
+    file: &ProjectFile,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<ImportBinder, RustCargoRouteError> {
+    let facts = rust.canonical_rust_hierarchy_source_facts(file, keep_going)?;
+    let mut root = None;
+    for context in &facts.items.contexts {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        if context.kind == RustSourceContextKind::FileRoot && context.parent.is_none() {
+            assert!(
+                root.replace(context.context).is_none(),
+                "published Rust source facts have one primary file root"
+            );
+        }
+    }
+    let root = root.expect("published Rust source facts have one primary file root");
+    let contexts = RustSourceContextIndex::new(facts.as_ref(), keep_going)?;
+    let binder = contexts.visible_import_binder(facts.as_ref(), root, keep_going)?;
+    if !keep_going() {
+        return Err(RustCargoRouteError::Cancelled);
+    }
+    Ok(binder)
+}
 
-pub type ReferenceContextResult<T> = Result<T, ReferenceContextInterrupted>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceContextError {
+    Interrupted,
+    CargoRoutes(RustCargoRouteError),
+}
+
+impl From<RustCargoRouteError> for ReferenceContextError {
+    fn from(error: RustCargoRouteError) -> Self {
+        Self::CargoRoutes(error)
+    }
+}
+
+impl From<ReferenceContextError> for RustCargoRouteError {
+    fn from(error: ReferenceContextError) -> Self {
+        match error {
+            ReferenceContextError::Interrupted => Self::Cancelled,
+            ReferenceContextError::CargoRoutes(error) => error,
+        }
+    }
+}
+
+pub type ReferenceContextResult<T> = Result<T, ReferenceContextError>;
 
 pub fn reference_context_checkpoint(progress: &dyn Fn() -> bool) -> ReferenceContextResult<()> {
-    progress().then_some(()).ok_or(ReferenceContextInterrupted)
+    progress()
+        .then_some(())
+        .ok_or(ReferenceContextError::Interrupted)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -262,8 +725,30 @@ impl<'a> RustReferenceContext<'a> {
         self.token
     }
 
-    fn going(&self) -> bool {
-        (self.keep_going)()
+    fn resolve_module_package(
+        &self,
+        module_specifier: &str,
+    ) -> ReferenceContextResult<Option<String>> {
+        resolve_module_package_while(
+            self.rust,
+            self.token,
+            &self.file,
+            module_specifier,
+            &*self.keep_going,
+        )
+    }
+
+    fn resolve_module_files(
+        &self,
+        module_specifier: &str,
+    ) -> ReferenceContextResult<Vec<ProjectFile>> {
+        resolve_module_files_while(
+            self.rust,
+            self.token,
+            &self.file,
+            module_specifier,
+            &*self.keep_going,
+        )
     }
 
     fn binder(&self) -> &ImportBinder {
@@ -284,11 +769,14 @@ impl<'a> RustReferenceContext<'a> {
     /// The callee fqn a bare `name` refers to: a named import, a same-file item,
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).
-    pub fn resolve_bare(&self, name: &str) -> Option<String> {
+    pub fn resolve_bare(&self, name: &str) -> ReferenceContextResult<Option<String>> {
         self.answer(RustReferenceQuery::Bare(name.to_string()))
     }
 
-    pub fn bare_names_resolving_to(&self, target_fqn: &str) -> HashSet<String> {
+    pub fn bare_names_resolving_to(
+        &self,
+        target_fqn: &str,
+    ) -> ReferenceContextResult<HashSet<String>> {
         let terminal = target_fqn.rsplit('.').next().unwrap_or(target_fqn);
         let mut candidates = HashSet::from_iter([terminal.to_string()]);
         candidates.extend(
@@ -306,9 +794,11 @@ impl<'a> RustReferenceContext<'a> {
                 })
                 .map(|(local, _)| local.clone()),
         );
+        let export_index = self
+            .rust
+            .export_index_of_while(&self.file, &*self.keep_going)?;
         candidates.extend(
-            self.rust
-                .export_index_of(&self.file)
+            export_index
                 .exports_by_name
                 .iter()
                 .filter(|(exported, entry)| {
@@ -317,52 +807,63 @@ impl<'a> RustReferenceContext<'a> {
                 })
                 .map(|(exported, _)| exported.clone()),
         );
-        candidates
-            .into_iter()
-            .filter(|name| self.binds_target(name, target_fqn))
-            .collect()
+        let mut result = HashSet::default();
+        for name in candidates {
+            if self.binds_target(name.as_str(), target_fqn)? {
+                result.insert(name);
+            }
+        }
+        Ok(result)
     }
 
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
-    pub fn resolve_scoped(&self, path: &str, name: &str) -> Option<String> {
+    pub fn resolve_scoped(&self, path: &str, name: &str) -> ReferenceContextResult<Option<String>> {
         self.resolve_scoped_owner(path)
-            .map(|owner| join_rust_fqn(&owner, name))
+            .map(|owner| owner.map(|owner| join_rust_fqn(&owner, name)))
     }
 
     /// The owner fqn a scoped `path::name` begins from: a namespace import, a
     /// rooted module path, or an imported / same-file type.
-    pub fn resolve_scoped_owner(&self, path: &str) -> Option<String> {
+    pub fn resolve_scoped_owner(&self, path: &str) -> ReferenceContextResult<Option<String>> {
         self.answer(RustReferenceQuery::ScopedOwner(path.to_string()))
     }
 
-    fn answer(&self, query: RustReferenceQuery) -> Option<String> {
+    fn answer(&self, query: RustReferenceQuery) -> ReferenceContextResult<Option<String>> {
         if let Some(cached) = self.memo.borrow().get(&query) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
         let answer = match &query {
             RustReferenceQuery::Bare(name) => self.compute_bare(name),
             RustReferenceQuery::ScopedOwner(path) => self.compute_scoped_owner(path),
         };
-        self.memo.borrow_mut().insert(query, answer.clone());
+        if let Ok(value) = &answer {
+            self.memo.borrow_mut().insert(query, value.clone());
+        }
         answer
     }
 
-    fn compute_bare(&self, name: &str) -> Option<String> {
-        self.going().then_some(())?;
-        self.named_binding(name)
-            .or_else(|| self.namespace_binding(name))
-            .or_else(|| self.same_file().get(name).cloned())
-            .or_else(|| self.glob_binding(name))
+    fn compute_bare(&self, name: &str) -> ReferenceContextResult<Option<String>> {
+        reference_context_checkpoint(&*self.keep_going)?;
+        if let Some(value) = self.named_binding(name)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.namespace_binding(name)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.same_file().get(name).cloned() {
+            return Ok(Some(value));
+        }
+        self.glob_binding(name)
     }
 
-    fn compute_scoped_owner(&self, path: &str) -> Option<String> {
-        self.going().then_some(())?;
-        if let Some(canonical) = self.scoped_binding(path) {
-            return Some(canonical);
+    fn compute_scoped_owner(&self, path: &str) -> ReferenceContextResult<Option<String>> {
+        reference_context_checkpoint(&*self.keep_going)?;
+        if let Some(canonical) = self.scoped_binding(path)? {
+            return Ok(Some(canonical));
         }
         if let Some((module_path, item_name)) = path.rsplit_once("::")
-            && let Some(package) = self.resolve_scoped_owner(module_path)
+            && let Some(package) = self.resolve_scoped_owner(module_path)?
         {
             let resolved = join_rust_fqn(&package, item_name);
             // Direct Cargo test/bench/example targets own a private `crate::`
@@ -372,131 +873,135 @@ impl<'a> RustReferenceContext<'a> {
             // recursive owner/reexport tiers instead of being mistaken for a
             // complete module package.
             if is_rooted_rust_module_path(path)
-                && let Some(shared) =
-                    resolve_target_kind_root_module(self.rust, self.token, &self.file, &resolved)
+                && let Some(shared) = resolve_target_kind_root_module_with_progress(
+                    self.rust,
+                    &self.file,
+                    &resolved,
+                    Some(&*self.keep_going),
+                )?
             {
-                return Some(shared);
+                return Ok(Some(shared));
             }
-            return Some(resolved);
+            return Ok(Some(resolved));
         }
-        if let Some(package) = self.namespace_binding(path) {
-            return Some(package);
+        if let Some(package) = self.namespace_binding(path)? {
+            return Ok(Some(package));
         }
         if is_rooted_rust_module_path(path)
             && let Some(package) =
                 resolve_rust_module_path_with_crate(&self.package, &self.crate_package, path)
         {
-            return Some(package);
+            return Ok(Some(package));
         }
-        self.named_binding(path)
-            .or_else(|| self.same_file().get(path).cloned())
-            .or_else(|| self.glob_binding(path))
+        let named = self.named_binding(path)?;
+        if named.is_some() {
+            return Ok(named);
+        }
+        if let Some(value) = self.same_file().get(path).cloned() {
+            return Ok(Some(value));
+        }
+        self.glob_binding(path)
     }
 
-    fn binds_target(&self, name: &str, target_fqn: &str) -> bool {
-        self.named_binding(name).as_deref() == Some(target_fqn)
-            || self.namespace_binding(name).as_deref() == Some(target_fqn)
+    fn binds_target(&self, name: &str, target_fqn: &str) -> ReferenceContextResult<bool> {
+        Ok(self.named_binding(name)?.as_deref() == Some(target_fqn)
+            || self.namespace_binding(name)?.as_deref() == Some(target_fqn)
             || self.same_file().get(name).map(String::as_str) == Some(target_fqn)
-            || self.glob_binding(name).as_deref() == Some(target_fqn)
+            || self.glob_binding(name)?.as_deref() == Some(target_fqn))
     }
 
-    fn named_binding(&self, name: &str) -> Option<String> {
+    fn named_binding(&self, name: &str) -> ReferenceContextResult<Option<String>> {
         if let Some(binding) = self.binder().bindings.get(name)
             && binding.kind == ImportKind::Named
             && let Some(imported) = binding.imported_name.as_deref()
         {
-            let module_files =
-                resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
-            let resolved = self
-                .canonical_export_fqn(&module_files, imported)
-                .or_else(|| {
-                    resolve_exported_module_item_fqn(
-                        self.rust,
-                        self.token,
-                        &self.file,
-                        &binding.module_specifier,
-                        imported,
-                    )
-                })
-                .or_else(|| {
-                    resolve_module_package(
-                        self.rust,
-                        self.token,
-                        &self.file,
-                        &binding.module_specifier,
-                    )
-                    .map(|package| join_rust_fqn(&package, imported))
-                });
+            let module_files = self.resolve_module_files(&binding.module_specifier)?;
+            let mut resolved = self.canonical_export_fqn(&module_files, imported)?;
+            if resolved.is_none() {
+                resolved = resolve_exported_module_item_fqn(
+                    self.rust,
+                    self.token,
+                    &self.file,
+                    &binding.module_specifier,
+                    imported,
+                    Some(&*self.keep_going),
+                )?;
+            }
             if resolved.is_some() {
-                return resolved;
+                return Ok(resolved);
+            }
+            if let Some(package) = self.resolve_module_package(&binding.module_specifier)? {
+                return Ok(Some(join_rust_fqn(&package, imported)));
             }
         }
         self.reexported_binding(name)
     }
 
-    fn namespace_binding(&self, name: &str) -> Option<String> {
-        let binding = self.binder().bindings.get(name)?;
-        (binding.kind == ImportKind::Namespace)
-            .then(|| {
-                let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
-                if segments.len() > 1 {
-                    let parent = segments[..segments.len() - 1].join("::");
-                    let terminal = segments.last().expect("non-empty parsed Rust path");
-                    let terminal_fqn = resolve_exported_module_item_fqn(
-                        self.rust, self.token, &self.file, &parent, terminal,
-                    );
-                    if let Some(fqn) = terminal_fqn {
-                        return Some(fqn);
-                    }
-                }
-                resolve_exported_module_package(
-                    self.rust,
-                    self.token,
-                    &self.file,
-                    &binding.module_specifier,
-                )
-                .or_else(|| {
-                    resolve_module_package(
-                        self.rust,
-                        self.token,
-                        &self.file,
-                        &binding.module_specifier,
-                    )
-                })
-            })
-            .flatten()
+    fn namespace_binding(&self, name: &str) -> ReferenceContextResult<Option<String>> {
+        let Some(binding) = self.binder().bindings.get(name) else {
+            return Ok(None);
+        };
+        if binding.kind != ImportKind::Namespace {
+            return Ok(None);
+        }
+        let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+        if segments.len() > 1 {
+            let parent = segments[..segments.len() - 1].join("::");
+            let terminal = segments.last().expect("non-empty parsed Rust path");
+            if let Some(fqn) = resolve_exported_module_item_fqn(
+                self.rust,
+                self.token,
+                &self.file,
+                &parent,
+                terminal,
+                Some(&*self.keep_going),
+            )? {
+                return Ok(Some(fqn));
+            }
+        }
+        if let Some(package) = resolve_exported_module_package(
+            self.rust,
+            self.token,
+            &self.file,
+            &binding.module_specifier,
+            Some(&*self.keep_going),
+        )? {
+            return Ok(Some(package));
+        }
+        self.resolve_module_package(&binding.module_specifier)
     }
 
-    fn reexported_binding(&self, name: &str) -> Option<String> {
-        let export_index = self.rust.export_index_of(&self.file);
+    fn reexported_binding(&self, name: &str) -> ReferenceContextResult<Option<String>> {
+        let export_index = self
+            .rust
+            .export_index_of_while(&self.file, &*self.keep_going)?;
         if let Some(ExportEntry::ReexportedNamed {
             module_specifier,
             imported_name,
         }) = export_index.exports_by_name.get(name)
         {
-            let module_files =
-                resolve_module_files(self.rust, self.token, &self.file, module_specifier);
+            let module_files = self.resolve_module_files(module_specifier)?;
             let mut targets = self.exported_targets(&module_files, imported_name)?;
             if targets.is_empty() {
-                targets.extend(rust_member_reexport_targets(
+                targets.extend(rust_member_reexport_targets_while(
                     self.rust,
                     self.token,
                     &self.file,
                     module_specifier,
                     imported_name,
-                ));
+                    &*self.keep_going,
+                )?);
             }
             if targets.is_empty() {
                 targets.extend(self.declaration_targets(&module_files, imported_name)?);
             }
             if let Some(fqn) = single_reexport_target_fqn(targets) {
-                return Some(fqn);
+                return Ok(Some(fqn));
             }
         }
         for star in &export_index.reexport_stars {
-            self.going().then_some(())?;
-            let module_files =
-                resolve_module_files(self.rust, self.token, &self.file, &star.module_specifier);
+            reference_context_checkpoint(&*self.keep_going)?;
+            let module_files = self.resolve_module_files(&star.module_specifier)?;
             if !self.export_closure_exports(&module_files, name)? {
                 continue;
             }
@@ -505,49 +1010,56 @@ impl<'a> RustReferenceContext<'a> {
                 targets.extend(self.declaration_targets(&module_files, name)?);
             }
             if let Some(fqn) = single_reexport_target_fqn(targets) {
-                return Some(fqn);
+                return Ok(Some(fqn));
             }
         }
-        None
+        Ok(None)
     }
 
-    fn glob_binding(&self, name: &str) -> Option<String> {
+    fn glob_binding(&self, name: &str) -> ReferenceContextResult<Option<String>> {
         let mut candidates = HashSet::default();
         for binding in self.binder().bindings.values() {
             if binding.kind != ImportKind::Glob {
                 continue;
             }
-            self.going().then_some(())?;
-            let module_files =
-                resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
+            reference_context_checkpoint(&*self.keep_going)?;
+            let module_files = self.resolve_module_files(&binding.module_specifier)?;
             if self.export_closure_exports(&module_files, name)?
-                && let Some(fqn) = self.canonical_export_fqn(&module_files, name)
+                && let Some(fqn) = self.canonical_export_fqn(&module_files, name)?
             {
                 candidates.insert(fqn);
             }
         }
-        (candidates.len() == 1)
+        Ok((candidates.len() == 1)
             .then(|| candidates.into_iter().next())
-            .flatten()
+            .flatten())
     }
 
-    fn scoped_binding(&self, path: &str) -> Option<String> {
-        let (local, name) = path.split_once("::")?;
+    fn scoped_binding(&self, path: &str) -> ReferenceContextResult<Option<String>> {
+        let Some((local, name)) = path.split_once("::") else {
+            return Ok(None);
+        };
         if name.contains("::") {
-            return None;
+            return Ok(None);
         }
-        let binding = self.binder().bindings.get(local)?;
+        let Some(binding) = self.binder().bindings.get(local) else {
+            return Ok(None);
+        };
         if binding.kind != ImportKind::Namespace {
-            return None;
+            return Ok(None);
         }
-        let module_files =
-            resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
-        self.export_closure_exports(&module_files, name)?
-            .then(|| self.canonical_export_fqn(&module_files, name))
-            .flatten()
+        let module_files = self.resolve_module_files(&binding.module_specifier)?;
+        if !self.export_closure_exports(&module_files, name)? {
+            return Ok(None);
+        }
+        self.canonical_export_fqn(&module_files, name)
     }
 
-    fn canonical_export_fqn(&self, module_files: &[ProjectFile], name: &str) -> Option<String> {
+    fn canonical_export_fqn(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> ReferenceContextResult<Option<String>> {
         canonical_export_fqn_from_files(
             self.rust,
             self.token,
@@ -556,16 +1068,14 @@ impl<'a> RustReferenceContext<'a> {
             self.forward,
             &*self.keep_going,
         )
-        .ok()
-        .flatten()
     }
 
     fn exported_targets(
         &self,
         module_files: &[ProjectFile],
         name: &str,
-    ) -> Option<BTreeSet<(ProjectFile, String)>> {
-        self.going().then_some(())?;
+    ) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
+        reference_context_checkpoint(&*self.keep_going)?;
         if self.forward {
             forward_exported_targets_from_files_with_progress(
                 self.rust,
@@ -574,14 +1084,15 @@ impl<'a> RustReferenceContext<'a> {
                 name,
                 &*self.keep_going,
             )
-            .ok()
         } else {
-            Some(exported_targets_from_files(
+            exported_targets_from_files_while(
                 self.rust,
                 self.token,
                 module_files,
                 name,
-            ))
+                &*self.keep_going,
+            )
+            .map_err(Into::into)
         }
     }
 
@@ -589,38 +1100,42 @@ impl<'a> RustReferenceContext<'a> {
         &self,
         module_files: &[ProjectFile],
         name: &str,
-    ) -> Option<Vec<(ProjectFile, String)>> {
+    ) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
         rust_declaration_targets_in_files_with_progress(
             self.rust.code_units(),
             module_files,
             name,
             &*self.keep_going,
         )
-        .ok()
     }
 
-    fn export_closure_exports(&self, module_files: &[ProjectFile], name: &str) -> Option<bool> {
+    fn export_closure_exports(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> ReferenceContextResult<bool> {
         let mut visited = HashSet::default();
         let mut pending = module_files.to_vec();
         while let Some(file) = pending.pop() {
-            self.going().then_some(())?;
+            reference_context_checkpoint(&*self.keep_going)?;
             if !visited.insert(file.clone()) {
                 continue;
             }
-            let index = self.rust.export_index_of(&file);
+            let index = self.rust.export_index_of_while(&file, &*self.keep_going)?;
             if index.exports_by_name.contains_key(name) {
-                return Some(true);
+                return Ok(true);
             }
             for star in &index.reexport_stars {
-                pending.extend(resolve_module_files(
+                pending.extend(resolve_module_files_with_progress(
                     self.rust,
                     self.token,
                     &file,
                     &star.module_specifier,
-                ));
+                    Some(&*self.keep_going),
+                )?);
             }
         }
-        Some(false)
+        Ok(false)
     }
 }
 
@@ -777,23 +1292,29 @@ fn single_reexport_target_fqn(
 }
 
 fn single_rust_target_fqn(
-    index: &dyn CodeUnitIndex,
+    rust: &dyn RustSource,
     targets: BTreeSet<(ProjectFile, String)>,
     progress: &dyn Fn() -> bool,
 ) -> ReferenceContextResult<Option<String>> {
     let mut fq_names = Vec::new();
     for (target_file, target_name) in targets {
         reference_context_checkpoint(progress)?;
-        for unit in index.declarations(&target_file) {
+        let properties = declaration_source_properties_while(rust, &target_file, progress)?;
+        for unit in rust.declarations(&target_file) {
             reference_context_checkpoint(progress)?;
-            if unit.identifier() == target_name && is_rust_export_visible_declaration(index, &unit)
-            {
-                fq_names.push(unit.fq_name());
+            if unit.identifier() == target_name {
+                let rows = properties
+                    .get(&unit)
+                    .ok_or(RustCargoRouteError::Unavailable)?;
+                if declaration_properties_are_export_visible(rows, progress)? {
+                    fq_names.push(unit.fq_name());
+                }
             }
         }
     }
     fq_names.sort();
     fq_names.dedup();
+    reference_context_checkpoint(progress)?;
     Ok((fq_names.len() == 1).then(|| fq_names.remove(0)))
 }
 
@@ -804,6 +1325,78 @@ fn is_rooted_rust_module_path(path: &str) -> bool {
         || path.starts_with("crate::")
         || path.starts_with("self::")
         || path.starts_with("super::")
+}
+
+fn cargo_routes_for_progress(
+    rust: &dyn RustSource,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Arc<RustCargoRouteIndex>> {
+    match progress {
+        Some(progress) => Ok(rust.cargo_routes_while(progress)?),
+        None => Ok(rust.cargo_routes()?),
+    }
+}
+
+fn route_progress_checkpoint(progress: Option<&dyn Fn() -> bool>) -> ReferenceContextResult<()> {
+    progress.map_or(Ok(()), reference_context_checkpoint)
+}
+
+fn resolve_declared_local_module_package_with_progress(
+    rust: &dyn RustSource,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    // `ImportBinder` supplies one AST-derived path. A Namespace binding for a
+    // function import retains the terminal (`dep::target`), so establish local
+    // authority from its first parsed segment and only then anchor the complete
+    // path under the importing module.
+    let segments = parse_symbol_path(Language::Rust, module_specifier);
+    if segments.is_empty()
+        || matches!(
+            segments.first().map(String::as_str),
+            Some("crate" | "self" | "super")
+        )
+    {
+        return Ok(None);
+    }
+    let package = rust_package_name(importing_file);
+    let crate_package = rust_crate_root_package(importing_file);
+    let routes = cargo_routes_for_progress(rust, progress)?;
+    let local_anchor = if routes.file_uses_rust_2015_edition(importing_file) {
+        "crate"
+    } else {
+        "self"
+    };
+    let mut root_segments = vec![local_anchor.to_string()];
+    root_segments.push(segments[0].clone());
+    let Some(local_root) =
+        resolve_rust_module_segments_with_crate(&package, &crate_package, root_segments.as_slice())
+    else {
+        return Ok(None);
+    };
+    let mut has_module = false;
+    for unit in rust.definitions(&local_root) {
+        route_progress_checkpoint(progress)?;
+        if unit.is_module()
+            && routes.target_relation(importing_file, unit.source())
+                != RustCargoTargetRelation::Disjoint
+        {
+            has_module = true;
+            break;
+        }
+    }
+    if !has_module {
+        return Ok(None);
+    }
+    let mut local_segments = Vec::with_capacity(segments.len() + 1);
+    local_segments.push(local_anchor.to_string());
+    local_segments.extend(segments);
+    Ok(resolve_rust_module_segments_with_crate(
+        &package,
+        &crate_package,
+        local_segments.as_slice(),
+    ))
 }
 
 fn rust_declaration_targets_in_files(
@@ -842,64 +1435,109 @@ pub fn resolve_visible_import_targets_forward(
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
-) -> Vec<(ProjectFile, String)> {
+) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
     let mut targets =
-        resolve_imported_export_from_binder_forward(rust, token, file, binder, reference);
+        resolve_imported_export_from_binder_forward(rust, token, file, binder, reference)?;
     for (local_name, binding) in &binder.bindings {
         if local_name != reference || binding.kind != ImportKind::Named {
             continue;
         }
         let imported = binding.imported_name.as_deref().unwrap_or(reference);
         targets.extend(
-            resolve_module_files(rust, token, file, &binding.module_specifier)
+            resolve_module_files(rust, token, file, &binding.module_specifier)?
                 .into_iter()
                 .map(|target_file| (target_file, imported.to_string())),
         );
     }
     targets.sort();
     targets.dedup();
-    targets
+    Ok(targets)
 }
 
-pub fn export_index_of_declarations(
+fn declaration_source_properties_while(
     rust: &dyn RustSource,
-    token: QueryToken<'_>,
+    file: &ProjectFile,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<Arc<RustDeclarationSourceProperties>> {
+    match rust.declaration_source_properties(file, progress) {
+        Ok(properties) => Ok(properties),
+        Err(RustCargoRouteError::Cancelled) => Err(ReferenceContextError::Interrupted),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn declaration_properties_are_export_visible(
+    properties: &[RustDeclarationPropertyFact],
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<bool> {
+    for property in properties {
+        reference_context_checkpoint(progress)?;
+        let visible = match &property.visibility {
+            RustVisibility::Public | RustVisibility::Crate => true,
+            RustVisibility::InPath(path) => path.first().is_some_and(|segment| segment == "crate"),
+            RustVisibility::Private | RustVisibility::SelfModule | RustVisibility::SuperModule => {
+                false
+            }
+        };
+        if visible {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn export_visible_declarations_from_properties(
+    rust: &dyn RustSource,
     file: &ProjectFile,
     declarations: &BTreeSet<CodeUnit>,
-) -> ExportIndex {
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<HashSet<CodeUnit>> {
+    let properties = declaration_source_properties_while(rust, file, progress)?;
+    let mut visible = HashSet::default();
+    for declaration in declarations {
+        reference_context_checkpoint(progress)?;
+        let rows = properties
+            .get(declaration)
+            .ok_or(RustCargoRouteError::Unavailable)?;
+        if declaration_properties_are_export_visible(rows, progress)? {
+            visible.insert(declaration.clone());
+        }
+    }
+    Ok(visible)
+}
+
+pub fn export_index_of_declarations_while(
+    rust: &dyn RustFactSource,
+    file: &ProjectFile,
+    declarations: &BTreeSet<CodeUnit>,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<ExportIndex> {
     let _scope = profiling::scope("RustAnalyzer::export_index_of_declarations");
-    let index_source = rust.code_units();
     let mut index = ExportIndex::empty();
-    // Declaration visibility and re-exports are two projections of the same
-    // file. Keep them on one prepared tree: the old path parsed the source
-    // independently for visibility, then immediately requested the analyzer's
-    // prepared syntax for `use` declarations.
-    let prepared = rust.prepared_syntax(token, file);
-    let export_visible = prepared.as_ref().map_or_else(
-        || export_visible_declarations(index_source, file, declarations),
-        |syntax| {
-            export_visible_declarations_from_syntax(
-                index_source,
-                declarations,
-                syntax.tree().root_node(),
-                syntax.source(),
-            )
-        },
-    );
+    reference_context_checkpoint(progress)?;
+    // Re-exports consume the coordinated producer's import properties. The
+    // local export set uses the same exact source-declaration properties, so
+    // repeated embedded CodeUnits retain existential visibility alternatives.
+    let facts = RustUsageQueries::new(rust).facts_of(file)?;
+    reference_context_checkpoint(progress)?;
+    let export_visible =
+        export_visible_declarations_from_properties(rust, file, declarations, progress)?;
     let mut external_visibility = HashMap::default();
 
     for code_unit in declarations {
+        reference_context_checkpoint(progress)?;
         let identifier = code_unit.identifier().trim();
         if identifier.is_empty() || identifier.starts_with('_') {
             continue;
         }
-        if !is_module_export_candidate(
+        if !is_module_export_candidate_while(
             rust,
             file,
             code_unit,
             &export_visible,
             &mut external_visibility,
-        ) {
+            progress,
+        )? {
             continue;
         }
         index.exports_by_name.insert(
@@ -910,52 +1548,41 @@ pub fn export_index_of_declarations(
         );
     }
 
-    if let Some(prepared) = prepared {
-        let source = prepared.source();
-        let root = prepared.tree().root_node();
-        for index_in_root in 0..root.named_child_count() {
-            let Some(node) = root.named_child(index_in_root) else {
-                continue;
-            };
-            let declaration = unwrap_attributes(node);
-            if declaration.kind() != "use_declaration" {
-                continue;
-            }
-            for import in rust_imports_with_visibility_from_use_declaration(declaration, source) {
-                let binding_name = import.binding_name();
-                if matches!(
-                    import.visibility,
-                    RustVisibility::Private | RustVisibility::SelfModule
-                ) {
-                    continue;
-                }
-                if binding_name.is_glob() {
-                    if !import.path.is_empty() {
-                        index.reexport_stars.push(ReexportStar {
-                            module_specifier: import.path.join("::"),
-                        });
-                    }
-                    continue;
-                }
-                let Some(imported_name) = import.path.last().cloned() else {
-                    continue;
-                };
-                let Some(local_name) = binding_name.named().map(str::to_string) else {
-                    continue;
-                };
-                let module_specifier = import.path[..import.path.len() - 1].join("::");
-                index.exports_by_name.insert(
-                    local_name,
-                    ExportEntry::ReexportedNamed {
-                        module_specifier,
-                        imported_name,
-                    },
-                );
-            }
+    for import in facts.iter().flat_map(|facts| &facts.import_targets) {
+        reference_context_checkpoint(progress)?;
+        if !import.owner_module.is_empty()
+            || import.local_extent.is_some()
+            || import.is_extern_crate
+            || matches!(
+                import.visibility,
+                RustVisibility::Private | RustVisibility::SelfModule
+            )
+        {
+            continue;
         }
+        if import.is_glob {
+            if !import.module_path.is_empty() {
+                index.reexport_stars.push(ReexportStar {
+                    module_specifier: import.module_path.join("::"),
+                });
+            }
+            continue;
+        }
+        let (Some(imported_name), Some(local_name)) = (&import.imported_name, &import.bound_name)
+        else {
+            continue;
+        };
+        index.exports_by_name.insert(
+            local_name.clone(),
+            ExportEntry::ReexportedNamed {
+                module_specifier: import.module_path.join("::"),
+                imported_name: imported_name.clone(),
+            },
+        );
     }
 
-    index
+    reference_context_checkpoint(progress)?;
+    Ok(index)
 }
 
 /// The named/namespace/glob binder walk shared by the forward and inverted
@@ -969,7 +1596,7 @@ fn resolve_imported_export_from_binder_with_mode(
     binder: &ImportBinder,
     reference: &str,
     forward: bool,
-) -> Vec<(ProjectFile, String)> {
+) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
     let index = rust.code_units();
     let mut targets = HashSet::default();
     let mut saw_explicit_binding = false;
@@ -978,12 +1605,19 @@ fn resolve_imported_export_from_binder_with_mode(
             ImportKind::Named if local_name == reference => {
                 saw_explicit_binding = true;
                 let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                let files = resolve_module_files(rust, token, file, &binding.module_specifier);
-                targets.extend(if forward {
-                    forward_imported_targets(rust, token, file, &binding.module_specifier, imported)
+                let files = resolve_module_files(rust, token, file, &binding.module_specifier)?;
+                let exported = if forward {
+                    forward_imported_targets(
+                        rust,
+                        token,
+                        file,
+                        &binding.module_specifier,
+                        imported,
+                    )?
                 } else {
-                    exported_targets_from_files(rust, token, &files, imported)
-                });
+                    exported_targets_from_files(rust, token, &files, imported)?
+                };
+                targets.extend(exported);
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(index, &files, imported));
                 }
@@ -995,12 +1629,13 @@ fn resolve_imported_export_from_binder_with_mode(
                     continue;
                 };
                 let module_specifier = module_segments.join("::");
-                let files = resolve_module_files(rust, token, file, &module_specifier);
-                targets.extend(if forward {
-                    forward_imported_targets(rust, token, file, &module_specifier, imported)
+                let files = resolve_module_files(rust, token, file, &module_specifier)?;
+                let exported = if forward {
+                    forward_imported_targets(rust, token, file, &module_specifier, imported)?
                 } else {
-                    exported_targets_from_files(rust, token, &files, imported)
-                });
+                    exported_targets_from_files(rust, token, &files, imported)?
+                };
+                targets.extend(exported);
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(index, &files, imported));
                 }
@@ -1015,21 +1650,22 @@ fn resolve_imported_export_from_binder_with_mode(
     if saw_explicit_binding {
         let mut sorted: Vec<_> = targets.into_iter().collect();
         sorted.sort();
-        return sorted;
+        return Ok(sorted);
     }
     for binding in binder.bindings.values() {
         if matches!(binding.kind, ImportKind::Glob) {
-            let files = resolve_module_files(rust, token, file, &binding.module_specifier);
-            targets.extend(if forward {
-                forward_imported_targets(rust, token, file, &binding.module_specifier, reference)
+            let files = resolve_module_files(rust, token, file, &binding.module_specifier)?;
+            let exported = if forward {
+                forward_imported_targets(rust, token, file, &binding.module_specifier, reference)?
             } else {
-                exported_targets_from_files(rust, token, &files, reference)
-            });
+                exported_targets_from_files(rust, token, &files, reference)?
+            };
+            targets.extend(exported);
         }
     }
     let mut sorted: Vec<_> = targets.into_iter().collect();
     sorted.sort();
-    sorted
+    Ok(sorted)
 }
 
 /// Compose imports against module identities, including namespaces brought into
@@ -1041,18 +1677,18 @@ fn forward_imported_targets(
     file: &ProjectFile,
     module_specifier: &str,
     name: &str,
-) -> BTreeSet<(ProjectFile, String)> {
-    forward_imported_identities(
+) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
+    Ok(forward_imported_identities(
         rust,
         token,
         file,
         &rust_package_name(file),
         module_specifier,
         name,
-    )
+    )?
     .into_iter()
     .map(|identity| (identity.file, identity.name))
-    .collect()
+    .collect())
 }
 
 /// Canonical declarations bound by a module import, with the original module
@@ -1064,14 +1700,14 @@ pub fn forward_imported_identities(
     package: &str,
     module_specifier: &str,
     name: &str,
-) -> HashSet<crate::usage::RustSymbolIdentity> {
-    let walks = crate::usage_walks::RustUsageWalks::new(rust, token);
+) -> ReferenceContextResult<HashSet<crate::usage::RustSymbolIdentity>> {
+    let walks = crate::usage_walks::RustUsageWalks::new(rust, token)?;
     let importer = walks.queries().module_key_of(file, package);
     let segments = parse_symbol_path(Language::Rust, module_specifier);
     let mut targets = HashSet::default();
-    for route in walks.resolve_segments(file, package, &segments) {
+    for route in walks.resolve_segments(file, package, &segments)? {
         for binding in walks
-            .bindings_at(&route.target_file, &route.target_module)
+            .bindings_at(&route.target_file, &route.target_module)?
             .iter()
         {
             if binding.name == name && binding.domain.contains_module(&importer) {
@@ -1079,7 +1715,7 @@ pub fn forward_imported_identities(
             }
         }
     }
-    targets
+    Ok(targets)
 }
 
 pub fn resolve_imported_export_from_binder_forward(
@@ -1088,7 +1724,7 @@ pub fn resolve_imported_export_from_binder_forward(
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
-) -> Vec<(ProjectFile, String)> {
+) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
     resolve_imported_export_from_binder_with_mode(rust, token, file, binder, reference, true)
 }
 
@@ -1098,7 +1734,7 @@ pub fn resolve_imported_export_from_binder(
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
-) -> Vec<(ProjectFile, String)> {
+) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
     resolve_imported_export_from_binder_with_mode(rust, token, file, binder, reference, false)
 }
 
@@ -1112,8 +1748,29 @@ pub fn resolve_module_package(
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
-) -> Option<String> {
+) -> ReferenceContextResult<Option<String>> {
     resolve_module_package_traced(rust, token, importing_file, module_specifier, None)
+}
+
+/// Progress-aware module-package resolution for bounded callers. The route
+/// producer uses the supplied predicate for its cold Cargo/index reads and
+/// every alias/export walk; it never falls back to the unbounded route entry
+/// point.
+pub fn resolve_module_package_while(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<Option<String>> {
+    resolve_module_package_traced_with_progress(
+        rust,
+        token,
+        importing_file,
+        module_specifier,
+        None,
+        Some(progress),
+    )
 }
 
 /// [`resolve_module_package`], recording the import-alias chase into `trace`.
@@ -1133,18 +1790,69 @@ pub fn resolve_module_package_traced(
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
+    trace: Option<&mut RewriteTrace>,
+) -> ReferenceContextResult<Option<String>> {
+    resolve_module_package_traced_with_progress(
+        rust,
+        token,
+        importing_file,
+        module_specifier,
+        trace,
+        None,
+    )
+}
+
+/// Progress-aware form of [`resolve_module_package_traced`]. The trace remains
+/// the same production chase; `progress` only controls whether the shared
+/// route reads may continue.
+pub fn resolve_module_package_traced_while(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    trace: Option<&mut RewriteTrace>,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<Option<String>> {
+    resolve_module_package_traced_with_progress(
+        rust,
+        token,
+        importing_file,
+        module_specifier,
+        trace,
+        Some(progress),
+    )
+}
+
+fn resolve_module_package_traced_with_progress(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
     mut trace: Option<&mut RewriteTrace>,
-) -> Option<String> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    route_progress_checkpoint(progress)?;
     let package = rust_package_name(importing_file);
     let crate_package = rust_crate_root_package(importing_file);
     if is_rooted_rust_module_path(module_specifier) {
-        return resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier);
+        return Ok(resolve_rust_module_path_with_crate(
+            &package,
+            &crate_package,
+            module_specifier,
+        ));
     }
-    if let Some(package) = rust
-        .cargo_routes()
+    if let Some(package) = resolve_declared_local_module_package_with_progress(
+        rust,
+        importing_file,
+        module_specifier,
+        progress,
+    )? {
+        return Ok(Some(package));
+    }
+    if let Some(package) = cargo_routes_for_progress(rust, progress)?
         .resolve_module_package(importing_file, module_specifier)
     {
-        return Some(package);
+        return Ok(Some(package));
     }
     // Only after cargo routing fails — the miss path, not the hot path — try
     // a `use <crate> as <alias>` module alias so the binder is built solely
@@ -1170,6 +1878,7 @@ pub fn resolve_module_package_traced(
     let mut steps_taken = 0usize;
     let mut current = module_specifier.to_string();
     loop {
+        route_progress_checkpoint(progress)?;
         let root = current.split("::").next().unwrap_or(current.as_str());
         if !seen_roots.insert(root.to_string()) {
             if let Some(trace) = trace.as_deref_mut() {
@@ -1215,26 +1924,37 @@ pub fn resolve_module_package_traced(
                 rule: ALIAS_SUBSTITUTION_RULE,
             });
         }
-        if let Some(package) =
-            resolve_import_alias_exported_module_package(rust, token, importing_file, &aliased)
-        {
+        if let Some(package) = resolve_import_alias_exported_module_package_with_progress(
+            rust,
+            token,
+            importing_file,
+            &aliased,
+            progress,
+        )? {
             finish_converged(trace, &aliased);
-            return Some(package);
+            return Ok(Some(package));
         }
         if is_rooted_rust_module_path(&aliased) {
             finish_converged(trace, &aliased);
-            return resolve_rust_module_path_with_crate(&package, &crate_package, &aliased);
+            return Ok(resolve_rust_module_path_with_crate(
+                &package,
+                &crate_package,
+                &aliased,
+            ));
         }
-        if let Some(package) = rust
-            .cargo_routes()
+        if let Some(package) = cargo_routes_for_progress(rust, progress)?
             .resolve_module_package(importing_file, &aliased)
         {
             finish_converged(trace, &aliased);
-            return Some(package);
+            return Ok(Some(package));
         }
         current = aliased;
     }
-    resolve_rust_module_path_with_crate(&package, &crate_package, &current)
+    Ok(resolve_rust_module_path_with_crate(
+        &package,
+        &crate_package,
+        &current,
+    ))
 }
 
 /// The ordered state sequence that closes a cycle: the visited roots from the
@@ -1263,40 +1983,53 @@ fn finish_converged(trace: Option<&mut RewriteTrace>, fixed_point: &str) {
     }
 }
 
-fn resolve_import_alias_exported_module_package(
+fn resolve_import_alias_exported_module_package_with_progress(
     rust: &dyn RustSource,
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
     aliased_specifier: &str,
-) -> Option<String> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    route_progress_checkpoint(progress)?;
     let segments = parse_symbol_path(Language::Rust, aliased_specifier);
-    let (root, suffix) = segments.split_first()?;
-    let suffix = (!suffix.is_empty()).then_some(suffix)?;
+    let Some((root, suffix)) = segments.split_first() else {
+        return Ok(None);
+    };
+    let Some(suffix) = (!suffix.is_empty()).then_some(suffix) else {
+        return Ok(None);
+    };
     if rust_apply_import_alias(rust, importing_file, root).is_some() {
-        return None;
+        return Ok(None);
     }
-    let mut files = resolve_module_files(rust, token, importing_file, root);
+    let mut files =
+        resolve_module_files_with_progress(rust, token, importing_file, root, progress)?;
     if files.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut package = None;
     for segment in suffix {
-        let target = forward_exported_module_fqn(rust, token, &files, segment)?;
+        route_progress_checkpoint(progress)?;
+        let Some(target) =
+            forward_exported_module_fqn_with_progress(rust, token, &files, segment, progress)?
+        else {
+            return Ok(None);
+        };
         package = Some(target.clone());
-        files = resolve_module_files(rust, token, importing_file, &target);
+        files = resolve_module_files_with_progress(rust, token, importing_file, &target, progress)?;
         if files.is_empty() {
-            return None;
+            return Ok(None);
         }
     }
-    package
+    Ok(package)
 }
 
-fn forward_exported_module_fqn(
+fn forward_exported_module_fqn_with_progress(
     rust: &dyn RustSource,
     token: QueryToken<'_>,
     module_files: &[ProjectFile],
     name: &str,
-) -> Option<String> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
     let mut pending = module_files
         .iter()
         .cloned()
@@ -1305,10 +2038,14 @@ fn forward_exported_module_fqn(
     let mut visited = HashSet::default();
     let mut targets = BTreeSet::new();
     while let Some((file, name, reached_through_reexport)) = pending.pop() {
+        route_progress_checkpoint(progress)?;
         if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
             continue;
         }
-        let export_index = rust.export_index_of(&file);
+        let export_index = match progress {
+            Some(progress) => rust.export_index_of_while(&file, progress)?,
+            None => rust.export_index_of(&file)?,
+        };
         match export_index.exports_by_name.get(&name) {
             Some(ExportEntry::Local { local_name }) => {
                 targets.extend(
@@ -1322,9 +2059,15 @@ fn forward_exported_module_fqn(
                 imported_name,
             }) => {
                 pending.extend(
-                    resolve_module_files(rust, token, &file, module_specifier)
-                        .into_iter()
-                        .map(|target| (target, imported_name.clone(), true)),
+                    resolve_module_files_with_progress(
+                        rust,
+                        token,
+                        &file,
+                        module_specifier,
+                        progress,
+                    )?
+                    .into_iter()
+                    .map(|target| (target, imported_name.clone(), true)),
                 );
             }
             Some(ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. }) => {}
@@ -1339,15 +2082,15 @@ fn forward_exported_module_fqn(
         }
         for ReexportStar { module_specifier } in &export_index.reexport_stars {
             pending.extend(
-                resolve_module_files(rust, token, &file, module_specifier)
+                resolve_module_files_with_progress(rust, token, &file, module_specifier, progress)?
                     .into_iter()
                     .map(|target| (target, name.clone(), true)),
             );
         }
     }
-    (targets.len() == 1)
+    Ok((targets.len() == 1)
         .then(|| targets.into_iter().next())
-        .flatten()
+        .flatten())
 }
 
 /// Resolve one export name after the caller has resolved the module files.
@@ -1373,9 +2116,9 @@ pub fn canonical_export_fqn_from_files(
             progress,
         )?
     } else {
-        exported_targets_from_files(rust, token, module_files, name)
+        exported_targets_from_files_while(rust, token, module_files, name, progress)?
     };
-    single_rust_target_fqn(rust.code_units(), targets, progress)
+    single_rust_target_fqn(rust, targets, progress)
 }
 
 pub fn forward_export_fqn_from_files(
@@ -1383,16 +2126,15 @@ pub fn forward_export_fqn_from_files(
     token: QueryToken<'_>,
     module_files: &[ProjectFile],
     name: &str,
-) -> Option<String> {
+) -> ReferenceContextResult<Option<String>> {
     if let Some(fqn) =
-        canonical_export_fqn_from_files(rust, token, module_files, name, true, &|| true)
-            .expect("uninterrupted Rust export traversal")
+        canonical_export_fqn_from_files(rust, token, module_files, name, true, &|| true)?
     {
-        return Some(fqn);
+        return Ok(Some(fqn));
     }
     let mut member_fqns = BTreeSet::new();
     for file in module_files {
-        let index = rust.export_index_of(file);
+        let index = rust.export_index_of(file)?;
         let Some(ExportEntry::ReexportedNamed {
             module_specifier,
             imported_name,
@@ -1400,7 +2142,7 @@ pub fn forward_export_fqn_from_files(
         else {
             continue;
         };
-        let Some(owner_fqn) = resolve_module_package(rust, token, file, module_specifier) else {
+        let Some(owner_fqn) = resolve_module_package(rust, token, file, module_specifier)? else {
             continue;
         };
         let target_fqn = join_rust_fqn(&owner_fqn, imported_name);
@@ -1408,9 +2150,9 @@ pub fn forward_export_fqn_from_files(
             member_fqns.insert(target_fqn);
         }
     }
-    (member_fqns.len() == 1)
+    Ok((member_fqns.len() == 1)
         .then(|| member_fqns.into_iter().next())
-        .flatten()
+        .flatten())
 }
 
 pub fn forward_exported_targets_from_files(
@@ -1418,7 +2160,7 @@ pub fn forward_exported_targets_from_files(
     token: QueryToken<'_>,
     module_files: &[ProjectFile],
     export_name: &str,
-) -> BTreeSet<(ProjectFile, String)> {
+) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
     forward_exported_targets_from_files_with_progress(
         rust,
         token,
@@ -1426,7 +2168,6 @@ pub fn forward_exported_targets_from_files(
         export_name,
         &|| true,
     )
-    .expect("uninterrupted Rust export traversal")
 }
 
 fn forward_exported_targets_from_files_with_progress(
@@ -1448,7 +2189,7 @@ fn forward_exported_targets_from_files_with_progress(
         if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
             continue;
         }
-        let index = rust.export_index_of(&file);
+        let index = rust.export_index_of_while(&file, progress)?;
         match index.exports_by_name.get(&name) {
             Some(ExportEntry::Local { local_name }) => {
                 targets.insert((file.clone(), local_name.clone()));
@@ -1457,15 +2198,17 @@ fn forward_exported_targets_from_files_with_progress(
                 module_specifier,
                 imported_name,
             }) => {
-                let module_files = resolve_module_files(rust, token, &file, module_specifier);
+                let module_files =
+                    resolve_module_files_while(rust, token, &file, module_specifier, progress)?;
                 if module_files.is_empty() {
-                    targets.extend(rust_member_reexport_targets(
+                    targets.extend(rust_member_reexport_targets_while(
                         rust,
                         token,
                         &file,
                         module_specifier,
                         imported_name,
-                    ));
+                        progress,
+                    )?);
                 } else {
                     pending.extend(
                         module_files
@@ -1482,12 +2225,16 @@ fn forward_exported_targets_from_files_with_progress(
             Some(ExportEntry::Default { local_name: None })
             | Some(ExportEntry::ReexportedModule { .. }) => {}
             None if reached_through_reexport => {
+                let properties = declaration_source_properties_while(rust, &file, progress)?;
                 for unit in rust.declarations(&file) {
                     reference_context_checkpoint(progress)?;
-                    if unit.identifier() == name
-                        && is_rust_export_visible_declaration(rust.code_units(), &unit)
-                    {
-                        targets.insert((file.clone(), unit.identifier().to_string()));
+                    if unit.identifier() == name {
+                        let rows = properties
+                            .get(&unit)
+                            .ok_or(RustCargoRouteError::Unavailable)?;
+                        if declaration_properties_are_export_visible(rows, progress)? {
+                            targets.insert((file.clone(), unit.identifier().to_string()));
+                        }
                     }
                 }
             }
@@ -1495,12 +2242,13 @@ fn forward_exported_targets_from_files_with_progress(
         }
         for star in &index.reexport_stars {
             pending.extend(
-                resolve_module_files(rust, token, &file, &star.module_specifier)
+                resolve_module_files_while(rust, token, &file, &star.module_specifier, progress)?
                     .into_iter()
                     .map(|target_file| (target_file, name.clone(), true)),
             );
         }
     }
+    reference_context_checkpoint(progress)?;
     Ok(targets)
 }
 
@@ -1510,19 +2258,44 @@ pub fn rust_member_reexport_targets(
     file: &ProjectFile,
     owner_path: &str,
     member_name: &str,
-) -> BTreeSet<(ProjectFile, String)> {
-    let Some(owner_fqn) = resolve_module_package(rust, token, file, owner_path) else {
-        return BTreeSet::new();
+) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
+    let Some(owner_fqn) = resolve_module_package(rust, token, file, owner_path)? else {
+        return Ok(BTreeSet::new());
     };
     let target_fqn = join_rust_fqn(&owner_fqn, member_name);
-    rust.definitions(&target_fqn)
+    Ok(rust
+        .definitions(&target_fqn)
         .map(|candidate| {
             (
                 candidate.source().clone(),
                 candidate.identifier().to_string(),
             )
         })
-        .collect()
+        .collect())
+}
+
+fn rust_member_reexport_targets_while(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    owner_path: &str,
+    member_name: &str,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
+    let Some(owner_fqn) = resolve_module_package_while(rust, token, file, owner_path, progress)?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let target_fqn = join_rust_fqn(&owner_fqn, member_name);
+    let mut targets = BTreeSet::new();
+    for candidate in rust.definitions(&target_fqn) {
+        reference_context_checkpoint(progress)?;
+        targets.insert((
+            candidate.source().clone(),
+            candidate.identifier().to_string(),
+        ));
+    }
+    Ok(targets)
 }
 
 /// Rewrite a leading aliased `use` segment in `module_specifier` to the
@@ -1579,32 +2352,83 @@ pub fn resolve_module_files(
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
-) -> Vec<ProjectFile> {
+) -> ReferenceContextResult<Vec<ProjectFile>> {
+    resolve_module_files_with_progress(rust, token, importing_file, module_specifier, None)
+}
+
+/// Progress-aware form of [`resolve_module_files`] for bounded consumers.
+pub fn resolve_module_files_while(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<Vec<ProjectFile>> {
+    resolve_module_files_with_progress(
+        rust,
+        token,
+        importing_file,
+        module_specifier,
+        Some(progress),
+    )
+}
+
+fn resolve_module_files_with_progress(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Vec<ProjectFile>> {
+    route_progress_checkpoint(progress)?;
     rust.note_module_file_resolution();
     let analyzed_files = rust.package_file_index();
     let package = rust_package_name(importing_file);
     let crate_package = rust_crate_root_package(importing_file);
     let rooted = is_rooted_rust_module_path(module_specifier);
-    if !rooted
-        && let Some(root_file) = rust
-            .cargo_routes()
-            .resolve_crate_root_file(importing_file, module_specifier)
-    {
-        return if analyzed_files.contains(&root_file) {
-            vec![root_file]
-        } else {
-            Vec::new()
-        };
-    }
+    // Keep the local declaration witness through file selection. Independent
+    // Cargo targets can have the same rendered package/module name.
+    let declared_local_module = if rooted {
+        None
+    } else {
+        resolve_declared_local_module_package_with_progress(
+            rust,
+            importing_file,
+            module_specifier,
+            progress,
+        )?
+    };
+    let local_target = rooted || declared_local_module.is_some();
     let Some(mut resolved_module) = (if rooted {
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+    } else if let Some(module) = declared_local_module {
+        Some(module)
     } else {
-        resolve_module_package(rust, token, importing_file, module_specifier)
+        resolve_module_package_traced_with_progress(
+            rust,
+            token,
+            importing_file,
+            module_specifier,
+            None,
+            progress,
+        )?
     }) else {
-        return rust_module_files_from_path(importing_file, module_specifier);
+        return Ok(rust_module_files_from_path(
+            importing_file,
+            module_specifier,
+        ));
     };
 
-    let mut files = resolved_module_files(rust, token, importing_file, &resolved_module);
+    let mut files =
+        resolved_module_files_with_progress(rust, importing_file, &resolved_module, progress)?;
+    if !rooted
+        && files.is_empty()
+        && let Some(root_file) = cargo_routes_for_progress(rust, progress)?
+            .resolve_crate_root_file(importing_file, module_specifier)
+        && analyzed_files.contains(&root_file)
+    {
+        files.push(root_file);
+    }
     files.extend(rust_module_files_from_path(
         importing_file,
         module_specifier,
@@ -1616,103 +2440,102 @@ pub fn resolve_module_files(
     // rather than a physical child of that crate. `crate::api` in a facade
     // that says `pub use engine::api` is one namespace with the physical
     // `engine::api`; treating the path-derived `facade.api` spelling as final
-    // reports an indexed workspace target as an external boundary. The same
-    // holds for a path rooted at another workspace crate -- `rig::tool` is
-    // `rig_core::tool` when the `rig` facade writes `pub use rig_core::*`
-    // (issue #2775). Follow the crate root's structured export graph only
-    // after the ordinary physical route misses, so a real local module keeps
-    // Rust's normal precedence.
+    // reports an indexed workspace target as an external boundary. Follow the
+    // crate root's structured export graph only after the ordinary physical
+    // route misses, so a real local module keeps Rust's normal precedence.
     if files.is_empty()
-        && let Some(exported_module) =
-            resolve_exported_module_package(rust, token, importing_file, module_specifier)
+        && let Some(exported_module) = resolve_exported_module_package(
+            rust,
+            token,
+            importing_file,
+            module_specifier,
+            progress,
+        )?
     {
         resolved_module = exported_module;
-        files = resolved_module_files(rust, token, importing_file, &resolved_module);
+        files =
+            resolved_module_files_with_progress(rust, importing_file, &resolved_module, progress)?;
     }
 
     // Path-derived Rust package names are shared by independent Cargo
-    // examples, benches, and binaries. Rooted paths are crate-relative, so
+    // examples, benches, and binaries. Rooted and declared local paths are crate-relative, so
     // only disambiguate when the package lookup actually collided: retain
     // physically shared targets when known, otherwise preserve unknown
     // relationships conservatively, and never cross a proven-disjoint root.
-    if rooted && files.len() > 1 {
-        let routes = rust.cargo_routes();
+    if local_target && files.len() > 1 {
+        let routes = cargo_routes_for_progress(rust, progress)?;
         let mut shared = Vec::new();
         let mut unknown = Vec::new();
         for candidate in files {
+            route_progress_checkpoint(progress)?;
             match routes.target_relation(importing_file, &candidate) {
                 RustCargoTargetRelation::Shared => shared.push(candidate),
                 RustCargoTargetRelation::Unknown => unknown.push(candidate),
                 RustCargoTargetRelation::Disjoint => {}
             }
         }
-        return if shared.is_empty() { unknown } else { shared };
+        return Ok(if shared.is_empty() { unknown } else { shared });
     }
-    files
+    Ok(files)
 }
 
-fn resolved_module_files(
+fn resolved_module_files_with_progress(
     rust: &dyn RustSource,
-    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     resolved_module: &str,
-) -> Vec<ProjectFile> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Vec<ProjectFile>> {
+    route_progress_checkpoint(progress)?;
     let analyzed_files = rust.package_file_index();
-    let mut files: Vec<_> = analyzed_files
-        .files_in_package(resolved_module)
-        .cloned()
-        .collect();
+    let mut files = Vec::new();
+    for file in analyzed_files.files_in_package(resolved_module) {
+        route_progress_checkpoint(progress)?;
+        files.push(file.clone());
+    }
     // Only units that *are* the module's definition back it. A bodiless
     // `mod svc;` item is a forwarder living in the declaring file, so
     // extending with its source handed every consumer lib.rs alongside the
     // real content file (#1342). An inline `mod svc { ... }` keeps its own
     // file: there the declaring file genuinely is the defining file.
-    files.extend(
-        rust.definitions(resolved_module)
-            .filter(|code_unit| {
-                code_unit.is_module()
-                    && !is_external_module_declaration(rust, token, code_unit)
-                    && (code_unit.source() == importing_file
-                        || is_visible_module_path(rust.code_units(), code_unit))
-            })
-            .map(|code_unit| code_unit.source().clone()),
-    );
+    for code_unit in
+        rust.declaration_candidates_by_fqn_while(resolved_module, progress.unwrap_or(&|| true))?
+    {
+        route_progress_checkpoint(progress)?;
+        if code_unit.is_module()
+            && !is_external_module_declaration(rust, &code_unit)?
+            && (code_unit.source() == importing_file
+                || is_visible_module_path_while(rust, &code_unit, progress.unwrap_or(&|| true))?)
+        {
+            files.push(code_unit.source().clone());
+        }
+    }
     files.sort();
     files.dedup();
-    files
+    Ok(files)
 }
 
-/// A module path's segments followed through the structured export graph of
-/// the crate root the path is anchored at.
-///
-/// Two spellings anchor at a crate root. `crate::api` names the importing
-/// file's own crate root, which may be a facade whose `pub use engine::api`
-/// puts the physical `engine::api` module in that namespace. `rig::tool` names
-/// *another* Cargo workspace member's root, and the same re-export can stand
-/// between that root and the module the path names: `rig::tool` is
-/// `rig_core::tool` because the `rig` facade writes `pub use rig_core::*`
-/// (issue #2775). Both are one walk over one export index; only the seed
-/// differs, so this states the seed and shares the walk.
-///
-/// A head segment that names no crate of the analyzed workspace answers
-/// `None`. That is the honest external boundary: a registry dependency's
-/// modules are in no index, and a same-named workspace module must not answer
-/// for one. `self::` and `super::` are module-relative rather than
-/// crate-rooted, so they are the path arithmetic's business, not this walk's.
+/// Follow a crate-root or dependency-crate module path through public facade
+/// exports. The crate-root helper above is retained for the explicit `crate::`
+/// path used by local module resolution; this variant also admits a routed
+/// dependency root such as `facade::api`.
 fn resolve_exported_module_package(
     rust: &dyn RustSource,
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
-) -> Option<String> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    route_progress_checkpoint(progress)?;
     let segments = parse_symbol_path(Language::Rust, module_specifier);
-    let (root, nested) = segments.split_first()?;
+    let Some((root, nested)) = segments.split_first() else {
+        return Ok(None);
+    };
     if nested.is_empty() || matches!(root.as_str(), "self" | "super") {
-        return None;
+        return Ok(None);
     }
-
     let mut files = if root == "crate" {
-        let mut roots = rust.cargo_routes().target_roots_for_file(importing_file);
+        let mut roots =
+            cargo_routes_for_progress(rust, progress)?.target_roots_for_file(importing_file);
         if roots.is_empty()
             && rust.is_analyzed(importing_file)
             && rust_package_name(importing_file) == rust_crate_root_package(importing_file)
@@ -1721,35 +2544,35 @@ fn resolve_exported_module_package(
         }
         roots
     } else {
-        // Not this file's crate: only a crate the importing file's manifest
-        // actually routes to, which is what keeps an external crate external.
-        vec![
-            rust.cargo_routes()
-                .resolve_crate_root_file(importing_file, root)?,
-        ]
+        let Some(root_file) = cargo_routes_for_progress(rust, progress)?
+            .resolve_crate_root_file(importing_file, root)
+        else {
+            return Ok(None);
+        };
+        vec![root_file]
     };
     files.retain(|file| rust.is_analyzed(file));
     files.sort();
     files.dedup();
-
-    // A `pub use` in the walked root can name a path that lands back here, so
-    // the walk re-enters through `resolve_module_files`. Cargo's dependency
-    // graph is a DAG, but a crate re-exporting through its own name
-    // (`pub use self_crate::part::*` at its root) closes a cycle inside one
-    // crate. Refuse the request already on this thread's stack rather than
-    // recursing; a chain of distinct facades still resolves hop by hop.
-    let _guard = ExportedModuleWalkGuard::enter(importing_file, module_specifier)?;
-
+    let _guard = ExportedModuleWalkGuard::enter(importing_file, module_specifier);
+    let Some(_guard) = _guard else {
+        return Ok(None);
+    };
     let mut package = None;
     for segment in nested {
-        let resolved = forward_exported_module_fqn(rust, token, &files, segment)?;
-        files = resolved_module_files(rust, token, importing_file, &resolved);
+        route_progress_checkpoint(progress)?;
+        let Some(resolved) =
+            forward_exported_module_fqn_with_progress(rust, token, &files, segment, progress)?
+        else {
+            return Ok(None);
+        };
+        files = resolved_module_files_with_progress(rust, importing_file, &resolved, progress)?;
         if files.is_empty() {
-            return None;
+            return Ok(None);
         }
         package = Some(resolved);
     }
-    package
+    Ok(package)
 }
 
 /// Resolve an item below a module path whose public spelling reaches the
@@ -1764,21 +2587,24 @@ fn resolve_exported_module_item_fqn(
     importing_file: &ProjectFile,
     module_specifier: &str,
     item_name: &str,
-) -> Option<String> {
-    let module_package =
-        resolve_exported_module_package(rust, token, importing_file, module_specifier)?;
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    let Some(module_package) =
+        resolve_exported_module_package(rust, token, importing_file, module_specifier, progress)?
+    else {
+        return Ok(None);
+    };
     let target_fqn = join_rust_fqn(&module_package, item_name);
-    let targets = rust
-        .definitions(&target_fqn)
-        .filter(|unit| {
-            unit.identifier() == item_name
-                && is_rust_export_visible_declaration(rust.code_units(), unit)
-        })
-        .map(|unit| unit.fq_name())
-        .collect::<BTreeSet<_>>();
-    (targets.len() == 1)
+    let mut targets = BTreeSet::new();
+    for unit in rust.definitions(&target_fqn) {
+        route_progress_checkpoint(progress)?;
+        if unit.identifier() == item_name && is_rust_export_visible_declaration(rust, &unit)? {
+            targets.insert(unit.fq_name());
+        }
+    }
+    Ok((targets.len() == 1)
         .then(|| targets.into_iter().next())
-        .flatten()
+        .flatten())
 }
 
 thread_local! {
@@ -1819,36 +2645,49 @@ impl Drop for ExportedModuleWalkGuard {
 /// inline declaration in the importing file. The shared spelling must be
 /// backed by a file Cargo classifies as shared; unknown and disjoint roots are
 /// never admitted here.
-fn resolve_target_kind_root_module(
+fn resolve_target_kind_root_module_with_progress(
     rust: &dyn RustSource,
-    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     resolved: &str,
-) -> Option<String> {
+    progress: Option<&dyn Fn() -> bool>,
+) -> ReferenceContextResult<Option<String>> {
+    route_progress_checkpoint(progress)?;
     let files = rust.package_file_index();
-    let routes = rust.cargo_routes();
-    if files.files_in_package(resolved).next().is_some()
-        || rust.definitions(resolved).any(|unit| {
-            unit.is_module()
-                && !is_external_module_declaration(rust, token, &unit)
-                && unit.source() == importing_file
-        })
-    {
-        return None;
+    let routes = cargo_routes_for_progress(rust, progress)?;
+    if files.files_in_package(resolved).next().is_some() {
+        return Ok(None);
     }
-    let declares_external_module = rust.definitions(resolved).any(|unit| {
-        unit.is_module()
-            && is_external_module_declaration(rust, token, &unit)
-            && unit.source() == importing_file
-    });
+    let mut has_inline_module = false;
+    let mut declares_external_module = false;
+    for unit in rust.definitions(resolved) {
+        route_progress_checkpoint(progress)?;
+        if !unit.is_module() || unit.source() != importing_file {
+            continue;
+        }
+        if is_external_module_declaration(rust, &unit)? {
+            declares_external_module = true;
+        } else {
+            has_inline_module = true;
+        }
+    }
+    if has_inline_module {
+        return Ok(None);
+    }
     if !declares_external_module {
-        return None;
+        return Ok(None);
     }
-    let alternative = rust_target_kind_root_alternative(importing_file, resolved)?;
-    let has_shared_file = files.files_in_package(&alternative).any(|candidate| {
-        routes.target_relation(importing_file, candidate) == RustCargoTargetRelation::Shared
-    });
-    has_shared_file.then_some(alternative)
+    let Some(alternative) = rust_target_kind_root_alternative(importing_file, resolved) else {
+        return Ok(None);
+    };
+    let mut has_shared_file = false;
+    for candidate in files.files_in_package(&alternative) {
+        route_progress_checkpoint(progress)?;
+        if routes.target_relation(importing_file, candidate) == RustCargoTargetRelation::Shared {
+            has_shared_file = true;
+            break;
+        }
+    }
+    Ok(has_shared_file.then_some(alternative))
 }
 
 pub fn exact_member(
@@ -1894,214 +2733,434 @@ pub fn rust_usage_candidate_files(
 }
 
 pub fn trait_implementer_names(
-    rust: &dyn RustSource,
+    rust: &dyn RustFactSource,
     token: QueryToken<'_>,
     trait_owner: &CodeUnit,
-    _importer_file: &ProjectFile,
-) -> HashSet<String> {
-    let project = rust.project();
-    rust.get_analyzed_files()
-        .into_iter()
-        .filter_map(|file| {
-            let source = project.read_source(&file).ok()?;
-            Some((file, source))
-        })
-        .flat_map(|(file, source)| {
-            let binder = rust.import_binder_of(&file);
-            trait_implementer_names_from_source(rust, token, trait_owner, &file, &source, &binder)
-        })
-        .collect()
+    keep_going: &dyn Fn() -> bool,
+) -> Result<HashSet<String>, RustCargoRouteError> {
+    let mut implementer_names = HashSet::default();
+    for file in impl_files_of_trait(rust, trait_owner)? {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let facts = rust.canonical_rust_hierarchy_source_facts(&file, keep_going)?;
+        let contexts = RustSourceContextIndex::new(facts.as_ref(), keep_going)?;
+        let mut types: HashMap<SourceOccurrenceId, _> = HashMap::default();
+        for ty in &facts.types {
+            assert!(
+                types.insert(ty.occurrence, ty).is_none(),
+                "one source occurrence cannot own two Rust type facts"
+            );
+        }
+
+        for impl_fact in &facts.items.impls {
+            if !keep_going() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            if impl_fact.negation.is_some()
+                || !contexts.is_primary(facts.as_ref(), impl_fact.context)?
+            {
+                continue;
+            }
+            let Some(trait_occurrence) = impl_fact.trait_type else {
+                continue;
+            };
+            let Some(target_occurrence) = impl_fact.target_type else {
+                continue;
+            };
+            let trait_ref = types
+                .get(&trait_occurrence)
+                .copied()
+                .expect("published impl trait type has a type source fact");
+            let target = types
+                .get(&target_occurrence)
+                .copied()
+                .expect("published impl target type has a type source fact");
+            let binder =
+                contexts.visible_import_binder(facts.as_ref(), impl_fact.context, keep_going)?;
+            let Some(resolved_trait) = resolve_rust_hierarchy_source_ref(
+                rust,
+                token,
+                &file,
+                &contexts,
+                facts.as_ref(),
+                impl_fact.context,
+                &binder,
+                trait_ref,
+                |candidate| is_rust_trait_declaration(rust, candidate),
+            )?
+            else {
+                continue;
+            };
+            if resolved_trait != *trait_owner {
+                continue;
+            }
+            if let Some(name) = source_type_identifier(target) {
+                implementer_names.insert(name.to_string());
+            }
+        }
+    }
+    if !keep_going() {
+        return Err(RustCargoRouteError::Cancelled);
+    }
+    Ok(implementer_names)
+}
+
+/// The files that hold an `impl` of one trait.
+///
+/// Every member-level walk across a trait used to read `get_analyzed_files()`
+/// and resolve each impl it found, which is a whole-workspace pass per
+/// question. The trait-implementation rows already name the blobs, so the walk
+/// reads those and applies the same filter to a strictly smaller set: every
+/// file the old pass would have kept is still here, because a file with no
+/// bound impl of the trait contributed nothing to the answer.
+///
+/// One blob can be mounted at more than one path, so each blob contributes
+/// every path it is mounted at.
+pub(crate) fn impl_files_of_trait(
+    rust: &dyn RustFactSource,
+    trait_owner: &CodeUnit,
+) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+    let live = rust.live_blobs();
+    let mut files = Vec::new();
+
+    // The trait's source can contain impls whose self type has no indexed
+    // nominal identity, so no trait-impl row names that file. It is still a
+    // bounded source candidate and the caller resolves each impl structurally.
+    if live.oid_for_path(trait_owner.source()).is_some() {
+        files.push(trait_owner.source().clone());
+    }
+
+    // Impls the relation bound: found by the trait's own placed declaration.
+    if let Some(blob) = live.oid_for_path(trait_owner.source()) {
+        let facts = rust.canonical_rust_hierarchy_source_facts(trait_owner.source(), &|| true)?;
+        let rel_path = brokk_bifrost_core::path_utils::rel_path_string(trait_owner.source());
+        for (declaration, unit) in &facts.declaration_units {
+            if unit != trait_owner {
+                continue;
+            }
+            let placed = RustPlacedDeclaration {
+                rel_path: rel_path.clone(),
+                blob,
+                declaration: declaration.get(),
+            };
+            for row in rust.rust_trait_impl_rows(&placed)? {
+                files.extend(live_file_at(rust, row.impl_blob, &row.impl_rel_path));
+            }
+        }
+    }
+
+    // Impls the relation could not bind: found by the name they wrote. These
+    // have no declaration to be sought by, which is the whole reason their
+    // spelling is a row. Handing their files to the same walk lets its own
+    // resolver decide them, instead of the caller refusing the question
+    // because a spelling somewhere failed.
+    for unresolved in rust.rust_unresolved_trait_impl_files(trait_owner.identifier())? {
+        files.extend(live_file_at(
+            rust,
+            unresolved.impl_blob,
+            &unresolved.impl_rel_path,
+        ));
+    }
+
+    files.extend(macro_impl_files_of_trait(rust, trait_owner)?);
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// The files that could hold an impl of one trait inside a macro's token tree.
+///
+/// Such an `impl` is not an item until the macro is replayed, so no producer
+/// fact and no row describes it. It still decides enumerability -- a macro that
+/// can contribute an implementation means the trait's implementations are not
+/// exhaustively known -- so the files that could hold one have to be offered
+/// to the walk. The bound is the identifier and the macro bit together: a file
+/// that never writes this name inside a macro cannot expand to an impl of it.
+pub(crate) fn macro_impl_files_of_trait(
+    rust: &dyn RustFactSource,
+    trait_owner: &CodeUnit,
+) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+    let live = rust.live_blobs();
+    let mut files = Vec::new();
+    for (blob, context) in rust.rust_identifier_occurrence_blobs(trait_owner.identifier())? {
+        if context & RUST_OCCURRENCE_MACRO != 0 {
+            files.extend(live.paths_for_oid(blob));
+        }
+    }
+    Ok(files)
 }
 
 pub fn rust_trait_member_implementations(
-    rust: &dyn RustSource,
+    rust: &dyn RustFactSource,
     token: QueryToken<'_>,
     trait_member: &CodeUnit,
-) -> Option<Vec<CodeUnit>> {
-    let trait_owner = rust.parent_of(trait_member)?;
-    if !is_rust_trait_declaration(rust.code_units(), &trait_owner) {
-        return None;
+) -> ReferenceContextResult<Option<Vec<CodeUnit>>> {
+    let Some(trait_owner) = rust.parent_of(trait_member) else {
+        return Ok(None);
+    };
+    if !is_trait_owner(rust, &trait_owner)? {
+        return Ok(None);
     }
-    let member_kind = rust_trait_member_kind(rust, trait_member)?;
+    let Some(member_kind) = rust_trait_member_kind(rust, trait_member)? else {
+        return Ok(None);
+    };
     let member_name = trait_member.identifier();
 
     let mut implementations = Vec::new();
     let mut seen = HashSet::default();
-    for file in rust.get_analyzed_files() {
-        let Ok(source) = rust.project().read_source(&file) else {
-            continue;
-        };
-        let Some(tree) = parse_rust_tree(&source) else {
-            continue;
-        };
-        for impl_item in named_descendants_of_kind(tree.root_node(), "impl_item") {
-            let Some((trait_ref, _implementer)) = trait_impl_parts(impl_item, &source) else {
-                continue;
-            };
-            let binder = visible_import_binder_at(&source, impl_item.start_byte());
-            if !trait_reference_matches(rust, token, &trait_owner, &file, &trait_ref, &binder) {
+    for file in impl_files_of_trait(rust, &trait_owner)? {
+        let facts = rust.canonical_rust_hierarchy_source_facts(&file, &|| true)?;
+        let contexts = RustSourceContextIndex::new(facts.as_ref(), &|| true)?;
+        let mut types = HashMap::default();
+        for ty in &facts.types {
+            assert!(
+                types.insert(ty.occurrence, ty).is_none(),
+                "one source occurrence cannot own two Rust type facts"
+            );
+        }
+        let mut declarations: HashMap<SourceDeclarationId, Vec<&CodeUnit>> = HashMap::default();
+        for (declaration, unit) in &facts.declaration_units {
+            declarations.entry(*declaration).or_default().push(unit);
+        }
+
+        for impl_fact in &facts.items.impls {
+            if !contexts.is_primary(facts.as_ref(), impl_fact.context)?
+                || impl_fact.negation.is_some()
+            {
                 continue;
             }
-            for member_node in rust_impl_member_nodes(impl_item, &source, member_name, member_kind)
-            {
-                let Some(candidate) = rust_declaration_for_exact_node(
-                    rust.code_units(),
-                    &file,
-                    member_node,
-                    member_name,
-                    member_kind,
-                ) else {
+            let Some(trait_occurrence) = impl_fact.trait_type else {
+                continue;
+            };
+            let trait_ref = types
+                .get(&trait_occurrence)
+                .copied()
+                .expect("published impl trait type has a type source fact");
+            let binder =
+                contexts.visible_import_binder(facts.as_ref(), impl_fact.context, &|| true)?;
+            let Some(resolved_trait) = resolve_rust_hierarchy_source_ref(
+                rust,
+                token,
+                &file,
+                &contexts,
+                facts.as_ref(),
+                impl_fact.context,
+                &binder,
+                trait_ref,
+                |candidate| is_rust_trait_declaration(rust, candidate),
+            )?
+            else {
+                continue;
+            };
+            if resolved_trait != trait_owner {
+                continue;
+            }
+            let expected_syntax_kind = match member_kind {
+                RustTraitMemberKind::AssociatedType => "type_item",
+                RustTraitMemberKind::Method => "function_item",
+            };
+            for child in &impl_fact.body_children {
+                if child.syntax_kind != expected_syntax_kind {
+                    continue;
+                }
+                let Some(declaration) = child.declaration else {
                     continue;
                 };
-                if seen.insert(candidate.clone()) {
-                    implementations.push(candidate);
+                let Some(candidates) = declarations.get(&declaration) else {
+                    continue;
+                };
+                for candidate in candidates {
+                    if candidate.identifier() != member_name
+                        || !rust_code_unit_kind_matches(candidate, member_kind)
+                    {
+                        continue;
+                    }
+                    let candidate = (**candidate).clone();
+                    if seen.insert(candidate.clone()) {
+                        implementations.push(candidate);
+                    }
                 }
             }
         }
     }
-    Some(implementations)
+    Ok(Some(implementations))
 }
 
-pub fn is_rust_trait_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| {
-        node.kind() == "trait_item"
+fn any_canonical_declaration_property(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+    predicate: impl FnMut(&RustDeclarationPropertyFact) -> bool,
+) -> Result<bool, RustCargoRouteError> {
+    let properties = rust.declaration_source_properties(code_unit.source(), &|| true)?;
+    let rows = properties
+        .get(code_unit)
+        .ok_or(RustCargoRouteError::Unavailable)?;
+    Ok(rows.iter().any(predicate))
+}
+
+pub fn is_rust_trait_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Trait
     })
 }
 
 pub fn is_rust_trait_impl_member_declaration(
-    index: &dyn CodeUnitIndex,
+    rust: &dyn RustSource,
     code_unit: &CodeUnit,
-) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| {
-        let mut parent = node.parent();
-        while let Some(candidate) = parent {
-            if candidate.kind() == "impl_item" {
-                return candidate.child_by_field_name("trait").is_some();
-            }
-            parent = candidate.parent();
-        }
-        false
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| property.trait_impl_member)
+}
+
+pub fn is_rust_struct_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Struct
     })
 }
 
-pub fn is_rust_struct_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| {
-        node.kind() == "struct_item"
+/// Whether any source alternative supplies a tuple or unit value constructor.
+/// Access constraints remain on the canonical constructor properties; missing
+/// declaration publication is an error, not evidence that no constructor exists.
+pub fn has_rust_value_constructor(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.value_constructor.is_some()
     })
 }
 
-pub fn has_rust_value_constructor(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, source| {
-        rust_value_constructor_visibilities(node, source).is_some()
+pub fn is_rust_enum_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Enum
     })
 }
 
-pub fn is_rust_enum_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| node.kind() == "enum_item")
-}
-
-pub fn is_rust_enum_variant_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| {
-        node.kind() == "enum_variant"
+pub fn is_rust_enum_variant_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::EnumVariant
     })
 }
 
 pub fn is_rust_const_or_static_declaration(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| {
-        matches!(node.kind(), "const_item" | "static_item")
-    })
-}
-
-pub fn is_rust_type_alias_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, _source| node.kind() == "type_item")
-}
-
-pub fn is_rust_macro_export_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    code_unit.is_macro()
-        && rust_declaration_node_is(index, code_unit, |node, source| {
-            is_rust_macro_export_node(node, source)
-        })
-}
-
-/// Whether this exact macro declaration occurrence carries `#[macro_export]`.
-///
-/// Declaration facts use this node-level form because a CodeUnit can represent
-/// multiple cfg or macro-expanded occurrences and each occurrence has its own
-/// export visibility.
-pub fn is_rust_macro_export_node(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "macro_definition" && rust_item_has_attribute(node, source, "macro_export")
-}
-
-pub fn is_rust_public_like_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, source| {
-        rust_visibility_text(node, source).is_some_and(|visibility| visibility.starts_with("pub"))
-    })
-}
-
-pub fn rust_declaration_visibility(
     rust: &dyn RustSource,
-    token: QueryToken<'_>,
     code_unit: &CodeUnit,
-) -> RustVisibility {
-    let Some(prepared) = rust.prepared_syntax(token, code_unit.source()) else {
-        return RustVisibility::Private;
-    };
-    inspect_rust_named_declaration_node(
-        rust.code_units(),
-        code_unit,
-        prepared.tree().root_node(),
-        prepared.source(),
-        crate::imports::rust_item_visibility,
-    )
-    .unwrap_or(RustVisibility::Private)
-}
-
-/// Whether the declaration's own visibility makes it part of the crate's
-/// exported surface (`pub` / `pub`), unlike the looser
-/// [`Self::is_rust_public_like_declaration`] which also accepts module-private
-/// forms such as `pub(self)`.
-pub fn is_rust_export_visible_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    is_export_public_declaration(index, code_unit)
-}
-
-pub fn is_export_public_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
-    rust_declaration_node_is(index, code_unit, |node, source| {
-        rust_visibility_text(node, source).is_some_and(is_export_visibility)
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        matches!(
+            property.kind,
+            RustDeclarationKind::Const | RustDeclarationKind::Static
+        )
     })
 }
 
-pub fn export_visible_declarations(
-    index: &dyn CodeUnitIndex,
-    file: &ProjectFile,
-    declarations: &BTreeSet<CodeUnit>,
-) -> HashSet<CodeUnit> {
-    let Ok(source) = index.project().read_source(file) else {
-        return HashSet::default();
-    };
-    let Some(tree) = parse_rust_tree(&source) else {
-        return HashSet::default();
-    };
-    export_visible_declarations_from_syntax(index, declarations, tree.root_node(), &source)
+pub fn is_rust_type_alias_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::TypeAlias
+    })
 }
 
-fn export_visible_declarations_from_syntax(
-    index: &dyn CodeUnitIndex,
-    declarations: &BTreeSet<CodeUnit>,
-    root: Node<'_>,
-    source: &str,
-) -> HashSet<CodeUnit> {
-    declarations
+pub fn is_rust_type_member_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.has_impl_or_trait_ancestor
+            && matches!(
+                property.kind,
+                RustDeclarationKind::TypeAlias | RustDeclarationKind::AssociatedType
+            )
+    })
+}
+
+pub fn is_rust_free_function_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Function && !property.has_impl_or_trait_ancestor
+    })
+}
+
+pub fn is_rust_module_type_alias_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    if !rust.is_type_alias(code_unit) {
+        return Ok(false);
+    }
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::TypeAlias && !property.has_impl_or_trait_ancestor
+    })
+}
+
+pub fn is_rust_module_value_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        matches!(
+            property.kind,
+            RustDeclarationKind::Const | RustDeclarationKind::Static
+        ) && matches!(
+            property.nearest_declaration_boundary,
+            RustDeclarationBoundary::ModuleOrFile | RustDeclarationBoundary::LocalBlockOrFunction
+        )
+    })
+}
+
+pub fn is_rust_macro_export_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    if !code_unit.is_macro() {
+        return Ok(false);
+    }
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::Macro && property.macro_exported
+    })
+}
+
+pub fn is_rust_public_like_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    let properties = rust.declaration_source_properties(code_unit.source(), &|| true)?;
+    let rows = properties
+        .get(code_unit)
+        .ok_or(RustCargoRouteError::Unavailable)?;
+    Ok(rows
         .iter()
-        .filter(|code_unit| {
-            rust_declaration_node(index, code_unit, root)
-                .and_then(|node| rust_visibility_text(node, source))
-                .is_some_and(is_export_visibility)
-        })
-        .cloned()
-        .collect()
+        .any(|property| property.visibility != RustVisibility::Private))
+}
+
+/// Whether any source alternative has public, crate, or crate-rooted restricted
+/// visibility. Unlike `is_rust_public_like_declaration`, this excludes `pub(self)`
+/// and `pub(super)`. Missing source facts are unavailable, never private.
+pub fn is_rust_export_visible_declaration(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
+    let properties = rust.declaration_source_properties(code_unit.source(), &|| true)?;
+    let rows = properties
+        .get(code_unit)
+        .ok_or(RustCargoRouteError::Unavailable)?;
+    declaration_properties_are_export_visible(rows, &|| true).map_err(Into::into)
 }
 
 /// Check export visibility with a source-aware owner walk.
@@ -2117,29 +3176,53 @@ pub fn is_module_export_candidate(
     code_unit: &CodeUnit,
     export_visible: &HashSet<CodeUnit>,
     external_visibility: &mut HashMap<CodeUnit, bool>,
-) -> bool {
+) -> ReferenceContextResult<bool> {
+    is_module_export_candidate_while(
+        rust,
+        file,
+        code_unit,
+        export_visible,
+        external_visibility,
+        &|| true,
+    )
+}
+
+fn is_module_export_candidate_while(
+    rust: &dyn RustSource,
+    file: &ProjectFile,
+    code_unit: &CodeUnit,
+    export_visible: &HashSet<CodeUnit>,
+    external_visibility: &mut HashMap<CodeUnit, bool>,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<bool> {
+    reference_context_checkpoint(progress)?;
     if !export_visible.contains(code_unit) {
-        return false;
+        return Ok(false);
     }
 
     let mut current = code_unit.clone();
     loop {
-        let parent = match rust_export_parent(rust, &current) {
+        reference_context_checkpoint(progress)?;
+        let parent = match rust_export_parent_while(rust, &current, progress)? {
             RustExportParent::Parent(parent) => parent,
-            RustExportParent::Root => return true,
-            RustExportParent::Ambiguous => return false,
+            RustExportParent::Root => return Ok(true),
+            RustExportParent::Ambiguous => return Ok(false),
         };
         let parent_is_export_visible = if parent.source() == file {
             export_visible.contains(&parent)
         } else if let Some(visible) = external_visibility.get(&parent) {
             *visible
         } else {
-            let visible = is_export_public_declaration(rust.code_units(), &parent);
+            let properties = declaration_source_properties_while(rust, parent.source(), progress)?;
+            let rows = properties
+                .get(&parent)
+                .ok_or(RustCargoRouteError::Unavailable)?;
+            let visible = declaration_properties_are_export_visible(rows, progress)?;
             external_visibility.insert(parent.clone(), visible);
             visible
         };
         if !parent.is_module() || !parent_is_export_visible {
-            return false;
+            return Ok(false);
         }
         current = parent;
     }
@@ -2151,73 +3234,80 @@ enum RustExportParent {
     Ambiguous,
 }
 
-fn rust_export_parent(rust: &dyn RustSource, code_unit: &CodeUnit) -> RustExportParent {
+fn rust_export_parent_while(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<RustExportParent> {
+    reference_context_checkpoint(progress)?;
     if let Some(parent) = rust.structural_parent_of(code_unit) {
-        return RustExportParent::Parent(parent);
+        return Ok(RustExportParent::Parent(parent));
     }
     let Some(owner_fq_name) = default_parent_fq_name(code_unit) else {
-        return RustExportParent::Root;
+        return Ok(RustExportParent::Root);
     };
-    let mut candidates = rust
-        .code_units()
-        .definitions(&owner_fq_name)
-        .collect::<Vec<_>>();
+    let mut candidates = rust.declaration_candidates_by_fqn_while(&owner_fq_name, progress)?;
     if candidates.is_empty() {
-        return RustExportParent::Root;
+        return Ok(RustExportParent::Root);
     }
+    reference_context_checkpoint(progress)?;
     if let Some(local) = rust
-        .cargo_routes()
+        .cargo_routes_while(progress)?
         .candidates_in_same_target_root(code_unit.source(), candidates.clone())
     {
         candidates = local;
     }
     candidates.sort();
     candidates.dedup();
-    match candidates.as_slice() {
+    Ok(match candidates.as_slice() {
         [] => RustExportParent::Root,
         [parent] => RustExportParent::Parent(parent.clone()),
         _ => RustExportParent::Ambiguous,
-    }
+    })
 }
 
-pub fn is_visible_module_path(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
+fn is_visible_module_path_while(
+    rust: &dyn RustSource,
+    code_unit: &CodeUnit,
+    progress: &dyn Fn() -> bool,
+) -> ReferenceContextResult<bool> {
     let mut current = code_unit.clone();
     loop {
-        if !current.is_module() || !is_export_public_declaration(index, &current) {
-            return false;
+        reference_context_checkpoint(progress)?;
+        if !current.is_module() {
+            return Ok(false);
         }
-        let Some(parent) = index.parent_of(&current) else {
-            return true;
+        let properties = declaration_source_properties_while(rust, current.source(), progress)?;
+        let rows = properties
+            .get(&current)
+            .ok_or(RustCargoRouteError::Unavailable)?;
+        if !declaration_properties_are_export_visible(rows, progress)? {
+            return Ok(false);
+        }
+        current = match rust_export_parent_while(rust, &current, progress)? {
+            RustExportParent::Parent(parent) => parent,
+            RustExportParent::Root => return Ok(true),
+            RustExportParent::Ambiguous => return Ok(false),
         };
-        current = parent;
     }
 }
 
 /// Whether this module unit is a bodiless `mod x;` item, which forwards to a
 /// definition in another file rather than being one.
 ///
-/// Reads the cached prepared syntax rather than `rust_declaration_node_is`'s
-/// own read-and-parse: `resolve_module_files` asks this per resolution, and
-/// #1230 made that path per-call cheap.
+/// Reads the canonical declaration property rather than reparsing syntax:
+/// `resolve_module_files` asks this per resolution, and the property cache
+/// keeps that path bounded.
 pub fn is_external_module_declaration(
     rust: &dyn RustSource,
-    token: QueryToken<'_>,
     code_unit: &CodeUnit,
-) -> bool {
+) -> Result<bool, RustCargoRouteError> {
     if !code_unit.is_module() {
-        return false;
+        return Ok(false);
     }
-    let Some(prepared) = rust.prepared_syntax(token, code_unit.source()) else {
-        return false;
-    };
-    inspect_rust_named_declaration_node(
-        rust.code_units(),
-        code_unit,
-        prepared.tree().root_node(),
-        prepared.source(),
-        |node, _| node.kind() == "mod_item" && node.child_by_field_name("body").is_none(),
-    )
-    .unwrap_or(false)
+    any_canonical_declaration_property(rust, code_unit, |property| {
+        property.kind == RustDeclarationKind::ExternalModule
+    })
 }
 
 pub fn rust_declaration_node_is<F>(
@@ -2231,7 +3321,7 @@ where
     let Ok(source) = index.project().read_source(code_unit.source()) else {
         return false;
     };
-    let Some(tree) = parse_rust_tree(&source) else {
+    let Some(tree) = crate::lexical_scope::parse_rust_tree(&source) else {
         return false;
     };
     inspect_rust_named_declaration_node(index, code_unit, tree.root_node(), &source, predicate)
@@ -2396,42 +3486,6 @@ fn rust_declaration_name_matches(name: Node<'_>, source: &str, identifier: &str)
     rust_node_text(name, source).trim() == identifier
 }
 
-#[cfg(test)]
-mod declaration_name_tests {
-    use super::*;
-
-    #[test]
-    fn public_raw_field_name_matches_its_canonical_identifier() {
-        let source = r#"pub struct DbColumn {
-    pub r#type: String,
-    pub type_name: String,
-}
-"#;
-        let tree = parse_rust_tree(source).expect("parse Rust fixture");
-        let fields = named_descendants_of_kind(tree.root_node(), "field_declaration");
-        let raw_field = fields
-            .iter()
-            .copied()
-            .find(|field| {
-                field
-                    .child_by_field_name("name")
-                    .and_then(|name| source.get(name.byte_range()))
-                    == Some("r#type")
-            })
-            .expect("raw field declaration");
-        let name = raw_field
-            .child_by_field_name("name")
-            .expect("raw field name");
-
-        assert!(rust_declaration_name_matches(name, source, "type"));
-        assert_eq!(rust_visibility_text(raw_field, source), Some("pub"));
-        assert!(
-            !rust_declaration_name_matches(name, source, "type_name"),
-            "normalization must not widen a raw identifier to a prefix near miss"
-        );
-    }
-}
-
 pub fn rust_declaration_node<'tree>(
     index: &dyn CodeUnitIndex,
     code_unit: &CodeUnit,
@@ -2442,52 +3496,22 @@ pub fn rust_declaration_node<'tree>(
     root.descendant_for_byte_range(range.start_byte, range.end_byte)
 }
 
-fn rust_declaration_for_exact_node(
-    index: &dyn CodeUnitIndex,
-    file: &ProjectFile,
-    node: Node<'_>,
-    member_name: &str,
-    member_kind: RustTraitMemberKind,
-) -> Option<CodeUnit> {
-    index
-        .declarations(file)
-        .into_iter()
-        .filter(|unit| unit.identifier() == member_name)
-        .filter(|unit| rust_code_unit_kind_matches(unit, member_kind))
-        .find(|unit| {
-            index.ranges(unit).iter().any(|range| {
-                range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
-            })
-        })
-}
-
-pub fn rust_associated_type_declaration_for_exact_node(
-    index: &dyn CodeUnitIndex,
-    file: &ProjectFile,
-    node: Node<'_>,
-    member_name: &str,
-) -> Option<CodeUnit> {
-    rust_declaration_for_exact_node(
-        index,
-        file,
-        node,
-        member_name,
-        RustTraitMemberKind::AssociatedType,
-    )
-}
-
 /// The visibility constraints on the value constructor introduced by a tuple
 /// or unit struct. Named-field structs are constructed in the type namespace
 /// and therefore return `None`.
-pub fn rust_value_constructor_visibilities(
+///
+/// Extract only the value-constructor constraints beyond the declaration's
+/// own visibility. The declaration producer stores that visibility separately,
+/// so canonical property rows do not duplicate it as the first vector entry.
+pub fn rust_value_constructor_properties(
     node: Node<'_>,
     source: &str,
-) -> Option<Vec<RustVisibility>> {
+) -> Option<RustValueConstructorProperties> {
     if node.kind() != "struct_item" {
         return None;
     }
 
-    let mut visibilities = vec![rust_item_visibility(node, source)];
+    let mut field_visibilities = Vec::new();
     match node.child_by_field_name("body") {
         None => {}
         Some(body) if body.kind() == "ordered_field_declaration_list" => {
@@ -2502,7 +3526,7 @@ pub fn rust_value_constructor_visibilities(
                     "visibility_modifier" => {
                         pending_visibility = Some(rust_visibility_modifier(child, source));
                     }
-                    _ => visibilities
+                    _ => field_visibilities
                         .push(pending_visibility.take().unwrap_or(RustVisibility::Private)),
                 }
             }
@@ -2510,10 +3534,10 @@ pub fn rust_value_constructor_visibilities(
         Some(_) => return None,
     }
 
-    if rust_item_has_attribute(node, source, "non_exhaustive") {
-        visibilities.push(RustVisibility::Crate);
-    }
-    Some(visibilities)
+    Some(RustValueConstructorProperties {
+        field_visibilities,
+        non_exhaustive: rust_item_has_attribute(node, source, "non_exhaustive"),
+    })
 }
 
 fn rust_visibility_modifier(node: Node<'_>, source: &str) -> RustVisibility {
@@ -2527,16 +3551,23 @@ enum RustTraitMemberKind {
 }
 
 fn rust_trait_member_kind(
-    rust: &dyn RustSource,
+    rust: &dyn RustFactSource,
     trait_member: &CodeUnit,
-) -> Option<RustTraitMemberKind> {
+) -> Result<Option<RustTraitMemberKind>, RustCargoRouteError> {
     if trait_member.is_function() {
-        return Some(RustTraitMemberKind::Method);
+        return Ok(Some(RustTraitMemberKind::Method));
     }
-    if rust.is_type_alias(trait_member) {
-        return Some(RustTraitMemberKind::AssociatedType);
+    if (trait_member.is_field() || trait_member.is_class())
+        && any_canonical_declaration_property(rust, trait_member, |property| {
+            matches!(
+                property.kind,
+                RustDeclarationKind::TypeAlias | RustDeclarationKind::AssociatedType
+            )
+        })?
+    {
+        return Ok(Some(RustTraitMemberKind::AssociatedType));
     }
-    None
+    Ok(None)
 }
 
 fn rust_code_unit_kind_matches(code_unit: &CodeUnit, member_kind: RustTraitMemberKind) -> bool {
@@ -2544,37 +3575,6 @@ fn rust_code_unit_kind_matches(code_unit: &CodeUnit, member_kind: RustTraitMembe
         RustTraitMemberKind::AssociatedType => code_unit.is_class(),
         RustTraitMemberKind::Method => code_unit.is_function(),
     }
-}
-
-fn rust_impl_member_nodes<'tree>(
-    impl_item: Node<'tree>,
-    source: &'tree str,
-    member_name: &str,
-    member_kind: RustTraitMemberKind,
-) -> Vec<Node<'tree>> {
-    let Some(body) = impl_item.child_by_field_name("body") else {
-        return Vec::new();
-    };
-    let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter(|child| rust_impl_member_node_matches(*child, source, member_name, member_kind))
-        .collect()
-}
-
-fn rust_impl_member_node_matches(
-    node: Node<'_>,
-    source: &str,
-    member_name: &str,
-    member_kind: RustTraitMemberKind,
-) -> bool {
-    let expected_kind = match member_kind {
-        RustTraitMemberKind::AssociatedType => "type_item",
-        RustTraitMemberKind::Method => "function_item",
-    };
-    node.kind() == expected_kind
-        && node
-            .child_by_field_name("name")
-            .is_some_and(|name| node_text(name, source) == member_name)
 }
 
 /// The files that can back the module at `relative_module`, relative to
@@ -2718,160 +3718,6 @@ pub fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> 
             Some(module_root.join(relative))
         })?;
     Some(module.to_string_lossy().replace("::", "/").into())
-}
-
-fn rust_visibility_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    (0..node.child_count())
-        .filter_map(|index| node.child(index))
-        .find(|child| child.kind() == "visibility_modifier")
-        .and_then(|child| source.get(child.start_byte()..child.end_byte()))
-        .map(str::trim)
-}
-
-fn is_export_visibility(visibility: &str) -> bool {
-    let compact: String = visibility
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
-    compact == "pub" || compact == "pub(crate)" || compact.starts_with("pub(incrate")
-}
-
-fn named_descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
-    let mut matches = Vec::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == kind {
-            matches.push(current);
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    matches.reverse();
-    matches
-}
-
-fn trait_implementer_names_from_source(
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    trait_owner: &CodeUnit,
-    impl_file: &ProjectFile,
-    source: &str,
-    binder: &ImportBinder,
-) -> Vec<String> {
-    let Some(tree) = parse_rust_tree(source) else {
-        return Vec::new();
-    };
-    let mut implementers = Vec::new();
-    collect_trait_implementer_names(
-        tree.root_node(),
-        rust,
-        token,
-        trait_owner,
-        impl_file,
-        source,
-        binder,
-        &mut implementers,
-    );
-    implementers
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_trait_implementer_names(
-    node: Node<'_>,
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    trait_owner: &CodeUnit,
-    impl_file: &ProjectFile,
-    source: &str,
-    binder: &ImportBinder,
-    implementers: &mut Vec<String>,
-) {
-    if node.kind() == "impl_item"
-        && let Some((trait_ref, implementer)) = trait_impl_parts(node, source)
-        && trait_reference_matches(rust, token, trait_owner, impl_file, &trait_ref, binder)
-    {
-        implementers.push(implementer);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_trait_implementer_names(
-            child,
-            rust,
-            token,
-            trait_owner,
-            impl_file,
-            source,
-            binder,
-            implementers,
-        );
-    }
-}
-
-fn trait_impl_parts(node: Node<'_>, source: &str) -> Option<(String, String)> {
-    let trait_node = node.child_by_field_name("trait")?;
-    let type_node = node.child_by_field_name("type")?;
-    Some((
-        node_text(trait_node, source).to_string(),
-        simple_type_name(type_node, source)?,
-    ))
-}
-
-fn simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "type_identifier" | "identifier" => Some(node_text(node, source).to_string()),
-        "scoped_type_identifier" | "scoped_identifier" => node
-            .child_by_field_name("name")
-            .map(|name| node_text(name, source).to_string()),
-        "generic_type" | "reference_type" => node
-            .named_children(&mut node.walk())
-            .find_map(|child| simple_type_name(child, source)),
-        _ => node
-            .named_children(&mut node.walk())
-            .find_map(|child| simple_type_name(child, source)),
-    }
-}
-
-/// Same identifier-kind-gated `r#` stripping as `declarations::rust_node_text`,
-/// applied here too so trait/impl member-name matching agrees with
-/// normalized declaration names (#1128).
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_ident_text(
-        node,
-        source,
-        true,
-        &crate::declarations::RUST_IDENTIFIER_SIGIL,
-    )
-}
-
-fn trait_reference_matches(
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    trait_owner: &CodeUnit,
-    impl_file: &ProjectFile,
-    trait_ref: &str,
-    impl_binder: &ImportBinder,
-) -> bool {
-    if let Some((module_specifier, imported_name)) = trait_ref.rsplit_once("::") {
-        return imported_name == trait_owner.identifier()
-            && resolve_module_files(rust, token, impl_file, module_specifier)
-                .into_iter()
-                .any(|file| file == *trait_owner.source());
-    }
-
-    if impl_file == trait_owner.source() && trait_ref == trait_owner.identifier() {
-        return true;
-    }
-
-    impl_binder
-        .bindings
-        .get(trait_ref)
-        .filter(|binding| binding.imported_name.as_deref() == Some(trait_owner.identifier()))
-        .is_some_and(|binding| {
-            resolve_module_files(rust, token, impl_file, &binding.module_specifier)
-                .into_iter()
-                .any(|file| file == *trait_owner.source())
-        })
 }
 
 pub fn resolve_direct_import_files(

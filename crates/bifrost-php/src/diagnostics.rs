@@ -29,7 +29,7 @@ use brokk_bifrost_core::analyzer::{
 };
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser};
 
 pub const PHP_UNRECOGNIZED_SYMBOL: &str = "php_unrecognized_symbol";
 pub const PHP_UNRECOGNIZED_MEMBER: &str = "php_unrecognized_member";
@@ -143,14 +143,6 @@ pub fn collect_php_semantic_diagnostics(
     collector.report
 }
 
-fn parse_php_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    parser.parse(source, None)
-}
-
 struct PhpDiagnosticCollector<'a> {
     php: &'a dyn PhpSource,
     index: &'a dyn CodeUnitIndex,
@@ -187,7 +179,7 @@ enum MemberAccessKind {
 ///
 /// The usage-facts index is analysis-owned and this pass never builds one, so
 /// both answers are absent and the shared receiver evaluator falls back to the
-/// declaration's own signature. Answering anything else here would claim a fact
+/// declaration's canonical source facts. Answering anything else here would claim a fact
 /// this pass did not compute.
 struct PhpDiagnosticCallableFacts;
 
@@ -719,27 +711,11 @@ impl PhpDiagnosticCollector<'_> {
     }
 
     fn class_unit_has_trait_use(&self, unit: &CodeUnit) -> bool {
-        let source_storage;
-        let source = if unit.source() == self.file {
-            self.source
-        } else {
-            let Ok(source) = unit.source().read_to_string() else {
-                return true;
-            };
-            source_storage = source;
-            &source_storage
-        };
-        let Some(tree) = parse_php_tree(source) else {
+        let Some(source) = self.php.php_source_facts(unit.source()) else {
             return true;
         };
-        let ranges = self.index.ranges(unit);
-        let Some(start) = ranges.iter().map(|range| range.start_byte).min() else {
-            return true;
-        };
-        let Some(end) = ranges.iter().map(|range| range.end_byte).max() else {
-            return true;
-        };
-        declaration_range_has_trait_use(tree.root_node(), start, end)
+        let mut declarations = source.declarations_for(unit).peekable();
+        declarations.peek().is_none() || declarations.any(|declaration| declaration.has_trait_use)
     }
 
     fn enclosing_owner_fqn(&self, node: Node<'_>) -> Option<String> {
@@ -863,20 +839,6 @@ fn is_unqualified_php_name(raw: &str) -> bool {
 
 fn is_dynamic_php_name(raw: &str) -> bool {
     raw.starts_with('$')
-}
-
-fn declaration_range_has_trait_use(root: Node<'_>, start: usize, end: usize) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.end_byte() < start || node.start_byte() > end {
-            continue;
-        }
-        if node.kind() == "use_declaration" {
-            return true;
-        }
-        push_named_children(&mut stack, node);
-    }
-    false
 }
 
 fn push_named_children<'tree>(stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {

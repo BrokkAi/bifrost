@@ -34,7 +34,10 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
-use super::{FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageQueryCompletion};
+use super::{
+    FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageProofAuthority,
+    UsageQueryCompletion,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallArgument {
@@ -266,7 +269,38 @@ pub struct CallRelationResult {
     pub truncated: bool,
     pub cancelled: bool,
     pub diagnostics: Vec<CallRelationDiagnostic>,
+    /// The authority of the producer that answered, so a consumer can tell an
+    /// incompleteness diagnostic that reports a gap in a certified inventory
+    /// from one a legacy resolver has always reported alongside a usable list.
+    /// The engine below answers as [`UsageProofAuthority::Legacy`]; a
+    /// registered provider's answer is stamped with that provider's authority.
+    pub proof_authority: UsageProofAuthority,
     pub work: CallRelationWork,
+}
+
+/// A language-owned call relation authority. Once registered, both directions
+/// use this provider exclusively, including incomplete and terminal outcomes.
+pub(crate) trait CallRelationProvider: Send + Sync {
+    /// Whether this provider's proof tiers are authoritative. Every answer it
+    /// returns is stamped with this value, so no construction site inside a
+    /// provider can forget it.
+    fn proof_authority(&self) -> UsageProofAuthority;
+
+    fn incoming(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        target: &CodeUnit,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallRelationResult;
+
+    fn outgoing(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        caller: &CodeUnit,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallRelationResult;
 }
 
 /// Domain for the digest of one call-relation answer.
@@ -328,6 +362,11 @@ pub(crate) fn call_relation_answer_digest(
     // from a complete one that happens to hold the same sites.
     hasher.field("truncated", &[u8::from(result.truncated)]);
     hasher.field("cancelled", &[u8::from(result.cancelled)]);
+    let mut diagnostics = result.diagnostics.iter().collect::<Vec<_>>();
+    diagnostics.sort();
+    for diagnostic in diagnostics {
+        hasher.field("diagnostic", format!("{diagnostic:?}").as_bytes());
+    }
     for (path, start, end, caller, callee) in sites {
         hasher.field(&path, &(start as u64).to_be_bytes());
         hasher.value(&(end as u64).to_be_bytes());
@@ -508,12 +547,9 @@ impl CallBindingCache {
             source,
             cancellation,
         );
-        // A cancelled batch answers a prefix of `ranges`, shorter than the
-        // request list it was handed (`resolve_definition_resolutions`
-        // stops at the first cancelled poll): `zip` caches exactly that
-        // prefix, and every range past it stays a cache miss that
-        // `resolved_call_target`'s fallback resolves (and, with the same
-        // cancellation token already tripped, answers unresolved) on its own.
+        // A cancelled batch retains one explicit terminal outcome per input
+        // range. The terminal outcomes carry no target prefix, so the cache
+        // cannot turn cancellation into a later absence or proof.
         self.call_targets.extend(
             ranges
                 .into_iter()
@@ -866,6 +902,14 @@ impl CallDispatchSession {
             self.language,
             Some(&site),
         );
+        refine_resolved_call_target_proofs(
+            &mut lookup,
+            self.language,
+            analyzer,
+            token,
+            &self.file,
+            &site,
+        );
         lookup
     }
 }
@@ -1035,6 +1079,7 @@ impl CallRelationService {
                 language,
                 Some(&site),
             );
+            refine_resolved_call_target_proofs(&mut lookup, language, analyzer, token, file, &site);
             lookups[*index] = Some(lookup);
         }
         let cancelled =
@@ -1122,6 +1167,13 @@ impl CallRelationService {
                 )],
                 ..CallRelationResult::default()
             };
+        }
+        if let Some(provider) = language_support(language_for_file(target.source()))
+            .and_then(|support| support.call_relation_provider())
+        {
+            let mut answer = provider.incoming(analyzer, target, limits, cancellation);
+            answer.proof_authority = provider.proof_authority();
+            return answer;
         }
         let mut finder = UsageFinder::new();
         if let Some(cancellation) = cancellation {
@@ -1248,6 +1300,7 @@ impl CallRelationService {
             truncated,
             cancelled,
             diagnostics,
+            proof_authority: UsageProofAuthority::Legacy,
             work,
         }
     }
@@ -1297,6 +1350,13 @@ impl CallRelationService {
     ) -> CallRelationResult {
         if !is_call_relation_unit(caller) {
             return CallRelationResult::default();
+        }
+        if let Some(provider) = language_support(language_for_file(caller.source()))
+            .and_then(|support| support.call_relation_provider())
+        {
+            let mut answer = provider.outgoing(analyzer, caller, limits, cancellation);
+            answer.proof_authority = provider.proof_authority();
+            return answer;
         }
         if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
             let context = caller.fq_name().to_string();
@@ -1474,6 +1534,7 @@ impl CallRelationService {
             truncated,
             cancelled: batch.cancelled,
             diagnostics,
+            proof_authority: UsageProofAuthority::Legacy,
             work: CallRelationWork {
                 scanned_files: 1,
                 scanned_source_bytes: source.len(),
@@ -1803,6 +1864,7 @@ fn apply_dispatch_outcome_with_flags(
     navigation_targets_truncated: bool,
 ) {
     let DefinitionLookupOutcome {
+        modeled_definitions: _,
         status,
         mut definitions,
         lexical_definition,
@@ -1977,6 +2039,10 @@ fn apply_dispatch_outcome_with_flags(
             )),
         },
         DefinitionLookupStatus::UnsupportedLanguage
+        | DefinitionLookupStatus::Unavailable
+        | DefinitionLookupStatus::Incomplete
+        | DefinitionLookupStatus::Cancelled
+        | DefinitionLookupStatus::ExceededBudget(_)
         | DefinitionLookupStatus::InvalidLocation
         | DefinitionLookupStatus::NotFound => lookup.boundaries.push(unresolved_call_boundary(
             status,
@@ -1984,6 +2050,24 @@ fn apply_dispatch_outcome_with_flags(
             normalized_static_owner,
         )),
     }
+}
+
+/// Let the language that owns a resolved call refine target proof from its
+/// structured receiver evidence.
+fn refine_resolved_call_target_proofs(
+    lookup: &mut CallDispatchLookup,
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    site: &ExternalCalleeSite<'_>,
+) {
+    if lookup.status != Some(DefinitionLookupStatus::Resolved) || lookup.targets.is_empty() {
+        return;
+    }
+    language_support(language)
+        .expect("every resolved call language has registered support")
+        .refine_resolved_call_targets(analyzer, token, file, site, &mut lookup.targets);
 }
 
 /// The canonical owner of a Java method-invocation object that the definition
@@ -2106,11 +2190,27 @@ fn call_hits(
     bool,
     Vec<CallRelationDiagnostic>,
 ) {
+    let semantic_diagnostics = match &result {
+        FuzzyResult::Incomplete { diagnostics, .. } => {
+            vec![CallRelationDiagnostic::analysis_failed(
+                format!("Usage analysis is incomplete: {diagnostics:?}"),
+                target.fq_name().to_string(),
+                "semantic_incomplete".to_string(),
+            )]
+        }
+        _ => Vec::new(),
+    };
     match result {
         FuzzyResult::Success {
             hits_by_overload,
             unproven_by_overload,
             unproven_total_by_overload,
+        }
+        | FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+            ..
         } => {
             let proven = hits_by_overload
                 .into_values()
@@ -2139,6 +2239,7 @@ fn call_hits(
                     )
                 })
                 .into_iter()
+                .chain(semantic_diagnostics)
                 .collect();
             (hits, false, diagnostics)
         }
@@ -2591,6 +2692,48 @@ mod tests {
     };
     use crate::test_support::AnalyzerFixture;
     use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn incomplete_call_hits_preserve_proof_and_semantic_diagnostics() {
+        let file = ProjectFile::new(std::env::temp_dir(), "incomplete_calls.rs");
+        let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+        let proven = UsageHit::new(file.clone(), 1, 0, 6, target.clone(), 1.0, "target");
+        let unproven = UsageHit::new(file, 2, 10, 16, target.clone(), 0.5, "target");
+        let result = FuzzyResult::Incomplete {
+            hits_by_overload: [(target.clone(), BTreeSet::from([proven.clone()]))]
+                .into_iter()
+                .collect(),
+            unproven_by_overload: [(target.clone(), BTreeSet::from([unproven.clone()]))]
+                .into_iter()
+                .collect(),
+            unproven_total_by_overload: [(target.clone(), 1)].into_iter().collect(),
+            diagnostics: vec![crate::analyzer::usages::UsageAnalysisDiagnostic {
+                fq_name: target.fq_name().to_string(),
+                strategy: "native".to_string(),
+                reason_kind: "unsupported_reference".to_string(),
+                reason: "Another call cannot be resolved".to_string(),
+            }],
+        };
+        let (hits, truncated, diagnostics) = call_hits(result, &target);
+        assert_eq!(
+            hits,
+            vec![
+                (proven, UsageProof::Proven),
+                (unproven, UsageProof::Unproven)
+            ]
+        );
+        assert!(
+            !truncated,
+            "semantic incompleteness is not a callsite budget"
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            CallRelationDiagnosticCode::AnalysisFailed
+        );
+        assert!(diagnostics[0].message.contains("unsupported_reference"));
+    }
 
     fn call_span(source: &str, call: &str) -> Range {
         let start_byte = source.rfind(call).expect("call exists");
@@ -3481,10 +3624,16 @@ func caller() {
             ),
         ] {
             let exact = lookup(call);
+            assert!(
+                scope.store_error().is_none(),
+                "modeled call store error: {:?}",
+                scope.store_error()
+            );
             assert_eq!(
                 exact.status,
                 Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-                "{call}: {exact:#?}"
+                "{call}: {exact:#?}; parse errors: {:?}",
+                fixture.analyzer.analyzer().parse_errors(&file)
             );
             assert_eq!(
                 exact.boundaries,
@@ -4065,6 +4214,7 @@ int caller() { return local_target(1); }
         );
         let outcome = |status, structure_unavailable, truncated| CallTargetLookupOutcome {
             outcome: DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status,
                 reference: None,
                 definitions: vec![definition.clone()],
@@ -4668,6 +4818,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut ambiguous,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
                 definitions: vec![second, first],
@@ -4707,6 +4858,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut partial_ambiguous,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
                 definitions: vec![retained],
@@ -4744,6 +4896,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut empty_ambiguous,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
                 definitions: Vec::new(),
@@ -4768,6 +4921,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut external,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::UnresolvableImportBoundary,
                 reference: None,
                 definitions: Vec::new(),
@@ -4796,6 +4950,7 @@ object Calls {
             apply_dispatch_outcome(
                 &mut unresolved,
                 DefinitionLookupOutcome {
+                    modeled_definitions: Vec::new(),
                     status,
                     reference: None,
                     definitions: Vec::new(),
@@ -4828,6 +4983,7 @@ object Calls {
             focus_end_byte: 12,
         };
         let outcome = |status| DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status,
             reference: Some(reference.clone()),
             definitions: Vec::new(),
@@ -4884,6 +5040,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut named,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::NotFound,
                 reference: Some(canonical_reference),
                 definitions: Vec::new(),
@@ -4906,6 +5063,7 @@ object Calls {
         apply_dispatch_outcome(
             &mut unnamed,
             DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::NotFound,
                 reference: None,
                 definitions: Vec::new(),

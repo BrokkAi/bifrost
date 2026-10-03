@@ -32,20 +32,21 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     cancellation: &CancellationToken,
 ) -> WorkspaceFileUsageGraphBuildOutcome {
-    let files = {
+    let (files, inventory_complete) = {
         let _scope = profiling::scope("file_usage_graph.files");
-        let mut files = analyzer
-            .analyzed_files()
+        let inventory = analyzer.source_file_inventory();
+        let mut files = inventory
+            .rows
             .into_iter()
             .filter(|file| {
                 selected_ecosystems.contains(&UsageEcosystem::of(
-                    crate::analyzer::common::language_for_file(file),
+                    crate::analyzer::common::declaration_language_for_file(file),
                 ))
             })
             .collect::<Vec<_>>();
         files.sort();
         files.dedup();
-        files
+        (files, inventory.complete)
     };
     if cancellation.is_cancelled() {
         return WorkspaceFileUsageGraphBuildOutcome::Cancelled;
@@ -63,12 +64,12 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
             .map(|(index, file)| (file, index))
             .collect();
         let adjacency = vec![Vec::new(); files.len()];
-        return WorkspaceFileUsageGraphBuildOutcome::Complete(file_graph(
-            files,
-            indices,
-            adjacency,
-            contains_tests,
-        ));
+        let graph = file_graph(files, indices, adjacency, contains_tests);
+        return if inventory_complete {
+            WorkspaceFileUsageGraphBuildOutcome::Complete(graph)
+        } else {
+            WorkspaceFileUsageGraphBuildOutcome::Incomplete(graph)
+        };
     };
     let dependency_facts = {
         let _scope = profiling::scope("file_usage_graph.import_facts");
@@ -80,22 +81,27 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
             .map(|(file, facts)| (file.clone(), facts.imports.clone()))
             .collect()
     });
+    let import_facts_complete = dependency_facts
+        .as_ref()
+        .is_none_or(|facts| files.iter().all(|file| facts.contains_key(file)));
     let contains_tests = files
         .iter()
-        .map(|file| {
-            let contains_tests = dependency_facts
-                .as_ref()
-                .and_then(|facts| facts.get(file))
-                .and_then(|facts| facts.contains_tests)
-                .unwrap_or_else(|| analyzer.contains_tests(file));
-            (file.clone(), contains_tests)
+        .filter_map(|file| {
+            let contains_tests = match dependency_facts.as_ref() {
+                Some(facts) => facts.get(file)?.contains_tests,
+                None => None,
+            }
+            .unwrap_or_else(|| analyzer.contains_tests(file));
+            Some((file.clone(), contains_tests))
         })
         .collect();
     if cancellation.is_cancelled() {
         return WorkspaceFileUsageGraphBuildOutcome::Cancelled;
     }
 
-    {
+    // Optional prefetch implementations may hydrate their whole input set.
+    // A partial authoritative batch must not invite catch-up for missing files.
+    if inventory_complete && import_facts_complete {
         let _scope = profiling::scope("file_usage_graph.prefetch_targets");
         provider.prefetch_file_dependency_targets(&files, import_infos.as_ref(), cancellation);
     }
@@ -107,8 +113,12 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
         let _scope = profiling::scope("file_usage_graph.additional_dependencies");
         provider.additional_direct_file_dependencies(&files, cancellation)
     };
-    let Some(additional_dependencies) = additional_dependencies else {
-        return WorkspaceFileUsageGraphBuildOutcome::Cancelled;
+    let additional_dependencies = match additional_dependencies {
+        Some(dependencies) => dependencies,
+        None if cancellation.is_cancelled() => {
+            return WorkspaceFileUsageGraphBuildOutcome::Cancelled;
+        }
+        None => crate::analyzer::AdditionalFileDependencies::incomplete(HashMap::default()),
     };
     let additional_dependencies_complete = additional_dependencies.complete;
     if cancellation.is_cancelled() {
@@ -136,14 +146,12 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
                         resolve_imported_files_from_infos(provider, file, &imports)
                     },
                     |infos_by_file| {
-                        let owned_imports;
-                        let imports = if let Some(imports) = infos_by_file.get(file) {
-                            imports.as_slice()
-                        } else {
-                            owned_imports = provider.import_info_of(token, file);
-                            &owned_imports
-                        };
-                        resolve_imported_files_from_infos(provider, file, imports)
+                        infos_by_file
+                            .get(file)
+                            .map(|imports| {
+                                resolve_imported_files_from_infos(provider, file, imports)
+                            })
+                            .unwrap_or_default()
                     },
                 );
                 if let Some(additional) = additional_dependencies.dependencies.get(file) {
@@ -168,7 +176,7 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
         let _scope = profiling::scope("file_usage_graph.compact");
         file_graph(files, indices, adjacency, contains_tests)
     };
-    if additional_dependencies_complete {
+    if inventory_complete && import_facts_complete && additional_dependencies_complete {
         WorkspaceFileUsageGraphBuildOutcome::Complete(graph)
     } else {
         WorkspaceFileUsageGraphBuildOutcome::Incomplete(graph)
@@ -185,11 +193,14 @@ fn file_graph(
     let nodes = files
         .iter()
         .cloned()
-        .map(|file| WorkspaceUsageRankingNode {
-            contains_tests: Some(contains_tests.get(&file).copied().unwrap_or(false)),
-            primary_file: file.clone(),
-            seed_files: vec![file],
-            incomplete: false,
+        .map(|file| {
+            let contains_tests = contains_tests.get(&file).copied();
+            WorkspaceUsageRankingNode {
+                contains_tests,
+                primary_file: file.clone(),
+                seed_files: vec![file],
+                incomplete: contains_tests.is_none(),
+            }
         })
         .collect();
     let node_indices_by_file = indices
@@ -255,3 +266,7 @@ mod tests {
         assert_eq!(Some(true), graph.nodes[2].contains_tests);
     }
 }
+
+#[cfg(test)]
+#[path = "file_usage_graph_tests.rs"]
+mod contract_tests;

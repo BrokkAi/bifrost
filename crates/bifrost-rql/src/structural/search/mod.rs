@@ -75,6 +75,13 @@ use crate::structural::analysis_context::{
 };
 use crate::structural::capabilities::QueryFeature;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+#[cfg(test)]
+use brokk_bifrost_analysis::native_resolution_test_support::SelectedReferenceInverseIndex;
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::native_resolution_test_support::{
+    FactReferenceEdgeCatalog, FactResolutionSource, SelectedFactResolutionSnapshot,
+    SelectedReferenceInverseIndexBuildOutcome, build_selected_reference_inverse_index,
+};
 use brokk_bifrost_analysis::searchtools::session_subset;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
@@ -120,6 +127,8 @@ mod member_family;
 mod occurrences;
 mod statement_reachability;
 use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
+#[cfg(any(test, feature = "test-support"))]
+pub use edges::{SelectedEdgesOfTelemetry, SelectedEdgesOfTelemetrySnapshot};
 mod paths;
 mod pipeline;
 mod receiver;
@@ -485,6 +494,9 @@ pub use results::CodeQueryResultContractFailureUse;
 pub use results::CodeQueryResultContractUse;
 pub use results::CodeQueryResultItem;
 pub use results::CodeQueryResultRef;
+pub use results::CodeQueryResultSubjectAssignment;
+pub use results::CodeQueryResultSubjectOutcome;
+pub use results::CodeQueryResultSubjectUse;
 pub use results::CodeQueryResultValue;
 pub use results::CodeQueryRowCoverage;
 pub use results::CodeQueryRowCoverageExtent;
@@ -1003,6 +1015,13 @@ struct PipelineExpansion {
 }
 
 #[derive(Debug, Clone)]
+struct ResultSubjectUseValue {
+    row: CodeQueryResultSubjectUse,
+    assignment_conversions: Vec<crate::analyzer::JavaLocalAssignmentEvidence>,
+    file: ProjectFile,
+}
+
+#[derive(Debug, Clone)]
 enum PipelineValue {
     StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
@@ -1025,6 +1044,7 @@ enum PipelineValue {
     CallEffect(Box<CallEffectValue>),
     CallResultContract(Box<CallResultContractValue>),
     CallResultObligation(Box<CallResultObligationValue>),
+    ResultSubjectUse(Box<ResultSubjectUseValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     NilnessOperation(Box<NilnessOperationValue>),
@@ -1203,6 +1223,7 @@ enum PipelineKey {
     CallEffect(String),
     CallResultContract(String),
     CallResultObligation(String),
+    ResultSubjectUse(String),
     ResultContractUse(String),
     ResultContractFailureUse(String),
     NilnessOperation(String),
@@ -1270,10 +1291,23 @@ impl PipelineValue {
     /// merge must not upgrade declaration kind evidence: upgrading here would
     /// make a whole-execution union diverge from the sliced per-seed-file
     /// merge, which renders each branch before it deduplicates.
+    ///
+    /// Concurrent access conflicts merge their task contexts here (#3760).
+    /// That merge cannot diverge from the sliced merge: a conflict id names
+    /// its root procedure, every branch that reaches the root runs that root's
+    /// whole solve, and the merge is order-independent and idempotent, so
+    /// every branch renders the same merged row. The exception is a solve the
+    /// shared semantic budget cuts short, which already marks the query
+    /// incomplete.
     fn merge_evidence(&mut self, other: Self) {
-        if let (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) = (self, other)
-        {
-            value.merge_evidence(*other);
+        match (self, other) {
+            (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) => {
+                value.merge_evidence(*other);
+            }
+            (Self::ConcurrentAccessConflict(value), Self::ConcurrentAccessConflict(other)) => {
+                value.merge_context(*other);
+            }
+            _ => {}
         }
     }
 
@@ -1345,6 +1379,7 @@ impl PipelineValue {
             Self::CallResultObligation(value) => {
                 PipelineKey::CallResultObligation(value.id.clone())
             }
+            Self::ResultSubjectUse(value) => PipelineKey::ResultSubjectUse(value.row.id.clone()),
             Self::ResultContractUse(value) => PipelineKey::ResultContractUse(value.id.clone()),
             Self::ResultContractFailureUse(value) => {
                 PipelineKey::ResultContractFailureUse(value.id.clone())
@@ -1675,6 +1710,7 @@ enum PipelineTraceValue {
     CallEffect(Box<CallEffectValue>),
     CallResultContract(Box<CallResultContractValue>),
     CallResultObligation(Box<CallResultObligationValue>),
+    ResultSubjectUse(Box<ResultSubjectUseValue>),
     ResultContractUse(Box<ResultContractUseValue>),
     ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     NilnessOperation(Box<NilnessOperationValue>),
@@ -2642,6 +2678,264 @@ pub fn execute_workspace_with_limits(
     result
 }
 
+/// Atomic result of the comparable selected-Java `edges_of` execution path.
+///
+/// Cancellation and generation drift deliberately carry no query result: the
+/// selected inverse index and the rendered rows are one generation-bound
+/// operation, so neither condition may expose a prefix.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub enum SelectedEdgesOfExecutionOutcome {
+    Executed(CodeQueryResult),
+    Cancelled,
+    Stale,
+}
+
+/// Execute one explicitly Java-only query with `edges_of` acquisition backed
+/// by the canonical selected-Java inverse index.
+///
+/// Parsing, planning, filtering, edge values, rendering, limits, and result
+/// assembly are the ordinary RQL pipeline. Only the request-local inverse
+/// provider injected into [`EdgeTraversalCache`] differs. A set composition
+/// may feed a shared `edges_of` suffix, but `edges_of` inside a set branch is
+/// rejected because the ordinary sequential-union retry does not transactionally
+/// publish branch-local diagnostic deduplication state.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_workspace_with_selected_edges_of<S>(
+    workspace: &WorkspaceAnalyzer,
+    _flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    query: &CodeQuery,
+    selected: &SelectedFactResolutionSnapshot<'_, S>,
+    catalog: &FactReferenceEdgeCatalog<'_>,
+    maximum_batch_size: usize,
+    cancellation: &CancellationToken,
+    telemetry: &SelectedEdgesOfTelemetry,
+) -> Result<SelectedEdgesOfExecutionOutcome, String>
+where
+    S: FactResolutionSource,
+{
+    if let Some(outcome) = selected_edges_of_entry_gate(query, cancellation)? {
+        return Ok(outcome);
+    }
+
+    let analyzer = workspace.analyzer();
+    let snapshot = analyzer.active_semantic_model_snapshot();
+    let scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot);
+    let token = scope.token();
+    let expected_generation = catalog.generation();
+    telemetry.record_build_attempt();
+    let build_result = build_selected_reference_inverse_index(
+        analyzer,
+        selected,
+        catalog,
+        maximum_batch_size,
+        cancellation,
+    );
+    if cancellation.is_cancelled() {
+        telemetry.record_cancelled_build();
+        return Ok(SelectedEdgesOfExecutionOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != expected_generation {
+        telemetry.record_stale_build();
+        return Ok(SelectedEdgesOfExecutionOutcome::Stale);
+    }
+    let build_outcome = match build_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            telemetry.record_failed_build();
+            return Err(error.to_string());
+        }
+    };
+    let index = match build_outcome {
+        SelectedReferenceInverseIndexBuildOutcome::Complete(index) => {
+            telemetry.record_complete_build(&index);
+            index
+        }
+        SelectedReferenceInverseIndexBuildOutcome::Incomplete(index) => {
+            telemetry.record_incomplete_build(&index);
+            index
+        }
+        SelectedReferenceInverseIndexBuildOutcome::Cancelled => {
+            telemetry.record_cancelled_build();
+            return Ok(SelectedEdgesOfExecutionOutcome::Cancelled);
+        }
+        SelectedReferenceInverseIndexBuildOutcome::Stale => {
+            telemetry.record_stale_build();
+            return Ok(SelectedEdgesOfExecutionOutcome::Stale);
+        }
+    };
+    let generation = index.generation();
+    debug_assert_eq!(generation, expected_generation);
+    if cancellation.is_cancelled() {
+        return Ok(SelectedEdgesOfExecutionOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return Ok(SelectedEdgesOfExecutionOutcome::Stale);
+    }
+
+    let edge_cache = EdgeTraversalCache::with_selected_inverse(index, telemetry.clone());
+    let mut result = execute_internal_with_analysis_strategy_and_edge_cache(
+        analyzer,
+        token,
+        Some(workspace),
+        None,
+        0,
+        query,
+        CodeQueryExecutionLimits::default(),
+        Some(cancellation),
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        benchmark_structural_access_mode(),
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+        None,
+        edge_cache,
+    )
+    .result;
+    augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+
+    Ok(selected_edges_of_publication_gate(
+        analyzer,
+        generation,
+        cancellation,
+        result,
+    ))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn selected_edges_of_entry_gate(
+    query: &CodeQuery,
+    cancellation: &CancellationToken,
+) -> Result<Option<SelectedEdgesOfExecutionOutcome>, String> {
+    if cancellation.is_cancelled() {
+        return Ok(Some(SelectedEdgesOfExecutionOutcome::Cancelled));
+    }
+    if !query_plan_has_explicit_java_only_seeds(&query.plan) {
+        return Err(
+            "selected-Java edges_of execution requires every query seed to name only the Java language explicitly"
+                .to_string(),
+        );
+    }
+    if query_plan_has_retryable_branch_local_edges_of(&query.plan) {
+        return Err(
+            "selected-Java edges_of execution requires set branches to feed a shared edges_of suffix; edges_of inside a set branch is unsupported"
+                .to_string(),
+        );
+    }
+    Ok(None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn selected_edges_of_publication_gate(
+    analyzer: &dyn IAnalyzer,
+    generation: u64,
+    cancellation: &CancellationToken,
+    result: CodeQueryResult,
+) -> SelectedEdgesOfExecutionOutcome {
+    if cancellation.is_cancelled() || matches!(result.completion(), CodeQueryCompletion::Cancelled)
+    {
+        return SelectedEdgesOfExecutionOutcome::Cancelled;
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return SelectedEdgesOfExecutionOutcome::Stale;
+    }
+    SelectedEdgesOfExecutionOutcome::Executed(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn query_plan_has_explicit_java_only_seeds(plan: &CodeQueryPlan) -> bool {
+    fn explicit_java_only(languages: &[Language]) -> bool {
+        !languages.is_empty() && languages.iter().all(|language| *language == Language::Java)
+    }
+
+    match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::Occurrences(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::Scopes(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::Bindings(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::Paths(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::GenerationSites(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::Exports(seed) => explicit_java_only(&seed.languages),
+        CodeQueryPlanSource::ConfigurationFacts(_) => false,
+        CodeQueryPlanSource::Set { branches, .. } => {
+            !branches.is_empty() && branches.iter().all(query_plan_has_explicit_java_only_seeds)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn query_plan_has_retryable_branch_local_edges_of(plan: &CodeQueryPlan) -> bool {
+    fn subtree_has_edges_of(plan: &CodeQueryPlan) -> bool {
+        plan.steps
+            .iter()
+            .any(|step| matches!(step, QueryStep::EdgesOf(_)))
+            || match &plan.source {
+                CodeQueryPlanSource::Set { branches, .. } => {
+                    branches.iter().any(subtree_has_edges_of)
+                }
+                CodeQueryPlanSource::Seed(_)
+                | CodeQueryPlanSource::Occurrences(_)
+                | CodeQueryPlanSource::Scopes(_)
+                | CodeQueryPlanSource::Bindings(_)
+                | CodeQueryPlanSource::Paths(_)
+                | CodeQueryPlanSource::GenerationSites(_)
+                | CodeQueryPlanSource::Exports(_)
+                | CodeQueryPlanSource::ConfigurationFacts(_) => false,
+            }
+    }
+
+    match &plan.source {
+        CodeQueryPlanSource::Set { branches, .. } => branches.iter().any(subtree_has_edges_of),
+        CodeQueryPlanSource::Seed(_)
+        | CodeQueryPlanSource::Occurrences(_)
+        | CodeQueryPlanSource::Scopes(_)
+        | CodeQueryPlanSource::Bindings(_)
+        | CodeQueryPlanSource::Paths(_)
+        | CodeQueryPlanSource::GenerationSites(_)
+        | CodeQueryPlanSource::Exports(_)
+        | CodeQueryPlanSource::ConfigurationFacts(_) => false,
+    }
+}
+
+#[cfg(test)]
+fn execute_workspace_with_selected_inverse_index_for_test(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    index: SelectedReferenceInverseIndex,
+    telemetry: &SelectedEdgesOfTelemetry,
+) -> CodeQueryResult {
+    let analyzer = workspace.analyzer();
+    let snapshot = analyzer.active_semantic_model_snapshot();
+    let scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot);
+    let token = scope.token();
+    let edge_cache = EdgeTraversalCache::with_selected_inverse(index, telemetry.clone());
+    let mut result = execute_internal_with_analysis_strategy_and_edge_cache(
+        analyzer,
+        token,
+        Some(workspace),
+        None,
+        0,
+        query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        benchmark_structural_access_mode(),
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+        None,
+        edge_cache,
+    )
+    .result;
+    augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+    result
+}
+
 #[cfg(test)]
 pub(crate) fn execute_with_cancellation(
     analyzer: &dyn IAnalyzer,
@@ -3105,6 +3399,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
         None,
         execution_scope,
         None,
+        EdgeTraversalCache::default(),
     )
 }
 
@@ -3212,6 +3507,7 @@ pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_s
         None,
         execution_scope,
         None,
+        EdgeTraversalCache::default(),
     )
 }
 
@@ -3674,6 +3970,53 @@ fn execute_internal_with_analysis_strategy(
         access_failure_out,
         scope,
         row_keys_out,
+        EdgeTraversalCache::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
+fn execute_internal_with_analysis_strategy_and_edge_cache(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    workspace: Option<&WorkspaceAnalyzer>,
+    analysis_context: Option<&QueryAnalysisContext>,
+    workspace_generation: u64,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+    access_mode: StructuralAccessMode,
+    occurrence_options: OccurrenceDerivationOptions,
+    semantic_continuation: Option<SemanticQueryContinuation>,
+    access_failure_out: Option<&mut Option<String>>,
+    edge_cache: EdgeTraversalCache,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_analysis_strategy_and_row_family_session(
+        analyzer,
+        token,
+        workspace,
+        None,
+        analysis_context,
+        workspace_generation,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        union_strategy,
+        scheduler_workers,
+        access_mode,
+        occurrence_options,
+        None,
+        semantic_continuation,
+        access_failure_out,
+        CodeQueryExecutionScope::whole_workspace(),
+        None,
+        edge_cache,
     )
 }
 
@@ -3699,6 +4042,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     access_failure_out: Option<&mut Option<String>>,
     scope: CodeQueryExecutionScope<'_>,
     mut row_keys_out: Option<&mut Vec<UnitRowKey>>,
+    edge_cache: EdgeTraversalCache,
 ) -> DetailedCodeQueryResult {
     let semantic_summaries = semantic_flow_resources
         .as_ref()
@@ -3814,7 +4158,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         environment_cache,
         configuration_cache: ConfigurationFactsTraversalCache::default(),
         materialization_cache: materialization::MaterializationTraversalCache::default(),
-        edge_cache: EdgeTraversalCache::default(),
+        edge_cache,
         flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
         control_relation_cache: ControlRelationTraversalCache::default(),
         branch_relation_cache: BranchRelationTraversalCache::default(),
@@ -4750,6 +5094,25 @@ fn detailed_evidence_for_pipeline_value(
             decorated_parameter: None,
             runtime_keyed_read: None,
         },
+        PipelineValue::ResultSubjectUse(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::ResultSubjectUse,
+            key: DetailedCodeQueryKey::ResultSubjectUse {
+                id: value.row.id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: None,
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: Some(CodeQueryStableOwnerCandidate::Derived {
+                namespace: value.row.language.to_string(),
+                derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+                semantic_key: value.row.id.clone(),
+            }),
+            provenance: Vec::new(),
+            decorated_parameter: None,
+            runtime_keyed_read: None,
+        },
         PipelineValue::ResultContractUse(value) => DetailedCodeQueryEvidence {
             result_index,
             domain: DetailedCodeQueryDomain::ResultContractUse,
@@ -5647,6 +6010,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallEffect(value) => Some(value.file()),
         PipelineValue::CallResultContract(value) => Some(value.file()),
         PipelineValue::CallResultObligation(value) => Some(value.file()),
+        PipelineValue::ResultSubjectUse(value) => Some(&value.file),
         PipelineValue::ResultContractUse(value) => Some(value.file()),
         PipelineValue::ResultContractFailureUse(value) => Some(value.file()),
         PipelineValue::NilnessOperation(value) => Some(value.file()),
@@ -5823,6 +6187,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         }
         PipelineValue::CallResultObligation(value) => {
             files.insert(value.file().clone());
+        }
+        PipelineValue::ResultSubjectUse(value) => {
+            files.insert(value.file.clone());
         }
         PipelineValue::ResultContractUse(value) => {
             files.insert(value.file().clone());
@@ -6018,6 +6385,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::CallResultObligation(value) => {
             files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ResultSubjectUse(value) => {
+            files.insert(value.file.clone());
         }
         PipelineTraceValue::ResultContractUse(value) => {
             files.insert(value.file().clone());
@@ -6487,6 +6857,17 @@ fn detailed_trace_provenance_ref(
             value.range,
             cache,
         ),
+        PipelineTraceValue::ResultSubjectUse(value) => DetailedCodeQueryProvenanceRefEvidence {
+            domain: DetailedCodeQueryDomain::ResultSubjectUse,
+            key: DetailedCodeQueryKey::ResultSubjectUse {
+                id: value.row.id.clone(),
+            },
+            file: value.file.clone(),
+            byte_span: None,
+            display_range: value.row.receiver_range,
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            source_slice_sha256: None,
+        },
         PipelineTraceValue::ResultContractUse(value) => detailed_call_shape_provenance_ref(
             DetailedCodeQueryDomain::ResultContractUse,
             DetailedCodeQueryKey::ResultContractUse {
@@ -7500,6 +7881,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::CallResultObligation(value) => {
             Some(PipelineTraceValue::CallResultObligation(value.clone()))
+        }
+        PipelineValue::ResultSubjectUse(value) => {
+            Some(PipelineTraceValue::ResultSubjectUse(value.clone()))
         }
         PipelineValue::ResultContractUse(value) => {
             Some(PipelineTraceValue::ResultContractUse(value.clone()))

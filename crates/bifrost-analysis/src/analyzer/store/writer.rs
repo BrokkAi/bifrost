@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use rusqlite::Connection;
 
 use super::{
-    GenerationId, PersistBatchLimits, PreparedParsedBlob, PreparedPersistenceWriter,
+    GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedPersistenceWriter,
     PreparedWriteCounters, StoreError, reader_source_path,
 };
 
@@ -89,6 +89,7 @@ struct RepairRequest {
 struct RepairGroup {
     prepared: PreparedParsedBlob,
     replies: Vec<SyncSender<Result<(), StoreError>>>,
+    conflict: Option<StoreError>,
 }
 
 static PERSISTENT_WRITERS: LazyLock<Mutex<HashMap<PathBuf, WriterSlot>>> =
@@ -211,6 +212,14 @@ impl StoreWriter {
     }
 
     #[cfg(test)]
+    pub(super) fn execute_submissions(&self) -> usize {
+        match self {
+            Self::Local(_) => 0,
+            Self::Persistent(writer) => writer.execute_submissions.load(Ordering::SeqCst),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn repair_transactions(&self) -> usize {
         match self {
             Self::Local(_) => 0,
@@ -259,6 +268,8 @@ pub(super) struct PersistentWriter {
     reader_source: PathBuf,
     sender: Mutex<Option<SyncSender<WriterMessage>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    execute_submissions: AtomicUsize,
     #[cfg(test)]
     repair_submissions: AtomicUsize,
     #[cfg(test)]
@@ -327,6 +338,19 @@ impl PersistentWriter {
                     }
                     attribution::record_job(busy.elapsed());
                 }
+                match brokk_bifrost_core::cache_db::checkpoint_wal_for_close(&conn) {
+                    // A reader that still holds a snapshot defers truncation;
+                    // the next checkpoint truncates the WAL. That is a normal
+                    // outcome, not a diagnostic, so it must not reach stderr,
+                    // which CLI hosts reserve for their own failure line.
+                    Ok(
+                        brokk_bifrost_core::cache_db::CloseCheckpoint::Complete
+                        | brokk_bifrost_core::cache_db::CloseCheckpoint::Deferred { .. },
+                    ) => {}
+                    Err(error) => {
+                        panic!("persistent analyzer writer close checkpoint failed: {error}");
+                    }
+                }
                 ON_ANALYZER_WRITER_THREAD.with(|active| active.set(false));
             })
             .map_err(|error| {
@@ -340,6 +364,8 @@ impl PersistentWriter {
             reader_source,
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(Some(thread)),
+            #[cfg(test)]
+            execute_submissions: AtomicUsize::new(0),
             #[cfg(test)]
             repair_submissions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -363,7 +389,9 @@ impl PersistentWriter {
         let (reply_tx, reply_rx) = sync_channel::<Result<T, Box<dyn Any + Send>>>(1);
         let envelope: WriterJob = Box::new(move |conn| {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn)));
-            let _ = reply_tx.send(outcome);
+            if reply_tx.send(outcome).is_err() {
+                eprintln!("persistent analyzer writer execute caller dropped its reply channel");
+            }
         });
         let sender = self
             .sender
@@ -377,6 +405,8 @@ impl PersistentWriter {
                     self.registry_key.display()
                 )
             });
+        #[cfg(test)]
+        self.execute_submissions.fetch_add(1, Ordering::SeqCst);
         sender
             .send(WriterMessage::Execute(envelope))
             .unwrap_or_else(|_| {
@@ -440,6 +470,8 @@ struct RepairBatch {
     groups: Vec<RepairGroup>,
     by_key: HashMap<(git2::Oid, String, GenerationId), usize>,
     generations_by_blob: HashMap<(git2::Oid, String), GenerationId>,
+    accepted_requests: usize,
+    fragments: usize,
     rows: usize,
     bytes: usize,
     counters: PreparedWriteCounters,
@@ -448,6 +480,7 @@ struct RepairBatch {
 impl RepairBatch {
     fn new(first: Box<RepairRequest>) -> Self {
         let first = *first;
+        let fragments = first.prepared.fragment_count();
         let rows = first.prepared.mutation_logical_rows();
         let bytes = first.prepared.mutation_payload_bytes();
         let key = repair_key(&first.prepared);
@@ -455,14 +488,28 @@ impl RepairBatch {
         let mut by_key = HashMap::new();
         by_key.insert(key.clone(), 0);
         let mut generations_by_blob = HashMap::new();
-        generations_by_blob.insert(blob_key, key.2);
+        let mut fragment_generations = Vec::with_capacity(first.prepared.fragment_count());
+        first
+            .prepared
+            .append_fragment_generations(&mut fragment_generations);
+        for (oid, storage_language, generation) in fragment_generations {
+            let previous = generations_by_blob.insert((oid, storage_language), generation);
+            assert!(
+                previous.is_none_or(|previous| previous == generation),
+                "one prepared envelope must use one generation per physical blob key"
+            );
+        }
+        debug_assert_eq!(generations_by_blob.get(&blob_key), Some(&key.2));
         Self {
             groups: vec![RepairGroup {
                 prepared: first.prepared,
                 replies: vec![first.reply],
+                conflict: None,
             }],
             by_key,
             generations_by_blob,
+            accepted_requests: 1,
+            fragments,
             rows,
             bytes,
             counters: first.counters,
@@ -470,24 +517,76 @@ impl RepairBatch {
     }
 
     fn try_push(&mut self, request: Box<RepairRequest>) -> Result<(), Box<RepairRequest>> {
-        let key = repair_key(&request.prepared);
-        if let Some(&group) = self.by_key.get(&key) {
-            self.groups[group].replies.push(request.reply);
-            return Ok(());
-        }
-        let blob_key = (key.0, key.1.clone());
-        if self
-            .generations_by_blob
-            .get(&blob_key)
-            .is_some_and(|generation| *generation != key.2)
-        {
+        let limits = PersistBatchTargets::PRODUCTION;
+        if self.accepted_requests >= limits.max_blobs {
             return Err(request);
         }
+        let key = repair_key(&request.prepared);
+        let mut fragment_generations = Vec::with_capacity(request.prepared.fragment_count());
+        request
+            .prepared
+            .append_fragment_generations(&mut fragment_generations);
+        for (oid, storage_language, generation) in &fragment_generations {
+            if self
+                .generations_by_blob
+                .get(&(*oid, storage_language.clone()))
+                .is_some_and(|current| current != generation)
+            {
+                return Err(request);
+            }
+        }
+        if let Some(&group) = self.by_key.get(&key) {
+            let group = &mut self.groups[group];
+            if group.conflict.is_some() {
+                group.replies.push(request.reply);
+                self.accepted_requests = self.accepted_requests.saturating_add(1);
+                return Ok(());
+            }
+            let Some((added_fragments, added_rows, added_bytes)) = group
+                .prepared
+                .compatible_persistence_envelope_addition_cost(&request.prepared)
+            else {
+                group.conflict = Some(StoreError::new(format!(
+                    "conflicting prepared repair envelopes for {}/{}",
+                    key.0, key.1
+                )));
+                group.replies.push(request.reply);
+                self.accepted_requests = self.accepted_requests.saturating_add(1);
+                return Ok(());
+            };
+            if added_fragments > 0
+                && (self.fragments.saturating_add(added_fragments) > limits.max_blobs
+                    || self.rows.saturating_add(added_rows) > limits.max_rows
+                    || self.bytes.saturating_add(added_bytes) > limits.max_payload_bytes)
+            {
+                return Err(request);
+            }
+            let RepairRequest {
+                prepared,
+                counters: _,
+                reply,
+            } = *request;
+            let merged = group
+                .prepared
+                .merge_compatible_persistence_envelope(prepared);
+            debug_assert_eq!(merged, (added_fragments, added_rows, added_bytes));
+            self.fragments = self.fragments.saturating_add(added_fragments);
+            self.rows = self.rows.saturating_add(added_rows);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+            for (oid, storage_language, generation) in fragment_generations {
+                self.generations_by_blob
+                    .entry((oid, storage_language))
+                    .or_insert(generation);
+            }
+            group.replies.push(reply);
+            self.accepted_requests = self.accepted_requests.saturating_add(1);
+            return Ok(());
+        }
 
-        let limits = PersistBatchLimits::PRODUCTION;
+        let fragments = request.prepared.fragment_count();
         let rows = request.prepared.mutation_logical_rows();
         let bytes = request.prepared.mutation_payload_bytes();
-        if self.groups.len() >= limits.max_blobs
+        if self.fragments.saturating_add(fragments) > limits.max_blobs
             || self.rows.saturating_add(rows) > limits.max_rows
             || self.bytes.saturating_add(bytes) > limits.max_payload_bytes
         {
@@ -496,11 +595,17 @@ impl RepairBatch {
 
         let group = self.groups.len();
         self.by_key.insert(key.clone(), group);
-        self.generations_by_blob.insert(blob_key, key.2);
+        for (oid, storage_language, generation) in fragment_generations {
+            self.generations_by_blob
+                .insert((oid, storage_language), generation);
+        }
         self.groups.push(RepairGroup {
             prepared: request.prepared,
             replies: vec![request.reply],
+            conflict: None,
         });
+        self.fragments = self.fragments.saturating_add(fragments);
+        self.accepted_requests = self.accepted_requests.saturating_add(1);
         self.rows = self.rows.saturating_add(rows);
         self.bytes = self.bytes.saturating_add(bytes);
         Ok(())
@@ -510,11 +615,24 @@ impl RepairBatch {
         let mut prepared = Vec::with_capacity(self.groups.len());
         let mut grouped_replies = Vec::with_capacity(self.groups.len());
         for group in self.groups {
-            prepared.push(group.prepared);
-            grouped_replies.push(group.replies);
+            if let Some(error) = group.conflict {
+                for reply in group.replies {
+                    send_repair_reply(reply, Err(error.clone()));
+                }
+            } else {
+                prepared.push(group.prepared);
+                grouped_replies.push(group.replies);
+            }
         }
-        let (outcomes, stats) = PreparedPersistenceWriter::new(conn, self.counters)
-            .persist_prepared_blobs(prepared, PersistBatchLimits::PRODUCTION);
+        if prepared.is_empty() {
+            return 0;
+        }
+        let (outcomes, stats) = PreparedPersistenceWriter::new(
+            conn,
+            self.counters,
+            crate::CancellationToken::default(),
+        )
+        .persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
         assert_eq!(
             outcomes.len(),
             grouped_replies.len(),
@@ -523,10 +641,19 @@ impl RepairBatch {
         for (outcome, replies) in outcomes.into_iter().zip(grouped_replies) {
             let result = outcome.error.map_or(Ok(()), Err);
             for reply in replies {
-                let _ = reply.send(result.clone());
+                send_repair_reply(reply, result.clone());
             }
         }
         stats.transactions
+    }
+}
+
+fn send_repair_reply(reply: SyncSender<Result<(), StoreError>>, result: Result<(), StoreError>) {
+    if let Err(error) = reply.send(result) {
+        eprintln!(
+            "persistent analyzer writer repair caller dropped its reply channel: {:?}",
+            error.0
+        );
     }
 }
 
@@ -535,8 +662,9 @@ fn persist_one_repair(
     prepared: PreparedParsedBlob,
     counters: PreparedWriteCounters,
 ) -> Result<(), StoreError> {
-    let (mut outcomes, _) = PreparedPersistenceWriter::new(conn, counters)
-        .persist_prepared_blobs(vec![prepared], PersistBatchLimits::PRODUCTION);
+    let (mut outcomes, _) =
+        PreparedPersistenceWriter::new(conn, counters, crate::CancellationToken::default())
+            .persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
     outcomes
         .pop()
         .expect("one prepared repair has one outcome")
@@ -669,12 +797,113 @@ mod tests {
         let db = temp.path().join("cache.db");
         let first_id = {
             let (writer, _) = StoreWriter::persistent(&db).unwrap();
-            assert_eq!(writer.execute(|_| 41), 41);
+            writer.execute(|conn| {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation)
+                     VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
+                    [],
+                )
+                .unwrap();
+            });
             writer.identity()
         };
+        let wal_len = match std::fs::metadata(brokk_bifrost_core::cache_db::store_file_with_suffix(
+            &db, "-wal",
+        )) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read checkpointed WAL metadata: {error}"),
+        };
+        assert_eq!(wal_len, 0);
 
         let (reopened, _) = StoreWriter::persistent(&db).unwrap();
         assert_ne!(first_id, reopened.identity());
         assert_eq!(reopened.execute(|_| 42), 42);
+    }
+
+    #[test]
+    fn active_reader_survives_writer_close_and_later_close_truncates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("busy-close.db");
+        let (writer, _) = StoreWriter::persistent(&db).unwrap();
+        writer.execute(|conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+            brokk_bifrost_core::cache_db::checkpoint_wal_for_close(conn).unwrap();
+        });
+        let reader = brokk_bifrost_core::cache_db::open_readonly_connection(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        writer.execute(|conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+        });
+
+        drop(writer);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the external reader keeps its snapshot across writer shutdown"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        let (reopened, _) = StoreWriter::persistent(&db).unwrap();
+        assert_eq!(
+            reopened.execute(|conn| conn
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap()),
+            2,
+            "both committed writes survive the deferred checkpoint"
+        );
+        reopened.execute(|conn| {
+            assert_eq!(
+                brokk_bifrost_core::cache_db::checkpoint_wal_for_close(conn).unwrap(),
+                brokk_bifrost_core::cache_db::CloseCheckpoint::Complete
+            );
+        });
+        assert_eq!(
+            std::fs::metadata(brokk_bifrost_core::cache_db::store_file_with_suffix(
+                &db, "-wal"
+            ))
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn persistent_store_open_repairs_missing_planner_statistics() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("statistics.db");
+        {
+            let conn = crate::cache_db::open_unified_connection(&db).unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('3333333333333333333333333333333333333333', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1;")
+                .unwrap();
+        }
+
+        let (writer, _) = StoreWriter::persistent(&db).unwrap();
+        assert!(writer.execute(|conn| {
+            brokk_bifrost_core::cache_gc::planner_statistics_describe_database(conn).unwrap()
+        }));
     }
 }

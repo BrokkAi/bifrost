@@ -339,6 +339,21 @@ impl Project for PersistentFileSetProject {
     fn persistence_root(&self) -> Option<&Path> {
         Some(&self.persistence_root)
     }
+
+    fn read_source_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> io::Result<brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot> {
+        self.sources.read_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot>> {
+        self.sources.read_source_snapshot_limited(file, max_bytes)
+    }
 }
 
 #[derive(Debug)]

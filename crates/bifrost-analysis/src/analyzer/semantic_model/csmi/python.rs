@@ -336,16 +336,94 @@ pub(crate) fn qualified_name(identity: &CsmiPortableSymbolIdentity) -> String {
         .join(".")
 }
 
+fn validate_python_payload(payload: &serde_json::Value) -> Result<(), String> {
+    let violations = super::validate::validate_python_profile_payload(payload);
+    if !violations.is_empty() {
+        return Err(format!(
+            "Python profile payload violates its pinned schema: {violations:?}"
+        ));
+    }
+    let mut conditions = Vec::new();
+    match payload.get("kind").and_then(serde_json::Value::as_str) {
+        Some("distribution-imports") => {
+            conditions.extend(payload.get("conditions"));
+        }
+        Some("import-bindings") => {
+            conditions.extend(
+                payload
+                    .get("bindings")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|binding| binding.get("conditions")),
+            );
+        }
+        Some("declaration-correspondence") => {
+            conditions.extend(
+                payload
+                    .get("mappings")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|mapping| mapping.get("conditions")),
+            );
+        }
+        Some("compatibility") => {}
+        _ => unreachable!("the Python profile schema rejected unknown payload kinds above"),
+    }
+    for condition in conditions {
+        let violations = super::validate::validate_python_profile_condition(condition);
+        if !violations.is_empty() {
+            return Err(format!(
+                "Python profile condition violates its pinned schema: {violations:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
     let [artifact] = model.artifact_selectors.as_slice() else {
         return Err("Python runtime model requires one exact artifact selector".to_owned());
     };
     validate_python_artifact(artifact)?;
-    if !model.compatibility_constraints.is_empty()
-        || !model.extensions.is_empty()
-        || !model.consumer_resolved_dependencies.is_empty()
+    if !model.extensions.is_empty() || !model.consumer_resolved_dependencies.is_empty() {
+        return Err(
+            "Python model extensions or external correspondence require additional consumer evidence"
+                .to_owned(),
+        );
+    }
+    for constraint in &model.compatibility_constraints {
+        if constraint.vocabulary != CSMI_PYTHON_PROFILE_ID
+            || constraint.version != CSMI_PYTHON_PROFILE_VERSION
+        {
+            return Err(
+                "Python compatibility constraints require the exact standard profile".to_owned(),
+            );
+        }
+        validate_python_payload(&constraint.value)?;
+        if constraint
+            .value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("compatibility")
+        {
+            return Err(
+                "Python compatibility constraint must carry a compatibility payload".into(),
+            );
+        }
+    }
+    for fact in model
+        .extension_facts
+        .iter()
+        .filter(|fact| fact.vocabulary == CSMI_PYTHON_PROFILE_ID)
     {
-        return Err("Python environment constraints, model extensions, or external correspondence require additional consumer evidence".to_owned());
+        if fact.version != CSMI_PYTHON_PROFILE_VERSION {
+            return Err(
+                "Python profile facts require the exact standard profile version".to_owned(),
+            );
+        }
+        validate_python_payload(&fact.payload)?;
     }
     let distribution = artifact.purl.starts_with("pkg:pypi/");
     let mut identity_uses = std::collections::HashSet::new();
@@ -448,6 +526,12 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
     {
         return Err("Python runtime identity requires its declared identity scope and cannot discard binding/correspondence facts".to_owned());
     }
+    if !model.compatibility_constraints.is_empty() && !artifact_use {
+        return Err(
+            "Python compatibility constraints require the standard profile's artifact-compatibility scope"
+                .to_owned(),
+        );
+    }
     if distribution {
         if !distribution_use {
             return Err(
@@ -490,9 +574,7 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
                         else {
                             return Err("Python import binding has no target".to_owned());
                         };
-                        if !model.symbols.iter().any(|symbol| symbol.id == target)
-                            || binding.get("conditions").is_some()
-                        {
+                        if !model.symbols.iter().any(|symbol| symbol.id == target) {
                             return Err(format!("unsupported Python import binding {binding:?}"));
                         }
                     }
@@ -506,7 +588,6 @@ pub(crate) fn validate_model(model: &CsmiSemanticModel) -> Result<(), String> {
                     || fact.scope != serde_json::json!({"artifact":"model"})
                     || fact.payload.get("kind").and_then(serde_json::Value::as_str)
                         != Some("distribution-imports")
-                    || fact.payload.get("conditions").is_some()
                 {
                     return Err(format!("unsupported Python distribution fact {fact:?}"));
                 }
@@ -1084,6 +1165,9 @@ pub(crate) fn native_profile_digest(
             }
         }
     }
+    if let Some(evidence) = bare.python_correspondence.as_mut() {
+        evidence.native_sha256.clear();
+    }
     let normalized = crate::analyzer::semantic_model::compiler::normalize(bare);
     super::canonical::sha256_hex(
         &serde_json::to_vec(&normalized).expect("native semantic pack serializes"),
@@ -1107,38 +1191,11 @@ pub(crate) fn native_correspondence_digest(
     )
 }
 
-pub(crate) fn validate_profile_evidence(
+fn profile_carriers(
     pack: &crate::analyzer::semantic_model::AuthoredSemanticModelPack,
-) -> Vec<crate::analyzer::semantic_model::Diagnostic> {
-    use crate::analyzer::semantic_model::{AuthoredPayload, Diagnostic, Locator};
-    if pack.python_correspondence.is_some() {
-        let mut diagnostics = validate_correspondence_evidence(pack);
-        if pack.shards.iter().any(|shard| match &shard.payload {
-            AuthoredPayload::DeclarationFacts { types, members, .. } => types
-                .iter()
-                .map(|fact| &fact.locator)
-                .chain(members.iter().map(|fact| &fact.locator))
-                .any(|locator| {
-                    matches!(
-                        locator,
-                        Locator::Interchange {
-                            profile_evidence: Some(_),
-                            ..
-                        }
-                    )
-                }),
-            _ => false,
-        }) {
-            diagnostics.push(Diagnostic::error(
-                "python.correspondence_duplicate_carrier",
-                "$.shards",
-                "cross-artifact profile evidence must have one pack-level owner",
-            ));
-        }
-        return diagnostics;
-    }
+) -> Vec<&crate::analyzer::semantic_model::PortableProfileEvidence> {
+    use crate::analyzer::semantic_model::{AuthoredPayload, Locator};
     let mut carriers = Vec::new();
-    let mut distribution = false;
     for shard in &pack.shards {
         if let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload {
             for locator in types
@@ -1147,18 +1204,186 @@ pub(crate) fn validate_profile_evidence(
                 .chain(members.iter().map(|fact| &fact.locator))
             {
                 if let Locator::Interchange {
-                    identity,
-                    profile_evidence,
+                    profile_evidence: Some(evidence),
                     ..
                 } = locator
                 {
+                    carriers.push(evidence.as_ref());
+                }
+            }
+        }
+    }
+    carriers
+}
+
+fn has_python_profile_use(
+    evidence: &crate::analyzer::semantic_model::PortableProfileEvidence,
+    affects: impl Fn(&CsmiAffectedUnit) -> bool,
+) -> bool {
+    evidence.vocabulary_uses.iter().any(|use_| {
+        use_.identifier == CSMI_PYTHON_PROFILE_ID
+            && use_.version == CSMI_PYTHON_PROFILE_VERSION
+            && use_.schema == CSMI_PYTHON_PROFILE_SCHEMA
+            && use_.requirement == CsmiVocabularyRequirement::Required
+            && use_.affects.iter().any(&affects)
+    })
+}
+
+fn validate_portable_profile_evidence(
+    evidence: &crate::analyzer::semantic_model::PortableProfileEvidence,
+) -> Vec<crate::analyzer::semantic_model::Diagnostic> {
+    use crate::analyzer::semantic_model::Diagnostic;
+    fn report(diagnostics: &mut Vec<Diagnostic>, code: &'static str, message: impl Into<String>) {
+        diagnostics.push(Diagnostic::error(code, "$.shards", message));
+    }
+    let mut diagnostics = Vec::new();
+    for use_ in &evidence.vocabulary_uses {
+        if use_.identifier != CSMI_PYTHON_PROFILE_ID
+            || use_.version != CSMI_PYTHON_PROFILE_VERSION
+            || use_.schema != CSMI_PYTHON_PROFILE_SCHEMA
+            || use_.requirement != CsmiVocabularyRequirement::Required
+        {
+            report(
+                &mut diagnostics,
+                "python.profile_vocabulary_use",
+                "retained Python profile requires the exact required standard vocabulary",
+            );
+        }
+    }
+    if !evidence.compatibility_constraints.is_empty()
+        && !has_python_profile_use(evidence, |affected| {
+            matches!(affected, CsmiAffectedUnit::CoreSlot(slot)
+                if slot.slot == "artifact-compatibility"
+                    && slot.target == serde_json::json!({"semanticModel":"current"}))
+        })
+    {
+        report(
+            &mut diagnostics,
+            "python.profile_compatibility_use",
+            "Python compatibility constraints require the exact required artifact-compatibility scope",
+        );
+    }
+    for constraint in &evidence.compatibility_constraints {
+        if constraint.vocabulary != CSMI_PYTHON_PROFILE_ID
+            || constraint.version != CSMI_PYTHON_PROFILE_VERSION
+        {
+            report(
+                &mut diagnostics,
+                "python.profile_compatibility_vocabulary",
+                "retained compatibility constraints require the exact standard Python profile",
+            );
+            continue;
+        }
+        if constraint
+            .value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("compatibility")
+        {
+            report(
+                &mut diagnostics,
+                "python.profile_compatibility_kind",
+                "retained compatibility constraint must carry a compatibility payload",
+            );
+        }
+        if let Err(message) = validate_python_payload(&constraint.value) {
+            report(
+                &mut diagnostics,
+                "python.profile_compatibility_schema",
+                message,
+            );
+        }
+    }
+    for fact in &evidence.extension_facts {
+        if fact.vocabulary != CSMI_PYTHON_PROFILE_ID || fact.version != CSMI_PYTHON_PROFILE_VERSION
+        {
+            report(
+                &mut diagnostics,
+                "python.profile_fact_vocabulary",
+                "retained Python facts require the exact standard vocabulary and version",
+            );
+            continue;
+        }
+        if !has_python_profile_use(evidence, |affected| {
+            matches!(affected, CsmiAffectedUnit::FactFamily(family)
+                if family.family == fact.family && family.scope == fact.scope)
+        }) {
+            report(
+                &mut diagnostics,
+                "python.profile_fact_use",
+                "retained Python facts require a matching required vocabulary scope",
+            );
+        }
+        if let Err(message) = validate_python_payload(&fact.payload) {
+            report(&mut diagnostics, "python.profile_fact_schema", message);
+            continue;
+        }
+        if fact.payload.get("kind").and_then(serde_json::Value::as_str)
+            != Some(fact.family.as_str())
+        {
+            report(
+                &mut diagnostics,
+                "python.profile_fact_family",
+                "retained Python fact family disagrees with its payload kind",
+            );
+        }
+    }
+    diagnostics
+}
+
+pub(crate) fn validate_profile_evidence(
+    pack: &crate::analyzer::semantic_model::AuthoredSemanticModelPack,
+) -> Vec<crate::analyzer::semantic_model::Diagnostic> {
+    use crate::analyzer::semantic_model::{AuthoredPayload, Diagnostic, Locator};
+    let carriers = profile_carriers(pack);
+    if let Some(correspondence) = pack.python_correspondence.as_ref() {
+        let mut diagnostics = validate_correspondence_evidence(pack);
+        if carriers.len() > 1 {
+            diagnostics.push(Diagnostic::error(
+                "python.correspondence_duplicate_carrier",
+                "$.shards",
+                "cross-artifact profile evidence must have at most one declaration carrier",
+            ));
+        } else if let Some(evidence) = carriers.first() {
+            if pack.language != "python"
+                || pack.ecosystem != "python"
+                || evidence.native_sha256 != native_profile_digest(pack)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "python.profile_evidence_mismatch",
+                    "$.shards",
+                    "retained Python profile evidence no longer matches the native pack",
+                ));
+            }
+            if evidence.vocabulary_uses != correspondence.vocabulary_uses
+                || evidence.extension_facts != correspondence.extension_facts
+                || evidence.completeness_statements != correspondence.completeness_statements
+                || evidence.provenance_records != correspondence.provenance_records
+                || evidence.default_provenance != correspondence.default_provenance
+            {
+                diagnostics.push(Diagnostic::error(
+                    "python.correspondence_carrier_mismatch",
+                    "$.shards",
+                    "declaration and pack-level Python profile evidence disagree",
+                ));
+            }
+            diagnostics.extend(validate_portable_profile_evidence(evidence));
+        }
+        return diagnostics;
+    }
+    let mut distribution = false;
+    for shard in &pack.shards {
+        if let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload {
+            for locator in types
+                .iter()
+                .map(|fact| &fact.locator)
+                .chain(members.iter().map(|fact| &fact.locator))
+            {
+                if let Locator::Interchange { identity, .. } = locator {
                     distribution |= identity
                         .artifact_selectors
                         .iter()
                         .any(|artifact| artifact.purl.starts_with("pkg:pypi/"));
-                    if let Some(evidence) = profile_evidence {
-                        carriers.push(evidence.as_ref());
-                    }
                 }
             }
         }
@@ -1173,17 +1398,18 @@ pub(crate) fn validate_profile_evidence(
     let Some(evidence) = carriers.first() else {
         return Vec::new();
     };
+    let mut diagnostics = validate_portable_profile_evidence(evidence);
     if pack.language != "python"
         || pack.ecosystem != "python"
         || evidence.native_sha256 != native_profile_digest(pack)
     {
-        return vec![Diagnostic::error(
+        diagnostics.push(Diagnostic::error(
             "python.profile_evidence_mismatch",
             "$.shards",
             "retained Python profile evidence no longer matches the native pack",
-        )];
+        ));
     }
-    Vec::new()
+    diagnostics
 }
 
 fn validate_correspondence_evidence(
@@ -1711,31 +1937,49 @@ pub(super) fn export_document(
         })
         .collect::<Vec<_>>();
     let distribution = selector.purl.starts_with("pkg:pypi/");
-    let retained_correspondence_profile =
+    let mut retained_correspondence_profile =
         correspondence.map(
             |retained| crate::analyzer::semantic_model::PortableProfileEvidence {
                 native_sha256: retained.native_sha256.clone(),
                 vocabulary_uses: retained.vocabulary_uses.clone(),
+                compatibility_constraints: Vec::new(),
                 extension_facts: retained.extension_facts.clone(),
                 completeness_statements: retained.completeness_statements.clone(),
                 provenance_records: retained.provenance_records.clone(),
                 default_provenance: retained.default_provenance.clone(),
             },
         );
-    let evidence = if let Some(retained) = retained_correspondence_profile.as_ref() {
-        if !profile_evidence.is_empty() {
+    if let Some(retained) = retained_correspondence_profile.as_mut() {
+        if profile_evidence.len() > 1 {
             return Err(unsupported(
-                "cross-artifact Python profile has duplicate evidence owners",
+                "cross-artifact Python profile has multiple declaration evidence carriers",
             ));
         }
+        if let Some(carrier) = profile_evidence.first() {
+            let relation = correspondence.expect("retained profile came from correspondence");
+            if carrier.vocabulary_uses != relation.vocabulary_uses
+                || carrier.extension_facts != relation.extension_facts
+                || carrier.completeness_statements != relation.completeness_statements
+                || carrier.provenance_records != relation.provenance_records
+                || carrier.default_provenance != relation.default_provenance
+            {
+                return Err(unsupported(
+                    "cross-artifact Python declaration and pack-level profile evidence disagree",
+                ));
+            }
+            retained.compatibility_constraints = carrier.compatibility_constraints.clone();
+        }
+    }
+    let evidence = if let Some(retained) = retained_correspondence_profile.as_ref() {
         Some(retained)
     } else {
         match (distribution, profile_evidence.as_slice()) {
             (true, [evidence]) => Some(*evidence),
             (false, []) => None,
+            (false, [evidence]) if evidence.extension_facts.is_empty() => Some(*evidence),
             _ => {
                 return Err(unsupported(
-                    "Python profile evidence must have one owner for a distribution and no owner for a runtime",
+                    "Python profile evidence must have one owner for a distribution or compatibility constraints only for a runtime",
                 ));
             }
         }
@@ -1956,7 +2200,7 @@ pub(super) fn export_document(
                 .value
                 .clone(),
             qualified_name(owner),
-            member.name.clone(),
+            qualified_name(keys[&member.id.as_str()]),
             signature.parameters.len() as u32,
             member.receiver.is_some(),
             signature
@@ -2102,6 +2346,7 @@ pub(super) fn export_document(
         })
             || !summary.effects.is_empty()
             || !summary.concurrency_effects.is_empty()
+            || summary.no_concurrency_effects
             || !summary.declared_effects.is_empty()
             || summary.preconditions.is_some()
             || !summary.result_contracts.is_empty()
@@ -2366,7 +2611,9 @@ pub(super) fn export_document(
     }
     let model = CsmiSemanticModel {
         artifact_selectors: vec![selector],
-        compatibility_constraints: Vec::new(),
+        compatibility_constraints: evidence
+            .map(|evidence| evidence.compatibility_constraints.clone())
+            .unwrap_or_default(),
         vocabulary_uses: uses,
         consumer_resolved_dependencies: Vec::new(),
         symbols,

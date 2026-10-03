@@ -273,6 +273,7 @@ pub enum QueryValueKind {
     FieldWriteValue,
     CallShape,
     CallResult,
+    ResultSubjectUse,
     CallArgumentGroup,
     CallArgument,
     CallBinding,
@@ -352,6 +353,7 @@ impl QueryValueKind {
             Self::FieldWriteValue => "field_write_value",
             Self::CallShape => "call_shape",
             Self::CallResult => "call_result",
+            Self::ResultSubjectUse => "result_subject_use",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
             Self::CallBinding => "call_binding",
@@ -722,6 +724,34 @@ impl AssignmentRelationKind {
     }
 }
 
+/// Which proof tier of absent-member findings one `absent_member` step keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AbsentMemberProofFilter {
+    /// Findings on a fully known receiver set.
+    #[default]
+    Proven,
+    /// Findings for a class that certainly reaches the access and lacks the
+    /// member while other unclassified values may also reach it.
+    Conditional,
+    Any,
+}
+
+impl AbsentMemberProofFilter {
+    pub const ALL: [Self; 3] = [Self::Proven, Self::Conditional, Self::Any];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::Conditional => "conditional",
+            Self::Any => "any",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|proof| proof.label() == label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AssignmentRelationFilter {
     pub relations: Vec<AssignmentRelationKind>,
@@ -1081,6 +1111,7 @@ pub struct ResolvedCallFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueryRowLiteral {
     String(String),
+    StringList(Vec<String>),
     Integer(u64),
     Boolean(bool),
     /// A public label from the selected field's constrained value domain.
@@ -1182,7 +1213,7 @@ pub enum QueryStep {
     ConcurrentAccessConflicts,
     ValueFlow(ValueFlowTraversal),
     ClassSet,
-    AbsentMember,
+    AbsentMember(AbsentMemberProofFilter),
     Taint(TaintTraversal),
     Witness(WitnessTraversal),
     FileOf,
@@ -1210,6 +1241,7 @@ pub enum QueryStep {
     ReceiverEvidence,
     CallShape,
     CallResults,
+    ResultSubjectUses,
     CallArgumentGroups,
     CallArguments,
     CallBindings,
@@ -1749,7 +1781,7 @@ impl QueryStep {
             Self::ConcurrentAccessConflicts => QueryStepOp::ConcurrentAccessConflicts,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
             Self::ClassSet => QueryStepOp::ClassSet,
-            Self::AbsentMember => QueryStepOp::AbsentMember,
+            Self::AbsentMember(_) => QueryStepOp::AbsentMember,
             Self::Taint(_) => QueryStepOp::Taint,
             Self::Witness(_) => QueryStepOp::Witness,
             Self::FileOf => QueryStepOp::FileOf,
@@ -1777,6 +1809,7 @@ impl QueryStep {
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
             Self::CallShape => QueryStepOp::CallShape,
             Self::CallResults => QueryStepOp::CallResults,
+            Self::ResultSubjectUses => QueryStepOp::ResultSubjectUses,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::CallBindings => QueryStepOp::CallBindings,
@@ -1860,7 +1893,9 @@ impl QueryStep {
             | QueryStepOp::Witness => None,
             QueryStepOp::ConcurrentAccessConflicts => Some(Self::ConcurrentAccessConflicts),
             QueryStepOp::ClassSet => Some(Self::ClassSet),
-            QueryStepOp::AbsentMember => Some(Self::AbsentMember),
+            QueryStepOp::AbsentMember => {
+                Some(Self::AbsentMember(AbsentMemberProofFilter::default()))
+            }
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -1900,6 +1935,7 @@ impl QueryStep {
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
             QueryStepOp::CallShape => Some(Self::CallShape),
             QueryStepOp::CallResults => Some(Self::CallResults),
+            QueryStepOp::ResultSubjectUses => Some(Self::ResultSubjectUses),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::CallBindings => Some(Self::CallBindings),
@@ -2005,7 +2041,7 @@ impl QueryStep {
             }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
             (Self::ClassSet, QueryValueKind::Procedure) => Some(QueryValueKind::ClassSetRow),
-            (Self::AbsentMember, QueryValueKind::Procedure) => {
+            (Self::AbsentMember(_), QueryValueKind::Procedure) => {
                 Some(QueryValueKind::AbsentMemberFinding)
             }
             (Self::Taint(_), QueryValueKind::Procedure) => Some(QueryValueKind::TaintFinding),
@@ -2044,6 +2080,7 @@ impl QueryStep {
                 | QueryValueKind::FieldWriteValue
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallResult
+                | QueryValueKind::ResultSubjectUse
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
                 | QueryValueKind::CallBinding
@@ -2153,6 +2190,9 @@ impl QueryStep {
                 Some(QueryValueKind::CallArgumentGroup)
             }
             (Self::CallResults, QueryValueKind::CallShape) => Some(QueryValueKind::CallResult),
+            (Self::ResultSubjectUses, QueryValueKind::CallResult) => {
+                Some(QueryValueKind::ResultSubjectUse)
+            }
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
             }
@@ -2391,7 +2431,7 @@ fn validate_query_steps(
             QueryStep::Typestate(_) => "procedure",
             QueryStep::ConcurrentAccessConflicts => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
-            QueryStep::ClassSet | QueryStep::AbsentMember => "procedure",
+            QueryStep::ClassSet | QueryStep::AbsentMember(_) => "procedure",
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding, flow_endpoint, or absent_member_finding",
             QueryStep::FileOf => {
@@ -2426,6 +2466,7 @@ fn validate_query_steps(
             }
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallResults => "call_shape",
+            QueryStep::ResultSubjectUses => "call_result",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::CallBindings => "call_shape",
@@ -2670,6 +2711,10 @@ fn validate_row_literal(
                 | CodeQueryRowScalarType::DeclarationIdentity,
             QueryRowLiteral::String(_)
         ) | (CodeQueryRowScalarType::Integer, QueryRowLiteral::Integer(_))
+            | (
+                CodeQueryRowScalarType::StringList,
+                QueryRowLiteral::StringList(_)
+            )
             | (CodeQueryRowScalarType::Boolean, QueryRowLiteral::Boolean(_))
             | (
                 CodeQueryRowScalarType::ConstrainedEnum,

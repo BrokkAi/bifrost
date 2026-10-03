@@ -17,7 +17,7 @@
 //! `rust_crate_root_package` (`imports.rs`) are the two consumers; both fall
 //! back to the legacy path-derived scheme when this module answers `None`.
 //!
-//! Everything here is memoized per analyzer generation. The resolvers ask for a
+//! Live naming results use bounded caches invalidated per analyzer generation. The resolvers ask for a
 //! file's naming once per resolved type node and once per import segment, and a
 //! `scan_usages` profile of this repository (#2632) put a quarter of all CPU in
 //! the ancestor walk below: one `is_file` syscall per directory level, one
@@ -27,15 +27,19 @@
 //! per-call filesystem work unnecessary rather than merely cheap.
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+#[cfg(test)]
+use std::sync::RwLock;
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
-use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::{PackageAnchor, ProjectFile};
+#[cfg(test)]
 use brokk_bifrost_core::hash::HashMap;
+use moka::sync::Cache;
 
-use crate::cargo_routes::{
-    cargo_manifest_library_name, cargo_manifest_package_name, normalize_crate_name,
-};
+use crate::cargo_manifest::{RustCargoManifestDocument, normalize_crate_name};
+use crate::selected_context::RustSelectedManifestMount;
 
 /// Directory names that Cargo gives their own target tree, relative to the
 /// manifest directory. A file directly in one of them is a target root and is
@@ -43,6 +47,200 @@ use crate::cargo_routes::{
 /// `crate::`); the shared modules beside it (`tests/common/mod.rs`) keep the
 /// kind-level root so cross-target references still name one file.
 const TARGET_DIRECTORIES: [&str; 3] = ["tests", "examples", "benches"];
+
+/// Cargo naming reconstructed from one selected operation's exact inputs.
+///
+/// This authority is deliberately separate from [`rust_crate_paths`]. The
+/// latter is the generation-scoped live-filesystem cache used while indexing;
+/// selected resolution must name a persisted row from the selected manifest
+/// bytes and selected source paths instead. In particular, changing a dirty
+/// manifest changes this value for one operation without invalidating or
+/// mutating the live naming cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustSelectedCargoNaming {
+    crates: Box<[RustSelectedCrateNaming]>,
+    source_paths: std::collections::BTreeSet<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RustSelectedCrateNaming {
+    manifest_path: PathBuf,
+    directory: PathBuf,
+    crate_name: String,
+    library_path: PathBuf,
+}
+
+impl RustSelectedCargoNaming {
+    /// Build naming from the exact selected source inventory and parsed Cargo
+    /// documents. No manifest or source path is read from the filesystem.
+    pub fn from_selected_inputs(
+        source_paths: impl IntoIterator<Item = PathBuf>,
+        manifest_mounts: &[RustSelectedManifestMount],
+    ) -> Result<Self, String> {
+        let source_paths = source_paths
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut crates = Vec::new();
+        for manifest in manifest_mounts {
+            let Some(package) = manifest.facts.package.as_ref() else {
+                continue;
+            };
+            let directory = manifest
+                .relative_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            crates.push(RustSelectedCrateNaming {
+                manifest_path: manifest.relative_path.clone(),
+                directory,
+                crate_name: package.library_name.clone(),
+                library_path: package.library_path.clone(),
+            });
+        }
+        crates.sort_by(|left, right| left.manifest_path.cmp(&right.manifest_path));
+        for pair in crates.windows(2) {
+            if pair[0].manifest_path == pair[1].manifest_path {
+                return Err(format!(
+                    "selected Rust naming has duplicate Cargo manifest path {:?}",
+                    pair[0].manifest_path
+                ));
+            }
+        }
+        Ok(Self {
+            crates: crates.into_boxed_slice(),
+            source_paths,
+        })
+    }
+
+    /// Resolve the package prefix for a selected persisted unit.
+    ///
+    /// `None` is a structured selected-input gap: the file is absent from the
+    /// selected source inventory, or two equally deep selected package
+    /// manifests would govern it. Manifest-less files intentionally use the
+    /// existing path-derived identity rather than consulting the live naming
+    /// cache.
+    pub fn resolve_package_anchor(
+        &self,
+        anchor: PackageAnchor,
+        _content_qualifier: &str,
+        relative_path: &Path,
+    ) -> Option<FqName> {
+        if !self.source_paths.contains(relative_path) {
+            return None;
+        }
+        let paths = match self.crate_for(relative_path) {
+            Some(selected_crate) => {
+                let relative = relative_path.strip_prefix(&selected_crate.directory).ok()?;
+                classify_selected(
+                    relative,
+                    selected_crate.crate_name.as_str(),
+                    &selected_crate.directory,
+                    &selected_crate.library_path,
+                    &self.source_paths,
+                )
+            }
+            None if self.has_package_manifest_for(relative_path) => return None,
+            None => path_derived_paths(relative_path),
+        };
+        let components = match anchor {
+            PackageAnchor::OwnModule { pop } => {
+                let keep = paths.package.len().saturating_sub(usize::from(pop));
+                &paths.package[..keep]
+            }
+            PackageAnchor::CrateRoot => &paths.crate_root,
+        };
+        Some(fq_from_package_components(components))
+    }
+
+    fn crate_for(&self, relative_path: &Path) -> Option<&RustSelectedCrateNaming> {
+        let mut selected = None;
+        let mut selected_depth = 0;
+        for candidate in &self.crates {
+            if !relative_path.starts_with(&candidate.directory) {
+                continue;
+            }
+            let depth = candidate.directory.components().count();
+            if depth < selected_depth {
+                continue;
+            }
+            if depth == selected_depth && selected.is_some() {
+                // Two package manifests at one depth make the selected
+                // authority ambiguous. Keep that distinction from becoming
+                // an accidental filesystem-order choice.
+                return None;
+            }
+            selected = Some(candidate);
+            selected_depth = depth;
+        }
+        selected
+    }
+
+    fn has_package_manifest_for(&self, relative_path: &Path) -> bool {
+        self.crates
+            .iter()
+            .any(|candidate| relative_path.starts_with(&candidate.directory))
+    }
+}
+
+fn fq_from_package_components(components: &[String]) -> FqName {
+    let interner = segment_interner();
+    let mut fq = FqName::new();
+    for component in components {
+        fq.push(interner.intern(component, SegmentKind::Package));
+    }
+    fq
+}
+
+fn path_derived_paths(relative_path: &Path) -> CratePaths {
+    CratePaths {
+        package: path_derived_package_components(relative_path),
+        crate_root: path_derived_crate_root_components(relative_path),
+    }
+}
+
+pub(crate) fn path_derived_package_components(relative_path: &Path) -> Vec<String> {
+    let mut components = relative_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let source_root = components.iter().rposition(|component| component == "src");
+    if source_root == Some(0) {
+        components.remove(0);
+    }
+    if components.is_empty() {
+        return Vec::new();
+    }
+    let file_name = components.pop().unwrap_or_default();
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if matches!(stem, "lib" | "main" | "mod") {
+        components
+    } else if source_root.is_some() {
+        components
+            .into_iter()
+            .chain(std::iter::once(stem.to_string()))
+            .filter(|component| !component.is_empty())
+            .collect()
+    } else {
+        components
+    }
+}
+
+pub(crate) fn path_derived_crate_root_components(relative_path: &Path) -> Vec<String> {
+    let components = relative_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let Some(src_index) = components.iter().rposition(|component| component == "src") else {
+        return path_derived_package_components(relative_path);
+    };
+    if src_index == 0 {
+        return Vec::new();
+    }
+    components[..=src_index].to_vec()
+}
 
 /// The crate-aware names of one file.
 ///
@@ -67,14 +265,11 @@ pub(super) struct CratePaths {
 /// Shared behind an `Arc` because the same file is named thousands of times per
 /// scan and the components below are the only allocation in the answer.
 pub(super) fn rust_crate_paths(file: &ProjectFile) -> Option<Arc<CratePaths>> {
-    if let Some(memoized) = CRATE_PATHS_BY_FILE.read().expect(POISONED).get(file) {
-        return memoized.clone();
+    if let Some(memoized) = CRATE_PATHS_BY_FILE.get(file) {
+        return memoized;
     }
     let paths = derive_crate_paths(file).map(Arc::new);
-    CRATE_PATHS_BY_FILE
-        .write()
-        .expect(POISONED)
-        .insert(file.clone(), paths.clone());
+    CRATE_PATHS_BY_FILE.insert(file.clone(), paths.clone());
     paths
 }
 
@@ -85,6 +280,7 @@ fn derive_crate_paths(file: &ProjectFile) -> Option<CratePaths> {
         &file.root().join(&nearest.directory),
         relative,
         nearest.crate_name.clone(),
+        &nearest.library_path,
     ))
 }
 
@@ -125,6 +321,7 @@ pub(super) fn rust_target_kind_root(file: &ProjectFile) -> Option<Vec<String>> {
 struct NearestCrate {
     directory: PathBuf,
     crate_name: String,
+    library_path: PathBuf,
 }
 
 /// Nearest ancestor directory holding a `Cargo.toml` that names a crate, paired
@@ -132,8 +329,8 @@ struct NearestCrate {
 /// walk continues upward past it.
 ///
 /// Every directory the walk passes through shares the manifest it lands on, so
-/// one walk answers the whole chain and each later file under any of those
-/// directories is a map lookup. Without that, the walk ran once per question
+/// one walk fills bounded cache entries for that chain. Later lookups reuse
+/// them until invalidation or eviction. Without that, the walk ran once per question
 /// about every file and paid one `is_file` syscall per level each time.
 fn nearest_crate(file: &ProjectFile) -> Option<Arc<NearestCrate>> {
     let root = file.root();
@@ -158,19 +355,18 @@ fn nearest_crate(file: &ProjectFile) -> Option<Arc<NearestCrate>> {
         record_manifest_probe(root);
         let manifest = root.join(relative).join("Cargo.toml");
         if manifest.is_file()
-            && let Some(crate_name) = cached_manifest_crate_name(&manifest)
+            && let Some(naming) = cached_manifest_naming(&manifest)
         {
             break Some(Arc::new(NearestCrate {
                 directory: relative.to_path_buf(),
-                crate_name,
+                crate_name: naming.crate_name.clone(),
+                library_path: naming.library_path.clone(),
             }));
         }
         directory = relative.parent();
     };
-    let mut memo = NEAREST_CRATE_BY_DIRECTORY.write().expect(POISONED);
-    let by_directory = memo.entry(root.to_path_buf()).or_default();
     for directory in walked {
-        by_directory.insert(directory, nearest.clone());
+        NEAREST_CRATE_BY_DIRECTORY.insert((root.to_path_buf(), directory), nearest.clone());
     }
     nearest
 }
@@ -179,18 +375,78 @@ fn nearest_crate(file: &ProjectFile) -> Option<Arc<NearestCrate>> {
 /// otherwise -- including `Some(None)` for a directory with no manifest above
 /// it, which is as expensive to rediscover as any other answer.
 fn memoized_nearest_crate(root: &Path, directory: &Path) -> Option<Option<Arc<NearestCrate>>> {
-    NEAREST_CRATE_BY_DIRECTORY
-        .read()
-        .expect(POISONED)
-        .get(root)?
-        .get(directory)
-        .cloned()
+    NEAREST_CRATE_BY_DIRECTORY.get(&(root.to_path_buf(), directory.to_path_buf()))
 }
 
 /// Split `relative` (a path below the manifest directory) into the crate-aware
 /// package and `crate::` root. `manifest_root` is the absolute manifest
 /// directory, used only for layout probes.
-fn classify(manifest_root: &Path, relative: &Path, crate_name: String) -> CratePaths {
+fn classify(
+    manifest_root: &Path,
+    relative: &Path,
+    crate_name: String,
+    library_path: &Path,
+) -> CratePaths {
+    classify_with_target_probe(
+        relative,
+        crate_name,
+        library_path,
+        |kind_directory, target| {
+            manifest_root
+                .join(kind_directory)
+                .join(target)
+                .join("main.rs")
+                .is_file()
+        },
+    )
+}
+
+/// The selected equivalent of [`classify`]. The source inventory is the only
+/// target-layout authority; this closure never probes the live filesystem.
+fn classify_selected(
+    relative: &Path,
+    crate_name: &str,
+    manifest_directory: &Path,
+    library_path: &Path,
+    source_paths: &std::collections::BTreeSet<PathBuf>,
+) -> CratePaths {
+    classify_with_target_probe(
+        relative,
+        crate_name.to_string(),
+        library_path,
+        |kind_directory, target| {
+            source_paths.contains(
+                &manifest_directory
+                    .join(kind_directory)
+                    .join(target)
+                    .join("main.rs"),
+            )
+        },
+    )
+}
+
+fn classify_with_target_probe(
+    relative: &Path,
+    crate_name: String,
+    library_path: &Path,
+    has_target_main: impl Fn(&Path, &str) -> bool,
+) -> CratePaths {
+    if relative == library_path {
+        return CratePaths {
+            package: vec![crate_name.clone()],
+            crate_root: vec![crate_name.clone()],
+        };
+    }
+    let relative = if library_path != Path::new("src/lib.rs") {
+        let library_directory = library_path.parent().unwrap_or_else(|| Path::new(""));
+        if library_directory != Path::new("src") && relative.starts_with(library_directory) {
+            relative.strip_prefix(library_directory).unwrap_or(relative)
+        } else {
+            relative
+        }
+    } else {
+        relative
+    };
     let mut components: Vec<String> = relative
         .components()
         .filter_map(|component| match component {
@@ -237,9 +493,10 @@ fn classify(manifest_root: &Path, relative: &Path, crate_name: String) -> CrateP
                 package: package_of(&tail),
                 crate_root: target_root(
                     &crate_name,
-                    &manifest_root.join("src").join("bin"),
+                    Path::new("src/bin"),
                     "bin",
                     below_bin,
+                    &has_target_main,
                 ),
             }
         }
@@ -258,7 +515,7 @@ fn classify(manifest_root: &Path, relative: &Path, crate_name: String) -> CrateP
             let crate_root = if rest.is_empty() {
                 package.clone()
             } else {
-                target_root(&crate_name, &manifest_root.join(head), head, rest)
+                target_root(&crate_name, Path::new(head), head, rest, &has_target_main)
             };
             CratePaths {
                 package,
@@ -286,96 +543,86 @@ fn target_root(
     kind_directory: &Path,
     kind: &str,
     below_kind: &[String],
+    has_target_main: &impl Fn(&Path, &str) -> bool,
 ) -> Vec<String> {
     let mut root = vec![crate_name.to_string(), kind.to_string()];
     if let Some(target) = below_kind.first()
-        && kind_directory.join(target).join("main.rs").is_file()
+        && has_target_main(kind_directory, target)
     {
         root.push(target.clone());
     }
     root
 }
 
-/// Crate name declared by a parsed manifest: the normalized `[lib]` name when
-/// one is declared, else the normalized `[package]` name. An implicit lib
-/// (`src/lib.rs` autodiscovery) is unnamed and therefore takes the package
-/// name too, so no layout probe is needed here. `None` for a manifest that
-/// declares no package, i.e. a `[workspace]`-only manifest.
-fn manifest_crate_name(manifest: &toml::Value) -> Option<String> {
-    let package_name = cargo_manifest_package_name(manifest)?;
+/// Derive the crate identifier from one already parsed Cargo document.
+/// The normalized `[lib]` name wins when one is declared; otherwise the
+/// normalized `[package]` name is returned. An implicit lib (`src/lib.rs`
+/// autodiscovery) inherits the package name. `None` means the document is a
+/// `[workspace]`-only manifest.
+///
+/// Selected operations can pass their exact retained manifest here instead of
+/// consulting the generation-scoped filesystem cache below.
+pub fn rust_manifest_crate_name(manifest: &RustCargoManifestDocument) -> Option<String> {
+    let package_name = manifest.package_name()?;
     Some(
-        cargo_manifest_library_name(manifest)
-            .unwrap_or_else(|| normalize_crate_name(&package_name)),
+        manifest
+            .library_name()
+            .map(normalize_crate_name)
+            .unwrap_or_else(|| normalize_crate_name(package_name)),
     )
 }
 
-/// The critical sections below are map reads, map writes and clones, none of
-/// which can panic while a lock is held, so a poisoned lock is a bug rather
-/// than a state to recover from.
-const POISONED: &str = "crate-naming memo lock is poisoned";
+/// Lookup results are bounded independently of workspace size. Eviction only
+/// repeats one naming query; selected resolution still reads its SQLite rows.
+const NAMING_CACHE_ENTRIES: u64 = 4096;
 
-/// Manifest absolute path plus its mtime, so an edited manifest re-parses
-/// instead of answering from the cache.
-type ManifestKey = (PathBuf, Option<SystemTime>);
-
-/// Process-global manifest cache. Naming is asked for every Rust file, and the
-/// same handful of manifests answer all of them.
-///
-/// Reached only when [`NEAREST_CRATE_BY_DIRECTORY`] misses, so the `stat` its
-/// key needs is paid once per directory tree per generation, not once per
-/// question.
-static MANIFEST_CRATE_NAMES: LazyLock<RwLock<HashMap<ManifestKey, Option<String>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::default()));
-
-/// The manifest governing each directory below one workspace root.
-type NearestCrateByDirectory = HashMap<PathBuf, Option<Arc<NearestCrate>>>;
-
-/// The manifest governing each directory, per workspace root.
-///
-/// Keyed by root first so a lookup borrows both path halves and allocates
-/// nothing on a hit.
-static NEAREST_CRATE_BY_DIRECTORY: LazyLock<RwLock<HashMap<PathBuf, NearestCrateByDirectory>>> =
-    LazyLock::new(|| RwLock::new(HashMap::default()));
-
-/// One file's crate-aware names. `classify` allocates both component vectors
-/// and probes `main.rs` for the multi-target layouts; a file's answer never
-/// changes while the manifests do not.
-static CRATE_PATHS_BY_FILE: LazyLock<RwLock<HashMap<ProjectFile, Option<Arc<CratePaths>>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::default()));
-
-/// Forget every memoized answer, so the next question re-reads the manifests on
-/// disk.
-///
-/// The memos deliberately do not `stat` a manifest per call -- that syscall is
-/// the cost they exist to remove -- so this is the only thing that makes a
-/// `Cargo.toml` edit visible. `RustAnalyzer` construction and update call it:
-/// an analyzer generation is exactly the span over which a workspace's crate
-/// naming is fixed.
-pub fn invalidate() {
-    MANIFEST_CRATE_NAMES.write().expect(POISONED).clear();
-    NEAREST_CRATE_BY_DIRECTORY.write().expect(POISONED).clear();
-    CRATE_PATHS_BY_FILE.write().expect(POISONED).clear();
+#[derive(Clone, Debug)]
+struct ManifestNaming {
+    crate_name: String,
+    library_path: PathBuf,
 }
 
-fn cached_manifest_crate_name(manifest: &Path) -> Option<String> {
+type ManifestKey = (PathBuf, Option<SystemTime>);
+static MANIFEST_NAMING: LazyLock<Cache<ManifestKey, Option<Arc<ManifestNaming>>>> =
+    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
+type DirectoryKey = (PathBuf, PathBuf);
+static NEAREST_CRATE_BY_DIRECTORY: LazyLock<Cache<DirectoryKey, Option<Arc<NearestCrate>>>> =
+    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
+static CRATE_PATHS_BY_FILE: LazyLock<Cache<ProjectFile, Option<Arc<CratePaths>>>> =
+    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
+
+/// Forget live-filesystem naming results at the analyzer generation boundary.
+pub fn invalidate() {
+    MANIFEST_NAMING.invalidate_all();
+    NEAREST_CRATE_BY_DIRECTORY.invalidate_all();
+    CRATE_PATHS_BY_FILE.invalidate_all();
+}
+
+fn cached_manifest_naming(manifest: &Path) -> Option<Arc<ManifestNaming>> {
     let modified = std::fs::metadata(manifest)
         .and_then(|metadata| metadata.modified())
         .ok();
     let key = (manifest.to_path_buf(), modified);
-    if let Some(cached) = MANIFEST_CRATE_NAMES.read().expect(POISONED).get(&key) {
-        return cached.clone();
+    if let Some(cached) = MANIFEST_NAMING.get(&key) {
+        return cached;
     }
-    let name = std::fs::read_to_string(manifest)
+    let naming = std::fs::read(manifest)
         .ok()
-        .and_then(|source| toml::from_str::<toml::Value>(&source).ok())
-        .as_ref()
-        .and_then(manifest_crate_name);
-    MANIFEST_CRATE_NAMES
-        .write()
-        .expect(POISONED)
-        .insert(key, name.clone());
-    name
+        .and_then(|source_bytes| {
+            RustCargoManifestDocument::from_source_bytes(source_bytes.into_boxed_slice()).ok()
+        })
+        .and_then(|document| {
+            Some(Arc::new(ManifestNaming {
+                crate_name: rust_manifest_crate_name(&document)?,
+                library_path: document.library_path().ok()?.to_path_buf(),
+            }))
+        });
+    MANIFEST_NAMING.insert(key, naming.clone());
+    naming
 }
+
+#[cfg(test)]
+const POISONED: &str = "crate-naming test probe lock is poisoned";
 
 /// Ancestor-walk manifest probes per workspace root, so a test can prove the
 /// walk runs once per directory rather than once per file. Per root, because
@@ -551,6 +798,219 @@ mod tests {
         assert_eq!(
             fixture.resolved("src/inner.rs").0,
             components("renamed.inner"),
+        );
+    }
+
+    #[test]
+    fn selected_manifest_name_uses_exact_document_without_filesystem_reads() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[package]\nname = \"outer-package\"\n\n[lib]\nname = \"renamed-lib\"\n",
+        )
+        .expect("selected manifest");
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/inner.rs"),
+                PathBuf::from("tests/common/mod.rs"),
+            ],
+            &[manifest],
+        )
+        .expect("selected naming");
+
+        let lib_root = naming
+            .resolve_package_anchor(PackageAnchor::CrateRoot, "", Path::new("src/lib.rs"))
+            .expect("selected library root");
+        assert_eq!(
+            lib_root.display(segment_interner()),
+            "renamed_lib",
+            "the explicit lib target controls the crate root",
+        );
+        let inner = naming
+            .resolve_package_anchor(
+                PackageAnchor::OwnModule { pop: 0 },
+                "",
+                Path::new("src/inner.rs"),
+            )
+            .expect("selected module package");
+        assert_eq!(inner.display(segment_interner()), "renamed_lib.inner");
+    }
+
+    #[test]
+    fn selected_target_roots_use_only_selected_source_paths() {
+        let manifest =
+            RustSelectedManifestMount::from_source("Cargo.toml", "[package]\nname = \"package\"\n")
+                .expect("selected manifest");
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("tests/common/mod.rs"),
+                PathBuf::from("src/bin/tool/main.rs"),
+            ],
+            &[manifest],
+        )
+        .expect("selected naming");
+
+        let shared_test_root = naming
+            .resolve_package_anchor(
+                PackageAnchor::CrateRoot,
+                "",
+                Path::new("tests/common/mod.rs"),
+            )
+            .expect("selected shared test root");
+        assert_eq!(
+            shared_test_root.display(segment_interner()),
+            "package.tests"
+        );
+        let binary_root = naming
+            .resolve_package_anchor(
+                PackageAnchor::CrateRoot,
+                "",
+                Path::new("src/bin/tool/main.rs"),
+            )
+            .expect("selected binary root");
+        assert_eq!(binary_root.display(segment_interner()), "package.bin.tool");
+        let popped = naming
+            .resolve_package_anchor(
+                PackageAnchor::OwnModule { pop: 1 },
+                "",
+                Path::new("src/bin/tool/main.rs"),
+            )
+            .expect("selected popped package");
+        assert_eq!(popped.display(segment_interner()), "package.bin");
+    }
+
+    #[test]
+    fn selected_nested_package_uses_workspace_relative_target_paths() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member-package\"\n",
+        )
+        .expect("selected manifest");
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [
+                PathBuf::from("crates/member/src/lib.rs"),
+                PathBuf::from("crates/member/src/bin/tool/main.rs"),
+            ],
+            &[manifest],
+        )
+        .expect("selected naming");
+        let root = naming
+            .resolve_package_anchor(
+                PackageAnchor::CrateRoot,
+                "",
+                Path::new("crates/member/src/bin/tool/main.rs"),
+            )
+            .expect("selected nested binary root");
+        assert_eq!(root.display(segment_interner()), "member_package.bin.tool");
+    }
+
+    #[test]
+    fn selected_custom_library_path_controls_module_package_root() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[package]\nname = \"package\"\n[lib]\npath = \"src/custom/lib.rs\"\n",
+        )
+        .expect("selected manifest");
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [
+                PathBuf::from("src/custom/lib.rs"),
+                PathBuf::from("src/custom/inner.rs"),
+                PathBuf::from("src/main.rs"),
+            ],
+            &[manifest],
+        )
+        .expect("selected naming");
+        let library_root = naming
+            .resolve_package_anchor(PackageAnchor::CrateRoot, "", Path::new("src/custom/lib.rs"))
+            .expect("selected custom library root");
+        assert_eq!(library_root.display(segment_interner()), "package");
+        let inner = naming
+            .resolve_package_anchor(
+                PackageAnchor::OwnModule { pop: 0 },
+                "",
+                Path::new("src/custom/inner.rs"),
+            )
+            .expect("selected custom library module");
+        assert_eq!(inner.display(segment_interner()), "package.inner");
+    }
+
+    #[test]
+    fn live_and_selected_custom_library_roots_have_the_same_identity() {
+        for (library, inner) in [
+            ("app.rs", "inner.rs"),
+            ("src/custom/lib.rs", "src/custom/inner.rs"),
+            ("alt/entry.rs", "alt/inner.rs"),
+        ] {
+            let manifest_source =
+                format!("[package]\nname = \"package\"\n[lib]\npath = {library:?}\n");
+            let fixture = Fixture::new(&[
+                ("Cargo.toml", &manifest_source),
+                (library, "pub mod inner;"),
+                (inner, "pub fn take() {}"),
+            ]);
+            let manifest = RustSelectedManifestMount::from_source("Cargo.toml", &manifest_source)
+                .expect("selected manifest");
+            let selected = RustSelectedCargoNaming::from_selected_inputs(
+                [PathBuf::from(library), PathBuf::from(inner)],
+                &[manifest],
+            )
+            .expect("selected naming");
+            for (file, expected) in [(library, "package"), (inner, "package.inner")] {
+                let live = fixture.paths(file).expect("live naming");
+                assert_eq!(live.package.join("."), expected, "{file}");
+                assert_eq!(live.crate_root, ["package"], "{file}");
+                let package = selected
+                    .resolve_package_anchor(
+                        PackageAnchor::OwnModule { pop: 0 },
+                        "",
+                        Path::new(file),
+                    )
+                    .expect("selected package");
+                assert_eq!(
+                    package.display(segment_interner()).to_string(),
+                    expected,
+                    "{file}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_manifestless_files_keep_path_derived_identity() {
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [PathBuf::from("src/lib.rs"), PathBuf::from("src/inner.rs")],
+            &[],
+        )
+        .expect("selected naming");
+        let root = naming
+            .resolve_package_anchor(PackageAnchor::CrateRoot, "", Path::new("src/lib.rs"))
+            .expect("manifestless crate root");
+        assert!(root.is_empty());
+        let inner = naming
+            .resolve_package_anchor(
+                PackageAnchor::OwnModule { pop: 0 },
+                "",
+                Path::new("src/inner.rs"),
+            )
+            .expect("manifestless module package");
+        assert_eq!(inner.display(segment_interner()), "inner");
+    }
+
+    #[test]
+    fn selected_naming_reports_files_outside_the_selected_inventory() {
+        let manifest =
+            RustSelectedManifestMount::from_source("Cargo.toml", "[package]\nname = \"package\"\n")
+                .expect("selected manifest");
+        let naming = RustSelectedCargoNaming::from_selected_inputs(
+            [PathBuf::from("src/lib.rs")],
+            &[manifest],
+        )
+        .expect("selected naming");
+        assert!(
+            naming
+                .resolve_package_anchor(PackageAnchor::CrateRoot, "", Path::new("src/missing.rs"))
+                .is_none()
         );
     }
 

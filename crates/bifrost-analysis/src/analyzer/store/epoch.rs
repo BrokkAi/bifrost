@@ -31,7 +31,7 @@ use tree_sitter::Language as TsLanguage;
 // Signature metadata now lives in the typed columns that migration 0023
 // created, so adding a signature fact does not justify an epoch bump: add a
 // column with a compatible default. Bump this salt only when existing content
-// rows cannot be transformed by SQL, as in v12 below.
+// rows cannot be transformed by SQL, as in v12 and v13 below.
 //
 // v11: merge of two v10 bumps made independently on both sides of a branch.
 // One added `SignatureMetadata::field_has_initializer`; the other added the
@@ -50,7 +50,28 @@ use tree_sitter::Language as TsLanguage;
 // v12: schema 26 makes `code_unit_fq_segments` the authoritative structured
 // identity and adds indexed content-tail projections. SQL cannot backfill the
 // FQ2 blob into rows, so old generations must be republished once.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v12-relational-fq-names";
+// v13: schema 63 persists exact metadata-to-signature ordinal pairs captured
+// at shared construction. Independent label/metadata deduplication means SQL
+// cannot reconstruct those identities by ordinal, label, or declaration range.
+// Remaining M4 language salts include canonical primary source ownership.
+// Nullable legacy family markers preserve old schema rows; their old epochs
+// must become dirty so ordinary primary analysis publishes the required facts.
+// Scoped malformed-syntax coverage replaces persisted fragment-wide gaps in
+// the common lowering. Every language must republish its sealed coverage rows.
+// The lazy interior's tier-1 headers (`resolution_identities`,
+// `resolution_blob_identities`, `resolution_path_endpoint_headers`,
+// `resolution_path_terminal_headers`, `resolution_candidate_gap_headers`) join
+// the persisted bundle, so every blob's sealed interior digest changes and
+// every language must republish.
+// `resolution_gaps.gap` is a dense per-blob ordinal in a key space of its own
+// instead of a semantic catalog key (#3737), and the catalog no longer holds
+// one identity per gap, so every blob's sealed interior changes and every
+// language must republish.
+const STORE_EPOCH_SALT: &str = concat!(
+    "analyzer-blob-store-v13-signature-metadata-pairs;scoped-malformed-coverage-2026-09;",
+    "lazy-interior-tier-1-headers-li3-2026-09-14;gap-ordinals-3737-2026-09-29;",
+    "gap-reasons-without-catalog-rows-3737-2026-09-29"
+);
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -98,6 +119,18 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     hasher.update(L::NAME.as_bytes());
     hasher.update(b"\n");
     hasher.update(language_salt.as_bytes());
+    hasher.update(b"\n");
+    // Persisted structural facts carry this version, and a reader does not
+    // repair an indexed source whose facts are at another version. A bump
+    // must therefore invalidate every language's rows by itself, rather than
+    // relying on a grammar, query or salt change landing beside it.
+    hasher.update(
+        format!(
+            "structural-facts-v{}",
+            crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION
+        )
+        .as_bytes(),
+    );
     hasher.update(b"\n");
     hash_grammar(&mut hasher, ts_language);
     hasher.update(b"\n");
@@ -215,6 +248,18 @@ macro_rules! lang_epoch {
             }
         }
     };
+    ($struct:ident, $name:literal, $dir:literal, $salt:literal, $append:literal) => {
+        struct $struct;
+        impl LanguageEpoch for $struct {
+            const NAME: &'static str = $name;
+            const QUERY_DIR: &'static str = $dir;
+            const SALT: &'static str = concat!($salt, $append);
+            fn cell() -> &'static OnceLock<String> {
+                static CELL: OnceLock<String> = OnceLock::new();
+                &CELL
+            }
+        }
+    };
 }
 
 // Salt bumped (#1611): Java `ImportInfo` paths now record a static import as
@@ -251,6 +296,11 @@ macro_rules! lang_epoch {
 // carry a source-coordinate identity that separates same-named locals in
 // overloaded methods. Warm rows either omit the enum-body owners entirely or
 // retain the old collapsed local-class FQNs.
+// Salt bumped again: Java resolution facts now explicitly declare the
+// visibility-eligible definition inventory consumed by common typed lowering.
+// Warm parsed blobs do not carry those authority rows.
+// Salt bumped again: root-import facts now retain their typed route anchor.
+// Warm parsed blobs omit that source-owned authority.
 // Salt bumped again (#1651): a type declaration's signature metadata now
 // records the declaration's own type-parameter list, which
 // `canonical_identity_of` projects as the identity's generic arity. A warm row
@@ -259,18 +309,26 @@ macro_rules! lang_epoch {
 // Salt bumped (#3410): a try-with-resources statement is now a persisted
 // `resource_release` structural fact, and its implicit close is lowered on
 // both continuations. Warm rows carry neither.
+// Static imports now publish source-owned root demands; reparse old blobs.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08;declaration-type-parameter-arity-2026-09;implicit-resource-release-3410"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08;enum-constant-body-and-coordinate-local-class-owners-2026-08;same-package-type-identifier-facts-2026-08;native-resolution-visibility-eligibility-2026-09;native-resolution-root-import-anchors-2026-09;declaration-type-parameter-arity-2026-09;coordinated-canonical-source-production-2026-09;structured-package-identity-2026-09;source-owned-declaration-visibility-2026-09;canonical-visibility-storage-2026-09;shared-java-declaration-shapes-2026-09;canonical-java-declaration-types-2026-09;implicit-resource-release-3410;native-static-import-root-demands-2026-09-28;java-array-type-components-2026-09"
 );
+// Package names now use the shared directive AST interpretation. Old text-based
+// names can contain comments or omit annotated declarations; reparse their units.
+// Java and Go now publish occurrence, declaration, import, structural, and
+// native links from one coordinated producer. SQL cannot recover the missing
+// AST identities from old display rows; both language salts require reparse.
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
 // Salt bumped again (#1548 stage 3 pilot): the Go `.scm` query assets moved
 // from this crate's `resources/treesitter/go/` into `brokk-bifrost-go`, so the
 // salted content now comes from a different crate's `include_str!`. The bytes
 // are unchanged, which is exactly why the salt has to carry the relocation.
+// Salt bumped again: root-import facts now retain their typed route anchor.
+// Warm parsed blobs omit that source-owned authority.
 // Salt bumped again (#3325): a Go 1.26 `new(expr)` call no longer leaves its
 // argument -- and, in an assignment, the whole statement that follows -- inside
 // an ERROR node. Those regions now yield ordinary declarations, references, and
@@ -289,11 +347,21 @@ lang_epoch!(
 // workspace with no error raised anywhere. The same gap was bumped for
 // JavaScript and TypeScript (#2597), for PHP and Ruby (#2912), and for Python
 // (#3451).
+// Unnamed input/receiver facts and result-list separation change native rows.
+// Selector assignment targets now emit member reference facts, and Go package
+// lookup names now reach reverse discovery headers; warm rows lacked both.
+// Bare call identifiers also retain Go's type-conversion namespace ambiguity.
+// If conditions now emit structured references from their expression operands.
+// Direct Go calls now publish argument-independent name binding and no
+// unsupported-route placeholder for their callee; warm bundles carry different
+// typed resolution facts and must be rebuilt.
+// Selector callees and references inside function literals now have complete
+// source owners, so warm bundles lack the call and graph identity facts.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09;go-callable-modifier-metadata-2026-09"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08;native-resolution-root-import-anchors-2026-09;coordinated-canonical-source-production-2026-09;canonical-go-declaration-source-2026-09;empty-interface-map-key-identity-2026-09;go-1-26-new-expression-parse-2026-09;go-constant-string-values-2026-09;go-callable-modifier-metadata-2026-09;native-unnamed-signatures-and-result-arity-2026-09-28;go-container-type-components-2026-09;native-go-selector-assignment-references-2026-09-30;native-go-call-type-conversion-identities-2026-09-30;native-go-if-condition-reference-traversal-2026-09-30;go-universe-call-name-binding-2026-09;native-go-selector-callees-and-reference-owners-2026-09-30"
 );
 
 /// The Go epoch as it stood before the #3455 callable-modifier bump.
@@ -495,12 +563,21 @@ pub(super) fn go_epoch_before_callable_modifier_metadata() -> String {
 // the restored prefix (simdjson's `basictests.cpp` published
 // `type_tests::validate_tests`), so a warm row holds the older qualified name
 // and Module ownership.
+// #3806: quoted native header paths now publish structured include facts.
+// Retire prior rows even if the public node/field fingerprint stays unchanged.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09;cpp-source-member-prototype-units-2026-09;cpp-member-dispatch-extensibility-2026-09;namespace-recovery-ancestry-authority-2026-09"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08;explicit-object-callable-arity-2026-08;structured-callable-parameter-types-2026-08;macro-template-return-free-function-ownership-2026-08;abstract-reference-declarator-identity-2026-08;c-tag-scope-2026-08;c-header-projection-2026-08;temporal-macro-definition-identity-2026-08;nested-include-claims-2026-08;recovered-named-class-member-linkage-2026-09;positional-export-macro-class-names-2026-09;collapsed-namespace-head-scope-2026-09;collapsed-aggregate-definition-ranges-2026-09;lexical-container-partition-2026-09;function-macro-replacement-local-scope-2026-09;canonical-primary-source-ownership-2026-09;canonical-field-activation-and-recovered-context-2026-09;canonical-generated-field-types-and-context-2026-09;canonical-recovered-field-types-and-callable-bodies-2026-09;forward-declared-class-declaration-ranges-2026-09;unterminated-macro-invocation-fields-2026-09;anonymous-aggregate-members-in-both-dialects-2026-09;recovered-namespace-header-ranges-2026-09;unproven-brace-pairing-extents-2026-09;free-function-callee-value-references-2026-09;cpp-callable-modifier-metadata-2026-09;cpp-declared-access-separate-from-linkage-2026-09;cpp-source-member-prototype-units-2026-09;cpp-member-dispatch-extensibility-2026-09;namespace-recovery-ancestry-authority-2026-09;cpp-completed-callable-guard-proof-2771-2026-09-26;raw-quoted-include-header-paths-3806-2026-10"
 );
+
+/// The C and C++ epoch before native quoted header paths were parsed correctly.
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_raw_quoted_include_header_paths() -> String {
+    let prior = salt_before_bump(Cpp::SALT, "raw-quoted-include-header-paths-3806-2026-10");
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+}
 
 /// The C and C++ epoch as it stood before the #3508 source member-prototype bump.
 #[cfg(test)]
@@ -794,7 +871,7 @@ lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08;js-private-name-assignment-is-not-a-declaration-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;js-nested-object-literal-property-indexing-2026-09;jsx-dialect-parsed-with-tsx-grammar-2026-09;js-grammar-reserved-word-jsx-names-2026-09;js-ts-augmented-template-operand-flows-3386"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08;js-private-name-assignment-is-not-a-declaration-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;canonical-primary-source-ownership-2026-09;js-nested-object-literal-property-indexing-2026-09;jsx-dialect-parsed-with-tsx-grammar-2026-09;js-grammar-reserved-word-jsx-names-2026-09;js-ts-augmented-template-operand-flows-3386;js-primary-walk-alias-and-local-object-metadata-2771-2026-09-26"
 );
 
 #[cfg(test)]
@@ -862,7 +939,7 @@ lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;js-ts-augmented-template-operand-flows-3386;ts-grammar-declaration-correctness-3502"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08;structured-rule-tester-test-detection-2026-08;structured-js-ts-test-classification-2026-08;ts-type-alias-type-identity-2026-09;canonical-primary-source-ownership-2026-09;js-ts-augmented-template-operand-flows-3386;ts-grammar-declaration-correctness-3502"
 );
 
 #[cfg(test)]
@@ -937,7 +1014,7 @@ lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09;python-subscripted-and-unnameable-bases-2026-09;python-bracketed-unpacking-self-attributes-2026-09;python-chained-assignment-targets-2026-09;python-class-qualified-call-binding-2026-09;python-type-flow-builtin-class-identities-2026-09;python-type-flow-unmodeled-guards-2026-09;python-scoped-dynamic-writes-3129;python-declared-diverging-calls-3135;python-structured-refinement-targets-3196;python-implicit-resource-release-3410;python-augmented-string-operand-flows-3386;python-callable-modifier-metadata-2026-09"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09;coordinated-python-source-production-2026-09;canonical-python-declaration-annotations-2026-09;python-source-only-callable-annotations-2026-09;python-subscripted-and-unnameable-bases-2026-09;python-bracketed-unpacking-self-attributes-2026-09;python-chained-assignment-targets-2026-09;python-class-qualified-call-binding-2026-09;python-type-flow-builtin-class-identities-2026-09;python-type-flow-unmodeled-guards-2026-09;python-scoped-dynamic-writes-3129;python-declared-diverging-calls-3135;python-structured-refinement-targets-3196;canonical-python-generic-return-owner-2026-09;python-implicit-resource-release-3410;python-augmented-string-operand-flows-3386;python-callable-modifier-metadata-2026-09;python-replacement-owned-metadata-links-2771-2026-09-26"
 );
 
 /// The Python epoch as it stood before the #3451 callable-modifier bump.
@@ -996,6 +1073,106 @@ pub(super) fn python_epoch_before_callable_modifier_metadata() -> String {
 // `extern crate` the file writes, not only the ones at its top level. Warm rows
 // omit a `use` written inside `mod tests { ... }` or any other inline module,
 // so the coarse file graph loses the file edges those imports name.
+// Rust salt bumped again: parsed blobs now carry the first nonempty common
+// native-resolution tranche. Resolution facts are intentionally not hydrated,
+// so advancing only the resolution-bundle epoch would republish an old parsed
+// blob with an empty bundle and would also erase its non-hydrated Rust usage
+// rows. Advancing the language epoch forces one source parse that republishes
+// both structured families together.
+// Rust salt bumped again: public top-level items and supported named `use`
+// declarations now emit native root-route halves. Resolution facts are still
+// not hydrated, so an old parsed blob cannot be reused to prepare this richer
+// bundle without reparsing the source-owned facts.
+// Rust salt bumped again: cfg-owned regions that the content-only producer
+// cannot activate are skipped with explicit gaps instead of publishing binders,
+// references, imports, or root exports from a potentially disabled subtree.
+// Resolution facts are still not hydrated, so this semantic correction needs
+// the language epoch as well as the resolution-bundle epoch.
+// Rust salt bumped again: a root wildcard import now emits a finite common
+// route whose demands come from supported references in the importing module.
+// Old parsed blobs cannot hydrate those added resolution rows.
+// Rust salt bumped again: bare structured type operands now emit common Type
+// references and therefore add exact consumer-glob demands.
+// Rust salt bumped again: item macro declarations and simple invocations now
+// emit source-ordered Macro bindings, references, and root exports.
+// Rust salt bumped again: supported native definitions now retain their exact
+// parsed CodeUnit crosswalk for selected consumer projection.
+// Rust salt bumped again: the whole-file unsupported marker now belongs only
+// to reference enumeration. Point gaps remain local to syntax the producer
+// actually skipped, so old non-hydrated resolution facts must be reparsed.
+// Rust salt bumped again: procedural item attributes and unsupported
+// trait/impl members now withhold transformed or mis-scoped declarations and
+// publish exact fail-closed boundaries. Old parsed blobs can otherwise retain
+// false root binders for methods or declarations replaced by an attribute
+// macro.
+// Rust salt bumped again: top-level `const` and `static` items now emit native
+// Value declarations and their exact parser-unit crosswalks. Old parsed blobs
+// cannot hydrate either source-owned resolution fact from cached content.
+// Rust salt bumped again: root `extern crate` declarations no longer emit
+// bogus lexical Value references. Their declaration surface remains an
+// enumeration-only boundary while selected Cargo topology owns exact aliases.
+// Rust salt bumped again: closures, for loops, and match arms now own exact
+// pattern scopes, while generic item interiors are withheld so their lexical
+// parameters cannot bind to same-named module declarations.
+// Rust salt bumped again: direct if-let and while-let patterns now activate in
+// only their consequence or loop body. Let chains remain an exact enumeration
+// boundary until their staged pattern scopes are represented.
+// Rust salt bumped again: repeated binder spellings in an or-pattern now share
+// one source-ordered semantic binder instead of becoming equal-rank ambiguity.
+// Their multiple declaration spellings retain enumeration-only uncertainty.
+// Rust salt bumped again: foreign function signatures now produce module
+// callable declarations rather than leaving their calls falsely absent.
+// Rust salt bumped again: union declarations now enter the parser-unit and
+// lexical indexes at every item position, completing native target projection.
+// Rust salt bumped again: block-local items and foreign types are withheld
+// behind point boundaries because the parser-unit contract cannot project them.
+// Bare if/while conditions, assignment sides, and range bounds now emit native
+// Value references instead of leaving their exact source ranges unavailable.
+// Rust salt bumped again: tuple and unit structs now publish their existing
+// semantic definition in both the Type and Value namespaces. Old parsed blobs
+// cannot hydrate the additional namespace or its public root-export half.
+// Rust salt bumped again: generic item interiors now retain supported ordinary
+// references while unprojectable type-parameter uses carry exact point gaps.
+// Old parsed blobs omit both kinds of positioned reference.
+// Rust salt bumped again: unqualified const-generic uses now carry positioned
+// Value-reference gaps instead of binding a same-named module constant.
+// Rust salt bumped again: callable Value binding, type-alias/module domains,
+// macro source-order hoisting, and visibility eligibility are explicit
+// producer authority rows. Warm parsed blobs still depend on evaluator rules.
+// Rust salt bumped again: the terminal tokens of qualified callable and type
+// paths now carry positioned reference sites with explicit qualifier slots.
+// Old blobs omit those sites and could falsely certify a complete absence.
+// Item-position macro invocations now carry a binder-surface boundary rather
+// than only an expression boundary, so an unexpanded generated declaration
+// cannot turn into a complete absence either.
+// Cfg-owned module and import declarations now retain route-placement
+// boundaries instead of fragment-wide route gaps, allowing a proven nearer
+// lexical binding to win without treating a conditional route as absent.
+// Rust salt bumped again: reference enumeration now records exact unsupported
+// identifier sites instead of one unconditional whole-file gap. Warm parsed
+// blobs would otherwise retain the blanket gap and could never certify a
+// complete selected binding world.
+// Rust salt bumped again: the built-in `test` attribute is source-preserving,
+// so its function declarations and references no longer sit behind a false
+// procedural-macro boundary. Cargo manifest fact v4 also distinguishes custom
+// target configuration from default-layout targets.
+// Rust salt bumped again: inline-module scope rows now persist source
+// visibility, and selected reachability composes cfg activation through every
+// inline ancestor before publishing descendants or external routes.
+// Rust salt bumped again: include splices now derive their host module and
+// included membership from the AST-owned inline scope containing the macro.
+// Rust salt bumped again: leading-absolute use-tree leaves retain their typed
+// anchor in both private topology facts and common root-import facts.
+// Rust salt bumped again: method callees retain exact qualified terminals,
+// and computed callees retain expression-local uncertainty instead of
+// poisoning all selected lexical bindings with a fragment-level route gap.
+// Skipped associated-member surfaces now retain dedicated enumeration and
+// reverse-inventory gaps without claiming unknown free lexical binders.
+// Inherent impl callables now retain exact crosswalks and body references with
+// deferred owner frontiers, without publishing lexical method binders.
+// Canonical source facts now publish Rust structural rows and native source
+// identities from one primary analysis, so older parsed blobs cannot satisfy
+// the migrated provider from their legacy structural snapshot.
 // Salt bumped again (#1651): a type declaration's signature metadata now
 // records the declaration's own type-parameter list, which
 // `canonical_identity_of` projects as the identity's generic arity. A warm row
@@ -1019,15 +1196,132 @@ pub(super) fn python_epoch_before_callable_modifier_metadata() -> String {
 // crate` import fact now records whether `#[macro_use]` imports that crate's
 // exported macros. Warm rows carry the old declaration identity and omit the
 // import route needed to resolve the macro through a facade re-export.
+// Rust reference and raw-pointer wrappers now carry distinct proven-reference
+// indirection in native resolution transfers. Cached source facts cannot hydrate
+// that added provenance, so they must be extracted again.
+// Untyped Rust let bindings now retain their direct call initializer as an
+// explicit Initialization transfer. Cached source facts omit that declaration
+// type producer and must be extracted again.
+// Rust source facts now retain exact named-leaf and wildcard demand target
+// provenance. Warm rows cannot reconstruct grouped leaf ownership.
+// Salt bumped: a declared type's unmodelled generic arguments now record
+// `UnsupportedTypeSyntax` instead of `UnsupportedScopeOrBinder`, so a warm
+// row would still claim an omitted binder in the attachment scope and make
+// every lookup there incomplete.
+// Salt bumped: a declared `Box<T>`, `Arc<T>` or `Rc<T>` now projects its
+// payload as the declared type, `Option<T>` and `Result<T, E>` project theirs
+// behind one unproven indirection layer, and `?`, `.unwrap()` and `.expect(..)`
+// in a let initializer record an `Unwrap` transfer that removes exactly that
+// layer. Cached source facts carry the old declared-type head and omit the
+// unwrap transfers, so they must be extracted again.
+// Salt bumped: a cfg-gated `use`, `mod`, or `extern crate` declared inside a
+// block, callable, or type body now records `UnsupportedScopeOrBinder` in
+// that scope instead of `UnsupportedPlacementBoundary`. Selected placement
+// never discharges a binding that lives inside a block, and a warm row keeps
+// the old placement gap, which lowering rejects on a non-root attachment
+// scope and which aborts preparation of the whole file.
+// Salt bumped: a value-position member chain now lowers every member as a
+// qualified reference with its receiver transfer; every path prefix below a
+// scoped or anchored path's head publishes its own root route, while the head
+// and any anchor keyword publish none; and a named struct or union field is a
+// member declaration with a binder in its owner's type body scope, a
+// member-owner row, and its declared value type. Cached source facts hold the
+// old lowering, where only a path terminal and a bare path's first segment had
+// a reference, a member read had only an unlowered boundary, and a field had no
+// declaration at all, so selected resolution kept reporting a missing native
+// reference for `util` and for every member of `outer.inner.value`.
+// Salt bumped: a qualified-type projection path (`<Service as Runner>::Output`)
+// now lowers the type syntax inside its head as ordinary type references and
+// its member as a qualified reference with an unqueried receiver and a
+// type-shaped gap. Cached source facts hold `MalformedSyntax` for the whole
+// path, which blocks the file's fragment, so every definition query in the file
+// answered Incomplete.
+// Salt bumped: named fields without parser CodeUnits now retain their canonical
+// lexical field source projection, including fields of block-local structs.
 // Salt bumped again (#3187): capital-`Self` occurrences are again extracted
 // as semantic type references to their enclosing implementation owner. Warm
 // Rust analysis created under the regressed extraction contract must not be
 // reused as evidence that those references are absent.
+// Salt bumped: crate export candidates are derived once per member blob and
+// reused by visibility, module/enum exports, variants, and activation gaps.
+// Salt bumped: a cfg-gated inline module (`#[cfg(test)] mod tests { .. }`) no
+// longer records an `UnsupportedPlacementBoundary`; only a cfg-gated
+// `mod name;` that routes into another compilation unit does. Warm rows keep
+// the old placement gap, which opens the reverse candidate inventory for the
+// whole workspace, so every reverse answer anywhere keeps reporting
+// `InverseIndexResolutionIncomplete`.
+// Salt bumped: a bare `self` method receiver (`self.method()`) now publishes
+// its own value reference site, the way a `self.field` chain already did. Warm
+// rows hold no reference at that token, so a request there answers
+// `native_reference_missing` instead of the method's receiver parameter.
+// Salt bumped: `let value = Type { .. };` now takes its declared value type
+// from the initializer's own `name` field. Warm rows give that binding no
+// declared type at all, so every later `value.member()` answers
+// `UnsupportedSemantic` and contributes neither an edge nor a usage.
+// Salt bumped: a block that declares items now carries an item scope above
+// its local scope, so a nested item no longer sees the block's locals and
+// still sees its sibling items. Warm rows hold the old single scope, in
+// which a name inside a nested `fn` binds to the enclosing function's
+// local instead of the item that name really denotes.
+// Salt bumped: every trait and impl member body is lowered, and an
+// item-position token tree of a definition-less macro is enumerated for
+// references. Warm rows hold neither: a reference written inside a trait
+// default body, inside a member of an impl whose subject type syntax is
+// unsupported, inside an associated constant's value, or inside
+// `criterion_group!(benches, bench)` has no site at all in them, so a request
+// at that token answers `native_reference_missing` and the reverse route finds
+// no candidate. One token covers both mechanisms; they land together.
+// Salt bumped (#3746): a bare `Self` value now carries the enclosing impl's
+// type identity. Warm rows answer it `no_indexed_definition`.
+// Salt bumped (#3746): a member whose receiver is `x.unwrap()` or
+// `x.expect(..)` over a call or member chain now takes that operand's payload
+// through `Unwrap` transfers. Warm rows route it through std's `unwrap`.
+// Salt bumped (#3746, U1): a grouped `{self}` import leaf binds only the type
+// namespace and its target site is the `self` token; a private associated
+// const or type of an inherent impl keeps its declared visibility; and
+// `impl crate::m::Type` binds a standard `self` receiver. Warm rows hold a
+// value-namespace import site on the prefix token, a public const, and no
+// `self` binder in a path-subject impl.
+// Salt bumped (#3746, U1): a parenthesized type (`&(dyn Trait + Send)`, which
+// the grammar parses as a one-element `tuple_type`) lowers as its inner type.
+// Warm rows hold an `UnsupportedTypeSyntax` gap there.
+// Salt bumped (#3746): the subject frontier of an impl whose target type has
+// no nominal head (`impl Trait for &[u8]`) no longer records a reference
+// enumeration gap; the names that type spells are enumerated elsewhere. Warm
+// rows keep the gap, which makes every reverse answer in such a file report
+// `InverseIndexResolutionIncomplete`.
+// Salt bumped again (#3746): consecutive `tt` bindings of a matched macro arm
+// are one run of source for static-path publication, so `wanted::free` in
+// `consume!(wanted::free())` under `$($tokens:tt)*` is a positioned
+// reference. Warm rows hold no site at that token.
+// Salt bumped again (#3746): a `macro_rules!` definition inside an attributed
+// inline module (`#[macro_use] mod child { .. }`) is a macro definition, not
+// malformed syntax. Warm rows give it no declaration and an enumeration gap.
+// Salt bumped again (#3746): a static call path in a macro `tt` run
+// (`EventInfo::default()`) is lowered as a call, with its call site and
+// result slot. Warm rows hold only a bare callable reference.
+// Salt bumped (#3746): a static path from matched `tt` bindings is published
+// only when replay proves it is emitted in order in an expression/path role.
+// Salt bumped (#3746): an explicitly typed closure parameter now carries
+// its declared value type. Warm rows give it none, so its uses answer an
+// incomplete type frontier.
+// Salt bumped again: an impl whose generic target arguments are exactly its
+// unconstrained type parameters no longer carries a spurious owner gap.
+// Salt bumped (#3746, f): per-arm no-item proofs and scoped inline-module
+// macro invocation names now contribute to Rust resolution.
+// Salt bumped (#3746): lower emitted bare macro-transcriber references and
+// the pattern operand of the standard `matches!` macro.
+// Salt bumped (#3746, c): mapped generic alias arguments retain target identity.
+// Salt bumped (#3746): restore expression-reference enumeration for unindexed
+// macros; only a selected workspace transcriber can establish pattern roles.
+// Salt bumped (#3746): lower the unindexed `matches!` pattern operand as a
+// refutable pattern so enum variants and fallback binders keep their roles.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09;source-external-module-signatures-2026-09;proc-macro-kind-and-macro-use-extern-facts-2026-09;capital-self-type-references-2026-09;primitive-spelled-impl-owners-2026-09;scoped-generated-rust-model-declarations-2026-09;attributed-impl-member-declarations-2026-09"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09;source-external-module-signatures-2026-09;proc-macro-kind-and-macro-use-extern-facts-2026-09;module-cfg-and-exported-macro-facts-2026-09;native-resolution-first-tranche-2026-09;native-resolution-root-route-halves-2026-09;native-resolution-cfg-fail-closed-2026-09;native-resolution-root-glob-demands-2026-09;native-resolution-type-references-2026-09;native-resolution-item-macros-2026-09;native-resolution-definition-unit-crosswalks-2026-09;native-resolution-point-gap-authority-2026-09;native-resolution-proc-macro-member-boundaries-2026-09;native-resolution-const-static-values-2026-09;native-resolution-extern-crate-routes-2026-09;native-resolution-local-pattern-scopes-2026-09;native-resolution-direct-let-condition-scopes-2026-09;native-resolution-or-pattern-binders-2026-09;native-resolution-foreign-functions-2026-09;native-resolution-union-types-2026-09;native-resolution-unprojectable-item-boundaries-2026-09;native-resolution-bare-condition-assignment-references-2026-09;native-resolution-struct-value-constructors-2026-09;native-resolution-generic-item-interiors-2026-09;native-resolution-const-generic-boundaries-2026-09;native-resolution-declared-rule-authority-2026-09;native-resolution-qualified-reference-boundaries-2026-09;native-resolution-item-macro-surface-boundaries-2026-09;native-resolution-cfg-route-placement-boundaries-2026-09;native-resolution-exact-reference-enumeration-gaps-2026-09;native-resolution-builtin-test-attribute-2026-09;cargo-manifest-default-target-inventory-2026-09;native-resolution-module-cycle-guard-2026-09;native-resolution-include-cycle-guard-2026-09;native-resolution-inline-module-ancestry-2026-09;native-resolution-inline-visibility-and-parent-cfg-2026-09;native-resolution-inline-include-scope-2026-09;native-resolution-inline-module-root-bridge-2026-09;native-resolution-inline-import-scope-2026-09;native-resolution-let-chain-scopes-2026-09;native-resolution-leading-absolute-imports-2026-09;native-resolution-positioned-call-callees-2026-09;native-resolution-member-scope-gaps-2026-09|native-resolution-root-references-2026-09;native-resolution-inherent-callable-bodies-2026-09;canonical-source-facts-2026-09;structured-extern-crate-import-form-2026-09;canonical-import-source-occurrences-2026-09;canonical-import-module-segments-2026-09;canonical-generic-import-spans-2026-09;canonical-import-properties-2026-09;canonical-rust-import-contexts-2026-09;canonical-embedded-declaration-identities-2026-09;canonical-rust-declaration-properties-2026-09;canonical-rust-declaration-classification-2026-09;canonical-rust-declaration-boundaries-2026-09;canonical-primary-module-properties-2026-09;shared-secondary-module-properties-2026-09;canonical-module-source-links-2026-09;ast-signature-header-boundaries-2026-09;source-owned-impl-type-construction-2026-09;shared-embedded-source-occurrences-2026-09;ast-parameter-label-spans-2026-09;primary-item-source-inventory-2026-09;secondary-item-source-inventory-2026-09;embedded-import-source-contexts-2026-09;normalized-item-syntax-2026-09;canonical-item-type-source-publication-2026-09;canonical-recovered-tree-root-contexts-2026-09;canonical-macro-source-position-2026-09;canonical-declaration-annotations-2026-09;canonical-generic-type-contexts-2026-09;canonical-macro-definition-patterns-2026-09;canonical-trait-type-forms-2026-09;canonical-macro-contexts-2026-09;canonical-native-declaration-bridge-publication-2026-09;native-resolution-reference-indirection-provenance-2026-09;native-resolution-let-initialization-2026-09;native-resolution-exact-import-demand-targets-2026-09;native-resolution-generic-argument-type-syntax-2026-09;native-resolution-wrapper-payload-projection-and-unwraps-2026-09;native-resolution-block-local-cfg-route-binders-2026-09;native-resolution-path-prefix-and-field-chain-occurrences-2026-09;native-resolution-qualified-type-projection-references-2026-09;native-resolution-detached-crate-module-trees-2026-09;native-resolution-enum-variant-members-2026-09;canonical-local-field-source-projections-2026-09;native-resolution-qualified-value-projections-2026-09;native-resolution-producer-reference-enumeration-b3-2026-09;native-resolution-census-ch-lexical-import-bindings-2026-09;native-resolution-selected-cfg-activation-2026-09;native-resolution-scoped-single-name-imports-and-serde-helpers-2026-09;native-resolution-trait-impl-bodies-ty-a-2026-09;native-resolution-type-alias-frontiers-ty-b-2026-09;native-resolution-associated-types-ty-c-2026-09;native-resolution-trait-bound-receivers-ty-d-2026-09-r2;native-resolution-macro-matcher-replay-mc-a-2026-09;native-resolution-macro-routes-mc-canonical-inputs-2026-09;native-resolution-include-splice-scopes-and-macros-mc-b-2026-09;transfer-owned-type-identity-observations-2026-09-13;native-resolution-enum-constructor-members-2026-09;native-resolution-terminal-prefix-qualifiers-ec-2026-09;native-resolution-enum-runtime-receivers-ec-2026-09;native-resolution-expression-name-focus-ec-2026-09;native-resolution-explicit-module-anchor-preservation-ec-2026-09;native-resolution-macro-callee-prefix-preservation-ec-2026-09;native-resolution-compound-member-receiver-enumeration-2026-09-13;native-resolution-initializer-field-reference-enumeration-2026-09-13;native-resolution-pattern-path-and-field-enumeration-2026-09-13;native-resolution-compound-type-operand-enumeration-2026-09-13;native-resolution-use-module-prefix-enumeration-2026-09-13;native-resolution-macro-use-module-body-enumeration-2026-09-13;native-resolution-literal-receiver-reference-enumeration-2026-09-13;native-resolution-unified-pending-receivers-reconciliation-2026-09-13;rust-crate-row-schema-cr-r8-1-2026-09;rust-crate-reconcile-cr-r8-2-2026-09;rust-crate-derivation-cr-r8-3-2026-09;rust-single-name-import-binder-cr-2026-09;rust-source-visibility-cr-2026-09;rust-conditional-module-definition-sites-cr-2026-09;rust-signature-source-links-cr-2026-09;rust-crate-target-dependencies-cr-2026-09;rust-canonical-visibility-evidence-cr-2026-09;rust-lexical-macro-access-cr-2026-09;rust-crate-blob-repair-cr-2026-09;rust-crate-held-blob-repair-cr-2026-09;rust-crate-module-sources-and-scoped-imports-cr-2026-09-13;rust-crate-glob-reexport-subtype-cr-2026-09-13;tuple-positional-field-receivers-2026-09-13;tuple-field-empty-name-anchors-2026-09-13;macro-fragment-source-node-identity-2026-09-13;rust-crate-public-use-binders-fw-2026-09-13;rust-crate-reexport-alias-identity-fw-2026-09-13;rust-crate-transitive-import-namespaces-fw-2026-09-13;rust-crate-inline-declaration-names-fw-2026-09-13;rust-crate-open-export-inventory-fw-2026-09-13;rust-crate-file-naming-fw-2026-09-13;rust-crate-local-reexport-inventory-routes-fw-2026-09-13;rust-crate-unknown-export-activation-fw-2026-09-13;rust-crate-2015-explicit-self-routes-fw-2026-09-13;rust-crate-import-placement-keys-fw-2026-09-13;rust-crate-canonical-restricted-visibility-fw-2026-09-13;rust-crate-external-import-gap-classification-fw-2026-09-13;rust-crate-external-bare-import-gap-fw-2026-09-13;rust-enum-export-containers-v1;native-resolution-tier-1-discovery-headers-li3-2026-09-14;native-resolution-root-demand-headers-rv-2026-09;native-resolution-crate-import-reexport-namespaces-rv-2026-09;native-resolution-sparse-reverse-lookup-identities-rv-2026-09;rust-crate-relative-import-roots-rv-2026-09;rust-crate-import-placement-key-rv-2026-09;root-path-route-segments-rv-2026-09;rust-crate-root-reference-routes-rv-2026-09",
+    ";rust-crate-per-blob-declaration-candidates-rc-2026-09-14;rust-crate-import-head-staging-rc-2026-09-14;native-resolution-dense-rekey-source-identities-dg-2026-09-14;native-resolution-inline-cfg-module-placement-mr-2026-09-14;native-resolution-tier-2-families-not-persisted-li4-2026-09-15;native-resolution-tier-1-root-routes-li5-2026-09-15;native-resolution-definition-less-macro-argument-enumeration-mc2-2026-09-15;native-resolution-self-receiver-value-reference-g6-2026-09-16;native-resolution-struct-literal-let-initializer-dc-2026-09-16;native-resolution-block-local-item-scopes-pr-2026-09-17;native-resolution-member-bodies-and-item-macro-arguments-pm-2026-09-17;m8-batch-one-self-root-routes-anchors-derive-surface-lifetime-args-initializers-root-scopes-2026-09-21;m8-batch-two-conditional-binder-sites-cfg-inline-module-exports-2026-09-22;m8-batch-three-trait-body-self-sites-open-member-surface-type-bindings-item-groups-2026-09-22;m8-batch-four-impl-declaration-rows-decided-macro-decorations-inline-modules-owning-traits-2026-09-24;capital-self-type-references-2026-09;primitive-spelled-impl-owners-2026-09;scoped-generated-rust-model-declarations-2026-09;attributed-impl-member-declarations-2026-09;rust-stack-graph-batch-five-macro-export-context-2771-2026-09-26;rust-method-values-enum-field-visibility-2771-2026-09-27;rust-attributed-member-owner-2771-2026-09-27;rust-self-constructor-binding-2771-2026-09-27;rust-conditional-file-module-exports-2771-2026-09-27;rust-inert-test-attributes-2771-2026-09-27;rust-alias-nominal-identity-2771-2026-09-27;rust-projection-outputs-unsafe-attributes-2771-2026-09-27;rust-import-anchor-occurrences-2771-2026-09-27;rust-function-signature-owners-2771-2026-09-27;rust-trait-signature-owners-2771-2026-09-27;rust-declaration-reference-owners-2771-2026-09-27;rust-shared-unit-type-identity-2771-2026-09-27;rust-impl-bound-and-turbofish-reference-owners-2771-2026-09-27;rust-computed-receiver-members-enumerated-3764-2026-09-29;rust-struct-constructor-root-exports-3746-2026-09;rust-struct-pattern-variant-field-owner-3746-2026-09;rust-unit-self-value-identity-3746-2026-09-29;rust-unwrapped-member-receivers-3746-2026-09-29;rust-u1-3746-producer-2026-09-29;rust-u1-3746-parenthesized-types-2026-09-29;rust-impl-subject-frontier-resolution-gap-3746-2026-09-29;rust-tt-binding-runs-3746-2026-09-29;rust-attributed-inline-module-macros-3746-2026-09-29;rust-tt-static-call-facts-3746-2026-09-29;rust-tt-transcriber-output-proof-3746-2026-09-30;rust-closure-parameter-declared-types-3746-2026-09-30;rust-impl-generic-parameter-owner-c-2026-09-30;rust-macro-scope-f-3746-2026-09-30;rust-u2-bare-transcriber-references-matches-pattern-2026-09-30-a;rust-generic-alias-target-identity-3746-2026-09-30;rust-unindexed-macro-argument-enumeration-restored-2026-09-30-a;rust-unindexed-matches-refutable-patterns-2026-09-30-a"
 );
 
 #[cfg(test)]
@@ -1082,7 +1376,7 @@ lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09;php-imported-type-names-2026-09;php-per-statement-namespace-scope-2026-09"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08;php-callable-modifier-metadata-2026-09;php-imported-type-names-2026-09;php-per-statement-namespace-scope-2026-09;canonical-primary-source-ownership-2026-09"
 );
 
 #[cfg(test)]
@@ -1115,7 +1409,7 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
 // Salt bumped again (#2082): a `package object p` body is now a package scope,
 // so the package prefixes in scope at a byte include `<clause>.p`. Two
 // persisted facts follow that value: an import declared inside a package
-// object records those prefixes in `import_lexical_prefixes`, and an anonymous
+// object records those prefixes in `source_import_prefixes`, and an anonymous
 // instance declared there records them in its supertype lookup path. A warm
 // workspace holds both without the package object's own package, so a
 // relative import and a supertype written inside a package object resolve
@@ -1155,7 +1449,7 @@ lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08;declaration-type-parameter-arity-2026-09;scala-type-alias-type-identity-2026-09;callable-modifiers-parameter-types-and-trait-marker-2026-09;recovered-type-header-one-based-range-2026-09;named-given-declarations-2026-09;abstract-val-var-declarations-export-selector-3499-2026-09"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08;same-package-type-identifier-facts-2026-08;top-level-extension-declarations-2026-08;declaration-type-parameter-arity-2026-09;scala-type-alias-type-identity-2026-09;callable-modifiers-parameter-types-and-trait-marker-2026-09;canonical-primary-source-ownership-2026-09;recovered-type-header-one-based-range-2026-09;named-given-declarations-2026-09;abstract-val-var-declarations-export-selector-3499-2026-09"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -1189,6 +1483,8 @@ lang_epoch!(
 // per type. Analyzer-level classification propagates that evidence to derived
 // test classes, so prior rows lack both inputs even when `contains_tests` for
 // the base file itself was true.
+// Salt bumped again: canonical using targets now ignore tree-sitter comment
+// extras. Previously sealed imports can omit valid comment-separated directives.
 // Salt bumped again (#1651): a type declaration's signature metadata now
 // records the declaration's own type-parameter list, which
 // `canonical_identity_of` projects as the identity's generic arity. A warm row
@@ -1221,7 +1517,7 @@ lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08;declaration-type-parameter-arity-2026-09;callable-parameter-types-and-interface-marker-2026-09;callable-override-modifier-2026-09;brokk-csharp-grammar-0.23.5-2026-09;static-local-function-grammar-0.23.6-2026-09;generic-attribute-shorthand-identity-2026-09;recovered-type-member-ownership-2026-09;contextual-partial-required-grammar-0.23.7-2026-09"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08;structured-csharp-runnable-test-classification-2026-08;csharp-inherited-test-classification-2026-08;declaration-type-parameter-arity-2026-09;callable-parameter-types-and-interface-marker-2026-09;callable-override-modifier-2026-09;comment-aware-canonical-using-targets-2026-09;brokk-csharp-grammar-0.23.5-2026-09;static-local-function-grammar-0.23.6-2026-09;generic-attribute-shorthand-identity-2026-09;recovered-type-member-ownership-2026-09;contextual-partial-required-grammar-0.23.7-2026-09"
 );
 
 #[cfg(test)]
@@ -1258,7 +1554,7 @@ lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08;ruby-callable-modifier-metadata-2026-09;ruby-constant-receiver-value-kind-2026-09"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08;ruby-callable-modifier-metadata-2026-09;canonical-ruby-primary-load-runtime-source-2026-09-static-loads;ruby-constant-receiver-value-kind-2026-09"
 );
 // The live grammar fingerprint does not include parser tables. Keep the exact
 // Kotlin crate release in the salt so parser-only grammar changes cannot reuse
@@ -1319,7 +1615,7 @@ lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-call-binding-constructor-identity-2026-09;kotlin-callable-modifier-metadata-2026-09"
+    "brokk-tree-sitter-kotlin-0.4.6-2026-09;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08;declaration-type-parameter-arity-2026-09;kotlin-type-alias-type-identity-2026-09;kotlin-coordinated-source-facts-parameter-names-enum-types-2026-09;kotlin-call-binding-constructor-identity-2026-09;kotlin-callable-modifier-metadata-2026-09"
 );
 
 #[cfg(test)]

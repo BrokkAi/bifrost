@@ -1,7 +1,7 @@
 use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support};
 use crate::analyzer::usages::candidates::find_default_candidates_within;
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::model::{FuzzyResult, UsageProofAuthority};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
     CandidateFileProvider, GraphUsageAnalyzer, PreparedUsageQuery, UsageScanScope,
@@ -51,8 +51,9 @@ pub(super) fn execute_graph_usage_query_in_scope(
 ) -> FuzzyResult {
     let cancellation = CancellationToken::default();
     let scan_scope = UsageScanScope::with_cancellation(candidate_files, &cancellation);
-    graph_strategy_find_usages(strategy, analyzer, overloads, &scan_scope, None, max_usages)
-        .into_fuzzy_result()
+    let outcome =
+        graph_strategy_find_usages(strategy, analyzer, overloads, &scan_scope, None, max_usages);
+    outcome.into_fuzzy_result()
 }
 
 /// A caller-supplied candidate-file predicate. Borrowing (`'a`) rather than
@@ -80,6 +81,9 @@ pub struct QueryResult {
     pub scanned_source_bytes: usize,
     pub candidate_files_sample: Option<CandidateFilesSample>,
     pub result: FuzzyResult,
+    /// The authority of the strategy that produced `result`, so a consumer can
+    /// read the proof tiers correctly without naming a language.
+    pub proof_authority: UsageProofAuthority,
     pub graph_failure: Option<crate::analyzer::usages::model::UsageAnalysisDiagnostic>,
 }
 
@@ -87,6 +91,16 @@ pub struct CandidateFilesSample {
     pub scanned: Vec<ProjectFile>,
     pub omitted: Vec<ProjectFile>,
     pub omitted_count: usize,
+}
+
+/// Scope and budget facts fixed before a graph scan and reported afterward.
+struct AdmittedUsageQuery {
+    candidate_files: HashSet<ProjectFile>,
+    candidate_files_truncated: bool,
+    candidate_files_budget_exhausted: bool,
+    source_bytes_truncated: bool,
+    scanned_source_bytes: usize,
+    candidate_files_sample: Option<CandidateFilesSample>,
 }
 
 /// The common reference engine.
@@ -237,6 +251,8 @@ impl<'a> ReferenceEngine<'a> {
                 scanned_source_bytes: 0,
                 candidate_files_sample: None,
                 result: FuzzyResult::empty_success(),
+                // No overloads means no target language and no strategy.
+                proof_authority: UsageProofAuthority::Legacy,
                 graph_failure: None,
             };
         }
@@ -337,60 +353,28 @@ impl<'a> ReferenceEngine<'a> {
         let candidate_files_sample =
             candidate_files_truncated.then(|| candidate_files_sample(&all_candidates, &candidates));
 
+        let admitted_query = AdmittedUsageQuery {
+            candidate_files: candidates,
+            candidate_files_truncated,
+            candidate_files_budget_exhausted,
+            source_bytes_truncated,
+            scanned_source_bytes,
+            candidate_files_sample,
+        };
+
         drop(_cand_scope);
-        let mut graph_failure = None;
-        let scan_scope = UsageScanScope::with_cancellation(&candidates, &self.cancellation);
+        let scan_scope =
+            UsageScanScope::with_cancellation(&admitted_query.candidate_files, &self.cancellation);
         let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
-        let result = match graph_find_usages(
+        let outcome = graph_find_usages(
             language_for_target(target),
             analyzer,
             overloads,
             &scan_scope,
             prepared.as_deref(),
             max_usages,
-        ) {
-            GraphUsageOutcome::Resolved(result) => result,
-            GraphUsageOutcome::FallbackSafe(diagnostic) => {
-                graph_failure = Some(diagnostic.clone());
-                FuzzyResult::Failure {
-                    fq_name: diagnostic.fq_name,
-                    reason_kind: diagnostic.reason_kind,
-                    reason: diagnostic.reason,
-                }
-            }
-            GraphUsageOutcome::TerminalFailure(diagnostic) => {
-                graph_failure = Some(diagnostic.clone());
-                FuzzyResult::Failure {
-                    fq_name: diagnostic.fq_name,
-                    reason_kind: diagnostic.reason_kind,
-                    reason: diagnostic.reason,
-                }
-            }
-        };
-        // The graph scan hands back whatever it accumulated before the token
-        // tripped. Those sites are real; only their exhaustiveness is in doubt,
-        // so report them alongside `Cancelled` rather than discarding them and
-        // letting a caller read the empty result as proven absence.
-        let cancelled = self.cancellation.is_cancelled();
-
-        QueryResult {
-            completion: if cancelled {
-                UsageQueryCompletion::Cancelled
-            } else if source_bytes_truncated {
-                UsageQueryCompletion::SourceBytesBudgetExhausted
-            } else if candidate_files_budget_exhausted {
-                UsageQueryCompletion::CandidateFilesBudgetExhausted
-            } else {
-                UsageQueryCompletion::Complete
-            },
-            candidate_files: candidates,
-            candidate_files_truncated,
-            source_bytes_truncated,
-            scanned_source_bytes,
-            candidate_files_sample,
-            result,
-            graph_failure,
-        }
+        );
+        finalize_graph_usage_query(outcome, &self.cancellation, admitted_query, strategy)
     }
 
     pub fn find_usages(
@@ -413,6 +397,58 @@ impl<'a> ReferenceEngine<'a> {
     }
 }
 
+fn finalize_graph_usage_query(
+    outcome: GraphUsageOutcome,
+    cancellation: &CancellationToken,
+    admitted_query: AdmittedUsageQuery,
+    strategy: Option<&dyn GraphUsageAnalyzer>,
+) -> QueryResult {
+    let mut graph_failure = None;
+    let result = match outcome {
+        GraphUsageOutcome::Resolved(result) => result,
+        GraphUsageOutcome::FallbackSafe(diagnostic) => {
+            graph_failure = Some(diagnostic.clone());
+            FuzzyResult::Failure {
+                fq_name: diagnostic.fq_name,
+                reason_kind: diagnostic.reason_kind,
+                reason: diagnostic.reason,
+            }
+        }
+        GraphUsageOutcome::TerminalFailure(diagnostic) => {
+            graph_failure = Some(diagnostic.clone());
+            FuzzyResult::Failure {
+                fq_name: diagnostic.fq_name,
+                reason_kind: diagnostic.reason_kind,
+                reason: diagnostic.reason,
+            }
+        }
+    };
+    // A cancelled graph scan may still have established individual hits. Keep
+    // those positives while marking the request's coverage incomplete.
+    QueryResult {
+        completion: if cancellation.is_cancelled() {
+            UsageQueryCompletion::Cancelled
+        } else if admitted_query.source_bytes_truncated {
+            UsageQueryCompletion::SourceBytesBudgetExhausted
+        } else if admitted_query.candidate_files_budget_exhausted {
+            UsageQueryCompletion::CandidateFilesBudgetExhausted
+        } else {
+            UsageQueryCompletion::Complete
+        },
+        candidate_files: admitted_query.candidate_files,
+        candidate_files_truncated: admitted_query.candidate_files_truncated,
+        source_bytes_truncated: admitted_query.source_bytes_truncated,
+        scanned_source_bytes: admitted_query.scanned_source_bytes,
+        candidate_files_sample: admitted_query.candidate_files_sample,
+        result,
+        proof_authority: strategy.map_or(
+            UsageProofAuthority::Legacy,
+            GraphUsageAnalyzer::proof_authority,
+        ),
+        graph_failure,
+    }
+}
+
 fn cancelled_query_result() -> QueryResult {
     QueryResult {
         completion: UsageQueryCompletion::Cancelled,
@@ -422,6 +458,8 @@ fn cancelled_query_result() -> QueryResult {
         scanned_source_bytes: 0,
         candidate_files_sample: None,
         result: FuzzyResult::empty_success(),
+        // A cancelled scan ran no strategy, so nothing certified this answer.
+        proof_authority: UsageProofAuthority::Legacy,
         graph_failure: None,
     }
 }
@@ -578,7 +616,10 @@ fn graph_find_usages(
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::{CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile};
+    use crate::analyzer::{
+        CodeUnitType, EmptyAnalyzer, FileSetProject, Language, Project, ProjectFile, RubyAnalyzer,
+    };
+    use crate::inline_project::InlineTestProject;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -669,85 +710,122 @@ mod tests {
         assert!(result.result.all_hits_including_imports().is_empty());
     }
 
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[test]
-    fn issue_1416_late_cancellation_keeps_the_hits_the_graph_scan_already_proved() {
-        // The graph scan returns what it accumulated before the token tripped.
-        // This used to be replaced wholesale by an empty success, so a caller
-        // read "0 usages" for a symbol the scan had already proved was used.
-        //
-        // `cancel_after_checks_for_test` counts `is_cancelled()` calls, and the
-        // number of those calls is fixed for a fixed fixture, so sweeping the
-        // count deterministically visits the late-cancellation window. Before
-        // the fix no count in the sweep could produce hits alongside Cancelled.
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonicalize temp dir");
-        std::fs::create_dir_all(root.join("src")).expect("create src");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"late\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
-        )
-        .expect("write manifest");
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub mod target;\npub mod caller;\n",
-        )
-        .expect("write lib");
-        std::fs::write(
-            root.join("src/target.rs"),
-            "pub fn collect_it() -> i32 {\n    1\n}\n",
-        )
-        .expect("write target");
-        let mut caller = String::from("use crate::target::collect_it;\n");
-        for index in 0..40 {
-            caller.push_str(&format!(
-                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
-            ));
-        }
-        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+    struct CancellingRubyGraphStrategy {
+        delegate: crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy,
+        cancellation: CancellationToken,
+    }
 
-        let project =
-            crate::analyzer::TestProject::new(root.clone(), crate::analyzer::Language::Rust);
-        let analyzer = crate::analyzer::RustAnalyzer::from_project(project);
-        let target_file = ProjectFile::new(root, "src/target.rs");
+    impl GraphUsageAnalyzer for CancellingRubyGraphStrategy {
+        fn find_graph_usages(
+            &self,
+            analyzer: &dyn IAnalyzer,
+            overloads: &[CodeUnit],
+            scan_scope: &UsageScanScope<'_>,
+            max_usages: usize,
+        ) -> GraphUsageOutcome {
+            let outcome = self
+                .delegate
+                .find_graph_usages(analyzer, overloads, scan_scope, max_usages);
+            self.cancellation.cancel();
+            outcome
+        }
+    }
+
+    #[test]
+    fn graph_cancellation_preserves_proven_hits_and_the_admitted_scope() {
+        let fixture = InlineTestProject::with_language(Language::Ruby)
+            .file(
+                "Gemfile",
+                "source \"https://rubygems.org\"\ngem \"rails\"\n",
+            )
+            .file(
+                "app/models/user.rb",
+                "class User\n  def self.build\n    new\n  end\nend\n",
+            )
+            .file(
+                "app/controllers/caller_controller.rb",
+                "class CallerController\n  def show\n    User.build\n  end\nend\n",
+            )
+            .build();
+        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
+        let target_file = fixture.file("app/models/user.rb");
         let target = analyzer
             .declarations(&target_file)
             .into_iter()
-            .find(|unit| unit.identifier() == "collect_it")
-            .expect("fixture declares collect_it");
+            .find(|unit| unit.identifier() == "build")
+            .expect("fixture declares User.build");
+        let candidate_files = HashSet::from_iter(analyzer.analyzed_files());
+        let strategy = crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy::new();
+        let complete_cancellation = CancellationToken::new();
 
-        let complete = UsageFinder::new().query(
+        let complete_outcome = graph_strategy_find_usages(
+            &strategy,
             &analyzer,
             std::slice::from_ref(&target),
-            DEFAULT_MAX_FILES,
+            &UsageScanScope::with_cancellation(&candidate_files, &complete_cancellation),
+            None,
             DEFAULT_MAX_USAGES,
         );
-        let complete_hits = complete.result.all_hits_including_imports().len();
+        let complete_hits = match &complete_outcome {
+            GraphUsageOutcome::Resolved(result) => result.all_hits_including_imports(),
+            other => panic!("uncancelled production resolver failed: {other:?}"),
+        };
+        assert!(
+            !complete_hits.is_empty(),
+            "fixture must prove User.build usage"
+        );
+        assert!(
+            complete_hits
+                .iter()
+                .all(|hit| hit.proof == crate::analyzer::usages::model::UsageProof::Proven)
+        );
+        let complete = finalize_graph_usage_query(
+            complete_outcome,
+            &complete_cancellation,
+            AdmittedUsageQuery {
+                candidate_files: candidate_files.clone(),
+                candidate_files_truncated: false,
+                candidate_files_budget_exhausted: false,
+                source_bytes_truncated: false,
+                scanned_source_bytes: 0,
+                candidate_files_sample: None,
+            },
+            Some(&strategy),
+        );
         assert_eq!(complete.completion, UsageQueryCompletion::Complete);
-        assert!(
-            complete_hits > 0,
-            "fixture must produce hits for the sweep to be meaningful"
+        assert_eq!(complete.proof_authority, UsageProofAuthority::Legacy);
+
+        let cancellation = CancellationToken::new();
+        let cancelling_strategy = CancellingRubyGraphStrategy {
+            delegate: strategy,
+            cancellation: cancellation.clone(),
+        };
+        let outcome = graph_strategy_find_usages(
+            &cancelling_strategy,
+            &analyzer,
+            std::slice::from_ref(&target),
+            &UsageScanScope::with_cancellation(&candidate_files, &cancellation),
+            None,
+            DEFAULT_MAX_USAGES,
+        );
+        let result = finalize_graph_usage_query(
+            outcome,
+            &cancellation,
+            AdmittedUsageQuery {
+                candidate_files: candidate_files.clone(),
+                candidate_files_truncated: false,
+                candidate_files_budget_exhausted: false,
+                source_bytes_truncated: false,
+                scanned_source_bytes: 0,
+                candidate_files_sample: None,
+            },
+            Some(&cancelling_strategy),
         );
 
-        let partial_with_hits = (1..=4_000).find_map(|checks| {
-            let result = UsageFinder::new()
-                .with_cancellation(CancellationToken::cancel_after_checks_for_test(checks))
-                .query(
-                    &analyzer,
-                    std::slice::from_ref(&target),
-                    DEFAULT_MAX_FILES,
-                    DEFAULT_MAX_USAGES,
-                );
-            let hits = result.result.all_hits_including_imports().len();
-            (result.completion == UsageQueryCompletion::Cancelled && hits > 0).then_some(hits)
-        });
-
-        let hits = partial_with_hits
-            .expect("a cancelled query must be able to report the hits the scan already proved");
-        assert!(
-            hits <= complete_hits,
-            "a partial result cannot exceed the complete one: {hits} > {complete_hits}"
-        );
+        assert_eq!(result.completion, UsageQueryCompletion::Cancelled);
+        assert_eq!(result.candidate_files, candidate_files);
+        assert_eq!(result.result.all_hits_including_imports(), complete_hits);
+        assert_eq!(result.proof_authority, UsageProofAuthority::Legacy);
     }
 
     fn write_fixture(root: &std::path::Path, files: &[(&str, &str)]) {

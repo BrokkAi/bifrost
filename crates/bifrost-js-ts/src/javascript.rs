@@ -14,10 +14,11 @@
 use crate::hierarchy::extract_js_supertypes;
 use crate::identifiers::collect_js_ts_identifiers;
 use crate::imports::{
-    parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
+    parse_commonjs_require_import_syntaxes_from_node, parse_es_import_syntaxes_from_node,
 };
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
+use crate::primary::JsTsParsedFile;
 use crate::syntax::js_program_is_external_module;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
@@ -36,13 +37,7 @@ use tree_sitter::{Node, Parser, Tree};
 /// and record every declaration, import statement and export the file spells.
 pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
-    let mut parsed = ParsedFile::new(String::new());
-    if flow_dialect_blocks_extraction(file, root, source) {
-        // Error recovery over Flow syntax invents declarations the file does
-        // not have -- a `boolean` field out of `{bailout: boolean}` -- so this
-        // file spells nothing this walk can honestly record (#1786).
-        return parsed;
-    }
+    let blocked = flow_dialect_blocks_extraction(file, root, source);
     let module = module_code_unit(file);
     let top_level_field_identity = if js_program_is_external_module(root, source) {
         file_scoped_field_identity
@@ -51,69 +46,139 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
     };
     let mut module_has_imports = false;
     let exported_roots = js_exported_binding_roots(root, source);
-
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
-        match child.kind() {
-            "import_statement" => {
-                module_has_imports = true;
-                parsed
-                    .imports
-                    .extend(parse_es_import_infos_from_node(child, source));
+    let mut assignment_state = JsAssignmentDeclarationState::new(
+        js_commonjs_exported_roots(root, source),
+        js_commonjs_exported_members(root, source),
+    );
+    crate::primary::parse_primary(
+        source,
+        tree,
+        &crate::structural::JAVASCRIPT_STRUCTURAL_SPEC,
+        |parsed, event| {
+            if blocked {
+                return;
             }
-            "expression_statement" => {
-                let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                if !imports.is_empty() {
-                    module_has_imports = true;
-                    parsed.imports.extend(imports);
+            match event {
+                crate::primary::PrimaryEvent::Enter {
+                    node: child,
+                    parent_kind,
+                    depth,
+                } => {
+                    if depth == 1 {
+                        match child.kind() {
+                            "import_statement" => {
+                                module_has_imports = true;
+                                parsed.add_import_syntaxes(parse_es_import_syntaxes_from_node(
+                                    child, source,
+                                ));
+                            }
+                            "expression_statement" => {
+                                let imports =
+                                    parse_commonjs_require_import_syntaxes_from_node(child, source);
+                                if !imports.is_empty() {
+                                    module_has_imports = true;
+                                    parsed.add_import_syntaxes(imports);
+                                }
+                            }
+                            "export_statement" => {
+                                visit_js_export(file, source, child, parsed);
+                            }
+                            "class_declaration" => {
+                                visit_js_class(file, source, child, None, parsed, false);
+                            }
+                            "function_declaration" => {
+                                visit_js_function(file, source, child, None, parsed, false);
+                            }
+                            "lexical_declaration" | "variable_declaration" => {
+                                let imports =
+                                    parse_commonjs_require_import_syntaxes_from_node(child, source);
+                                if !imports.is_empty() {
+                                    module_has_imports = true;
+                                    parsed.add_import_syntaxes(imports);
+                                }
+                                visit_js_variable_statement(
+                                    file,
+                                    source,
+                                    child,
+                                    None,
+                                    parsed,
+                                    false,
+                                    &exported_roots,
+                                    top_level_field_identity,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    register_js_assignment_declaration_name(child, source, &mut assignment_state);
+                    if let Some(scope) = js_assignment_scope_kind(child) {
+                        assignment_state.enter_scope(scope);
+                        register_js_assignment_parameters(child, source, &mut assignment_state);
+                    }
+                    register_js_assignment_variable(
+                        child,
+                        parent_kind,
+                        source,
+                        &mut assignment_state,
+                    );
+                    if child.kind() == "variable_declarator"
+                        && assignment_state.scopes.len() > 1
+                        && let Some(name) = child
+                            .child_by_field_name("name")
+                            .filter(|name| name.kind() == "identifier")
+                        && let Some(object) = child
+                            .child_by_field_name("value")
+                            .and_then(js_object_literal_value)
+                    {
+                        // Local literal keys have the same lookup-only surface as
+                        // properties established by local member assignments.
+                        // Do not publish the local binding as a global declaration.
+                        let name = node_text(name, source);
+                        let owner = CodeUnit::new_fq(
+                            file.clone(),
+                            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                            "",
+                            name,
+                            FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                        );
+                        visit_js_object_literal_properties_for_surface(
+                            file,
+                            source,
+                            object,
+                            &owner,
+                            &owner,
+                            parsed,
+                            JsAssignmentSymbolSurface::DefinitionLookupOnly,
+                        );
+                    }
+                    if child.kind() == "assignment_expression" {
+                        visit_js_assignment_expression(
+                            file,
+                            source,
+                            child,
+                            parsed,
+                            &assignment_state,
+                        );
+                    }
+                }
+                crate::primary::PrimaryEvent::Exit { node } => {
+                    if js_assignment_scope_kind(node).is_some() {
+                        assignment_state.exit_scope();
+                    }
+                    if node.id() == root.id() && module_has_imports {
+                        parsed.add_code_unit(module.clone(), root, source, None, None);
+                    }
                 }
             }
-            "export_statement" => {
-                visit_js_export(file, source, child, &mut parsed);
-            }
-            "class_declaration" => {
-                visit_js_class(file, source, child, None, &mut parsed, false);
-            }
-            "function_declaration" => {
-                visit_js_function(file, source, child, None, &mut parsed, false);
-            }
-            "lexical_declaration" | "variable_declaration" => {
-                let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                if !imports.is_empty() {
-                    module_has_imports = true;
-                    parsed.imports.extend(imports);
-                }
-                visit_js_variable_statement(
-                    file,
-                    source,
-                    child,
-                    None,
-                    &mut parsed,
-                    false,
-                    &exported_roots,
-                    top_level_field_identity,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    visit_js_assignment_declarations(file, source, root, &mut parsed);
-
-    if module_has_imports {
-        parsed.add_code_unit(module, root, source, None, None);
-    }
-
-    parsed
+        },
+    )
 }
 
 fn visit_js_export(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     if let Some(declaration) = node.child_by_field_name("declaration") {
         match declaration.kind() {
@@ -181,7 +246,7 @@ fn visit_js_default_export_value(
     source: &str,
     export: Node<'_>,
     value: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     match value.kind() {
         "arrow_function" | "function_expression" | "generator_function" => {
@@ -223,7 +288,7 @@ fn visit_js_default_export_function(
     source: &str,
     export: Node<'_>,
     function: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> CodeUnit {
     let code_unit = add_default_export_unit(
         file,
@@ -248,7 +313,7 @@ fn visit_js_default_export_class(
     source: &str,
     export: Node<'_>,
     class: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> CodeUnit {
     let code_unit = add_default_export_unit(
         file,
@@ -274,7 +339,7 @@ fn visit_js_class(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) -> Option<CodeUnit> {
     let definition = if node.kind() == "export_statement" {
@@ -334,7 +399,7 @@ fn visit_js_class_body(
     class: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let Some(body) = class.child_by_field_name("body") else {
         return;
@@ -358,7 +423,7 @@ fn visit_js_function(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) -> Option<CodeUnit> {
     let definition = if node.kind() == "export_statement" {
@@ -415,7 +480,7 @@ fn visit_js_method(
     node: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -459,7 +524,7 @@ fn visit_js_constructor_assigned_fields(
     constructor: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let mut stack = vec![constructor];
     while let Some(node) = stack.pop() {
@@ -518,7 +583,7 @@ fn visit_js_field(
     node: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     // `field_definition` names its property through `property`; the TSX
     // grammar's `public_field_definition`, which reads every `.jsx` file
@@ -560,7 +625,7 @@ fn visit_js_variable_statement(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
     exported_roots: &HashSet<String>,
     top_level_field_identity: TopLevelFieldIdentity,
@@ -646,9 +711,10 @@ fn visit_js_variable_statement(
         let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
         let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
+        parsed.add_named_code_unit(
             code_unit.clone(),
             range_node,
+            name_node,
             source,
             parent.cloned(),
             Some(top_level.clone()),
@@ -726,7 +792,7 @@ fn visit_js_object_literal_properties(
     object: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     visit_js_object_literal_properties_for_surface(
         file,
@@ -745,7 +811,7 @@ fn visit_js_object_literal_properties_for_surface(
     object: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     surface: JsAssignmentSymbolSurface,
 ) {
     let mut pending = vec![(object, parent.clone())];
@@ -799,7 +865,7 @@ fn visit_js_module_exports_object_literal_properties(
     file: &ProjectFile,
     source: &str,
     object: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     for index in 0..object.named_child_count() {
         let Some(child) = object.named_child(index) else {
@@ -1156,7 +1222,7 @@ fn visit_js_return_object_literal_properties(
     function: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let mut objects = Vec::new();
     collect_js_return_object_literals(function, function.id(), &mut objects);
@@ -1444,99 +1510,6 @@ impl JsAssignmentDeclarationState {
     }
 }
 
-fn visit_js_assignment_declarations(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-) {
-    let mut state = JsAssignmentDeclarationState::new(
-        js_commonjs_exported_roots(root, source),
-        js_commonjs_exported_members(root, source),
-    );
-    let mut stack = vec![JsAssignmentWalkFrame::Enter {
-        node: root,
-        parent_kind: None,
-    }];
-    let mut cursor = root.walk();
-
-    while let Some(frame) = stack.pop() {
-        match frame {
-            JsAssignmentWalkFrame::Enter { node, parent_kind } => {
-                register_js_assignment_declaration_name(node, source, &mut state);
-                let scope = js_assignment_scope_kind(node);
-                if let Some(scope) = scope {
-                    state.enter_scope(scope);
-                    register_js_assignment_parameters(node, source, &mut state);
-                }
-                register_js_assignment_variable(node, parent_kind, source, &mut state);
-                if node.kind() == "variable_declarator"
-                    && state.scopes.len() > 1
-                    && let Some(name) = node
-                        .child_by_field_name("name")
-                        .filter(|name| name.kind() == "identifier")
-                    && let Some(object) = node
-                        .child_by_field_name("value")
-                        .and_then(js_object_literal_value)
-                {
-                    // Local literal keys have the same lookup-only surface as
-                    // properties established by local member assignments.
-                    // Do not publish the local binding as a global declaration.
-                    let name = node_text(name, source);
-                    let owner = CodeUnit::new_fq(
-                        file.clone(),
-                        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
-                        "",
-                        name,
-                        FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
-                    );
-                    visit_js_object_literal_properties_for_surface(
-                        file,
-                        source,
-                        object,
-                        &owner,
-                        &owner,
-                        parsed,
-                        JsAssignmentSymbolSurface::DefinitionLookupOnly,
-                    );
-                }
-                if node.kind() == "assignment_expression" {
-                    visit_js_assignment_expression(file, source, node, parsed, &state);
-                }
-                if scope.is_some() {
-                    stack.push(JsAssignmentWalkFrame::Exit);
-                }
-                let node_kind = node.kind();
-                let first_child = stack.len();
-                stack.extend(node.named_children(&mut cursor).map(|child| {
-                    JsAssignmentWalkFrame::Enter {
-                        node: child,
-                        parent_kind: Some(node_kind),
-                    }
-                }));
-                stack[first_child..].reverse();
-            }
-            JsAssignmentWalkFrame::Exit => state.exit_scope(),
-        }
-    }
-}
-
-/// A pending node of the assignment walk, carrying its parent's kind.
-///
-/// The parent kind is carried rather than asked for: tree-sitter nodes hold no
-/// parent pointer, so `Node::parent` re-descends from the root and costs the
-/// node's absolute position in the tree. Asking it once per walked node is
-/// quadratic, which livelocked the workspace build on bun's 9MB
-/// 320,000-deep nested-`for` fixture (#2369). The traversal already knows every
-/// parent, so it hands the answer down.
-enum JsAssignmentWalkFrame<'tree> {
-    Enter {
-        node: Node<'tree>,
-        parent_kind: Option<&'static str>,
-    },
-    Exit,
-}
-
 fn js_assignment_scope_kind(node: Node<'_>) -> Option<JsAssignmentScopeKind> {
     match node.kind() {
         "function_declaration"
@@ -1674,7 +1647,7 @@ fn visit_js_assignment_expression(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     state: &JsAssignmentDeclarationState,
 ) {
     let Some(left) = node.child_by_field_name("left") else {
@@ -1745,7 +1718,7 @@ fn visit_js_assignment_expression(
 }
 
 fn add_js_assignment_code_unit(
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     surface: JsAssignmentSymbolSurface,
     code_unit: CodeUnit,
     node: Node<'_>,

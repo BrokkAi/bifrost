@@ -3,7 +3,8 @@ use super::super::ids::{
     SemanticLanguage, SemanticLocator, SemanticRole, WorkspaceMountId, WorkspaceRelativePath,
 };
 use super::super::ir::{
-    CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProcedureKind, ProofStatus,
+    ArgumentDomain, CallArgumentExpansion, CallSiteHandle, EvidenceCompleteness, ProcedureHandle,
+    ProcedureKind, ProofStatus, SemanticCallArgument,
 };
 use super::error::OracleContractError;
 use super::limits::OracleLimits;
@@ -538,7 +539,92 @@ pub struct UnmaterializedExternalTarget {
     /// against the selected external declaration. Model and dispatch
     /// applicability still require separate proofs.
     selected_jdk_artifact: Option<SemanticModelActivationEvidence>,
+    /// Exact PyPI distribution artifact selected for a Python external
+    /// declaration by resolver-owned installed-artifact and active-profile
+    /// evidence. Model and dispatch applicability still require separate
+    /// proofs.
+    selected_python_artifact: Option<SemanticModelActivationEvidence>,
+    selected_python_model_manifest_sha256: Option<Box<str>>,
+    /// Declaration formals from the checked Python defining binding. `arity`
+    /// stays the actual call arity used by the locator alias.
+    python_formal_call_shape: Option<PythonFormalCallShape>,
     locator: SemanticLocator,
+    python_formal_locator: Option<SemanticLocator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PythonFormalCallShape {
+    formal_parameter_count: u32,
+    required_parameter_count: u32,
+    // Formal ordinals for each actual, retained from structured call binding.
+    actual_to_formal: Option<Box<[u32]>>,
+}
+
+fn python_actual_to_formal_slots(
+    arguments: &[SemanticCallArgument],
+    slots: &[crate::analyzer::lexical_definitions::FormalParameterSlot],
+) -> Option<Box<[u32]>> {
+    use crate::analyzer::lexical_definitions::FormalParameterPassingMode;
+
+    if slots
+        .iter()
+        .any(|slot| slot.receiver || slot.variadic.is_some() || slot.unique_name().is_none())
+    {
+        return None;
+    }
+
+    let mut supplied = vec![false; slots.len()];
+    let mut actual_to_formal = Vec::with_capacity(arguments.len());
+    let mut next_positional = 0usize;
+    let mut saw_keyword = false;
+    for argument in arguments {
+        match (&argument.expansion, argument.keyword.as_deref()) {
+            (CallArgumentExpansion::Direct(ArgumentDomain::Positional), None) => {
+                if saw_keyword {
+                    return None;
+                }
+                while next_positional < slots.len()
+                    && slots[next_positional].passing_mode == FormalParameterPassingMode::NamedOnly
+                {
+                    next_positional += 1;
+                }
+                let slot = slots.get(next_positional)?;
+                if supplied[next_positional]
+                    || !matches!(
+                        slot.passing_mode,
+                        FormalParameterPassingMode::PositionalOnly
+                            | FormalParameterPassingMode::PositionalOrNamed
+                    )
+                {
+                    return None;
+                }
+                actual_to_formal
+                    .push(u32::try_from(next_positional).expect("checked formal count fits u32"));
+                supplied[next_positional] = true;
+                next_positional += 1;
+            }
+            (CallArgumentExpansion::Direct(ArgumentDomain::Keyword), Some(name)) => {
+                saw_keyword = true;
+                let mut matches = slots.iter().enumerate().filter(|(_, slot)| {
+                    slot.unique_name() == Some(name)
+                        && slot.passing_mode != FormalParameterPassingMode::PositionalOnly
+                });
+                let (index, _) = matches.next()?;
+                if matches.next().is_some() || supplied[index] {
+                    return None;
+                }
+                actual_to_formal.push(u32::try_from(index).expect("checked formal count fits u32"));
+                supplied[index] = true;
+            }
+            _ => return None,
+        }
+    }
+
+    slots
+        .iter()
+        .zip(supplied)
+        .all(|(slot, supplied)| supplied || slot.default_range.is_some())
+        .then(|| actual_to_formal.into_boxed_slice())
 }
 
 impl UnmaterializedExternalTarget {
@@ -583,6 +669,10 @@ impl UnmaterializedExternalTarget {
             resolver_owned_call_shape: false,
             normalized_static_owner,
             selected_jdk_artifact: None,
+            selected_python_artifact: None,
+            selected_python_model_manifest_sha256: None,
+            python_formal_call_shape: None,
+            python_formal_locator: None,
             locator,
         }
     }
@@ -614,6 +704,228 @@ impl UnmaterializedExternalTarget {
 
     pub fn selected_jdk_artifact(&self) -> Option<&SemanticModelActivationEvidence> {
         self.selected_jdk_artifact.as_ref()
+    }
+
+    pub fn selected_python_artifact(&self) -> Option<&SemanticModelActivationEvidence> {
+        self.selected_python_artifact.as_ref()
+    }
+
+    /// Copy Python applicability only from an exact call proof that was
+    /// promoted with defining-binding and provider evidence.
+    pub(in crate::analyzer::semantic) fn with_selected_python_artifact(
+        mut self,
+        proof: &crate::analyzer::usages::get_definition::ExactExternalCallProof,
+        arguments: &[SemanticCallArgument],
+    ) -> Option<Self> {
+        assert!(self.resolver_owned_call_shape);
+        assert_eq!(
+            self.language(),
+            SemanticLanguage::Standard(Language::Python)
+        );
+        let evidence = proof.python_runtime_artifact()?;
+        let slots = proof
+            .python_formal_slots()
+            .expect("promoted Python proof retains its checked formal slots");
+        let formal_parameter_count = u32::try_from(slots.len())
+            .expect("checked Python formal slot count fits the summary contract");
+        let required_parameter_count = u32::try_from(
+            slots
+                .iter()
+                .filter(|slot| slot.default_range.is_none())
+                .count(),
+        )
+        .expect("checked Python required slot count fits the summary contract");
+        let actual_to_formal = python_actual_to_formal_slots(arguments, slots);
+        // Qualify the lookup anchor with checked artifact evidence. Identical
+        // import spellings from different installations must coexist in a
+        // summary set without sharing its target key.
+        let mut artifact_key = b"bifrost.python-runtime-target.v2\0".to_vec();
+        for component in [
+            evidence.package.as_ref()?.name.as_bytes(),
+            evidence.artifact_sha256.as_ref()?.as_bytes(),
+            proof
+                .python_model_manifest_sha256()
+                .expect("promoted Python proof retains model applicability")
+                .as_bytes(),
+        ] {
+            artifact_key.extend_from_slice(&(component.len() as u64).to_le_bytes());
+            artifact_key.extend_from_slice(component);
+        }
+        let mut segments = self.locator.declaration().segments().to_vec();
+        segments.insert(
+            0,
+            DeclarationSegment::named(
+                super::super::ids::DeclarationSegmentKind::Namespace,
+                format!(
+                    "bifrost.python-artifact.{}",
+                    crate::analyzer::canonical_hash::lower_hex_string(
+                        &crate::analyzer::canonical_hash::sha256_bytes(&artifact_key)
+                    )
+                ),
+                self.locator.anchor(),
+                0,
+            )
+            .expect("artifact digest namespace is nonempty"),
+        );
+        self.locator = SemanticLocator::new(
+            self.locator.mount(),
+            self.locator.path().clone(),
+            self.locator.language(),
+            DeclarationLocator::new(segments).expect("qualified target preserves declaration"),
+            self.locator.role(),
+            self.locator.anchor(),
+        );
+        self.qualify_python_argument_mapping(formal_parameter_count, actual_to_formal.as_deref());
+        self.selected_python_artifact = Some(evidence.clone());
+        self.selected_python_model_manifest_sha256 =
+            proof.python_model_manifest_sha256().map(Into::into);
+        self.python_formal_call_shape = Some(PythonFormalCallShape {
+            formal_parameter_count,
+            required_parameter_count,
+            actual_to_formal,
+        });
+        Some(self)
+    }
+
+    fn qualify_python_argument_mapping(
+        &mut self,
+        formal_parameter_count: u32,
+        actual_to_formal: Option<&[u32]>,
+    ) {
+        self.python_formal_locator = Some(self.locator.clone());
+        if let Some(mapping) = actual_to_formal {
+            // Call-specific argument order is part of the target alias, while
+            // the shared summary remains anchored to its formal declaration.
+            let mut bytes = b"bifrost.python-call-mapping.v1\0".to_vec();
+            bytes.extend_from_slice(&formal_parameter_count.to_le_bytes());
+            for formal in mapping {
+                bytes.extend_from_slice(&formal.to_le_bytes());
+            }
+            let mut segments = self.locator.declaration().segments().to_vec();
+            segments.insert(
+                0,
+                DeclarationSegment::named(
+                    super::super::ids::DeclarationSegmentKind::Namespace,
+                    format!(
+                        "bifrost.python-call-mapping.{}",
+                        crate::analyzer::canonical_hash::lower_hex_string(
+                            &crate::analyzer::canonical_hash::sha256_bytes(&bytes)
+                        )
+                    ),
+                    self.locator.anchor(),
+                    0,
+                )
+                .expect("mapping digest namespace is nonempty"),
+            );
+            self.locator = SemanticLocator::new(
+                self.locator.mount(),
+                self.locator.path().clone(),
+                self.locator.language(),
+                DeclarationLocator::new(segments).expect("mapped target preserves declaration"),
+                self.locator.role(),
+                self.locator.anchor(),
+            );
+        }
+    }
+
+    pub(crate) fn python_formal_parameter_count(&self) -> Option<u32> {
+        self.python_formal_call_shape
+            .as_ref()
+            .map(|shape| shape.formal_parameter_count)
+    }
+
+    pub(crate) fn python_formal_call_shape_accepts_arity(&self, arity: u32) -> Option<bool> {
+        self.python_formal_call_shape.as_ref().map(|shape| {
+            // Every formal needs one actual value. Defaults with no supplied
+            // actual remain incomplete until default-value semantics exist.
+            arity == shape.formal_parameter_count
+                && arity >= shape.required_parameter_count
+                && shape.actual_to_formal.as_deref().is_some_and(|mapping| {
+                    mapping.len() == arity as usize
+                        && (0..arity).all(|formal| {
+                            mapping.iter().filter(|value| **value == formal).count() == 1
+                        })
+                })
+        })
+    }
+
+    pub(crate) fn python_actual_to_formal(&self) -> Option<&[u32]> {
+        self.python_formal_call_shape
+            .as_ref()
+            .and_then(|shape| shape.actual_to_formal.as_deref())
+    }
+
+    pub(crate) fn formal_summary_locator(&self, arity: u32) -> SemanticLocator {
+        let Some(formal) = &self.python_formal_locator else {
+            return self.locator_for_arity(arity);
+        };
+        let mut target = self.clone();
+        target.locator = formal.clone();
+        target.locator_for_arity(arity)
+    }
+
+    pub(crate) fn selected_python_model_manifest_sha256(&self) -> Option<&str> {
+        self.selected_python_model_manifest_sha256.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_python_model_manifest_for_test(mut self, manifest: &str) -> Self {
+        self.selected_python_model_manifest_sha256 = Some(manifest.into());
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_selected_python_for_test(
+        mut self,
+        evidence: SemanticModelActivationEvidence,
+    ) -> Self {
+        assert_eq!(
+            self.language(),
+            SemanticLanguage::Standard(Language::Python)
+        );
+        self.resolver_owned_call_shape = true;
+        self.selected_python_artifact = Some(evidence);
+        self.python_formal_call_shape = Some(PythonFormalCallShape {
+            formal_parameter_count: self.arity,
+            required_parameter_count: self.arity,
+            actual_to_formal: Some((0..self.arity).collect()),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_python_formal_shape_for_test(
+        mut self,
+        evidence: SemanticModelActivationEvidence,
+        formal_parameter_count: u32,
+        required_parameter_count: u32,
+    ) -> Self {
+        assert_eq!(
+            self.language(),
+            SemanticLanguage::Standard(Language::Python)
+        );
+        assert!(required_parameter_count <= formal_parameter_count);
+        self.resolver_owned_call_shape = true;
+        self.selected_python_artifact = Some(evidence);
+        self.python_formal_call_shape = Some(PythonFormalCallShape {
+            formal_parameter_count,
+            required_parameter_count,
+            actual_to_formal: Some((0..self.arity).collect()),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_python_mapping_for_test(mut self, mapping: Option<Vec<u32>>) -> Self {
+        let count = self
+            .python_formal_parameter_count()
+            .expect("test has formal shape");
+        self.qualify_python_argument_mapping(count, mapping.as_deref());
+        self.python_formal_call_shape
+            .as_mut()
+            .expect("test has formal shape")
+            .actual_to_formal = mapping.map(Vec::into_boxed_slice);
+        self
     }
 
     #[cfg(test)]
@@ -1432,6 +1744,91 @@ mod split_canonical_qualified_callee_tests {
         assert_eq!(
             split_canonical_qualified_callee("std::str::from_utf8", Language::Java),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_formal_binding_tests {
+    use super::*;
+    use crate::analyzer::Range;
+    use crate::analyzer::lexical_definitions::{FormalParameterPassingMode, FormalParameterSlot};
+    use crate::analyzer::semantic::ValueId;
+
+    fn slots() -> Vec<FormalParameterSlot> {
+        ["first", "second"]
+            .into_iter()
+            .map(|name| FormalParameterSlot {
+                names: vec![name.into()],
+                declaration_range: Range {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 0,
+                    end_line: 0,
+                },
+                receiver: false,
+                variadic: None,
+                passing_mode: FormalParameterPassingMode::PositionalOrNamed,
+                default_range: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn python_binding_retains_keyword_ordinals_and_rejects_unknown_or_duplicate_names() {
+        let slots = slots();
+        let first = ValueId::new(0);
+        let second = ValueId::new(1);
+        assert_eq!(
+            python_actual_to_formal_slots(
+                &[
+                    SemanticCallArgument::keyword(second, "second"),
+                    SemanticCallArgument::keyword(first, "first"),
+                ],
+                &slots
+            )
+            .as_deref(),
+            Some([1, 0].as_slice())
+        );
+        assert_eq!(
+            python_actual_to_formal_slots(
+                &[
+                    SemanticCallArgument::direct(first, ArgumentDomain::Positional),
+                    SemanticCallArgument::keyword(second, "second"),
+                ],
+                &slots
+            )
+            .as_deref(),
+            Some([0, 1].as_slice())
+        );
+        assert!(
+            python_actual_to_formal_slots(
+                &[
+                    SemanticCallArgument::keyword(first, "first"),
+                    SemanticCallArgument::keyword(second, "first"),
+                ],
+                &slots
+            )
+            .is_none()
+        );
+        assert!(
+            python_actual_to_formal_slots(
+                &[SemanticCallArgument::keyword(first, "unknown"),],
+                &slots
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn python_binding_requires_missing_formals_and_preserves_default_omission() {
+        let mut slots = slots();
+        let actual = SemanticCallArgument::direct(ValueId::new(0), ArgumentDomain::Positional);
+        assert!(python_actual_to_formal_slots(std::slice::from_ref(&actual), &slots).is_none());
+        slots[1].default_range = Some(slots[1].declaration_range);
+        assert_eq!(
+            python_actual_to_formal_slots(&[actual], &slots).as_deref(),
+            Some([0].as_slice())
         );
     }
 }

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { required } from "./cli-argument-helpers.mjs";
 import { normalizeReleaseTag } from "./release-version.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -110,13 +111,6 @@ function parseArgs(args) {
     index += 2;
   }
   return parsed;
-}
-
-function required(value, name) {
-  if (!value) {
-    throw new Error(`Missing required --${name}`);
-  }
-  return value;
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === scriptPath) {

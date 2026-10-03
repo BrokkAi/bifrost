@@ -32,10 +32,10 @@ use crate::analyzer::semantic::cfg_algorithms::{
 };
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::{
-    CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CallToReturnModel,
-    CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation,
-    ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, IcfgProvider,
-    LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
+    BindingOriginIndex, CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId,
+    CallToReturnModel, CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity,
+    ControlContinuation, ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, EvidenceCompleteness,
+    IcfgProvider, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
     OracleCallContext, ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPointHandle,
     ProgramPointId, ProofStatus, PropertyReachCertainty, PropertyReachingIncompleteReason,
     PropertyReachingLimits, PropertyReachingResult, SemanticArtifact, SemanticArtifactKey,
@@ -809,6 +809,10 @@ impl FlowStateDerivation {
     ///
     /// - A yield's abrupt resumption is an exceptional gap at the yield's
     ///   point, beside its suspension gap, and takes the same rule.
+    /// - An exceptional gap discharged as `NonRejoiningExceptionalExit` omits
+    ///   only a route that leaves the procedure without entering a handler or
+    ///   cleanup. No read of this procedure lies on that route, so it cannot
+    ///   change any read's initialization.
     ///
     /// Every other gap stays open. In particular, any other exceptional-control
     /// gap is not discharged here: some producers publish one for an operation
@@ -819,6 +823,11 @@ impl FlowStateDerivation {
         gap: &SemanticGap,
         binding: ValueId,
     ) -> bool {
+        if gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+        {
+            return true;
+        }
         match gap.capability {
             SemanticCapability::Captures => match gap.subject {
                 // A nested rebinding assigns the binding, so it cannot leave
@@ -1153,10 +1162,9 @@ impl FlowStateDerivation {
     /// Join an exact source loop to its body and own repeat edge, then ask
     /// whether the body can reach that edge before leaving this invocation of
     /// the loop. The source adapter must validate the prepared syntax against
-    /// this artifact before passing its structured AST spans. These exact
-    /// point joins are currently qualified by Java lowering; another
-    /// language needs its own source-to-control evidence before publishing
-    /// a positive `NoRepeat` claim.
+    /// this artifact before passing its structured AST spans. The header and
+    /// body come from the producer's loop site for the exact loop span, so a
+    /// language whose lowering authors no loop sites stays open.
     pub fn loop_body_reaches_own_repeat(
         &self,
         procedure: &ProcedureHandle,
@@ -1295,7 +1303,9 @@ impl FlowStateDerivation {
                 SemanticGapSubject::MemoryLocation(location) => semantics
                     .memory_location(location)
                     .and_then(|memory| match memory.kind {
-                        MemoryLocationKind::Field { .. } | MemoryLocationKind::Property { .. } => {
+                        MemoryLocationKind::Field { .. }
+                        | MemoryLocationKind::Property { .. }
+                        | MemoryLocationKind::Dereference { .. } => {
                             semantics.point(gap.point).and_then(|point| {
                                 let mut retains_access = false;
                                 let mut stored_values = Vec::new();
@@ -1567,6 +1577,35 @@ impl FlowStateDerivation {
         closure: &ExactLocalValueAliasClosure,
         read_event: usize,
     ) -> bool {
+        self.walk_local_alias_read_identity(procedure, closure, read_event, |_| {})
+    }
+
+    /// The ordered event chain for one exact read, using the same predecessor
+    /// walk and identity checks as [`Self::exact_local_alias_read_identity_is_closed`].
+    /// The allocation is owned only by callers that need to retain a witness.
+    pub fn exact_local_alias_read_identity_witness(
+        &self,
+        procedure: &ProcedureHandle,
+        closure: &ExactLocalValueAliasClosure,
+        read_event: usize,
+    ) -> Option<Vec<usize>> {
+        let mut reverse_witness = Vec::new();
+        self.walk_local_alias_read_identity(procedure, closure, read_event, |event| {
+            reverse_witness.push(event);
+        })
+        .then(|| {
+            reverse_witness.reverse();
+            reverse_witness
+        })
+    }
+
+    fn walk_local_alias_read_identity(
+        &self,
+        procedure: &ProcedureHandle,
+        closure: &ExactLocalValueAliasClosure,
+        read_event: usize,
+        mut witness_event: impl FnMut(usize),
+    ) -> bool {
         let procedure_artifact = Arc::downgrade(procedure.artifact());
         if closure.proof_open
             || self.procedure != procedure.id()
@@ -1584,6 +1623,7 @@ impl FlowStateDerivation {
                 return false;
             }
             debug_assert!(visited.len() <= self.events.len());
+            witness_event(current_read);
             let Some(&establishment) = closure.reaching_establishment_by_read.get(&current_read)
             else {
                 return false;
@@ -1613,6 +1653,7 @@ impl FlowStateDerivation {
             if !identity_closed {
                 return false;
             }
+            witness_event(establishment.event);
             let Some(&source_read) = closure
                 .copied_from_read_by_establishment
                 .get(&establishment.event)
@@ -2522,6 +2563,43 @@ impl FlowStateDerivation {
             && self.result_identity_is_closed(procedure, result_origins, relevant_values)
     }
 
+    /// Whether omitted control can introduce a repeat of a retained result
+    /// origin. Non-rejoining exceptional exits cannot return to that origin;
+    /// retained topology/order markers do not omit a source-local successor.
+    pub fn result_occurrence_control_is_complete(&self, procedure: &ProcedureHandle) -> bool {
+        self.result_observation_account_is_available(procedure)
+            && procedure.semantics().points().iter().all(|point| {
+                let evidence = procedure
+                    .semantics()
+                    .evidence_row(point.evidence)
+                    .expect("validated control point evidence");
+                matches!(evidence.proof, ProofStatus::Proven)
+                    && matches!(evidence.completeness, EvidenceCompleteness::Complete)
+            })
+            && procedure.semantics().control_edges().iter().all(|edge| {
+                let evidence = procedure
+                    .semantics()
+                    .evidence_row(edge.evidence)
+                    .expect("validated control edge evidence");
+                matches!(evidence.proof, ProofStatus::Proven)
+                    && matches!(evidence.completeness, EvidenceCompleteness::Complete)
+            })
+            && !self.completeness.reasons().iter().any(|reason| {
+                reason.blocks(FlowStateAxis::DominanceRelation)
+                    && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
+            })
+            && !procedure.semantics().gaps().iter().any(|gap| {
+                axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+                    && !matches!(
+                        gap.discharge,
+                        SemanticGapDischarge::RetainedControlTopology
+                            | SemanticGapDischarge::RetainedEvaluationOrder
+                            | SemanticGapDischarge::NonRejoiningExceptionalExit
+                            | SemanticGapDischarge::ExitOnlyProcedureCompletion
+                    )
+            })
+    }
+
     /// Whether retained flow and gaps completely enumerate observations,
     /// without conflating that question with binding-cell address escape.
     ///
@@ -2811,7 +2889,8 @@ fn result_observation_gap_is_relevant(
             .memory_location(location)
             .is_some_and(|memory| match memory.kind {
                 MemoryLocationKind::Field { base, .. }
-                | MemoryLocationKind::Property { base, .. } => {
+                | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Dereference { address: base } => {
                     relevant_values.contains(&base)
                         && !(retained_read_values.contains(&base)
                             && gap_point_retains_memory_access(semantics, gap, location))
@@ -2832,6 +2911,7 @@ fn result_observation_gap_is_relevant(
                         .is_some_and(|location| match location.kind {
                             MemoryLocationKind::Field { base, .. }
                             | MemoryLocationKind::Property { base, .. }
+                            | MemoryLocationKind::Dereference { address: base }
                             | MemoryLocationKind::Index { base, .. } => {
                                 relevant_values.contains(&base)
                             }
@@ -2891,6 +2971,7 @@ fn result_alias_identity_is_closed(
     relevant_values: &HashSet<ValueId>,
 ) -> bool {
     let address_aliases = address_alias_values(semantics, relevant_values);
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
     if address_aliases.is_empty() {
         return true;
     }
@@ -2906,7 +2987,14 @@ fn result_alias_identity_is_closed(
         return true;
     }
 
-    if indirect_address_write_points(semantics, &address_aliases).any(|write| {
+    if indirect_address_write_points(
+        semantics,
+        &address_aliases,
+        relevant_values,
+        &binding_origins,
+    )
+    .into_iter()
+    .any(|write| {
         result_origins.iter().any(|origin| {
             derivation.point_reaches(semantics, *origin, write, true)
                 && observations.iter().any(|observation| {
@@ -2948,6 +3036,7 @@ fn capture_gap_may_involve_bindings(
             .is_none_or(|location| match location.kind {
                 MemoryLocationKind::Field { base, .. }
                 | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Dereference { address: base }
                 | MemoryLocationKind::Index { base, .. } => relevant_values.contains(&base),
                 MemoryLocationKind::LexicalCell { binding } => relevant_values.contains(&binding),
                 // A child capture slot does not identify its parent value.
@@ -2991,9 +3080,14 @@ where
 {
     let relevant = std::iter::once(binding).collect::<HashSet<_>>();
     let address_aliases = address_alias_values(semantics, &relevant);
-    if indirect_address_write_points(semantics, &address_aliases).any(|write| {
-        point_reaches(graph, origin, write, true) && point_reaches(graph, write, observation, false)
-    }) {
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
+    if indirect_address_write_points(semantics, &address_aliases, &relevant, &binding_origins)
+        .into_iter()
+        .any(|write| {
+            point_reaches(graph, origin, write, true)
+                && point_reaches(graph, write, observation, false)
+        })
+    {
         return false;
     }
     if address_escape_points(semantics, &address_aliases, &[])
@@ -3015,19 +3109,62 @@ where
     })
 }
 
-fn indirect_address_write_points<'a>(
-    semantics: &'a ProcedureSemantics,
-    address_aliases: &'a HashSet<ValueId>,
-) -> impl Iterator<Item = ProgramPointId> + 'a {
-    semantics.gaps().iter().filter_map(|gap| {
-        (gap.capability == SemanticCapability::Assignments
-            && gap.impacts.contains(SemanticGapImpact::HeapWrite))
-        .then_some(gap.subject)
-        .and_then(|subject| match subject {
-            SemanticGapSubject::Value(value) if address_aliases.contains(&value) => Some(gap.point),
-            _ => None,
+fn indirect_address_write_points(
+    semantics: &ProcedureSemantics,
+    address_aliases: &HashSet<ValueId>,
+    relevant_values: &HashSet<ValueId>,
+    binding_origins: &BindingOriginIndex,
+) -> Vec<ProgramPointId> {
+    let mut writes = semantics
+        .gaps()
+        .iter()
+        .filter_map(|gap| {
+            (gap.capability == SemanticCapability::Assignments
+                && gap.impacts.contains(SemanticGapImpact::HeapWrite))
+            .then_some(gap.subject)
+            .and_then(|subject| match subject {
+                SemanticGapSubject::Value(value) if address_aliases.contains(&value) => {
+                    Some(gap.point)
+                }
+                _ => None,
+            })
         })
-    })
+        .collect::<Vec<_>>();
+    for point in semantics.points() {
+        for event in &point.events {
+            let address = match event.effect {
+                SemanticEffect::MemoryStore { location, .. } => semantics
+                    .memory_location(location)
+                    .and_then(|location| match location.kind {
+                        MemoryLocationKind::Dereference { address } => Some(address),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            let Some(address) = address else { continue };
+            if !address_aliases.contains(&address) {
+                continue;
+            }
+            let origins = binding_origins.addressed_binding_origins(address);
+            if origins.unique_binding().is_some() {
+                continue;
+            }
+            let may_bindings = if origins.is_complete() {
+                origins.bindings()
+            } else {
+                binding_origins.address_taken_binding_set()
+            };
+            if may_bindings
+                .iter()
+                .any(|binding| relevant_values.contains(binding))
+            {
+                writes.push(point.id);
+            }
+        }
+    }
+    writes.sort_unstable();
+    writes.dedup();
+    writes
 }
 
 pub(crate) fn address_escape_points(
@@ -3066,6 +3203,7 @@ pub(crate) fn address_escape_points(
                     }
                     MemoryLocationKind::Field { base, .. }
                     | MemoryLocationKind::Property { base, .. }
+                    | MemoryLocationKind::Dereference { address: base }
                     | MemoryLocationKind::Index { base, .. }
                         if address_aliases.contains(&base) =>
                     {
@@ -3076,6 +3214,7 @@ pub(crate) fn address_escape_points(
                     | MemoryLocationKind::LexicalCell { .. }
                     | MemoryLocationKind::Field { .. }
                     | MemoryLocationKind::Property { .. }
+                    | MemoryLocationKind::Dereference { .. }
                     | MemoryLocationKind::Index { .. } => None,
                 }),
         }
@@ -4203,6 +4342,7 @@ impl ModeledControlProjectionDerivation {
 
 /// One exact root- or dependency-procedure call whose complete dispatch set
 /// could become non-returning when all of its workspace callees do.
+#[derive(Clone)]
 struct WorkspaceNonreturnCall {
     call: CallSiteId,
     transfers: CallTransferSet,
@@ -4211,6 +4351,7 @@ struct WorkspaceNonreturnCall {
 /// Request-local control evidence for one procedure reached from the file
 /// being derived. Handles keep every dense ID scoped to its exact immutable
 /// artifact; nothing in this proof is persisted across requests.
+#[derive(Clone)]
 struct WorkspaceNonreturnProcedure {
     handle: ProcedureHandle,
     exact_call_resolutions: HashSet<CallSiteId>,
@@ -4252,6 +4393,22 @@ enum WorkspaceNonreturnDiscovery {
         callees: Vec<ProcedureHandle>,
     },
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceNonreturnDiscoveryKey {
+    procedure: ProcedureHandle,
+    root_artifact: bool,
+    provider: crate::analyzer::semantic::IcfgProviderBehaviorIdentity,
+}
+
+/// Complete procedure discoveries retained by one race-query cache. A hit
+/// saves the exact CFG and call-dispatch discovery for this procedure role and
+/// provider snapshot; a fresh fixed-point evaluation still runs per request.
+#[derive(Default)]
+pub(crate) struct WorkspaceNonreturnDiscoveryCache {
+    entries:
+        std::cell::RefCell<HashMap<WorkspaceNonreturnDiscoveryKey, WorkspaceNonreturnProcedure>>,
 }
 
 enum WorkspaceNonreturnInterruption {
@@ -4747,6 +4904,70 @@ fn discover_workspace_nonreturn_procedure(
     }
 }
 
+fn discover_workspace_nonreturn_procedure_with_cache(
+    provider: &WorkspaceIcfgProvider<'_>,
+    root_artifact: &Arc<SemanticArtifact>,
+    handle: ProcedureHandle,
+    semantic_budget: &mut SemanticBudget,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+    cache: &WorkspaceNonreturnDiscoveryCache,
+) -> WorkspaceNonreturnDiscovery {
+    if cancellation.is_cancelled() {
+        return WorkspaceNonreturnDiscovery::Cancelled;
+    }
+    let key = WorkspaceNonreturnDiscoveryKey {
+        root_artifact: Arc::ptr_eq(handle.artifact(), root_artifact),
+        provider: provider.behavior_identity(),
+        procedure: handle.clone(),
+    };
+    let cached = cache.entries.borrow().get(&key).cloned();
+    if let Some(procedure) = cached {
+        match semantic_budget.charge(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        }) {
+            Ok(()) if !cancellation.is_cancelled() => {
+                let callees = procedure
+                    .nonreturn_candidates
+                    .iter()
+                    .flat_map(|call| call.transfers.transfers.iter())
+                    .map(|transfer| transfer.callee.clone())
+                    .collect();
+                return WorkspaceNonreturnDiscovery::Complete { procedure, callees };
+            }
+            Ok(()) => return WorkspaceNonreturnDiscovery::Cancelled,
+            Err(exceeded) => {
+                return WorkspaceNonreturnDiscovery::Complete {
+                    procedure: WorkspaceNonreturnProcedure::incomplete(
+                        handle,
+                        format!(
+                            "workspace non-return discovery cache lookup exhausted its semantic budget: {exceeded}"
+                        ),
+                    ),
+                    callees: Vec::new(),
+                };
+            }
+        }
+    }
+
+    let discovery = discover_workspace_nonreturn_procedure(
+        provider,
+        root_artifact,
+        handle,
+        semantic_budget,
+        cfg_budget,
+        cancellation,
+    );
+    if let WorkspaceNonreturnDiscovery::Complete { procedure, .. } = &discovery
+        && procedure.incomplete_detail.is_none()
+        && !cancellation.is_cancelled()
+    {
+        cache.entries.borrow_mut().insert(key, procedure.clone());
+    }
+    discovery
+}
+
 fn normal_return_gap_is_discharged(
     semantics: &ProcedureSemantics,
     gap: &SemanticGap,
@@ -4955,6 +5176,7 @@ fn derive_workspace_nonreturn_projection(
         semantic_budget,
         cfg_budget,
         cancellation,
+        None,
     )
 }
 
@@ -5158,14 +5380,64 @@ pub fn procedure_continuation_projection(
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
 ) -> ProcedureContinuationProjection {
-    let mut derived = derive_nonreturn_projection(
+    let derived = derive_nonreturn_projection(
         provider,
         procedure.artifact(),
         vec![procedure.clone()],
         semantic_budget,
         cfg_budget,
         cancellation,
+        None,
     );
+    continuation_projection_from_derivation(procedure, derived, cancellation)
+}
+
+/// Derive or reuse a complete continuation projection in the caller's
+/// one-query cache. The procedure handle names the exact materialization and
+/// the provider identity includes workspace content and the active model set.
+pub fn procedure_continuation_projection_with_cache(
+    provider: &WorkspaceIcfgProvider<'_>,
+    procedure: &ProcedureHandle,
+    semantic_budget: &mut SemanticBudget,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+    cache: &crate::concurrency::ConcurrencyQueryCache,
+) -> ProcedureContinuationProjection {
+    let provider_identity = provider.behavior_identity();
+    if !cancellation.is_cancelled()
+        && let Some(projection) = cache.continuation_projection(procedure, provider_identity)
+        && semantic_budget
+            .charge(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            })
+            .is_ok()
+        && !cancellation.is_cancelled()
+    {
+        return projection;
+    }
+
+    let derived = derive_nonreturn_projection(
+        provider,
+        procedure.artifact(),
+        vec![procedure.clone()],
+        semantic_budget,
+        cfg_budget,
+        cancellation,
+        Some(cache),
+    );
+    let projection = continuation_projection_from_derivation(procedure, derived, cancellation);
+    if projection.reasons().is_empty() && !cancellation.is_cancelled() {
+        cache.retain_continuation_projection(procedure, provider_identity, projection.clone());
+    }
+    projection
+}
+
+fn continuation_projection_from_derivation(
+    procedure: &ProcedureHandle,
+    mut derived: ModeledControlProjectionDerivation,
+    cancellation: &CancellationToken,
+) -> ProcedureContinuationProjection {
     let mut reasons = derived.file_reasons;
     reasons.extend(
         derived
@@ -5198,6 +5470,7 @@ fn derive_nonreturn_projection(
     semantic_budget: &mut SemanticBudget,
     cfg_budget: &mut CfgAlgorithmBudget,
     cancellation: &CancellationToken,
+    cache: Option<&crate::concurrency::ConcurrencyQueryCache>,
 ) -> ModeledControlProjectionDerivation {
     let mut scheduled = roots.iter().cloned().collect::<HashSet<_>>();
     let mut pending = roots.into_iter().collect::<VecDeque<_>>();
@@ -5206,14 +5479,27 @@ fn derive_nonreturn_projection(
         if cancellation.is_cancelled() {
             return ModeledControlProjectionDerivation::default();
         }
-        let (procedure, callees) = match discover_workspace_nonreturn_procedure(
-            provider,
-            artifact,
-            handle,
-            semantic_budget,
-            cfg_budget,
-            cancellation,
-        ) {
+        let discovery = if let Some(cache) = cache {
+            discover_workspace_nonreturn_procedure_with_cache(
+                provider,
+                artifact,
+                handle,
+                semantic_budget,
+                cfg_budget,
+                cancellation,
+                &cache.nonreturn_discoveries,
+            )
+        } else {
+            discover_workspace_nonreturn_procedure(
+                provider,
+                artifact,
+                handle,
+                semantic_budget,
+                cfg_budget,
+                cancellation,
+            )
+        };
+        let (procedure, callees) = match discovery {
             WorkspaceNonreturnDiscovery::Complete { procedure, callees } => (procedure, callees),
             WorkspaceNonreturnDiscovery::Cancelled => {
                 return ModeledControlProjectionDerivation::default();
@@ -6064,6 +6350,7 @@ impl EventBuilder<'_> {
         property_result: Option<&PropertyReachingResult>,
     ) {
         let bases = BindingBases::build(procedure);
+        let binding_origins = BindingOriginIndex::from_semantics(procedure);
         let property_stores = property_result.map_or_else(HashMap::default, |result| {
             result
                 .stores()
@@ -6192,6 +6479,29 @@ impl EventBuilder<'_> {
                         }) {
                             continue;
                         }
+                        (
+                            StateEventClass::Establish,
+                            FlowSubject::Binding { value: binding },
+                            *value,
+                        )
+                    }
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Dereference,
+                        location,
+                        value,
+                    } => {
+                        let Some(MemoryLocationKind::Dereference { address }) = procedure
+                            .memory_location(*location)
+                            .map(|location| &location.kind)
+                        else {
+                            continue;
+                        };
+                        let Some(binding) = binding_origins
+                            .addressed_binding_origins(*address)
+                            .unique_binding()
+                        else {
+                            continue;
+                        };
                         (
                             StateEventClass::Establish,
                             FlowSubject::Binding { value: binding },
@@ -6997,24 +7307,6 @@ where
     Ok(OverwrittenUnreadAnswer::Proven { replacement_events })
 }
 
-fn exact_points_for_span(
-    semantics: &ProcedureSemantics,
-    span: SourceSpan,
-    request: &mut CfgAlgorithmRequest<'_>,
-) -> Result<Vec<ProgramPointId>, CfgAlgorithmError<ProgramPointId>> {
-    let mut points = Vec::new();
-    for point in semantics.points() {
-        request.visit_pair()?;
-        let mapping = semantics
-            .source_mapping(point.source)
-            .expect("validated point has a source mapping");
-        if mapping.kind == SourceMappingKind::Exact && mapping.locator.anchor().span() == span {
-            points.push(point.id);
-        }
-    }
-    Ok(points)
-}
-
 fn loop_repeat_over_graph<G>(
     graph: &G,
     semantics: &ProcedureSemantics,
@@ -7064,95 +7356,42 @@ where
             });
         }
     }
-    let loop_points = exact_points_for_span(semantics, site.loop_span, request)?;
-    let body_points = exact_points_for_span(semantics, site.body_span, request)?;
-    let body = match site.kind {
-        LoopSourceKind::Do => None,
-        LoopSourceKind::While | LoopSourceKind::For => match body_points.as_slice() {
-            [body] => Some(*body),
-            _ => return Ok(join_open("body_entry")),
-        },
-    };
-    let header = match (site.kind, site.condition_span) {
-        (LoopSourceKind::While | LoopSourceKind::Do, _) => match loop_points.as_slice() {
-            [header] => *header,
-            _ => return Ok(join_open("loop_header")),
-        },
-        (LoopSourceKind::For, Some(condition)) => {
-            let candidates = exact_points_for_span(semantics, condition, request)?;
-            let mut headers = Vec::new();
-            for point in &candidates {
-                request.visit_pair()?;
-                for (edge, _) in graph.predecessors(*point) {
-                    request.visit_pair()?;
-                    if semantics
-                        .control_edge(edge)
-                        .is_some_and(|edge| edge.kind == ControlEdgeKind::LoopBack)
-                    {
-                        headers.push(*point);
-                        break;
-                    }
-                }
-            }
-            if headers.is_empty() && candidates.len() == 1 {
-                headers.push(candidates[0]);
-            }
-            if headers.is_empty() {
-                // A body that always exits may leave no back edge. The
-                // condition entry is then the unique exact condition point
-                // reached from this loop's lexical entry or initializer,
-                // before the condition's own evaluation graph.
-                for point in &candidates {
-                    request.visit_pair()?;
-                    for (edge, source) in graph.predecessors(*point) {
-                        request.visit_pair()?;
-                        let source_point = semantics
-                            .point(source)
-                            .expect("graph predecessor belongs to procedure");
-                        let source_mapping = semantics
-                            .source_mapping(source_point.source)
-                            .expect("validated point has a source mapping");
-                        let source_span = source_mapping.locator.anchor().span();
-                        let from_loop_entry = loop_points.contains(&source);
-                        let from_initializer = within_loop(source_span)
-                            && source_span.end_byte() <= condition.start_byte();
-                        if source_mapping.kind == SourceMappingKind::Exact
-                            && (from_loop_entry || from_initializer)
-                            && semantics
-                                .control_edge(edge)
-                                .is_some_and(|edge| edge.kind == ControlEdgeKind::Normal)
-                        {
-                            headers.push(*point);
-                            break;
-                        }
-                    }
-                }
-            }
-            match headers.as_slice() {
-                [header] => *header,
-                _ => return Ok(join_open("for_condition_header")),
-            }
+    // The producer attests each loop's iteration header and body entry; a
+    // span search cannot tell a loop point from a suite or label that shares
+    // its span, or from a condition point that each iteration re-enters.
+    let mut sites = Vec::new();
+    for loop_site in semantics.loop_sites() {
+        request.visit_pair()?;
+        let mapping = semantics
+            .source_mapping(loop_site.source)
+            .expect("validated loop site has a source mapping");
+        if mapping.kind == SourceMappingKind::Exact
+            && mapping.locator.anchor().span() == site.loop_span
+        {
+            sites.push(loop_site);
         }
-        (LoopSourceKind::For, None) => {
-            let body = body.expect("for loop has a body entry");
-            let mut candidates = Vec::new();
-            for point in loop_points {
-                request.visit_pair()?;
-                for (_, target) in graph.successors(point) {
-                    request.visit_pair()?;
-                    if target == body {
-                        candidates.push(point);
-                        break;
-                    }
-                }
-            }
-            match candidates.as_slice() {
-                [header] => *header,
-                _ => return Ok(join_open("for_unconditioned_header")),
-            }
-        }
+    }
+    let [loop_site] = sites.as_slice() else {
+        return Ok(join_open("loop_site"));
     };
-    let body = body.unwrap_or(header);
+    let header = loop_site.header;
+    let body = loop_site.body;
+    // The adapter's body span and the producer's body entry must name the
+    // same source. A lowering may enter a do body at the loop's own point.
+    let body_mapping = semantics
+        .source_mapping(
+            semantics
+                .point(body)
+                .expect("validated loop site body point exists")
+                .source,
+        )
+        .expect("validated point has a source mapping");
+    let body_span = body_mapping.locator.anchor().span();
+    let body_matches = body_span == site.body_span
+        || (site.kind == LoopSourceKind::Do && body_span == site.loop_span);
+    if body_mapping.kind != SourceMappingKind::Exact || !body_matches {
+        return Ok(join_open("body_entry"));
+    }
 
     let mut exit = None;
     let mut intentional_constant_false_do = false;
@@ -7780,7 +8019,8 @@ impl EvaluationDependence {
                         if let Some(location) = procedure.memory_location(*location) {
                             match &location.kind {
                                 MemoryLocationKind::Field { base, .. }
-                                | MemoryLocationKind::Property { base, .. } => {
+                                | MemoryLocationKind::Property { base, .. }
+                                | MemoryLocationKind::Dereference { address: base } => {
                                     record(*result, *base)
                                 }
                                 MemoryLocationKind::Index { base, index, .. } => {
@@ -15343,6 +15583,27 @@ func nonLocal(target *os.File, value holder) {
             .collect::<HashSet<_>>(),
             "direct and parenthesized local copies retain exact identity"
         );
+        let alias_read = closure
+            .reads
+            .iter()
+            .copied()
+            .find(|event| spelling(GO_EXACT_LOCAL_VALUE_ALIASES, aliases.event(*event)) == "alias")
+            .expect("parenthesized assignment reads the saved alias");
+        let witness = aliases
+            .exact_local_alias_read_identity_witness(&aliases_procedure, &closure, alias_read)
+            .expect("exact local copy retains its ordered witness");
+        let witness_establishments = witness
+            .iter()
+            .copied()
+            .map(|event| aliases.event(event))
+            .filter(|event| event.event_class == StateEventClass::Establish)
+            .map(|event| spelling(GO_EXACT_LOCAL_VALUE_ALIASES, event))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            witness_establishments,
+            ["file, _ := os.Open(\"aliases.xlsx\")", "alias := file"]
+        );
+        assert_eq!(witness.last(), Some(&alias_read));
         let returned_copy = closure
             .uncertain_reads
             .iter()

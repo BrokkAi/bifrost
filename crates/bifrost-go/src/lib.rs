@@ -27,5 +27,8 @@ pub mod imports;
 pub mod packages;
 pub mod parse;
 pub mod queries;
+mod resolution;
+pub mod source_facts;
+pub(crate) mod source_properties;
 pub mod structural;
 pub mod test_detection;

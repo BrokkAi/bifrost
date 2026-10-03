@@ -39,8 +39,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
     CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSyncMapOperation,
     CompiledTaskSpawnCondition, Completeness, PROCEDURE_SUMMARY_CONTRACT_VERSION,
-    ProcedureSummaryMatch, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition,
+    ProcedureSummaryMatch, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -263,6 +262,7 @@ impl std::error::Error for ProcedureSummaryBindingError {
 }
 
 struct SelectedUnmaterializedSummaryFamily {
+    payload_identity: usize,
     language: String,
     payload: Vec<CompiledProcedureSummary>,
     root_ids: HashSet<String>,
@@ -283,19 +283,14 @@ pub fn bind_active_unmaterialized_procedure_summaries(
 ) -> Result<Option<ExternalSemanticSummarySet>, ProcedureSummaryBindingError> {
     let mut families = HashMap::<usize, SelectedUnmaterializedSummaryFamily>::default();
     for target in targets {
-        let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
-            target.language().semantic_pack_label(),
-            target.owner_fqn(),
-            target.member(),
-            target.has_receiver(),
-            target.arity(),
-        ));
+        let matched = active.procedure_summaries_for_external_target(target);
         let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
             continue;
         };
         let family = families
             .entry(selected.payload.as_ptr() as usize)
             .or_insert_with(|| SelectedUnmaterializedSummaryFamily {
+                payload_identity: selected.payload.as_ptr() as usize,
                 language: selected.shard.manifest.language.clone(),
                 payload: selected.payload.to_vec(),
                 root_ids: HashSet::default(),
@@ -375,22 +370,16 @@ pub fn bind_active_unmaterialized_procedure_summaries(
             for target in targets.iter().filter(|target| {
                 target.language().semantic_pack_label() == family.language
                     && target.has_receiver() == summary.target.has_receiver
-                    && summary.target.accepts_parameter_count(target.arity())
                     && owner == target.owner_fqn()
                     && member == target.member()
             }) {
-                let matched =
-                    active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
-                        target.language().semantic_pack_label(),
-                        target.owner_fqn(),
-                        target.member(),
-                        target.has_receiver(),
-                        target.arity(),
-                    ));
+                let matched = active.procedure_summaries_for_external_target(target);
                 let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                     continue;
                 };
-                if selected.record.model_id == summary.model_id && selected.record.id == summary.id
+                if selected.payload.as_ptr() as usize == family.payload_identity
+                    && selected.record.model_id == summary.model_id
+                    && selected.record.id == summary.id
                 {
                     let binding =
                         selected
@@ -484,6 +473,13 @@ fn select_unmaterialized_flow_summary<'matched, 'model>(
     >,
     ProcedureSummaryBindingError,
 > {
+    if matched.applicability
+        == brokk_bifrost_analysis::analyzer::semantic_model::ProcedureSummaryApplicability::Incomplete
+    {
+        // Keep the unresolved call boundary and any partial findings. An
+        // existing model with incomplete applicability cannot close it.
+        return Ok(None);
+    }
     match matched.disposition {
         SemanticModelMatchDisposition::Empty if matched.records.is_empty() => Ok(None),
         SemanticModelMatchDisposition::Empty => {

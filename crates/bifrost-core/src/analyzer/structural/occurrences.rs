@@ -81,6 +81,18 @@ macro_rules! occurrence_roles {
                 }
             }
         }
+
+        impl crate::analyzer::structural::code::VocabularyCode for OccurrenceRole {
+            /// The declaration ordinal. `#[repr(u8)]` on the enum makes the
+            /// cast the ordinal itself.
+            fn code(self) -> u8 {
+                self as u8
+            }
+
+            fn from_code(code: u8) -> Option<OccurrenceRole> {
+                ALL_OCCURRENCE_ROLES.get(code as usize).copied()
+            }
+        }
     };
 }
 
@@ -118,12 +130,15 @@ impl fmt::Display for OccurrenceRole {
 }
 
 macro_rules! labelled_enum {
-    ($(#[$meta:meta])* $name:ident, $all:ident { $($variant:ident => $label:literal,)+ }) => {
+    ($(#[$meta:meta])* $name:ident, $all:ident {
+        $($(#[$variant_meta:meta])* $variant:ident => $label:literal,)+
+    }) => {
         $(#[$meta])*
+        #[repr(u8)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
-            $($variant,)+
+            $($(#[$variant_meta])* $variant,)+
         }
 
         pub const $all: &[$name] = &[$($name::$variant,)+];
@@ -144,6 +159,18 @@ macro_rules! labelled_enum {
 
             pub fn from_label(label: &str) -> Option<$name> {
                 $all.iter().copied().find(|value| value.label() == label)
+            }
+        }
+
+        impl crate::analyzer::structural::code::VocabularyCode for $name {
+            /// The declaration ordinal. `#[repr(u8)]` on the enum makes the
+            /// cast the ordinal itself.
+            fn code(self) -> u8 {
+                self as u8
+            }
+
+            fn from_code(code: u8) -> Option<$name> {
+                $all.get(code as usize).copied()
             }
         }
 

@@ -18,6 +18,10 @@ use tree_sitter::Tree;
 pub struct JavaAdapter;
 
 impl LanguageAdapter for JavaAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::java::source_publication::SOURCE_STORAGE)
+    }
+
     fn language(&self) -> Language {
         Language::Java
     }
@@ -69,5 +73,25 @@ impl LanguageAdapter for JavaAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&JAVA_COGNITIVE_CONFIG)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn declaration_visibility_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::source_facts::SOURCE_DECLARATION_VISIBILITY_VERSION)
+    }
+
+    fn java_type_constructor_facts_version(&self) -> Option<i64> {
+        Some(1)
+    }
+
+    fn java_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::java_facts::JAVA_SOURCE_FACTS_VERSION)
     }
 }

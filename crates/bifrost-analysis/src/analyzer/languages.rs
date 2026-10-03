@@ -11,6 +11,9 @@
 //! smaller than the plan's eventual one.
 
 use crate::analyzer::common::language_for_target;
+use crate::analyzer::loop_facts::LoopSyntax;
+use crate::analyzer::semantic::ProcedureKind;
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof,
@@ -32,9 +35,11 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentKind, joined_segments, segment_interner,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -70,18 +75,58 @@ pub(crate) struct LocalDeclarationBindingScope<'tree> {
     pub visibility: LocalDeclarationVisibility,
 }
 
+/// Physical source roles used by navigation after language-owned interpretation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclarationNavigationRole {
+    Declaration,
+    Definition,
+    Both,
+    Unknown,
+}
+
+impl DeclarationNavigationRole {
+    pub(crate) fn api_label(self) -> Option<&'static str> {
+        match self {
+            Self::Declaration => Some("declaration"),
+            Self::Definition => Some("definition"),
+            Self::Both | Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeclarationNavigationOccurrence {
+    pub range: Range,
+    pub role: DeclarationNavigationRole,
+}
 /// AST-level helper that returns the identifier introduced by one pattern node.
 pub(crate) type PatternBindingNameProvider =
     for<'tree> fn(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>;
+
+/// Syntax roles one language supplies for procedure-local source proofs:
+/// statement-entry assessment and loop repetition. Both enumerate syntax
+/// independently of the producer, so a statement or loop classified here
+/// without matching producer evidence stays open.
+#[derive(Clone, Copy)]
+pub(crate) struct ProcedureSyntaxRoles {
+    /// Classify an executable statement node; `None` for any other node.
+    pub statement_kind: fn(tree_sitter::Node<'_>) -> Option<&'static str>,
+    /// Classify a conditional loop whose repetition the loop proof can join
+    /// to control flow. Iteration loops (for-each) are not classified.
+    pub loop_site: for<'tree> fn(tree_sitter::Node<'tree>) -> Option<LoopSyntax<'tree>>,
+    /// Whether `node` is the syntax of a procedure of this kind.
+    pub procedure_matches: fn(ProcedureKind, tree_sitter::Node<'_>) -> bool,
+    /// Whether `node` starts code that belongs to another procedure.
+    pub nested_procedure: fn(tree_sitter::Node<'_>) -> bool,
+}
 
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
-    /// Classify one prepared syntax node as an executable statement owned by
-    /// this language. `None` means either that the node is not a statement or
-    /// that the language does not expose statement-entry assessment.
-    fn executable_statement_kind(&self, _node: tree_sitter::Node<'_>) -> Option<&'static str> {
+    /// The syntax roles procedure-local source proofs need for this language.
+    /// `None` means the language's lowering does not author statement entries.
+    fn procedure_syntax_roles(&self) -> Option<ProcedureSyntaxRoles> {
         None
     }
 
@@ -131,6 +176,58 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// The one reference-analysis plugin serving both target-directed and
     /// whole-workspace workloads for this language.
     fn reference_plugin(&self) -> ReferenceLanguagePlugin;
+
+    fn call_relation_provider(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_relations::CallRelationProvider> {
+        None
+    }
+
+    /// Refine proof for resolved source-call targets using language-owned
+    /// receiver evidence. The default keeps the resolver's proof unchanged.
+    fn refine_resolved_call_targets(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+        _site: &ExternalCalleeSite<'_>,
+        _targets: &mut [crate::analyzer::usages::call_relations::CallDispatchTarget],
+    ) {
+    }
+
+    fn rename_provider(&self) -> Option<&'static dyn crate::symbol_rename::RenameProvider> {
+        None
+    }
+
+    /// The builder of this language's whole-workspace selected inverse
+    /// reference index, or `None` when the language has no selected resolution
+    /// engine and its inverse edges are derived one declaration at a time.
+    ///
+    /// Registering a provider makes the selected index this language's only
+    /// inverse-edge authority for RQL `edges_of` and the policy edge asserts,
+    /// so those consumers report a build refusal as an incomplete inverse
+    /// axis rather than deriving the same question by the other route.
+    fn selected_inverse_reference_provider(
+        &self,
+    ) -> Option<
+        &'static dyn crate::analyzer::structural::reference_edges::SelectedInverseReferenceProvider,
+    > {
+        None
+    }
+
+    /// This language's reader of the macro rows its producer sealed into a
+    /// selected blob, or `None` when the language publishes no macro rows.
+    ///
+    /// Selected resolution replays macro invocations from persisted rows, and
+    /// the rows belong to the producing language, so the operation asks the
+    /// mount's support for this reader instead of calling a language module's
+    /// storage directly.
+    fn selected_macro_source_rows(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::store::resolution_operation::SelectedMacroSourceRows>
+    {
+        None
+    }
 
     /// This language's analyzer inside `analyzer`, viewed as a forward-query provider.
     /// Each support owns the downcast to its own concrete analyzer; `None` means the
@@ -236,6 +333,25 @@ pub(crate) trait LanguageSupport: Send + Sync {
         limit: usize,
     ) -> Option<LimitedQueryRows<Range>>;
 
+    /// Canonical physical occurrences for navigation. Missing required evidence is
+    /// `None`; languages without distinct physical roles expose unknown roles.
+    fn declaration_navigation_occurrences(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<Vec<DeclarationNavigationOccurrence>> {
+        Some(
+            analyzer
+                .ranges(unit)
+                .into_iter()
+                .map(|range| DeclarationNavigationOccurrence {
+                    range,
+                    role: DeclarationNavigationRole::Unknown,
+                })
+                .collect(),
+        )
+    }
+
     /// Separator between a package name and its parent. Only Go and C++ differ from the
     /// dotted default.
     fn package_separator(&self) -> &'static str {
@@ -260,6 +376,15 @@ pub(crate) trait LanguageSupport: Send + Sync {
         DeadCodeSupport::default()
     }
 
+    /// Whether a candidate requires the language's precise dead-code strategy.
+    fn dead_code_needs_precise_scan(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _candidate: &CodeUnit,
+    ) -> bool {
+        false
+    }
+
     /// Bounded structural receiver resolution, or `None` when receiver queries for this
     /// language take another route (Java runs a resolution session, JS/TS runs its own
     /// syntax-index path) or are unsupported entirely.
@@ -274,6 +399,22 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// interactive type lookup; Java and JS/TS take their other routes there too.
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         None
+    }
+
+    /// The native row-backed point resolver of a language whose production
+    /// routing has not flipped yet, reached only by the rollout probes. At the
+    /// flip it becomes the language's `structural_receiver` and this returns
+    /// `None` again.
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_rollout_points(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        None
+    }
+
+    /// Whether a workspace-relative path is a build configuration input this
+    /// language captures by exact bytes (for example go.mod or a Gradle build
+    /// file), for the selected configuration and its overlay guards.
+    fn is_configuration_input_path(&self, _path: &std::path::Path) -> bool {
+        false
     }
 
     /// Class-set type-propagation adapter for this language, or `None` when the
@@ -496,12 +637,6 @@ pub(crate) trait LanguageSupport: Send + Sync {
         false
     }
 
-    /// Build this language's lazily constructed usage indexes ahead of demand, if it has
-    /// any worth warming. Called for every language on a workspace whether or not the
-    /// workspace analyzes it, so an implementation resolves its own analyzer first and
-    /// does nothing when it is absent.
-    fn warm_usage_analysis(&self, _analyzer: &dyn IAnalyzer) {}
-
     /// Attach language-owned source scope to declarations emitted by semantic-model rules.
     /// The default leaves generated symbols unchanged.
     fn bind_generated_symbols(
@@ -603,6 +738,22 @@ impl EdgePassId {
 pub(crate) trait LanguageEdgePass: Send + Sync {
     fn id(&self) -> EdgePassId;
 
+    /// Check input authority even when unavailable declarations leave no roots.
+    /// None means no known failure (including an inapplicable language).
+    ///
+    /// `request_files` is the file set this request will resolve: the files a
+    /// rooted request named, or every analyzable file when it named none. A
+    /// pass whose authority is per file must answer about those files only, so
+    /// a rooted request is never made unavailable by a file it never named and
+    /// never pays a workspace-sized read for one.
+    fn input_failure(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _request_files: &[ProjectFile],
+    ) -> Option<LanguageEdgeFailure> {
+        None
+    }
+
     /// Whether an FQN-only edge can be a proven relation to a logical callable
     /// family even when no single physical overload is selected. Consumers
     /// retain every candidate endpoint and report the non-exact relation.
@@ -612,7 +763,7 @@ pub(crate) trait LanguageEdgePass: Send + Sync {
 
     /// Location-bearing edges for the `usage_graph` consumer. `None` when the workspace
     /// does not analyze this pass's languages; the consumer records nothing and reports
-    /// no diagnostic.
+    /// no diagnostic. An applicable pass that could not build reports `Unavailable`.
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites>;
 
     /// Reference-kind counts for the workspace-graph consumer, in whichever node
@@ -630,7 +781,7 @@ pub(crate) trait LanguageEdgePass: Send + Sync {
 #[derive(Clone, Copy)]
 pub(crate) struct ReferenceLanguagePlugin {
     strategy: &'static dyn GraphUsageAnalyzer,
-    edge_pass: Option<&'static dyn LanguageEdgePass>,
+    graph: LanguageGraphBackend,
 }
 
 impl ReferenceLanguagePlugin {
@@ -640,17 +791,88 @@ impl ReferenceLanguagePlugin {
     ) -> Self {
         Self {
             strategy,
-            edge_pass: Some(edge_pass),
+            graph: LanguageGraphBackend::Legacy(edge_pass),
+        }
+    }
+
+    pub(crate) const fn native(
+        strategy: &'static dyn GraphUsageAnalyzer,
+        provider: &'static dyn NativeWorkspaceGraphProvider,
+    ) -> Self {
+        Self {
+            strategy,
+            graph: LanguageGraphBackend::Native(provider),
         }
     }
 
     pub(crate) const fn target_strategy(self) -> &'static dyn GraphUsageAnalyzer {
         self.strategy
     }
+}
 
-    pub(crate) const fn edge_pass(self) -> Option<&'static dyn LanguageEdgePass> {
-        self.edge_pass
+/// A pass has exactly one graph authority. Native endpoints retain declaration
+/// identity instead of being converted back into legacy name-based edges.
+#[derive(Clone, Copy)]
+pub(crate) enum LanguageGraphBackend {
+    Legacy(&'static dyn LanguageEdgePass),
+    Native(&'static dyn NativeWorkspaceGraphProvider),
+}
+
+impl LanguageGraphBackend {
+    fn id(self) -> EdgePassId {
+        match self {
+            Self::Legacy(pass) => pass.id(),
+            Self::Native(provider) => provider.id(),
+        }
     }
+
+    /// The input-authority preflight of whichever backend holds this pass.
+    ///
+    /// Both graph consumers run this before building a catalog, because an
+    /// unavailable declaration catalog is empty rather than absent: without the
+    /// preflight a pass whose canonical facts could not be read reports a
+    /// complete graph with no edges. The question is the backend's, not the
+    /// legacy implementation's, so it is asked through the authority the
+    /// language actually registered.
+    pub(crate) fn input_failure(
+        self,
+        analyzer: &dyn IAnalyzer,
+        request_files: &[ProjectFile],
+    ) -> Option<LanguageEdgeFailure> {
+        match self {
+            Self::Legacy(pass) => pass.input_failure(analyzer, request_files),
+            Self::Native(provider) => provider.input_failure(analyzer, request_files),
+        }
+    }
+}
+
+pub(crate) trait NativeWorkspaceGraphProvider: Send + Sync {
+    fn id(&self) -> EdgePassId;
+
+    /// Check input authority even when unavailable declarations leave no roots.
+    /// None means no known failure (including an inapplicable language).
+    ///
+    /// `request_files` carries the same contract as
+    /// [`LanguageEdgePass::input_failure`]: it is the request's own file set,
+    /// and a per-file authority answers about those files alone.
+    fn input_failure(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _request_files: &[ProjectFile],
+    ) -> Option<LanguageEdgeFailure> {
+        None
+    }
+
+    /// An empty caller slice admits no sources. Dependency definitions remain
+    /// available, but only admitted callers may contribute outgoing edges.
+    fn project(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        admitted_callers: &[ProjectFile],
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome,
+    >;
 }
 
 /// Location-bearing edges in the node identity native to the language family.
@@ -659,6 +881,15 @@ impl ReferenceLanguagePlugin {
 pub(crate) enum LanguageEdgeSites {
     Fqn(UsageEdges),
     Scoped(UsageEdges<UsageNodeKey>),
+    Unavailable(LanguageEdgeFailure),
+}
+
+/// An applicable language pass could not obtain complete input facts. This is
+/// different from an inapplicable pass or a complete graph with no edges.
+#[derive(Debug)]
+pub(crate) struct LanguageEdgeFailure {
+    pub reason: &'static str,
+    pub files: Vec<ProjectFile>,
 }
 
 /// Reference-kind counts in this pass's node identity. JS/TS keys by `{file, fqn}` because
@@ -667,6 +898,7 @@ pub(crate) enum LanguageEdgeSites {
 pub(crate) enum LanguageEdgeWeights {
     Fqn(UsageEdgeWeights),
     Scoped(JsTsScopedUsageEdges),
+    Unavailable(LanguageEdgeFailure),
 }
 
 /// Inputs to a sites scan. `keep_file` drops out-of-scope caller files before parsing and
@@ -691,8 +923,45 @@ pub(crate) struct EdgeWeightScanCtx<'a> {
 pub(crate) struct EdgePassEntry {
     pub(crate) id: EdgePassId,
     pub(crate) ecosystem: UsageEcosystem,
-    pub(crate) pass: &'static dyn LanguageEdgePass,
+    pub(crate) languages: Vec<Language>,
+    pub(crate) backend: LanguageGraphBackend,
 }
+
+/// The graph authority every edge pass is registered with, as one digest.
+///
+/// Which implementation answers a language's reference, call, graph and
+/// dead-code questions is an engine input exactly like the grammar it parses
+/// with: two engines that disagree about it derive different answers from
+/// identical bytes. Every identity that must not survive a per-language flip --
+/// the workspace usage-graph cache key and the analysis epoch a recorded read
+/// set carries -- folds this value, so a flip rotates them all and there is no
+/// separate hand-bumped version to remember on the next one.
+///
+/// Derived from the live registry rather than from a constant, which is why
+/// [`graph_authority_digest_of`] takes the passes: the production digest reads
+/// [`edge_passes`], and a test can ask what the same registry would digest with
+/// one language on the other authority.
+pub(crate) fn graph_authority_digest() -> StableDigest {
+    static PRODUCTION: std::sync::OnceLock<StableDigest> = std::sync::OnceLock::new();
+    *PRODUCTION.get_or_init(|| graph_authority_digest_of(&edge_passes()))
+}
+
+pub(crate) fn graph_authority_digest_of(passes: &[EdgePassEntry]) -> StableDigest {
+    let mut hasher = CanonicalHasher::new(GRAPH_AUTHORITY_DOMAIN);
+    for entry in passes {
+        hasher.field(
+            entry.id.as_str(),
+            match entry.backend {
+                LanguageGraphBackend::Legacy(_) => b"legacy".as_slice(),
+                LanguageGraphBackend::Native(_) => b"native".as_slice(),
+            },
+        );
+    }
+    StableDigest::from_array(hasher.finish())
+}
+
+/// Domain for [`graph_authority_digest`].
+const GRAPH_AUTHORITY_DOMAIN: &[u8] = b"bifrost-language-graph-authority:v1";
 
 /// Every distinct edge pass, deduplicated by [`EdgePassId`] and ordered by
 /// [`EdgePassId::ALL`].
@@ -707,26 +976,40 @@ pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
         let mut entry: Option<EdgePassEntry> = None;
         for language in Language::ANALYZABLE {
             let support = language_support(language).expect("analyzable languages are registered");
-            let Some(pass) = support
-                .reference_plugin()
-                .edge_pass()
-                .filter(|pass| pass.id() == id)
-            else {
+            let backend = support.reference_plugin().graph;
+            if backend.id() != id {
                 continue;
-            };
-            match &entry {
+            }
+            match &mut entry {
                 None => {
                     entry = Some(EdgePassEntry {
                         id,
                         ecosystem: support.ecosystem(),
-                        pass,
+                        languages: vec![language],
+                        backend,
                     });
                 }
-                Some(entry) => assert_eq!(
-                    entry.ecosystem,
-                    support.ecosystem(),
-                    "{language:?} shares edge pass {id:?} but disagrees on its ecosystem"
-                ),
+                Some(entry) => {
+                    assert_eq!(
+                        entry.ecosystem,
+                        support.ecosystem(),
+                        "{language:?} shares edge pass {id:?} but disagrees on its ecosystem"
+                    );
+                    assert!(
+                        matches!(
+                            (entry.backend, backend),
+                            (
+                                LanguageGraphBackend::Legacy(_),
+                                LanguageGraphBackend::Legacy(_)
+                            ) | (
+                                LanguageGraphBackend::Native(_),
+                                LanguageGraphBackend::Native(_)
+                            )
+                        ),
+                        "languages sharing a pass must share its graph authority"
+                    );
+                    entry.languages.push(language);
+                }
             }
         }
         entries.push(entry.unwrap_or_else(|| panic!("no language owns edge pass {id:?}")));
@@ -1210,19 +1493,19 @@ mod tests {
     /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
     /// own behavior test instead.
     const CAPABILITY_MATRIX: &str = "\
-language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl  | tflow
-Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes | -
-Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes | -
-Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | yes | -
-JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | yes
-TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | yes
-Python     | Python               | Python | .   | -        | Python | yes  | -     | yes | yes
-Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes | -
-Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes | yes
-Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes | -
-CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes | -
-Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes | yes
-Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | -     | yes | -
+language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow
+Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | -
+Go         | Go                   | Go     | legacy | /   | yes      | Go     | yes  | -     | yes | -
+Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | -
+JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
+TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
+Python     | Python               | Python | legacy | .   | -        | Python | yes  | -     | yes | yes
+Rust       | Rust                 | Rust   | native | .   | yes      | Rust   | yes  | -     | yes | -
+Php        | Php                  | Php    | legacy | .   | yes      | Php    | yes  | -     | yes | yes
+Scala      | Jvm                  | Scala  | legacy | .   | yes      | Scala  | yes  | -     | yes | -
+CSharp     | CSharp               | CSharp | legacy | .   | yes      | CSharp | yes  | -     | yes | -
+Ruby       | Ruby                 | Ruby   | legacy | .   | yes      | Ruby   | yes  | -     | yes | yes
+Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | yes  | -     | yes | -
 ";
 
     fn mark(present: bool) -> &'static str {
@@ -1231,24 +1514,29 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
 
     fn capability_matrix() -> String {
         let mut rendered = String::from(
-            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl  | tflow\n",
+            "language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow\n",
         );
         for language in ANALYZABLE {
             let support = support_of(language);
             let dead_code = support.dead_code();
+            let backend = support.reference_plugin().graph;
+            let backend_name = match backend {
+                LanguageGraphBackend::Legacy(_) => "legacy",
+                LanguageGraphBackend::Native(_) => "native",
+            };
+            let bulk = match backend {
+                LanguageGraphBackend::Native(provider) => Some(provider.id()),
+                LanguageGraphBackend::Legacy(_) => dead_code.bulk.map(|bulk| bulk.id()),
+            };
             rendered.push_str(&format!(
-                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<3} | {}\n",
+                "{:<10} | {:<20} | {:<6} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<3} | {}\n",
                 format!("{language:?}"),
                 format!("{:?}", support.ecosystem()),
-                support
-                    .reference_plugin()
-                    .edge_pass()
-                    .map_or_else(|| "-".to_string(), |pass| format!("{:?}", pass.id())),
+                format!("{:?}", backend.id()),
+                backend_name,
                 support.package_separator(),
                 mark(dead_code.strategy.is_some()),
-                dead_code
-                    .bulk
-                    .map_or_else(|| "-".to_string(), |bulk| format!("{:?}", bulk.id())),
+                bulk.map_or_else(|| "-".to_string(), |bulk| format!("{bulk:?}")),
                 mark(support.structural_receiver().is_some()),
                 mark(support.receiver_facts().is_some()),
                 mark(support.highlight_query().is_some()),
@@ -1261,6 +1549,69 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
     #[test]
     fn the_capability_matrix_matches_its_snapshot() {
         assert_eq!(capability_matrix(), CAPABILITY_MATRIX);
+    }
+
+    /// Flipping one language's graph authority must move the digest that every
+    /// cross-engine identity folds.
+    ///
+    /// The workspace usage-graph cache key and the analysis epoch a recorded
+    /// read set carries both fold `graph_authority_digest`. Before it existed,
+    /// the only thing separating a pre-flip identity from a post-flip one was a
+    /// hand-bumped representation constant, so a derived artifact built by the
+    /// legacy Rust resolver and one built by the native engine shared an id
+    /// whenever the bytes were equal.
+    #[test]
+    fn the_graph_authority_digest_separates_a_flipped_language_from_production() {
+        struct StandInLegacyPass(EdgePassId);
+        impl LanguageEdgePass for StandInLegacyPass {
+            fn id(&self) -> EdgePassId {
+                self.0
+            }
+
+            fn edge_sites(&self, _ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+                unimplemented!("the authority digest reads registration, never a scan")
+            }
+
+            fn edge_weights(&self, _ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+                unimplemented!("the authority digest reads registration, never a scan")
+            }
+        }
+        static RUST_LEGACY_STAND_IN: StandInLegacyPass = StandInLegacyPass(EdgePassId::Rust);
+
+        let production = edge_passes();
+        assert!(
+            matches!(
+                production
+                    .iter()
+                    .find(|entry| entry.id == EdgePassId::Rust)
+                    .expect("Rust owns an edge pass")
+                    .backend,
+                LanguageGraphBackend::Native(_)
+            ),
+            "Rust is registered on the native graph authority"
+        );
+        assert_eq!(
+            graph_authority_digest_of(&production),
+            graph_authority_digest(),
+            "the production digest is the digest of the production registry"
+        );
+
+        let flipped: Vec<EdgePassEntry> = production
+            .into_iter()
+            .map(|entry| EdgePassEntry {
+                backend: if entry.id == EdgePassId::Rust {
+                    LanguageGraphBackend::Legacy(&RUST_LEGACY_STAND_IN)
+                } else {
+                    entry.backend
+                },
+                ..entry
+            })
+            .collect();
+        assert_ne!(
+            graph_authority_digest_of(&flipped),
+            graph_authority_digest(),
+            "one language on the other authority is a different engine"
+        );
     }
 
     /// Compiler exhaustiveness proves every `Language` has an arm; it cannot prove the
@@ -1331,11 +1682,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
     }
 
     fn edge_pass_id_of(language: Language) -> EdgePassId {
-        support_of(language)
-            .reference_plugin()
-            .edge_pass()
-            .unwrap_or_else(|| panic!("{language:?} must have an edge pass"))
-            .id()
+        support_of(language).reference_plugin().graph.id()
     }
 
     /// Pass cardinality is the whole reason [`EdgePassId`] exists: it is neither one per

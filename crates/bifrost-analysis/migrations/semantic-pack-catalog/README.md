@@ -38,3 +38,13 @@ Current history:
   Records the epoch for candidate selection. Historical rows remain stored;
   migration marks them current only if their canonical digest verifies against
   this binary's epoch. Unverified historical output is not activated.
+
+- `0010-shard-validation.sql`: records bounded shard validation certificates and
+  the verified generated-production view.
+- `0011-native-compatibility.sql`: keeps legacy engine ranges while allowing
+  schema-8 packs to store an absent range as NULL. The parent table and its
+  dependent view are rebuilt transactionally, preserving existing bytes, child
+  rows, indexes and mutation epochs. The caller disables foreign keys before
+  opening this transaction, checks every foreign key before committing, and
+  restores enforcement after success or rollback. Read-only older catalogs
+  return `ReadOnlySchema` instead of migrating.

@@ -730,6 +730,14 @@ fn generate_one(
     input: &BundleInput,
     spec: &PinnedPackSpec,
 ) -> Result<(ReleasePack, ReleasePackMeasurement, ReleasePackRejects), BundleError> {
+    if !matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel)
+        && spec.compatibility.bifrost.is_some()
+    {
+        return Err(BundleError::new(format!(
+            "generated pack spec {} targets native schema 8 and must omit compatibility.bifrost; remove the engine-version gate instead of stripping it during production",
+            input.spec_path.display()
+        )));
+    }
     // A release bundle is the durable extraction-accounting boundary. Retain
     // the interactive safety bound, but size it to the already-bounded source
     // set so every rejected declaration can be named in `rejects.json`.
@@ -3724,7 +3732,7 @@ mod tests {
             kind,
             artifact,
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: toolchain.to_owned(),
                     requirement: format!("={version}"),
@@ -3933,7 +3941,7 @@ mod tests {
                 container: None,
             },
             compatibility: Compatibility {
-                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: format!("={version}"),
@@ -4276,7 +4284,34 @@ mod tests {
         authored.schema_version = 2;
         authored.producer.name = generated.producer_name.clone();
         authored.producer.version = generated.producer_version.clone();
-        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        // Schema 2 predates positive callable-surface coverage claims. Preserve
+        // the validator's rejection for the near miss, then remove those
+        // current-schema claims to model a genuine schema-2 pack.
+        assert!(
+            compile_pack(&authored, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema.callable_surface_version")
+        );
+        let mut legacy_authored = authored;
+        // Reconstruct the schema-2 producer contract explicitly: unlike the
+        // schema-8 pinned request above, a legacy native pack requires an
+        // engine range. This synthetic downgrade is only used to prove stale
+        // generated output remains ineligible under the current cache epoch.
+        legacy_authored.compatibility.bifrost = Some(format!("={}", env!("CARGO_PKG_VERSION")));
+        let mut downgraded_callable_surfaces = 0;
+        for shard in &mut legacy_authored.shards {
+            if let AuthoredPayload::DeclarationFacts { types, .. } = &mut shard.payload {
+                for fact in types {
+                    if fact.callable_surface_complete {
+                        downgraded_callable_surfaces += 1;
+                    }
+                    fact.callable_surface_complete = false;
+                }
+            }
+        }
+        assert!(downgraded_callable_surfaces > 0);
+        let compiled = compile_pack(&legacy_authored, &CompilerOptions::default()).unwrap();
         let (manifest, semantic_digest, content_digest, shards) =
             write_compiled_assets(&first, &compiled).unwrap();
         let mut old_schema = first_bundle.index.clone();
@@ -4497,7 +4532,7 @@ mod tests {
                 container: None,
             },
             compatibility: Compatibility {
-                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: format!("={version}"),
@@ -4654,7 +4689,7 @@ mod tests {
                 container: None,
             },
             compatibility: Compatibility {
-                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                bifrost: None,
                 toolchains: vec![VersionConstraint {
                     name: "jdk".to_owned(),
                     requirement: format!("={version}"),
@@ -5813,6 +5848,16 @@ mod tests {
             )
         };
         let valid_json = serde_json::to_value(&valid).unwrap();
+
+        let mut pinned_engine_gate = valid_json.clone();
+        pinned_engine_gate["compatibility"]["bifrost"] = serde_json::json!("=0.12.0");
+        let error = generate_with("engine-gated-generated.json", &pinned_engine_gate).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must omit compatibility.bifrost"),
+            "{error}"
+        );
 
         let mut unknown_family = valid_json.clone();
         unknown_family["kind"] = serde_json::json!({ "artifact_kind": "nuget_package" });

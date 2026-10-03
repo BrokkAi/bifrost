@@ -19,6 +19,8 @@ pub(crate) mod providers;
 mod receiver_analysis_tests;
 pub(crate) mod receiver_facts;
 pub(crate) mod semantic;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 mod type_flow;
 use crate::analyzer::store::LimitedQueryRows;
@@ -654,6 +656,10 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
         Some(module_code_unit(file))
     }
@@ -770,6 +776,10 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn call_argument_conversion_prover(

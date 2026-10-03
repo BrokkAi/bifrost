@@ -47,6 +47,27 @@ pub enum UsageProof {
     Unproven,
 }
 
+/// Who produced a reference or call answer, and therefore whether its proof
+/// tiers are authoritative.
+///
+/// A native proof-tiered provider certifies the inventory it enumerated: a
+/// retained unproven site, an omitted candidate total, or an incompleteness
+/// diagnostic is a gap in a list that claims to be complete, so a consumer that
+/// must publish only proven evidence has to reject the answer instead of
+/// presenting the remainder as the whole truth. A legacy language resolver
+/// makes no such claim; unproven and editor-only candidates are the answer it
+/// has always returned, and dropping them would remove references its callers
+/// depend on.
+///
+/// [`Legacy`](Self::Legacy) is the default so that an answer no proof-tiered
+/// producer stamped is never mistaken for a certified inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UsageProofAuthority {
+    #[default]
+    Legacy,
+    Native,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UsageHitSurface {
     /// Agent/search/relevance/call-graph surfaces that should count only external
@@ -219,6 +240,20 @@ impl UsageHit {
         self.reference_kind = Some(kind);
         self
     }
+
+    /// Whether this hit belongs on the editor find-references / rename
+    /// surface: included by [`UsageHitKind::included_in`] for
+    /// [`UsageHitSurface::LspReferences`], and not a `Self`-type-alias
+    /// occurrence. A `Self`-type-alias hit names its owner through the
+    /// language's own alias for the enclosing type rather than by writing the
+    /// type's name, so the token is not the symbol's name: it must not be
+    /// listed as a reference, and it must not be rewritten by a rename.
+    /// Editor find-references and rename share this one check so the two
+    /// surfaces cannot drift apart on it again.
+    pub fn is_lsp_reference_site(&self) -> bool {
+        self.kind.included_in(UsageHitSurface::LspReferences)
+            && self.reference_kind != Some(ReferenceKind::SelfTypeAlias)
+    }
 }
 
 impl PartialEq for UsageHit {
@@ -249,6 +284,12 @@ pub enum ReferenceKind {
     FieldRead,
     FieldWrite,
     TypeReference,
+    /// An occurrence that names its owner through the language's own alias for
+    /// the enclosing type (Rust's capital `Self`) rather than by writing the
+    /// type's name. It is a type reference for graph and usage surfaces, and
+    /// the editor find-references surface excludes it: the token is not the
+    /// symbol's name, so rust-analyzer and the LSP contract do not list it.
+    SelfTypeAlias,
     StaticReference,
     SuperCall,
     Inheritance,
@@ -329,6 +370,15 @@ pub enum FuzzyResult {
         hits_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
         unproven_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
         unproven_total_by_overload: HashMap<CodeUnit, usize>,
+    },
+    /// Structured evidence is available, but semantic enumeration is incomplete.
+    /// Proven hits remain useful positives; missing hits cannot prove absence.
+    /// Execution cancellation and budgets are reported separately by the query.
+    Incomplete {
+        hits_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
+        unproven_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
+        unproven_total_by_overload: HashMap<CodeUnit, usize>,
+        diagnostics: Vec<UsageAnalysisDiagnostic>,
     },
     /// The analyzer/LLM could not produce a result for this query.
     Failure {
@@ -438,6 +488,9 @@ impl FuzzyResult {
             FuzzyResult::Success {
                 hits_by_overload, ..
             }
+            | FuzzyResult::Incomplete {
+                hits_by_overload, ..
+            }
             | FuzzyResult::Ambiguous {
                 hits_by_overload, ..
             } => hits_by_overload
@@ -450,9 +503,12 @@ impl FuzzyResult {
 
     /// Lossy adapter equivalent to `EitherUsagesOrError`. Returns `Ok(set)` for `Success` and
     /// `Ambiguous` (the latter filtered by [`CONFIDENCE_THRESHOLD`]) and `Err(message)` for
-    /// `Failure` / `TooManyCallsites`.
+    /// `Failure` / `TooManyCallsites` / `Incomplete`.
     pub fn into_either(self) -> Result<BTreeSet<UsageHit>, String> {
         match self {
+            FuzzyResult::Incomplete { diagnostics, .. } => {
+                Err(format!("Usage analysis is incomplete: {diagnostics:?}"))
+            }
             FuzzyResult::Failure { fq_name, .. } => {
                 Err(format!("No relevant usages found for symbol: {fq_name}"))
             }
@@ -791,6 +847,87 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn lsp_reference_sites_preserve_bindings_and_exclude_self_type_aliases() {
+        let reference = UsageHit::new(
+            project_file("lib.rs"),
+            1,
+            0,
+            6,
+            enclosing_unit(),
+            1.0,
+            "Widget",
+        );
+        for kind in [
+            UsageHitKind::Reference,
+            UsageHitKind::Import,
+            UsageHitKind::Reexport,
+            UsageHitKind::SelfReceiver,
+            UsageHitKind::DeclaredReference,
+            UsageHitKind::Definition,
+            UsageHitKind::OverrideDeclaration,
+        ] {
+            let mut hit = reference.clone();
+            hit.kind = kind;
+            hit.reference_kind = Some(ReferenceKind::TypeReference);
+            assert!(hit.is_lsp_reference_site(), "explicit reference: {kind:?}");
+            hit.reference_kind = Some(ReferenceKind::SelfTypeAlias);
+            assert!(!hit.is_lsp_reference_site(), "self alias: {kind:?}");
+        }
+        assert!(reference.is_lsp_reference_site());
+    }
+
+    #[test]
+    fn incomplete_usage_retains_positive_evidence_without_certifying_absence() {
+        let unit = enclosing_unit();
+        let reference = UsageHit::new(
+            project_file("Foo.java"),
+            10,
+            100,
+            110,
+            unit.clone(),
+            1.0,
+            "target()",
+        );
+        let import = UsageHit::new(
+            project_file("Foo.java"),
+            1,
+            0,
+            10,
+            unit.clone(),
+            1.0,
+            "import target",
+        )
+        .into_import();
+        let diagnostic = UsageAnalysisDiagnostic {
+            fq_name: unit.fq_name().to_string(),
+            strategy: "native".to_string(),
+            reason_kind: "unsupported_reference".to_string(),
+            reason: "A structured reference remains unresolved".to_string(),
+        };
+        for hits in [
+            BTreeSet::new(),
+            BTreeSet::from([reference.clone(), import.clone()]),
+        ] {
+            let result = FuzzyResult::Incomplete {
+                hits_by_overload: [(unit.clone(), hits.clone())].into_iter().collect(),
+                unproven_by_overload: HashMap::default(),
+                unproven_total_by_overload: HashMap::default(),
+                diagnostics: vec![diagnostic.clone()],
+            };
+            assert_eq!(result.all_hits_including_imports(), hits);
+            assert_eq!(
+                result.all_hits(),
+                hits.into_iter().filter(|hit| hit == &reference).collect()
+            );
+            let error = result
+                .into_either()
+                .expect_err("partial enumeration cannot certify absence");
+            assert!(error.contains(&diagnostic.reason_kind), "{error}");
+            assert!(error.contains(&diagnostic.reason), "{error}");
+        }
     }
 
     #[test]

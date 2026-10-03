@@ -5,11 +5,11 @@
 //! here is the two provider impls the analyzer satisfies and the memo cells
 //! (`OnceLock`, `PoolSafeMemo`) whose contents those functions produce.
 //!
-//! Every resolution point here reads `#include <...>` and `#include "..."` the
-//! same way, through [`parse_include_path`] / [`include_paths`]. The
-//! quoted-only spellings this module used to carry made a project that reaches
-//! its own headers with angle brackets invisible to the inverse while the
-//! forward resolved it (#1829).
+//! Every resolution point here reads the AST-owned `CppIncludeFact` paths. The
+//! quoted bit is retained for rendered relevance results, while target lookup
+//! applies the same indexed path rules to both spellings. This keeps projects
+//! that reach their own headers with angle brackets visible to the inverse
+//! while the forward resolver resolves them too (#1829).
 //!
 //! The two include-to-file rules differ by what the caller does with the
 //! answer, not by include spelling. A *visibility* claim
@@ -25,8 +25,9 @@
 
 use super::*;
 use brokk_bifrost_cpp::compile_context::CompiledLanguage;
+use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::imports::{
-    include_paths, parse_include_path, resolve_include_targets_with_index,
+    canonical_include_statement, extract_type_identifiers, resolve_include_targets_with_index,
 };
 use std::collections::VecDeque;
 use std::path::Path;
@@ -119,8 +120,10 @@ impl ImportAnalysisProvider for CppAnalyzer {
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
-        let imports = self.import_statements_from_projection(token, file);
-        for path in include_paths(&imports) {
+        let Some(paths) = CppSource::canonical_include_paths(self, token, file) else {
+            return Arc::new(resolved);
+        };
+        for path in paths {
             for target in resolve_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target));
             }
@@ -157,13 +160,15 @@ impl ImportAnalysisProvider for CppAnalyzer {
     fn imported_files_from_infos(
         &self,
         file: &ProjectFile,
-        imports: &[ImportInfo],
+        _imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let paths = CppSource::canonical_include_paths(self, token, file)?;
         let include_targets = self.include_target_index();
         Some(
-            imports
-                .iter()
-                .filter_map(|import| parse_include_path(&import.raw_snippet))
+            paths
+                .into_iter()
                 .flat_map(|path| resolve_include_targets_with_index(file, &path, include_targets))
                 .collect(),
         )
@@ -173,40 +178,48 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         let source = code_unit.source();
-        let identifiers = brokk_bifrost_cpp::imports::extract_type_identifiers(
-            &self.inner.get_source(code_unit, true).unwrap_or_default(),
-        );
-        self.import_statements_from_projection(token, source)
+        let Some(prepared) = self.prepared_syntax(token, source) else {
+            return HashSet::default();
+        };
+        let Some(declaration) = prepared.declaration_node(code_unit) else {
+            return HashSet::default();
+        };
+        let identifiers = extract_type_identifiers(declaration, prepared.source());
+        let Some(includes) = CppSource::canonical_include_facts(self, token, source) else {
+            return HashSet::default();
+        };
+        includes
             .iter()
-            .filter(|line| {
-                parse_include_path(line).is_some_and(|path| {
-                    let stem = Path::new(&path)
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("");
-                    identifiers.contains(stem)
-                })
+            .filter(|include| {
+                let stem = Path::new(&include.path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
+                identifiers.contains(stem)
             })
-            .cloned()
+            .map(|include| canonical_include_statement(&include.path, include.quoted))
             .collect()
     }
 
     fn could_import_file(
         &self,
         source_file: &ProjectFile,
-        imports: &[ImportInfo],
+        _imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let Some(includes) = CppSource::canonical_include_facts(self, token, source_file) else {
+            return false;
+        };
         let target_name = target
             .rel_path()
             .file_name()
             .and_then(|value| value.to_str());
-        imports.iter().any(|import| {
-            parse_include_path(&import.raw_snippet).is_some_and(|include| {
-                target.rel_path() == Path::new(&include)
-                    || target_name.is_some_and(|name| include.ends_with(name))
-                    || source_file.parent().join(&include) == target.rel_path()
-            })
+        includes.iter().any(|include| {
+            target.rel_path() == Path::new(&include.path)
+                || target_name.is_some_and(|name| include.path.ends_with(name))
+                || source_file.parent().join(&include.path) == target.rel_path()
         })
     }
 }
@@ -266,8 +279,10 @@ impl CppAnalyzer {
         let include_targets = self.include_target_index();
         let mut matched_targets = HashSet::default();
         let mut resolved_targets = Vec::new();
-        let imports = self.import_statements_from_projection(token, candidate);
-        for include in include_paths(&imports) {
+        let Some(paths) = CppSource::canonical_include_paths(self, token, candidate) else {
+            return resolved_targets;
+        };
+        for include in paths {
             for target in include_targets.resolve_indexed(&include) {
                 if matched_targets.insert(target.clone()) {
                     resolved_targets.push(target);

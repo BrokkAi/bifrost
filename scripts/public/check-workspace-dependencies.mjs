@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
@@ -20,7 +23,6 @@ const RQL = "brokk-bifrost-rql";
 const POLICY = "brokk-bifrost-policy";
 const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
-const LSP = "brokk-bifrost-lsp";
 const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 
 const EXPECTED_MEMBERS = new Set([
@@ -41,7 +43,6 @@ const EXPECTED_MEMBERS = new Set([
   POLICY,
   RUNTIME,
   MCP,
-  LSP,
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
@@ -73,8 +74,12 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
   [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
-  [LSP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
-  [FACADE, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
+  [FACADE, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, MCP, SEMANTIC_PACKS, RQL])],
+]);
+// The private facade integration suites exercise parser and identity contracts
+// directly. These edges are permitted only for tests, never production or builds.
+const ALLOWED_DEVELOPMENT_DEPENDENCIES = new Map([
+  [FACADE, new Set([CORE, JS_TS, JVM])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
@@ -94,7 +99,6 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
   [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
-  [LSP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
   [FACADE, new Set()],
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
@@ -154,7 +158,6 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   [SEMANTIC_PACKS, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [RUNTIME, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [MCP, new Set(["lsp-server", "lsp-types", "pyo3"])],
-  [LSP, new Set(["pyo3"])],
   [FACADE, new Set()],
 ]);
 
@@ -167,6 +170,14 @@ export function validateWorkspaceGraph(metadata) {
   const members = metadata.workspace_members.map((id) => packagesById.get(id)).filter(Boolean);
   const memberNames = new Set(members.map((pkg) => pkg.name));
   const errors = [];
+
+  // Inspect resolved registry dependencies too: the retired upstream host may
+  // return transitively even when it is no longer a workspace member.
+  for (const pkg of metadata.packages) {
+    if (pkg.name === "brokk-bifrost-lsp") {
+      errors.push(`engine dependency graph contains retired upstream host ${pkg.id}`);
+    }
+  }
 
   for (const missing of sorted([...EXPECTED_MEMBERS].filter((name) => !memberNames.has(name)))) {
     errors.push(`missing workspace package ${missing}`);
@@ -202,12 +213,15 @@ export function validateWorkspaceGraph(metadata) {
       errors.push(`${pkg.name} must depend on workspace package ${missing}`);
     }
     for (const dependency of pkg.dependencies) {
-      if (EXPECTED_MEMBERS.has(dependency.name) && !allowed.has(dependency.name)) {
+      const isAllowed = allowed.has(dependency.name) ||
+        (dependency.kind === "dev" &&
+          ALLOWED_DEVELOPMENT_DEPENDENCIES.get(pkg.name)?.has(dependency.name));
+      if (EXPECTED_MEMBERS.has(dependency.name) && !isAllowed) {
         errors.push(`${pkg.name} must not depend on workspace package ${dependency.name}`);
       }
       if (
         EXPECTED_MEMBERS.has(dependency.name) &&
-        allowed.has(dependency.name) &&
+        isAllowed &&
         dependency.req !== `=${facade.version}`
       ) {
         errors.push(
@@ -224,14 +238,28 @@ export function validateWorkspaceGraph(metadata) {
 }
 
 function readMetadata() {
-  const result = spawnSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    process.stderr.write(result.stderr);
-    throw new Error(`cargo metadata exited with status ${result.status ?? "unknown"}`);
+  // Full resolution exceeds spawnSync's default stdout buffer. Let Cargo write
+  // its query result to disk, then parse it once for this validation.
+  const temporary = mkdtempSync(join(tmpdir(), "bifrost-workspace-metadata-"));
+  try {
+    const path = join(temporary, "metadata.json");
+    const output = openSync(path, "w");
+    let result;
+    try {
+      result = spawnSync("cargo", ["metadata", "--locked", "--format-version", "1"], {
+        stdio: ["ignore", output, "inherit"],
+      });
+    } finally {
+      closeSync(output);
+    }
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`cargo metadata exited with status ${result.status ?? "unknown"}`);
+    }
+    return JSON.parse(readFileSync(path, "utf8"));
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
-  return JSON.parse(result.stdout);
 }
 
 function main() {

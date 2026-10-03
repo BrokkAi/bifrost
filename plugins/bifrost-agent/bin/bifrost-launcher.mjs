@@ -8,6 +8,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  OpenPackError,
+  openPackCacheRootFor,
+  prepareOpenPacks,
+  readEnginePackProfile
+} from "./open-packs.mjs";
 
 const execFileAsync = promisify(execFile);
 const OWNER = "BrokkAi";
@@ -1047,16 +1053,18 @@ export async function resolveBifrostLaunch(options = {}) {
     allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
+  const openPacks = await prepareLaunchOpenPacks(binary.path, env, options);
   const launch = {
     command: binary.path,
     args: buildBifrostArgs(root, options.toolset, options.passThrough),
     cwd: root,
-    env,
+    env: openPacks ? { ...env, ...openPacks.env } : env,
     source: binary.source,
     preferredVersion: binary.preferredVersion,
     selectedVersion: binary.selectedVersion,
     compatibilityMode: binary.compatibilityMode
   };
+  if (openPacks) launch.openPackReceipt = openPacks.receipt;
   schedulePreferredBifrostPreparation(launch, options);
   return launch;
 }
@@ -1070,18 +1078,44 @@ export async function resolveBifrostLspLaunch(options = {}) {
     allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
+  const openPacks = await prepareLaunchOpenPacks(binary.path, env, options);
   const launch = {
     command: binary.path,
     args: buildBifrostLspArgs(root, options.passThrough),
     cwd: root,
-    env,
+    env: openPacks ? { ...env, ...openPacks.env } : env,
     source: binary.source,
     preferredVersion: binary.preferredVersion,
     selectedVersion: binary.selectedVersion,
     compatibilityMode: binary.compatibilityMode
   };
+  if (openPacks) launch.openPackReceipt = openPacks.receipt;
   schedulePreferredBifrostPreparation(launch, options);
   return launch;
+}
+
+async function prepareLaunchOpenPacks(binaryPath, env, options) {
+  try {
+    const profile = await (options.openPackProfileImpl ?? readEnginePackProfile)(binaryPath, {
+      execFileImpl: options.execFileImpl ?? execFileAsync,
+      env
+    });
+    return await (options.prepareOpenPacksImpl ?? prepareOpenPacks)( {
+      cacheDir: options.openPackCacheDir ?? openPackCacheRootFor(env),
+      engineProfile: profile,
+      fetchImpl: options.openPackFetchImpl ?? globalThis.fetch,
+      offline: env.BIFROST_LAUNCHER_AUTO_INSTALL === "0" ||
+        env.BIFROST_OPEN_PACKS_OFFLINE === "1" || env.BIFROST_OPEN_PACKS_OFFLINE === "true",
+      refresh: env.BIFROST_OPEN_PACKS_REFRESH === "1" || env.BIFROST_OPEN_PACKS_REFRESH === "true"
+    });
+  } catch (error) {
+    const code = error instanceof OpenPackError ? error.code : error?.code;
+    if (!["unsupported", "pending", "no-compatible-release", "unavailable"].includes(code)) throw error;
+    const diagnostic = `[bifrost] Open pack selection ${code}: ${error.message} Continuing with the engine's embedded packs.\n`;
+    if (options.onOpenPackDiagnostic) options.onOpenPackDiagnostic(diagnostic, error);
+    else process.stderr.write(diagnostic);
+    return null;
+  }
 }
 
 export function spawnBifrost(binaryPath, args, options = {}) {

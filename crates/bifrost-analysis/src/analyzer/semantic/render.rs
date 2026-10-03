@@ -615,6 +615,9 @@ fn write_memory_location(writer: &mut dyn fmt::Write, location: &MemoryLocation)
                 write!(writer, " :constant-index {index}")?;
             }
         }
+        MemoryLocationKind::Dereference { address } => {
+            write!(writer, " :address-value {address}")?;
+        }
         MemoryLocationKind::LexicalCell { binding } => {
             write!(writer, " :binding-value {binding}")?;
         }
@@ -1137,8 +1140,14 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
 
 fn write_callable(writer: &mut dyn fmt::Write, callable: &CallableValue) -> fmt::Result {
     write!(writer, ":callable-kind {} ", quoted(callable.kind.label()))?;
-    if let super::ir::CallableReferenceKind::TypeQualifiedMethod { qualifier } = callable.kind {
-        write!(writer, ":type-qualifier {qualifier} ")?;
+    match callable.kind {
+        super::ir::CallableReferenceKind::ModuleQualified { qualifier } => {
+            write!(writer, ":module-qualifier {qualifier} ")?;
+        }
+        super::ir::CallableReferenceKind::TypeQualifiedMethod { qualifier } => {
+            write!(writer, ":type-qualifier {qualifier} ")?;
+        }
+        _ => {}
     }
     write_target_resolution(writer, &callable.targets)?;
     write!(

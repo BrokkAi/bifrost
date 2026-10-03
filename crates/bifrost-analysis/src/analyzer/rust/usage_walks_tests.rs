@@ -11,17 +11,21 @@ mod tests {
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{AnalyzerTestHooks, CodeUnitIndex};
     use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_rust::graph_support::{
-        rust_module_files_at, rust_module_files_from_path, rust_relative_module_segments,
+        RustCargoRouteError, rust_module_files_at, rust_module_files_from_path,
+        rust_relative_module_segments,
     };
     use brokk_bifrost_rust::usage::{
         Domain, RustMacroInvocationResolution, RustMacroInvocationRoute, RustSymbolIdentity,
         RustSymbolNamespace,
     };
     use brokk_bifrost_rust::usage::{usage_binding_seeds, usage_importers};
+    use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
     use brokk_bifrost_rust::usage_walks::RustUsageWalks;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -62,6 +66,20 @@ mod tests {
         project(&borrowed)
     }
 
+    fn binding_edge_project() -> (BuiltInlineTestProject, RustAnalyzer) {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub mod service;\npub mod consumer;\n")
+            .file("src/service.rs", "pub struct Widget;\n")
+            .file(
+                "src/consumer.rs",
+                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(project.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 3);
+        (project, analyzer)
+    }
+
     fn file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
         analyzer
             .get_analyzed_files()
@@ -78,6 +96,7 @@ mod tests {
         walks
             .queries()
             .identities_in_file_named(file, name)
+            .expect("uncancelled fixture identity lookup")
             .into_iter()
             .map(|(identity, _)| identity)
             .find(|identity| identity.namespace == RustSymbolNamespace::Type)
@@ -115,12 +134,15 @@ mod tests {
             ),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let service = file(&analyzer, "service.rs");
         let consumer = file(&analyzer, "consumer.rs");
         let target = identity_named(&walks, &service, "Widget");
 
-        let candidates = walks.importer_candidates_for(&target);
+        let candidates = walks
+            .importer_candidates_for(&target)
+            .expect("uncancelled fixture importer candidates");
         assert!(
             candidates.contains(&file(&analyzer, "impostor.rs"))
                 && candidates.contains(&file(&analyzer, "bystander.rs")),
@@ -129,6 +151,7 @@ mod tests {
 
         let importers: BTreeSet<ProjectFile> = walks
             .edges_binding_identity(&target)
+            .expect("uncancelled fixture binding-edge walk")
             .into_iter()
             .map(|edge| edge.importer)
             .collect();
@@ -136,6 +159,107 @@ mod tests {
             importers,
             BTreeSet::from([consumer]),
             "only the import that resolves to the declaring module binds the target"
+        );
+    }
+
+    #[test]
+    fn failed_binding_edge_walk_is_retryable_without_empty_cache() {
+        let (_temp, analyzer) = binding_edge_project();
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
+        let service = file(&analyzer, "service.rs");
+        let consumer = file(&analyzer, "consumer.rs");
+        let target = identity_named(&walks, &service, "Widget");
+
+        analyzer
+            .analyzer_store()
+            .with_unreadable_rust_identifier_occurrences_for_test(|| {
+                assert_eq!(
+                    walks.edges_binding_identity(&target).unwrap_err(),
+                    RustCargoRouteError::Unavailable,
+                    "an identifier inverse-read failure must be terminal"
+                );
+            });
+        assert!(
+            analyzer_scope.store_error().is_some(),
+            "the failed inverse read must remain visible at the query boundary"
+        );
+
+        let retry = walks
+            .edges_binding_identity(&target)
+            .expect("restoring the identifier table makes the same walk retryable");
+        assert!(
+            retry.iter().any(|edge| edge.importer == consumer),
+            "a failed walk must not publish an empty binding-edge cache: {retry:#?}"
+        );
+    }
+
+    #[test]
+    fn failed_include_fact_read_does_not_cache_empty_routes() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "include!(\"generated.rs\");\n")
+            .file("src/generated.rs", "pub fn generated() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 2);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
+        let generated = fixture.file("src/generated.rs");
+        analyzer
+            .analyzer_store()
+            .with_unreadable_rust_identifier_occurrences_for_test(|| {
+                // Include verification hydrates the host's complete fact families;
+                // a failed family read must not publish an empty include route.
+                assert_eq!(
+                    includes.include_routes_for(&generated).unwrap_err(),
+                    RustCargoRouteError::Unavailable
+                );
+                assert_eq!(
+                    includes.all_included_files().unwrap_err(),
+                    RustCargoRouteError::Unavailable
+                );
+            });
+        assert!(scope.store_error().is_some());
+        let routes = includes.include_routes_for(&generated).unwrap();
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.root_file == fixture.file("src/lib.rs")),
+            "{routes:?}"
+        );
+        assert_eq!(includes.all_included_files().unwrap(), vec![generated]);
+    }
+
+    #[test]
+    fn cancellation_reaches_warm_forward_and_binding_edge_walks() {
+        let (_temp, analyzer) = binding_edge_project();
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let keep_going = AtomicBool::new(true);
+        let should_continue = || keep_going.load(Ordering::Relaxed);
+        let walks = RustUsageWalks::new_while(&analyzer, analyzer_scope.token(), &should_continue)
+            .expect("Cargo routes available for the fixture");
+        let service = file(&analyzer, "service.rs");
+        let consumer = file(&analyzer, "consumer.rs");
+        let target = identity_named(&walks, &service, "Widget");
+
+        walks
+            .forward_import_edges_of(&consumer)
+            .expect("healthy forward edge walk");
+        walks
+            .edges_binding_identity(&target)
+            .expect("healthy binding edge walk");
+
+        keep_going.store(false, Ordering::Relaxed);
+        assert_eq!(
+            walks.forward_import_edges_of(&consumer).unwrap_err(),
+            RustCargoRouteError::Cancelled,
+            "cancellation must win over a warm forward-edge cache"
+        );
+        assert_eq!(
+            walks.edges_binding_identity(&target).unwrap_err(),
+            RustCargoRouteError::Cancelled,
+            "cancellation must win over a warm binding-edge cache"
         );
     }
 
@@ -202,12 +326,16 @@ mod tests {
             .collect();
         let (_temp, analyzer) = project(&borrowed);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let target_file = file(&analyzer, "src/service.rs");
         let target = identity_named(&walks, &target_file, "Widget");
 
-        let candidates: BTreeSet<ProjectFile> =
-            walks.importer_candidates_for(&target).into_iter().collect();
+        let candidates: BTreeSet<ProjectFile> = walks
+            .importer_candidates_for(&target)
+            .expect("uncancelled fixture importer candidates")
+            .into_iter()
+            .collect();
         assert_eq!(
             candidates,
             BTreeSet::from([
@@ -223,6 +351,7 @@ mod tests {
 
         let importers: BTreeSet<ProjectFile> = walks
             .edges_binding_identity(&target)
+            .expect("uncancelled fixture binding-edge walk")
             .into_iter()
             .map(|edge| edge.importer)
             .collect();
@@ -248,9 +377,11 @@ mod tests {
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let first = walks.files_in_module_package("service");
         let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture")
             .files_in_module_package("service");
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -267,8 +398,9 @@ mod tests {
 
         let updated = analyzer.update_all();
         let updated_scope = AnalyzerQueryScope::new(&updated);
-        let after =
-            RustUsageWalks::new(&updated, updated_scope.token()).files_in_module_package("service");
+        let after = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update")
+            .files_in_module_package("service");
         assert!(
             !Arc::ptr_eq(&first, &after),
             "a generation bump must not serve the previous generation's entry"
@@ -290,7 +422,8 @@ mod tests {
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let importer = file(&analyzer, "lib.rs");
 
         let before = walks.caches.module_probe_computations();
@@ -315,6 +448,7 @@ mod tests {
         }
         // A second walker in the same generation shares the analyzer's caches.
         let sibling = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture")
             .probed_module_files_from_path(&importer, "crate::service");
         assert!(Arc::ptr_eq(&first, &sibling));
         assert_eq!(
@@ -336,7 +470,8 @@ mod tests {
         // cache: a fresh analyzer probes the filesystem again.
         let updated = analyzer.update_all();
         let updated_scope = AnalyzerQueryScope::new(&updated);
-        let next = RustUsageWalks::new(&updated, updated_scope.token());
+        let next = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update");
         let importer = file(&updated, "lib.rs");
         let fresh = next.probed_module_files_from_path(&importer, "crate::service");
         assert_eq!(next.caches.module_probe_computations(), 1);
@@ -385,12 +520,12 @@ mod tests {
             .collect();
         let (_temp, analyzer) = project(&borrowed);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token()).unwrap();
         let service = file(&analyzer, "service.rs");
         let root = identity_named(&walks, &service, "Widget");
 
         let before = walks.caches.route_resolutions();
-        let root_edges = walks.edges_binding_identity(&root);
+        let root_edges = walks.edges_binding_identity(&root).unwrap();
         let after_root = walks.caches.route_resolutions();
         assert!(
             after_root > before,
@@ -416,7 +551,7 @@ mod tests {
         );
 
         for alias in &aliases {
-            walks.edges_binding_identity(alias);
+            walks.edges_binding_identity(alias).unwrap();
         }
         assert_eq!(
             walks.caches.route_resolutions(),
@@ -458,7 +593,7 @@ mod tests {
             .collect();
         let (_temp, analyzer) = project(&borrowed);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token()).unwrap();
 
         let before = walks.caches.module_declaration_lookups();
         for index in 0..MODULES {
@@ -494,7 +629,7 @@ mod tests {
         // The generation is the invalidation, as for every other walk cache.
         let updated = analyzer.update_all();
         let updated_scope = AnalyzerQueryScope::new(&updated);
-        let next = RustUsageWalks::new(&updated, updated_scope.token());
+        let next = RustUsageWalks::new(&updated, updated_scope.token()).unwrap();
         assert_eq!(
             *next.files_in_module_package("m0.tests"),
             vec![file(&updated, "m0.rs")],
@@ -512,7 +647,8 @@ mod tests {
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let importer = file(&analyzer, "lib.rs");
         let segments = vec!["crate".to_string(), "service".to_string()];
 
@@ -547,12 +683,15 @@ mod tests {
             ),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let alpha = file(&analyzer, "alpha.rs");
         let beta = file(&analyzer, "beta.rs");
         let alpha_module = walks.physical_root_of(&alpha).expect("alpha is analyzed");
 
-        let bindings = walks.bindings_at(&alpha, &alpha_module);
+        let bindings = walks
+            .bindings_at(&alpha, &alpha_module)
+            .expect("uncancelled export-chain walk");
         let echo = bindings
             .iter()
             .find(|binding| {
@@ -586,11 +725,14 @@ mod tests {
             ("src/user.rs", "use crate::defs::target;\n"),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let defs = file(&analyzer, "defs.rs");
         let defs_module = walks.physical_root_of(&defs).expect("defs is analyzed");
 
-        let bindings = walks.bindings_at(&defs, &defs_module);
+        let bindings = walks
+            .bindings_at(&defs, &defs_module)
+            .expect("uncancelled module-binding walk");
         let republished: Vec<_> = bindings
             .iter()
             .filter(|binding| {
@@ -632,11 +774,14 @@ mod tests {
         const NEIGHBOURS: usize = 4;
         let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let head = file(&analyzer, "m0.rs");
         let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
 
-        let bindings = walks.bindings_at(&head, &head_module);
+        let bindings = walks
+            .bindings_at(&head, &head_module)
+            .expect("uncancelled cyclic walk");
 
         // The cycle must still answer, and answer with the real declarations:
         // `m0` publishes its own `Item0` and the four names it re-exports,
@@ -692,9 +837,14 @@ mod tests {
         let head = file(&analyzer, "m0.rs");
 
         let complete = {
-            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+                .expect("Cargo routes available for the fixture");
             let module = walks.physical_root_of(&head).expect("m0 is analyzed");
-            walks.bindings_at(&head, &module).as_ref().clone()
+            walks
+                .bindings_at(&head, &module)
+                .expect("uncancelled cyclic walk")
+                .as_ref()
+                .clone()
         };
         assert!(
             complete.iter().any(|binding| binding.name == "Item1"),
@@ -707,26 +857,28 @@ mod tests {
         // cancellation point is not what this test is about, and a cold build
         // there would stop the walker before it ever walked.
         let module = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update")
             .physical_root_of(&head)
             .expect("m0 is analyzed");
         let keep_going = || false;
         let walks = RustUsageWalks::new_while(&updated, updated_scope.token(), &keep_going)
             .expect("routes build before the poll");
-        let truncated = walks.bindings_at(&head, &module);
+        assert_eq!(
+            walks.bindings_at(&head, &module).unwrap_err(),
+            RustCargoRouteError::Cancelled,
+            "a cancelled walk must report cancellation, not a truncated success"
+        );
         assert_eq!(
             walks.recursion_computations(),
             1,
             "a cancelled walk must stop after the frame it was already inside"
         );
-        assert!(
-            !truncated.iter().any(|binding| binding.name == "Item1"),
-            "the cancelled walk did not get far enough to see the re-exports, \
-             which is what makes the next assertion meaningful: {truncated:?}"
-        );
-
-        let after = RustUsageWalks::new(&updated, updated_scope.token());
+        let after = RustUsageWalks::new(&updated, updated_scope.token())
+            .expect("Cargo routes available after update");
         assert_eq!(
-            *after.bindings_at(&head, &module),
+            *after
+                .bindings_at(&head, &module)
+                .expect("uncancelled walk after cancellation"),
             complete,
             "a cancelled walk must not memoize its truncated answer"
         );
@@ -758,12 +910,15 @@ mod tests {
             .collect();
         let (_temp, analyzer) = project(&borrowed);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let head = file(&analyzer, "link0.rs");
         let tail = file(&analyzer, &format!("link{}.rs", LINKS - 1));
         let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
 
-        let bindings = walks.bindings_at(&head, &head_module);
+        let bindings = walks
+            .bindings_at(&head, &head_module)
+            .expect("uncancelled deep export walk");
         let value = bindings
             .iter()
             .find(|binding| binding.name == "Value")
@@ -783,7 +938,9 @@ mod tests {
             walks.import_binding_computations()
         );
         let classified = walks.queries().path_identity_computations();
-        let _ = walks.bindings_at(&head, &head_module);
+        let _ = walks
+            .bindings_at(&head, &head_module)
+            .expect("repeated uncancelled deep export walk");
         assert_eq!(
             walks.queries().path_identity_computations(),
             classified,
@@ -815,22 +972,29 @@ mod tests {
             ),
         ]);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let outer = file(&analyzer, "outer.rs");
         let outer_module = walks.physical_root_of(&outer).expect("outer is analyzed");
 
-        let one = walks.alias_routes_at(&outer_module.with_suffix(&["routed".to_string()]));
-        let two = walks.alias_routes_at(&outer_module.with_suffix(&["routed_inner".to_string()]));
+        let one = walks
+            .alias_routes_at(&outer_module.with_suffix(&["routed".to_string()]))
+            .expect("uncancelled alias-route walk");
+        let two = walks
+            .alias_routes_at(&outer_module.with_suffix(&["routed_inner".to_string()]))
+            .expect("uncancelled alias-route walk");
         assert!(!one.is_empty() && !two.is_empty(), "{one:?} {two:?}");
 
         // `routed_inner` is a one-component alias, so the longest prefix of
         // `routed_inner` is itself and the route lands on `real::inner`, never
         // on the shorter `routed` alias.
-        let resolved = walks.resolve_segments(
-            &outer,
-            &outer_module.package(),
-            &["routed_inner".to_string()],
-        );
+        let resolved = walks
+            .resolve_segments(
+                &outer,
+                &outer_module.package(),
+                &["routed_inner".to_string()],
+            )
+            .expect("uncancelled module-route walk");
         assert_eq!(
             resolved
                 .iter()
@@ -882,15 +1046,14 @@ mod tests {
                 .expect("Widget declaration")
         };
 
-        let before = usage_importers(
+        let before_seeds = usage_binding_seeds(
             &analyzer,
             analyzer_scope.token(),
-            &usage_binding_seeds(
-                &analyzer,
-                analyzer_scope.token(),
-                &BTreeSet::from([widget_of(&analyzer)]),
-            ),
-        );
+            &BTreeSet::from([widget_of(&analyzer)]),
+        )
+        .expect("uncancelled fixture binding seeds");
+        let before = usage_importers(&analyzer, analyzer_scope.token(), &before_seeds)
+            .expect("uncancelled fixture importer walk");
         assert!(
             !before.contains(&consumer),
             "before the edit the consumer imports the decoy: {before:?}"
@@ -903,15 +1066,14 @@ mod tests {
         let updated_scope = AnalyzerQueryScope::new(&updated);
         updated.reset_full_declaration_scan_count_for_test();
 
-        let after = usage_importers(
+        let after_seeds = usage_binding_seeds(
             &updated,
             updated_scope.token(),
-            &usage_binding_seeds(
-                &updated,
-                updated_scope.token(),
-                &BTreeSet::from([widget_of(&updated)]),
-            ),
-        );
+            &BTreeSet::from([widget_of(&updated)]),
+        )
+        .expect("uncancelled updated binding seeds");
+        let after = usage_importers(&updated, updated_scope.token(), &after_seeds)
+            .expect("uncancelled updated importer walk");
         assert!(
             after.contains(&consumer),
             "the edited import must bind the target: {after:?}"
@@ -956,8 +1118,10 @@ mod tests {
         let roots = BTreeSet::from([target]);
         analyzer.reset_full_declaration_scan_count_for_test();
 
-        let seeds = usage_binding_seeds(&analyzer, analyzer_scope.token(), &roots);
-        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds);
+        let seeds = usage_binding_seeds(&analyzer, analyzer_scope.token(), &roots)
+            .expect("uncancelled fixture binding seeds");
+        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds)
+            .expect("uncancelled fixture importer walk");
 
         assert!(
             importers.contains(&file(&analyzer, "consumer.rs")),
@@ -1000,9 +1164,12 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.identifier() == "Thing")
             .expect("Thing declaration");
-        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
         let identity = identity_named(&walks, &target_file, "Thing");
-        let direct_edges = walks.edges_binding_identity(&identity);
+        let direct_edges = walks
+            .edges_binding_identity(&identity)
+            .expect("uncancelled fixture binding-edge walk");
         assert!(
             direct_edges
                 .iter()
@@ -1010,8 +1177,10 @@ mod tests {
             "raw-module glob edge: identity={identity:#?} edges={direct_edges:#?}"
         );
         let seeds =
-            usage_binding_seeds(&analyzer, analyzer_scope.token(), &BTreeSet::from([target]));
-        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds);
+            usage_binding_seeds(&analyzer, analyzer_scope.token(), &BTreeSet::from([target]))
+                .expect("uncancelled fixture binding seeds");
+        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds)
+            .expect("uncancelled fixture importer walk");
         assert!(
             importers.contains(&consumer),
             "raw-module glob importers: {importers:#?}"
@@ -1028,7 +1197,7 @@ mod tests {
             ("src/macros.rs", "macro_rules! m_macro { () => {} }\n"),
         ]);
         let scope = AnalyzerQueryScope::new(&analyzer);
-        let walks = RustUsageWalks::new(&analyzer, scope.token());
+        let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("fixture walks");
         let macro_file = file(&analyzer, "macros.rs");
         let invocation_file = file(&analyzer, "lib.rs");
         let target = analyzer
@@ -1037,15 +1206,13 @@ mod tests {
             .find(|declaration| declaration.identifier() == "m_macro")
             .expect("macro declaration");
         let seeds =
-            usage_binding_seeds(&analyzer, scope.token(), &BTreeSet::from([target.clone()]));
+            usage_binding_seeds(&analyzer, scope.token(), &BTreeSet::from([target.clone()]))
+                .expect("fixture seeds");
         let source = std::fs::read_to_string(invocation_file.abs_path()).expect("fixture source");
         let byte = source.find("m_macro!()").expect("macro invocation");
-        let candidates = walks.selected_macro_invocation_candidates_named(
-            &seeds,
-            &invocation_file,
-            "m_macro",
-            byte,
-        );
+        let candidates = walks
+            .selected_macro_invocation_candidates_named(&seeds, &invocation_file, "m_macro", byte)
+            .expect("fixture macro candidates");
 
         let RustMacroInvocationResolution::Exact(exact) =
             seeds.resolve_macro_invocation_targets(&candidates)

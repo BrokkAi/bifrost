@@ -1,15 +1,35 @@
 //! Compact exact-identity usage graph shared by relevance ranking and graph APIs.
 
-use super::common::{language_for_file, language_for_target};
-use super::inverted_edges::{UsageNodeKey, UsageReferenceCounts};
-use crate::analyzer::languages::{
-    EdgeWeightScanCtx, LanguageEdgeWeights, LanguageSupport, edge_passes, language_support,
+#[path = "canonical_workspace_graph.rs"]
+mod canonical_workspace_graph;
+#[cfg(test)]
+pub(crate) use canonical_workspace_graph::CanonicalWorkspaceUsageProjectedEdge;
+pub(crate) use canonical_workspace_graph::NativeWorkspaceUsageGraphAccumulator;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use canonical_workspace_graph::build_selected_workspace_usage_graph_projection;
+pub(crate) use canonical_workspace_graph::{
+    SelectedWorkspaceUsageGraphProjection, SelectedWorkspaceUsageGraphProjectionOutcome,
 };
-use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range};
+#[cfg(any(test, feature = "test-support"))]
+pub use canonical_workspace_graph::{
+    SelectedWorkspaceUsageRankingBuildOutcome, SelectedWorkspaceUsageRankingGraph,
+    build_selected_workspace_usage_ranking_graph,
+};
+
+use super::common::language_for_target;
+use super::inverted_edges::{UsageNodeKey, UsageReferenceCounts};
+use crate::analyzer::common::is_java_module_descriptor_file;
+use crate::analyzer::languages::{
+    EdgeWeightScanCtx, LanguageEdgeWeights, LanguageGraphBackend, LanguageSupport, edge_passes,
+    language_support,
+};
+use crate::analyzer::store::StoreError;
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 
 type CatalogDeclaration = (CodeUnit, Option<Range>);
 
@@ -148,6 +168,7 @@ pub(crate) struct WorkspaceUsageCatalog {
 }
 
 impl WorkspaceUsageCatalog {
+    #[cfg(test)]
     pub(crate) fn build(analyzer: &dyn IAnalyzer) -> Self {
         Self::build_with_cancellation(analyzer, &CancellationToken::default())
             .expect("uncancelled workspace usage catalog construction")
@@ -264,17 +285,25 @@ impl WorkspaceUsageCatalog {
     /// projection per file. This is the rooted `usage_graph` path: it must not
     /// enumerate every declaration in a long-lived workspace cache before it can
     /// answer a handful of changed-file roots.
+    #[cfg(test)]
     pub(crate) fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
-        let cancellation = CancellationToken::default();
-        let declarations = files
-            .iter()
-            .flat_map(|file| {
-                Self::declarations_for_file(analyzer, file, &cancellation)
-                    .expect("uncancelled rooted file declaration enumeration")
-            })
-            .collect();
-        Self::from_declarations(declarations, &CancellationToken::default())
+        Self::build_for_files_with_cancellation(analyzer, files, &CancellationToken::default())
             .expect("uncancelled rooted workspace usage catalog construction")
+    }
+
+    pub(crate) fn build_for_files_with_cancellation(
+        analyzer: &dyn IAnalyzer,
+        files: &[ProjectFile],
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let mut declarations = Vec::new();
+        for file in files {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            declarations.extend(Self::declarations_for_file(analyzer, file, cancellation)?);
+        }
+        Self::from_declarations(declarations, cancellation)
     }
 
     /// Group an enumerated declaration inventory into graph nodes.
@@ -453,6 +482,33 @@ impl WorkspaceUsageCatalog {
         self.indices_by_id.get(id).copied()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_reduced_nodes(
+        nodes: Vec<WorkspaceUsageNode>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let mut indices_by_id = HashMap::default();
+        for (index, node) in nodes.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            for id in &node.declaration_ids {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                let previous = indices_by_id.insert(id.clone(), index);
+                assert!(
+                    previous.is_none(),
+                    "one reduced declaration ID belongs to one graph node"
+                );
+            }
+        }
+        Some(Self {
+            nodes,
+            indices_by_id,
+        })
+    }
+
     /// Join each non-primary member of a merged node to the cataloged node its
     /// primary heads, keyed `member id -> node id`.
     ///
@@ -528,16 +584,10 @@ fn range_key(range: &Range) -> (usize, usize) {
 }
 
 pub(crate) fn is_graph_declaration(unit: &CodeUnit) -> bool {
-    let is_java_module_descriptor_scope = unit.is_file_scope()
-        && language_for_target(unit) == Language::Java
-        && unit.source().rel_path().file_name() == Some(OsStr::new("module-info.java"));
+    let is_java_module_descriptor_scope =
+        unit.is_file_scope() && is_java_module_descriptor_file(unit.source());
     (!unit.is_synthetic() || is_java_module_descriptor_scope)
         && (unit.is_class() || unit.is_callable() || is_java_module_descriptor_scope)
-}
-
-fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {
-    language_for_file(file) == Language::Java
-        && file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +653,52 @@ impl WorkspaceUsageRankingGraph {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn from_exact_with_cancellation(
+        graph: WorkspaceUsageGraph,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let WorkspaceUsageGraph {
+            nodes: exact_nodes,
+            edges,
+            #[cfg(test)]
+            resolved_ecosystems,
+        } = graph;
+        let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
+        let mut nodes = Vec::with_capacity(exact_nodes.len());
+        for (index, node) in exact_nodes.into_iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            for file in &node.declaration_files {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                node_indices_by_file
+                    .entry(file.clone())
+                    .or_default()
+                    .push(index);
+            }
+            nodes.push(WorkspaceUsageRankingNode {
+                primary_file: node.primary.source().clone(),
+                seed_files: node.declaration_files,
+                incomplete: node.truncated_inbound.is_some() || node.unproven_inbound > 0,
+                contains_tests: None,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let graph = Self {
+            nodes,
+            edges,
+            node_indices_by_file,
+            #[cfg(test)]
+            resolved_ecosystems,
+        };
+        (!cancellation.is_cancelled()).then_some(graph)
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let mut retained = std::mem::size_of::<Self>()
             .saturating_add(
@@ -653,7 +749,11 @@ fn project_file_retained_bytes(file: &ProjectFile) -> usize {
 
 pub(crate) enum WorkspaceUsageGraphBuildOutcome {
     Complete(WorkspaceUsageGraph),
+    Incomplete(WorkspaceUsageGraph),
     Cancelled,
+    Stale,
+    Unavailable(String),
+    Failed(StoreError),
 }
 
 pub(crate) fn build_workspace_usage_graph_with_cancellation(
@@ -662,18 +762,103 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     cancellation: &CancellationToken,
 ) -> WorkspaceUsageGraphBuildOutcome {
+    build_workspace_usage_graph_with_passes(
+        analyzer,
+        catalog,
+        selected_ecosystems,
+        cancellation,
+        &edge_passes(),
+    )
+}
+
+pub(crate) fn build_workspace_usage_graph_with_passes(
+    analyzer: &dyn IAnalyzer,
+    catalog: WorkspaceUsageCatalog,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+    passes: &[crate::analyzer::languages::EdgePassEntry],
+) -> WorkspaceUsageGraphBuildOutcome {
+    let scope = AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+    let generation = analyzer.project().analysis_generation();
+    let mut native_projections = Vec::new();
     let mut nodes = catalog.nodes.clone();
     let mut edges = Vec::new();
+    let mut passes_complete = true;
     #[cfg(test)]
     let mut resolved_ecosystems = Vec::new();
     let keep_file = |_: &ProjectFile| !cancellation.is_cancelled();
-    for entry in edge_passes() {
+    // This consumer's request is the whole workspace, so the preflight's file
+    // set is every *analyzable* file. It cannot be `analyzed_files`:
+    // publication readiness is part of the analyzed-file predicate, so a file
+    // whose canonical facts were never published is missing from that listing
+    // for exactly the reason the preflight exists to report.
+    // `source_file_inventory` is the listing that keeps such a file, and it
+    // reads the project's shared file listing rather than the store.
+    let analyzable_files = analyzer.source_file_inventory().rows;
+    for entry in passes {
         if !selected_ecosystems.contains(&entry.ecosystem) {
             continue;
         }
         if cancellation.is_cancelled() {
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
+        // Input authority is the backend's question, asked before any caller
+        // admission: a pass whose canonical facts cannot be read admits every
+        // file and reports a complete graph with no edges for them.
+        if entry
+            .backend
+            .input_failure(analyzer, &analyzable_files)
+            .is_some()
+        {
+            passes_complete = false;
+            continue;
+        }
+        let pass = match entry.backend {
+            LanguageGraphBackend::Legacy(pass) => pass,
+            LanguageGraphBackend::Native(provider) => {
+                // Admission is the analyzed listing, not the analyzable one:
+                // only a published file can contribute an edge, and the
+                // preflight above has already reported any that cannot.
+                let mut admitted_callers = Vec::new();
+                for file in analyzer.analyzed_files() {
+                    if cancellation.is_cancelled() {
+                        return WorkspaceUsageGraphBuildOutcome::Cancelled;
+                    }
+                    if entry
+                        .languages
+                        .contains(&super::common::language_for_file(&file))
+                    {
+                        admitted_callers.push(file);
+                    }
+                }
+                let projection = match provider.project(analyzer, &admitted_callers, cancellation) {
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(projection)) => {
+                        projection
+                    }
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(projection)) => {
+                        passes_complete = false;
+                        projection
+                    }
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled) => {
+                        return WorkspaceUsageGraphBuildOutcome::Cancelled;
+                    }
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale) => {
+                        return WorkspaceUsageGraphBuildOutcome::Stale;
+                    }
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason)) => {
+                        return WorkspaceUsageGraphBuildOutcome::Unavailable(reason);
+                    }
+                    Err(error) => return WorkspaceUsageGraphBuildOutcome::Failed(error),
+                };
+                assert_eq!(
+                    projection.admitted_callers(),
+                    &admitted_callers.into_iter().collect::<HashSet<_>>(),
+                    "native graph providers must retain exact caller admission"
+                );
+                native_projections.push(projection);
+                continue;
+            }
+        };
         let _scope = crate::profiling::scope(format!(
             "workspace_usage_graph::resolve_{}",
             entry.id.as_str()
@@ -706,7 +891,7 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
             scoped_nodes: &scoped_nodes,
             keep_file: &keep_file,
         };
-        match entry.pass.edge_weights(&ctx) {
+        match pass.edge_weights(&ctx) {
             Some(LanguageEdgeWeights::Fqn(result)) => {
                 record_fqn_weights_exact(entry.ecosystem, result, &catalog, &mut nodes, &mut edges)
             }
@@ -717,18 +902,55 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
                 &mut nodes,
                 &mut edges,
             ),
+            Some(LanguageEdgeWeights::Unavailable(_failure)) => {
+                // This consumer returns completeness, not per-file diagnostics;
+                // its partial graph must not be cached as a complete result.
+                passes_complete = false;
+            }
             None => {}
         }
     }
     edges.sort_by_key(|edge| (edge.from, edge.to));
     #[cfg(test)]
     resolved_ecosystems.dedup();
-    WorkspaceUsageGraphBuildOutcome::Complete(WorkspaceUsageGraph {
+    let graph = WorkspaceUsageGraph {
         nodes,
         edges,
         #[cfg(test)]
         resolved_ecosystems,
-    })
+    };
+    if cancellation.is_cancelled() {
+        return WorkspaceUsageGraphBuildOutcome::Cancelled;
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return WorkspaceUsageGraphBuildOutcome::Stale;
+    }
+    let graph = match canonical_workspace_graph::merge_workspace_usage_graph_projections(
+        graph,
+        &native_projections,
+        generation,
+        cancellation,
+    ) {
+        WorkspaceUsageGraphBuildOutcome::Complete(graph) => graph,
+        WorkspaceUsageGraphBuildOutcome::Incomplete(graph) => {
+            passes_complete = false;
+            graph
+        }
+        terminal => return terminal,
+    };
+    if cancellation.is_cancelled() {
+        return WorkspaceUsageGraphBuildOutcome::Cancelled;
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return WorkspaceUsageGraphBuildOutcome::Stale;
+    }
+    if let Some(error) = scope.store_error() {
+        return WorkspaceUsageGraphBuildOutcome::Failed(error);
+    }
+    if !passes_complete {
+        return WorkspaceUsageGraphBuildOutcome::Incomplete(graph);
+    }
+    WorkspaceUsageGraphBuildOutcome::Complete(graph)
 }
 
 fn record_fqn_weights_exact(
@@ -810,9 +1032,12 @@ mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
-        AnalyzerDelegate, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, ScalaAnalyzer, TestProject,
+        AnalyzerDelegate, GoAnalyzer, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, RustAnalyzer,
+        ScalaAnalyzer, TestProject,
     };
+    use crate::inline_project::InlineTestProject;
     use std::collections::BTreeMap;
+    use std::ffi::OsStr;
     use std::sync::Arc;
 
     static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -896,6 +1121,113 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Losing the canonical Rust facts must not become a complete empty graph.
+    ///
+    /// A blob whose fact manifests are gone also fails `source_fact_readiness`,
+    /// which is part of the analyzed-file predicate, so it is not in
+    /// `analyzed_files` at all. This consumer's preflight therefore asks about
+    /// the analyzable inventory, which still holds the file, and the pass is
+    /// skipped with the build reported incomplete. Taking the preflight's set
+    /// from the analyzed listing would have hidden the one file the preflight
+    /// exists to report and let the projection fail one stage later instead.
+    #[test]
+    fn unavailable_rust_facts_make_the_workspace_graph_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "Cargo.toml")
+            .write(
+                "[package]\nname = \"workspace_graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub fn target() {}\n")
+            .unwrap();
+
+        let project = TestProject::new(root, Language::Rust);
+        let analyzer = RustAnalyzer::from_project(project);
+        let catalog = WorkspaceUsageCatalog::build(&analyzer);
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+
+        let outcome = build_workspace_usage_graph_with_cancellation(
+            &analyzer,
+            catalog,
+            &BTreeSet::from([UsageEcosystem::Rust]),
+            &CancellationToken::default(),
+        );
+        let described = match &outcome {
+            WorkspaceUsageGraphBuildOutcome::Complete(graph) => {
+                format!("Complete({} edges)", graph.edges.len())
+            }
+            WorkspaceUsageGraphBuildOutcome::Incomplete(graph) => {
+                format!("Incomplete({} edges)", graph.edges.len())
+            }
+            WorkspaceUsageGraphBuildOutcome::Cancelled => "Cancelled".to_owned(),
+            WorkspaceUsageGraphBuildOutcome::Stale => "Stale".to_owned(),
+            WorkspaceUsageGraphBuildOutcome::Unavailable(reason) => {
+                format!("Unavailable({reason})")
+            }
+            WorkspaceUsageGraphBuildOutcome::Failed(error) => format!("Failed({error})"),
+        };
+        assert!(
+            matches!(outcome, WorkspaceUsageGraphBuildOutcome::Incomplete(_)),
+            "missing canonical Rust facts must not become a complete empty graph: {described}"
+        );
+    }
+
+    #[test]
+    fn unreprojected_go_module_overlay_makes_the_workspace_graph_incomplete_and_recovers() {
+        use crate::analyzer::{OverlayProject, Project};
+
+        let source = "package app\n\nfunc target() {}\nfunc caller() { target() }\n";
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n")
+            .file("app.go", source)
+            .build();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let file = fixture.file("app.go");
+        assert!(overlay.set(file.abs_path(), source.to_owned()));
+        let analyzer = GoAnalyzer::new(overlay.clone() as Arc<dyn Project>);
+        let build = |catalog: WorkspaceUsageCatalog| {
+            assert!(
+                !catalog.nodes.is_empty(),
+                "the Go pass must have graph roots"
+            );
+            build_workspace_usage_graph_with_cancellation(
+                &analyzer,
+                catalog,
+                &BTreeSet::from([UsageEcosystem::Go]),
+                &CancellationToken::default(),
+            )
+        };
+        assert!(analyzer.graph_inventory_complete());
+        assert!(matches!(
+            build(WorkspaceUsageCatalog::build(&analyzer)),
+            WorkspaceUsageGraphBuildOutcome::Complete(_)
+        ));
+
+        // Preserve the selected roots while invalidating the authority for
+        // their package-qualified identities. A source-only edit can be
+        // hydrated on demand; a module rename requires workspace reprojection.
+        let catalog = WorkspaceUsageCatalog::build(&analyzer);
+        let module = fixture.file("go.mod");
+        assert!(overlay.set(module.abs_path(), "module example.com/renamed\n".to_owned()));
+        assert!(!analyzer.graph_inventory_complete());
+        assert!(
+            matches!(
+                build(catalog),
+                WorkspaceUsageGraphBuildOutcome::Incomplete(_)
+            ),
+            "unreprojected Go identities must not become a complete empty graph"
+        );
+
+        assert!(overlay.clear(&module.abs_path()));
+        assert!(analyzer.graph_inventory_complete());
+        assert!(matches!(
+            build(WorkspaceUsageCatalog::build(&analyzer)),
+            WorkspaceUsageGraphBuildOutcome::Complete(_)
+        ));
     }
 
     /// A persisted multi-language workspace, analyzed twice so the second

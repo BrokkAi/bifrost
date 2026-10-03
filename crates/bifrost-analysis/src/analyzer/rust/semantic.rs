@@ -37,7 +37,7 @@ use crate::analyzer::{DispatchExtensibility, IAnalyzer, Language, ProjectFile, R
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v12";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v14";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -2080,9 +2080,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(source) = source
             && source != target
         {
-            self.append_effect(
+            // The read is spelled by the name itself, not by the enclosing
+            // evaluation's point: for `x = y` that point is the whole
+            // assignment.
+            let metadata = self.value_mapping(builder, node)?;
+            self.session.append_effect_with_metadata(
                 builder,
                 point,
+                metadata,
                 SemanticEffect::ValueFlow {
                     kind,
                     source,
@@ -2145,7 +2150,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -3667,6 +3675,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         let body = required_field(node, "body")?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        // A `loop` re-enters its body.
+        self.session
+            .record_loop_site(builder, node, body_entry, body_entry)?;
         let label = control_label(node, self.source);
         let loop_scope = builder.push_scope(
             Some(scope),
@@ -3704,6 +3715,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -6154,6 +6167,66 @@ fn condition_introduces_pattern_bindings(node: Node<'_>) -> bool {
         stack.extend(named_children(current));
     }
     false
+}
+
+/// Procedure syntax roles for the Rust lowering. A block's statements and
+/// its trailing expression are statements; items declare and do not run.
+/// `loop` is an unconditional loop and `while`/`while let` are conditional;
+/// `for` iterates and is not assessed.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: rust_statement_kind,
+        loop_site: |node| {
+            use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+            match node.kind() {
+                "loop_expression" => Some(LoopSyntax {
+                    kind: LoopKind::For,
+                    body: node.child_by_field_name("body"),
+                    condition: None,
+                }),
+                "while_expression" => Some(LoopSyntax {
+                    kind: LoopKind::While,
+                    body: node.child_by_field_name("body"),
+                    condition: node.child_by_field_name("condition"),
+                }),
+                _ => None,
+            }
+        },
+        procedure_matches: |_, node| {
+            matches!(
+                node.kind(),
+                "function_item" | "closure_expression" | "async_block" | "gen_block"
+            )
+        },
+        nested_procedure: |node| {
+            matches!(
+                node.kind(),
+                "function_item"
+                    | "closure_expression"
+                    | "async_block"
+                    | "gen_block"
+                    | "impl_item"
+                    | "trait_item"
+                    | "mod_item"
+                    | "const_item"
+                    | "static_item"
+                    | "macro_definition"
+            )
+        },
+    };
+
+fn rust_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if !node.parent().is_some_and(|parent| parent.kind() == "block") {
+        return None;
+    }
+    Some(match node.kind() {
+        "expression_statement" => "expression",
+        "let_declaration" => "local_declaration",
+        "empty_statement" => "empty",
+        "block" => "block",
+        kind if is_rust_expression(kind) => "expression",
+        _ => return None,
+    })
 }
 
 fn is_rust_expression(kind: &str) -> bool {

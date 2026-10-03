@@ -27,8 +27,8 @@
 use std::path::{Path, PathBuf};
 
 use super::dependency_discovery::{
-    XmlNode, expand_maven_value, is_maven_pom, maven_project_properties, parse_xml,
-    read_bounded_source,
+    MAX_BUILD_METADATA_BYTES, expand_maven_value, is_maven_pom, maven_project_properties,
+    parse_xml, read_bounded_source,
 };
 use crate::analyzer::Project;
 use crate::analyzer::topology::{
@@ -65,6 +65,69 @@ impl BuildModelProvider for JvmBuildModel {
 /// The `src/main` and `src/test` roles Maven's default lifecycle fixes.
 const MAVEN_SOURCE_SETS: [(&str, &str); 2] = [("main", "src/main"), ("test", "src/test")];
 
+/// A declared value retains failed interpolation separately from absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MavenValue {
+    Missing,
+    Unresolved,
+    Resolved(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MavenModelLimitation {
+    ParentModel,
+    Profiles,
+    DependencyManagement,
+    CustomSourceRoots,
+    BuildPlugins,
+}
+
+/// Direct declarations in one selected pom, not an effective Maven model.
+/// The caller retains the selected configuration file-version/content identity.
+#[derive(Debug)]
+pub(crate) struct MavenConfigurationFacts {
+    pub(crate) directory: PathBuf,
+    pub(crate) group_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: MavenValue,
+    pub(crate) modules: Vec<MavenValue>,
+    pub(crate) dependencies: Vec<MavenDependencyFacts>,
+    pub(crate) limitations: Vec<MavenModelLimitation>,
+}
+
+impl MavenConfigurationFacts {
+    pub(crate) fn default_source_roots(&self) -> [(&'static str, PathBuf); 2] {
+        MAVEN_SOURCE_SETS.map(|(role, relative)| (role, self.directory.join(relative)))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MavenDependencyFacts {
+    pub(crate) ordinal: u32,
+    pub(crate) group_id: MavenValue,
+    pub(crate) artifact_id: MavenValue,
+    pub(crate) version: MavenValue,
+    pub(crate) artifact_type: MavenValue,
+    pub(crate) classifier: MavenValue,
+    pub(crate) scope: MavenValue,
+    pub(crate) optional: MavenValue,
+    // Keep the established display topology's literal optional interpretation.
+    topology_kind: DependencyScope,
+}
+
+/// Parse one exact configuration without consulting other files or the host.
+/// Absence, malformed XML, invalid UTF-8, an oversized input or an unresolved
+/// required project coordinate cannot supply a named Maven project.
+pub(crate) fn maven_configuration_from_bytes(
+    pom_path: &Path,
+    source: &[u8],
+) -> Option<MavenConfigurationFacts> {
+    if source.len() > MAX_BUILD_METADATA_BYTES {
+        return None;
+    }
+    read_maven_configuration(pom_path, std::str::from_utf8(source).ok()?)
+}
+
 /// One pom, read.
 struct MavenProject {
     /// Workspace-relative path of the pom itself.
@@ -76,6 +139,7 @@ struct MavenProject {
     /// Workspace-relative pom paths of the modules this pom lists.
     modules: Vec<PathBuf>,
     dependencies: Vec<MavenDependency>,
+    source_roots: [(&'static str, PathBuf); 2],
 }
 
 struct MavenDependency {
@@ -88,17 +152,43 @@ fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
     let Ok(files) = project.all_files() else {
         return WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
     };
+    let configurations: Vec<_> = files
+        .iter()
+        .filter(|file| is_maven_pom(file))
+        .map(|file| (file.rel_path(), read_bounded_source(project, file)))
+        .collect();
+    maven_topology_from_inputs(
+        files.iter().map(|file| file.rel_path()),
+        configurations
+            .iter()
+            .map(|(path, source)| (*path, source.as_ref().map(|source| source.as_bytes()))),
+    )
+}
+
+/// Interpret one selected inventory without reading current project files.
+///
+/// `files` must enumerate the selected workspace paths, and `configurations`
+/// must include every selected pom, with `None` for unavailable bytes. Omission
+/// means absence, not a request to load a current file. Both inputs belong to
+/// the same selection; the result is owned by this topology query only.
+/// Configuration identities and external/JDK inventories remain the caller's
+/// authority. This reader models only Maven's default source layout.
+pub(crate) fn maven_topology_from_inputs<'a>(
+    files: impl IntoIterator<Item = &'a Path> + Clone,
+    configurations: impl IntoIterator<Item = (&'a Path, Option<&'a [u8]>)>,
+) -> WorkspaceTopology {
     let mut complete = TopologyCompleteness::Complete;
     let mut projects = Vec::new();
-    for file in &files {
-        if !is_maven_pom(file) {
+    for (path, source) in configurations {
+        if path.file_name().is_none_or(|name| name != "pom.xml") {
             continue;
         }
-        match read_maven_project(project, file) {
+        let parsed = source
+            .filter(|source| source.len() <= MAX_BUILD_METADATA_BYTES)
+            .and_then(|source| std::str::from_utf8(source).ok())
+            .and_then(|source| read_maven_project(path, source));
+        match parsed {
             Some(parsed) => projects.push(parsed),
-            // A pom the workspace has but this reader could not read or could
-            // not name: the topology it produces is missing whatever that pom
-            // declares, and must say so.
             None => complete = TopologyCompleteness::Incomplete,
         }
     }
@@ -182,12 +272,12 @@ fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
             completeness: TopologyCompleteness::Complete,
         });
 
-        for (role, relative) in MAVEN_SOURCE_SETS {
-            let root = parsed.directory.join(relative);
+        for (role, root) in &parsed.source_roots {
             let owned: Vec<PathBuf> = files
-                .iter()
-                .map(|file| file.rel_path().to_path_buf())
-                .filter(|path| path.starts_with(&root))
+                .clone()
+                .into_iter()
+                .map(Path::to_path_buf)
+                .filter(|path| path.starts_with(root))
                 .collect();
             if owned.is_empty() {
                 continue;
@@ -197,7 +287,7 @@ fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
                 kind: TopologyEntityKind::SourceSet,
                 name: name.clone(),
                 owner: Some(parsed.artifact_id.clone()),
-                root: Some(root),
+                root: Some(root.clone()),
                 provenance: vec![TopologyProvenance::new(
                     parsed.pom.clone(),
                     TopologyProvenanceKind::BuildModelLayout,
@@ -291,87 +381,158 @@ fn collapse_ambiguous_ownership(ownership: &mut Vec<FileOwnership>) {
     *ownership = collapsed;
 }
 
-fn read_maven_project(
-    project: &dyn Project,
-    file: &crate::analyzer::ProjectFile,
-) -> Option<MavenProject> {
-    let source = read_bounded_source(project, file)?;
-    let node = parse_xml(&source)?;
+fn read_maven_project(path: &Path, source: &str) -> Option<MavenProject> {
+    let facts = maven_configuration_from_bytes(path, source.as_bytes())?;
+    let source_roots = facts.default_source_roots();
+    let modules = facts
+        .modules
+        .into_iter()
+        .filter_map(|module| {
+            let MavenValue::Resolved(module) = module else {
+                return None;
+            };
+            Some(facts.directory.join(module).join("pom.xml"))
+        })
+        .collect();
+    let dependencies = facts
+        .dependencies
+        .into_iter()
+        .filter_map(|dependency| {
+            let MavenValue::Resolved(group_id) = dependency.group_id else {
+                return None;
+            };
+            let MavenValue::Resolved(artifact_id) = dependency.artifact_id else {
+                return None;
+            };
+            Some(MavenDependency {
+                group_id,
+                artifact_id,
+                kind: dependency.topology_kind,
+            })
+        })
+        .collect();
+    Some(MavenProject {
+        pom: path.to_path_buf(),
+        directory: facts.directory,
+        group_id: facts.group_id,
+        artifact_id: facts.artifact_id,
+        modules,
+        dependencies,
+        source_roots,
+    })
+}
+
+fn maven_value(value: Option<&str>, properties: &HashMap<String, String>) -> MavenValue {
+    match value {
+        None => MavenValue::Missing,
+        Some(value) => expand_maven_value(value, properties)
+            .map(MavenValue::Resolved)
+            .unwrap_or(MavenValue::Unresolved),
+    }
+}
+
+fn read_maven_configuration(path: &Path, source: &str) -> Option<MavenConfigurationFacts> {
+    let node = parse_xml(source)?;
     if node.name != "project" {
         return None;
     }
     let properties = maven_project_properties(&node);
     let parent = node.child("parent");
-    let group_id = node
-        .child_text("groupId")
-        .or_else(|| parent.and_then(|parent| parent.child_text("groupId")))
-        .and_then(|value| expand_maven_value(value, &properties))?;
-    let artifact_id = node
-        .child_text("artifactId")
-        .and_then(|value| expand_maven_value(value, &properties))?;
+    let MavenValue::Resolved(group_id) = maven_value(
+        node.child_text("groupId")
+            .or_else(|| parent.and_then(|parent| parent.child_text("groupId"))),
+        &properties,
+    ) else {
+        return None;
+    };
+    let MavenValue::Resolved(artifact_id) = maven_value(node.child_text("artifactId"), &properties)
+    else {
+        return None;
+    };
     if group_id.is_empty() || artifact_id.is_empty() {
         return None;
     }
-    let pom = file.rel_path().to_path_buf();
-    let directory = pom.parent().map(Path::to_path_buf).unwrap_or_default();
-
+    let version = maven_value(
+        node.child_text("version")
+            .or_else(|| parent.and_then(|parent| parent.child_text("version"))),
+        &properties,
+    );
+    let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let modules = node
         .child("modules")
         .map(|modules| {
             modules
                 .children_named("module")
-                .filter_map(|module| expand_maven_value(module.text.trim(), &properties))
-                .map(|module| directory.join(module).join("pom.xml"))
+                .map(|module| maven_value(Some(module.text.trim()), &properties))
                 .collect()
         })
         .unwrap_or_default();
-
     let dependencies = node
         .child("dependencies")
-        .map(|dependencies| maven_dependencies(dependencies, &properties))
+        .map(|dependencies| {
+            dependencies
+                .children_named("dependency")
+                .enumerate()
+                .map(|(ordinal, dependency)| {
+                    let scope = maven_value(dependency.child_text("scope"), &properties);
+                    let optional_literal = dependency
+                        .child_text("optional")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                    let topology_kind = if optional_literal {
+                        DependencyScope::Optional
+                    } else {
+                        maven_scope_edge_kind(match &scope {
+                            MavenValue::Resolved(value) => Some(value),
+                            _ => None,
+                        })
+                    };
+                    MavenDependencyFacts {
+                        ordinal: u32::try_from(ordinal)
+                            .expect("bounded XML node inventory fits u32"),
+                        group_id: maven_value(dependency.child_text("groupId"), &properties),
+                        artifact_id: maven_value(dependency.child_text("artifactId"), &properties),
+                        version: maven_value(dependency.child_text("version"), &properties),
+                        artifact_type: maven_value(dependency.child_text("type"), &properties),
+                        classifier: maven_value(dependency.child_text("classifier"), &properties),
+                        scope,
+                        optional: maven_value(dependency.child_text("optional"), &properties),
+                        topology_kind,
+                    }
+                })
+                .collect()
+        })
         .unwrap_or_default();
-
-    Some(MavenProject {
-        pom,
+    let mut limitations = Vec::new();
+    if parent.is_some() {
+        limitations.push(MavenModelLimitation::ParentModel);
+    }
+    if node.child("profiles").is_some() {
+        limitations.push(MavenModelLimitation::Profiles);
+    }
+    if node.child("dependencyManagement").is_some() {
+        limitations.push(MavenModelLimitation::DependencyManagement);
+    }
+    if let Some(build) = node.child("build") {
+        if build.child("sourceDirectory").is_some() || build.child("testSourceDirectory").is_some()
+        {
+            limitations.push(MavenModelLimitation::CustomSourceRoots);
+        }
+        if build.child("plugins").is_some()
+            || build.child("pluginManagement").is_some()
+            || build.child("extensions").is_some()
+        {
+            limitations.push(MavenModelLimitation::BuildPlugins);
+        }
+    }
+    Some(MavenConfigurationFacts {
         directory,
         group_id,
         artifact_id,
+        version,
         modules,
         dependencies,
+        limitations,
     })
-}
-
-fn maven_dependencies(
-    dependencies: &XmlNode,
-    properties: &HashMap<String, String>,
-) -> Vec<MavenDependency> {
-    dependencies
-        .children_named("dependency")
-        .filter_map(|dependency| {
-            let group_id = dependency
-                .child_text("groupId")
-                .and_then(|value| expand_maven_value(value, properties))?;
-            let artifact_id = dependency
-                .child_text("artifactId")
-                .and_then(|value| expand_maven_value(value, properties))?;
-            let optional = dependency
-                .child_text("optional")
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-            let scope = dependency
-                .child_text("scope")
-                .and_then(|value| expand_maven_value(value, properties));
-            let kind = if optional {
-                DependencyScope::Optional
-            } else {
-                maven_scope_edge_kind(scope.as_deref())
-            };
-            Some(MavenDependency {
-                group_id,
-                artifact_id,
-                kind,
-            })
-        })
-        .collect()
 }
 
 /// The Maven scope vocabulary as topology edge kinds. An absent scope is
@@ -406,6 +567,194 @@ mod tests {
         }
         let project = TestProject::new(root, Language::Java);
         JVM_BUILD_MODEL.topology(&project)
+    }
+
+    #[test]
+    fn maven_configuration_preserves_direct_dependency_values_and_limits() {
+        let source = br#"<project>
+            <parent><groupId>parent</groupId><artifactId>base</artifactId><version>1</version></parent>
+            <groupId>example</groupId><artifactId>app</artifactId><version>${revision}</version>
+            <properties><revision>21</revision><optionalFlag>true</optionalFlag></properties>
+            <modules><module>child</module><module>${missingModule}</module></modules>
+            <dependencies>
+                <dependency><groupId>example</groupId><artifactId>lib</artifactId>
+                    <scope>test</scope><optional>${optionalFlag}</optional><type>test-jar</type><classifier>tests</classifier>
+                </dependency>
+                <dependency><groupId>${missingGroup}</groupId><version>${managedVersion}</version></dependency>
+            </dependencies>
+            <profiles/><dependencyManagement/>
+            <build><sourceDirectory>custom</sourceDirectory><plugins/></build>
+        </project>"#;
+        let facts = maven_configuration_from_bytes(Path::new("module/pom.xml"), source).unwrap();
+        assert_eq!(facts.group_id, "example");
+        assert_eq!(facts.artifact_id, "app");
+        assert_eq!(facts.version, MavenValue::Resolved("21".to_owned()));
+        assert_eq!(
+            facts.modules,
+            vec![
+                MavenValue::Resolved("child".to_owned()),
+                MavenValue::Unresolved
+            ]
+        );
+        assert_eq!(facts.dependencies.len(), 2);
+        let dependency = &facts.dependencies[0];
+        assert_eq!(dependency.ordinal, 0);
+        assert_eq!(
+            dependency.group_id,
+            MavenValue::Resolved("example".to_owned())
+        );
+        assert_eq!(
+            dependency.artifact_id,
+            MavenValue::Resolved("lib".to_owned())
+        );
+        assert_eq!(dependency.version, MavenValue::Missing);
+        assert_eq!(dependency.scope, MavenValue::Resolved("test".to_owned()));
+        assert_eq!(dependency.optional, MavenValue::Resolved("true".to_owned()));
+        assert_eq!(
+            dependency.artifact_type,
+            MavenValue::Resolved("test-jar".to_owned())
+        );
+        assert_eq!(
+            dependency.classifier,
+            MavenValue::Resolved("tests".to_owned())
+        );
+        // Current display topology treats only literal true as optional.
+        assert_eq!(dependency.topology_kind, DependencyScope::Test);
+        let unresolved = &facts.dependencies[1];
+        assert_eq!(unresolved.ordinal, 1);
+        assert_eq!(unresolved.group_id, MavenValue::Unresolved);
+        assert_eq!(unresolved.artifact_id, MavenValue::Missing);
+        assert_eq!(unresolved.version, MavenValue::Unresolved);
+        assert_eq!(
+            facts.limitations,
+            vec![
+                MavenModelLimitation::ParentModel,
+                MavenModelLimitation::Profiles,
+                MavenModelLimitation::DependencyManagement,
+                MavenModelLimitation::CustomSourceRoots,
+                MavenModelLimitation::BuildPlugins
+            ]
+        );
+        assert_eq!(
+            facts.default_source_roots(),
+            [
+                ("main", PathBuf::from("module/src/main")),
+                ("test", PathBuf::from("module/src/test"))
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_maven_display_names_retain_distinct_configuration_directories() {
+        let source =
+            br#"<project><groupId>example</groupId><artifactId>same</artifactId></project>"#;
+        let first = maven_configuration_from_bytes(Path::new("first/pom.xml"), source).unwrap();
+        let second = maven_configuration_from_bytes(Path::new("second/pom.xml"), source).unwrap();
+        assert_eq!(first.artifact_id, second.artifact_id);
+        assert_ne!(first.directory, second.directory);
+        assert_ne!(first.default_source_roots(), second.default_source_roots());
+        assert_eq!(first.version, MavenValue::Missing);
+        assert!(first.limitations.is_empty());
+    }
+
+    #[test]
+    fn selected_bytes_and_paths_control_topology_without_project_reads() {
+        let domain = domain_pom("");
+        let paths = [Path::new("domain/src/main/java/Order.java")];
+        let configurations = [
+            (Path::new("pom.xml"), Some(ROOT_POM.as_bytes())),
+            (Path::new("domain/pom.xml"), Some(domain.as_bytes())),
+            (
+                Path::new("persistence/pom.xml"),
+                Some(PERSISTENCE_POM.as_bytes()),
+            ),
+        ];
+        let before = maven_topology_from_inputs(paths, configurations);
+        assert_eq!(before.completeness(), TopologyCompleteness::Complete);
+        assert_eq!(
+            before.ownership_of(paths[0]).target.as_deref(),
+            Some("domain")
+        );
+
+        let replacement = domain.replace(
+            "<artifactId>domain</artifactId>",
+            "<artifactId>renamed</artifactId>",
+        );
+        let after = maven_topology_from_inputs(
+            paths,
+            [
+                configurations[0],
+                (Path::new("domain/pom.xml"), Some(replacement.as_bytes())),
+                configurations[2],
+            ],
+        );
+        assert_eq!(
+            after.ownership_of(paths[0]).target.as_deref(),
+            Some("renamed")
+        );
+        assert!(after.entity(TopologyEntityKind::Target, "domain").is_none());
+        assert_eq!(
+            before.ownership_of(paths[0]).target.as_deref(),
+            Some("domain")
+        );
+
+        let removed = maven_topology_from_inputs(paths, [configurations[0], configurations[2]]);
+        assert_eq!(removed.completeness(), TopologyCompleteness::Incomplete);
+        assert_eq!(
+            removed.ownership_of(paths[0]).state,
+            FileOwnershipState::Unknown
+        );
+        let no_sources = maven_topology_from_inputs([], configurations);
+        assert_eq!(
+            no_sources
+                .entities_of_kind(TopologyEntityKind::SourceSet)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn selected_unavailable_invalid_and_oversized_poms_keep_topology_open() {
+        let mut oversized = domain_pom("").into_bytes();
+        oversized.resize(MAX_BUILD_METADATA_BYTES + 1, b' ');
+        for source in [
+            None,
+            Some(&b"<invalid/>"[..]),
+            Some(&b"\xff"[..]),
+            Some(oversized.as_slice()),
+        ] {
+            let topology = maven_topology_from_inputs(
+                [],
+                [
+                    (Path::new("pom.xml"), Some(ROOT_POM.as_bytes())),
+                    (Path::new("domain/pom.xml"), source),
+                    (
+                        Path::new("persistence/pom.xml"),
+                        Some(PERSISTENCE_POM.as_bytes()),
+                    ),
+                ],
+            );
+            assert_eq!(topology.completeness(), TopologyCompleteness::Incomplete);
+            assert!(
+                topology
+                    .entity(TopologyEntityKind::Target, "domain")
+                    .is_none()
+            );
+        }
+        let gradle = maven_topology_from_inputs(
+            [Path::new("src/main/java/App.java")],
+            [(
+                Path::new("build.gradle"),
+                Some(&b"plugins { id 'java' }"[..]),
+            )],
+        );
+        assert_eq!(gradle.completeness(), TopologyCompleteness::Incomplete);
+        assert_eq!(
+            gradle
+                .ownership_of(Path::new("src/main/java/App.java"))
+                .state,
+            FileOwnershipState::Unknown
+        );
     }
 
     const ROOT_POM: &str = r#"<project>

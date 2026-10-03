@@ -1,13 +1,9 @@
 use super::*;
-use crate::analyzer::LanguageAdapter;
-use crate::analyzer::cpp::CppAdapter;
 use crate::analyzer::cpp::{
-    CppOccurrenceRole, CppRecoveredExportClassIndex,
-    cpp_callable_definitions_share_identity_evidence_with_visibility,
+    CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence_with_visibility,
     cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
-    cpp_occurrence_role_for_range, cpp_range_is_pure_virtual_declaration,
+    cpp_range_is_pure_virtual_declaration,
 };
-use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::structural::resolution::{
@@ -21,30 +17,29 @@ use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
+use brokk_bifrost_core::analyzer::cpp_facts::{CppEnumOwnerKind, CppStructuredAliasTarget};
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_cpp::call_match::{
-    CppArgType, CppRefQualifier, cpp_filter_candidates_by_args, cpp_forwarding_call_argument,
-    cpp_literal_arg_type, cpp_parameter_type_text, cpp_signature_param_types,
-    cpp_signature_ref_qualifier, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
-    normalize_cpp_type_name,
+    CppArgType, CppRefQualifier, cpp_filter_candidates_by_args_with_parameter_types,
+    cpp_forwarding_call_argument, cpp_literal_arg_type, cpp_parameter_type_text,
+    cpp_signature_ref_qualifier, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::extractor::{QualifiedReceiverBase, qualified_receiver_base};
 use brokk_bifrost_cpp::graph::resolver::lexical_component_tiers;
 use brokk_bifrost_cpp::graph::resolver::{
     CppClassDeclarationStrength, MacroLocalBinding, OrdinaryMacroReferenceResolution,
-    anonymous_aggregate_owner, c_offsetof_member_parts, cpp_alias_declaration_names_function_type,
-    cpp_alias_declaration_target_text, cpp_class_declaration_strength,
-    cpp_field_declaration_names_function_type, cpp_field_expression_receiver,
-    cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix,
-    field_declared_binding, field_initializer_holds_subobject,
-    guard_requirements_hold_at_reference, is_c_offsetof_member_node,
-    is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
-    preprocessor_guard_environment, recovered_c_new_expression_argument_at,
-    recovered_macro_decorated_declarator_type, same_logical_symbol, same_visible_symbol,
-    type_owner_of,
+    anonymous_aggregate_owner, c_offsetof_member_parts, cpp_class_declaration_strength,
+    cpp_field_expression_receiver, cpp_qualified_name_has_scope_suffix, field_declared_binding,
+    field_initializer_holds_subobject, guard_requirements_hold_at_reference,
+    is_c_offsetof_member_node, is_c_sizeof_expression_type_candidate, is_c_source_file,
+    is_type_shaped_template_argument_name, preprocessor_guard_environment,
+    recovered_c_new_expression_argument_at, recovered_macro_decorated_declarator_type,
+    same_logical_symbol, same_visible_symbol, type_owner_of,
 };
+use brokk_bifrost_cpp::graph_support::CppSource;
 use std::time::Instant;
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
@@ -83,74 +78,62 @@ fn cpp_template_resolution_message(text: &str, error: &CppTemplateResolutionErro
         }
     }
 }
-const CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
-    crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;
-
-pub(super) struct CppNavigationIndex {
-    ranges: HashMap<CodeUnit, Vec<Range>>,
-    truncated: HashSet<CodeUnit>,
+pub(super) fn declaration_at_offset(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<(CodeUnit, Range, CppOccurrenceRole)> {
+    if analyzer.indexed_source(file).as_deref() != Some(source) {
+        return None;
+    }
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let scope = AnalyzerQueryScope::new(analyzer);
+    declaration_occurrence_at_offset_in_facts(cpp, scope.token(), file, offset)
 }
 
-impl CppNavigationIndex {
-    pub(super) fn build(file: &ProjectFile, source: &str, tree: &Tree) -> Self {
-        let parsed = CppAdapter.parse_file(file, source, tree);
-        Self {
-            ranges: parsed.navigation_ranges,
-            truncated: parsed.navigation_ranges_truncated,
+fn declaration_occurrence_at_offset_in_facts(
+    cpp: &CppAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    offset: usize,
+) -> Option<(CodeUnit, Range, CppOccurrenceRole)> {
+    let facts = CppSource::declaration_source_facts(cpp, token, file)?;
+    let mut best: Option<(usize, CodeUnit, Range, CppOccurrenceRole)> = None;
+    for (declaration_index, declaration) in facts.source.declarations().iter().enumerate() {
+        let declaration_id = SourceDeclarationId::new(
+            u32::try_from(declaration_index).expect("source declaration arena exceeds u32"),
+        );
+        let Some(name) = declaration.name else {
+            continue;
+        };
+        let name_range = facts.source.occurrence(name).range;
+        if offset < name_range.start_byte || offset >= name_range.end_byte {
+            continue;
+        }
+        let Some(fact) = facts
+            .facts
+            .declarations
+            .iter()
+            .find(|fact| fact.declaration == declaration_id)
+        else {
+            continue;
+        };
+        let Some(units) = facts.declaration_units.get(&fact.declaration) else {
+            continue;
+        };
+        let length = name_range.end_byte.saturating_sub(name_range.start_byte);
+        for unit in units {
+            let candidate = (length, unit.clone(), name_range, fact.occurrence_role);
+            if best
+                .as_ref()
+                .is_none_or(|current| (candidate.0, &candidate.1) < (current.0, &current.1))
+            {
+                best = Some(candidate);
+            }
         }
     }
-
-    fn ranges(&self, candidate: &CodeUnit) -> &[Range] {
-        self.ranges.get(candidate).map(Vec::as_slice).unwrap_or(&[])
-    }
-
-    fn is_truncated(&self, candidate: &CodeUnit) -> bool {
-        self.truncated.contains(candidate)
-    }
-}
-
-pub(super) fn declaration_at_offset(
-    file: &ProjectFile,
-    source: &str,
-    offset: usize,
-) -> Option<CodeUnit> {
-    let tree = parse_cpp_tree(source)?;
-    declaration_occurrence_at_offset_in_tree(file, source, &tree, offset)
-        .map(|(declaration, _)| declaration)
-}
-
-fn declaration_occurrence_at_offset_in_tree(
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-    offset: usize,
-) -> Option<(CodeUnit, Range)> {
-    let index = CppNavigationIndex::build(file, source, tree);
-    index
-        .ranges
-        .iter()
-        .flat_map(|(candidate, ranges)| {
-            ranges
-                .iter()
-                // This index was parsed from these exact bytes. A declaration
-                // whose range excludes the offset cannot name this token.
-                .filter(|range| offset >= range.start_byte && offset < range.end_byte)
-                .filter_map(|range| {
-                    let name_range = code_unit_declaration_name_range_for_range(
-                        source,
-                        tree.root_node(),
-                        candidate,
-                        *range,
-                    )?;
-                    (offset >= name_range.start_byte && offset < name_range.end_byte).then_some((
-                        name_range.end_byte.saturating_sub(name_range.start_byte),
-                        candidate.clone(),
-                        *range,
-                    ))
-                })
-        })
-        .min_by_key(|(length, candidate, _)| (*length, candidate.clone()))
-        .map(|(_, candidate, range)| (candidate, range))
+    best.map(|(_, unit, range, role)| (unit, range, role))
 }
 
 pub(super) struct CppNavigationSelection {
@@ -169,30 +152,15 @@ pub(super) fn select_navigation_targets(
 ) -> CppNavigationSelection {
     let cpp = resolve_analyzer::<CppAnalyzer>(context.analyzer);
     let mut classified = Vec::new();
-    let mut recovered_export_classes_by_file: HashMap<
-        ProjectFile,
-        Arc<CppRecoveredExportClassIndex>,
-    > = HashMap::default();
     let mut structure_unavailable = false;
     let mut source_ranges_truncated = false;
     for candidate in candidates {
-        let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
-        let candidate_started = Instant::now();
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=candidate status=started fqn={} file={}",
-                candidate.fq_name(),
-                candidate.source().rel_path().display(),
-            );
-        }
-        let indexed_tree_started = Instant::now();
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=indexed_tree status=started fqn={}",
-                candidate.fq_name(),
-            );
-        }
-        let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
+        let occurrences = cpp.and_then(|cpp| {
+            brokk_bifrost_cpp::graph_support::CppSource::declaration_navigation_occurrences(
+                cpp, token, candidate,
+            )
+        });
+        let Some(mut occurrences) = occurrences else {
             if operation == NavigationOperation::Declaration {
                 classified.push((
                     candidate.clone(),
@@ -205,100 +173,12 @@ pub(super) fn select_navigation_targets(
             structure_unavailable = true;
             continue;
         };
-        let indexed_source = context
-            .cpp_indexed_source(candidate.source())
-            .expect("an indexed C++ tree is parsed from the indexed source");
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=indexed_tree status=completed fqn={} elapsed_ms={}",
-                candidate.fq_name(),
-                indexed_tree_started.elapsed().as_millis(),
-            );
-        }
-        let root = tree.root_node();
-        let navigation_index_started = Instant::now();
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=navigation_index status=started fqn={}",
-                candidate.fq_name(),
-            );
-        }
-        let Some(index) = context.cpp_navigation_index(candidate.source()) else {
-            if operation == NavigationOperation::Declaration {
-                classified.push((
-                    candidate.clone(),
-                    None,
-                    CppOccurrenceRole::Unknown,
-                    None,
-                    false,
-                ));
-            }
-            structure_unavailable = true;
-            continue;
-        };
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=navigation_index status=completed fqn={} elapsed_ms={}",
-                candidate.fq_name(),
-                navigation_index_started.elapsed().as_millis(),
-            );
-        }
-        let direct_ranges_started = Instant::now();
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=direct_ranges status=started fqn={}",
-                candidate.fq_name(),
-            );
-        }
-        let mut ranges = index.ranges(candidate).to_vec();
-        source_ranges_truncated |= index.is_truncated(candidate);
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=direct_ranges status=completed fqn={} ranges={} elapsed_ms={}",
-                candidate.fq_name(),
-                ranges.len(),
-                direct_ranges_started.elapsed().as_millis(),
-            );
-        }
-        if ranges.is_empty()
-            && let Some(cpp) = cpp
-        {
-            let started = Instant::now();
-            if report_stats {
-                eprintln!(
-                    "BIFROST_CPP_NAVIGATION_RECONCILIATION_STATS status=started fqn={} file={}",
-                    candidate.fq_name(),
-                    candidate.source().rel_path().display(),
-                );
-            }
-            let provisional = cpp.reconciled_provisional(candidate);
-            if let Some(provisional) = provisional.as_ref() {
-                ranges = index.ranges(provisional).to_vec();
-                source_ranges_truncated |= index.is_truncated(provisional);
-            }
-            if report_stats {
-                eprintln!(
-                    "BIFROST_CPP_NAVIGATION_RECONCILIATION_STATS status=completed fqn={} file={} provisional={} ranges={} elapsed_ms={}",
-                    candidate.fq_name(),
-                    candidate.source().rel_path().display(),
-                    provisional.is_some(),
-                    ranges.len(),
-                    started.elapsed().as_millis(),
-                );
-            }
-        }
-        // #1970: this navigation index is the C++ walk of the file, so it has
-        // nothing for an identity only the C reading of a header mints. Those
-        // declaration ranges live in the stored `cpp:c` row-set, which the
-        // analyzer overlays; `c_reading_ranges` answers only for a unit that
-        // reading actually mints, so no other candidate is affected.
-        if ranges.is_empty()
-            && let Some(c_reading_ranges) =
-                cpp.and_then(|cpp| cpp.c_reading_ranges(token, candidate))
-        {
-            ranges = c_reading_ranges;
-        }
-        if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
+        occurrences.sort_by_key(|occurrence| occurrence.range);
+        occurrences.dedup();
+        // Preserve the existing per-declaration navigation bound.
+        source_ranges_truncated |= occurrences.len() > 257;
+        occurrences.truncate(257);
+        if occurrences.is_empty() && !candidate.is_callable() && !candidate.is_class() {
             classified.push((
                 candidate.clone(),
                 None,
@@ -306,40 +186,27 @@ pub(super) fn select_navigation_targets(
                 None,
                 false,
             ));
-            continue;
         }
-        // Resolved once per file for the whole candidate loop: the occurrence
-        // role reads the recovered export-macro shapes, and deriving those walks
-        // every `ERROR` subtree in the file (#1496).
-        let recovered_export_classes = recovered_export_classes_by_file
-            .entry(candidate.source().clone())
-            .or_insert_with(|| Arc::new(CppRecoveredExportClassIndex::build(root, &indexed_source)))
-            .clone();
-        classified.extend(ranges.iter().copied().map(|range| {
-            let kind = cpp_occurrence_role_for_range(
-                &recovered_export_classes,
-                root,
-                &indexed_source,
-                candidate,
-                &range,
-            );
-            let family = brokk_bifrost_cpp::graph::resolver::preprocessor_conditional_family_range(
-                root,
-                range.start_byte,
-                range.end_byte,
-            );
-            let pure_virtual = kind == CppOccurrenceRole::DeclarationOnly
+        classified.extend(occurrences.into_iter().map(|occurrence| {
+            let pure_virtual = occurrence.role == CppOccurrenceRole::DeclarationOnly
                 && candidate.is_callable()
-                && cpp_range_is_pure_virtual_declaration(root, &indexed_source, &range);
-            (candidate.clone(), Some(range), kind, family, pure_virtual)
+                && cpp
+                    .and_then(|cpp| cpp.prepared_syntax(token, candidate.source()))
+                    .is_some_and(|prepared| {
+                        cpp_range_is_pure_virtual_declaration(
+                            prepared.tree().root_node(),
+                            prepared.source(),
+                            &occurrence.range,
+                        )
+                    });
+            (
+                candidate.clone(),
+                Some(occurrence.range),
+                occurrence.role,
+                occurrence.conditional_family,
+                pure_virtual,
+            )
         }));
-        if report_stats {
-            eprintln!(
-                "BIFROST_CPP_NAVIGATION_PHASE phase=candidate status=completed fqn={} elapsed_ms={}",
-                candidate.fq_name(),
-                candidate_started.elapsed().as_millis(),
-            );
-        }
     }
     let has_declaration_only = classified
         .iter()
@@ -604,16 +471,10 @@ pub(super) fn resolve_cpp<'a>(
     }
     if operation == Some(NavigationOperation::Definition)
         && cpp_is_non_reference_declaration_name(node)
-        && let Some((declaration, declaration_range)) =
-            declaration_occurrence_at_offset_in_tree(file, source, tree, site.focus_start_byte)
+        && let Some((declaration, _declaration_range, declaration_role)) =
+            declaration_at_offset(analyzer, file, source, site.focus_start_byte)
         && declaration.is_callable()
-        && cpp_occurrence_role_for_range(
-            &CppRecoveredExportClassIndex::build(root, source),
-            root,
-            source,
-            &declaration,
-            &declaration_range,
-        ) == CppOccurrenceRole::DeclarationOnly
+        && declaration_role == CppOccurrenceRole::DeclarationOnly
     {
         // The exact prototype establishes the callable, but its body may be
         // indexed in another file. Expand only to declarations of that same
@@ -1232,45 +1093,9 @@ impl CppBoundedProvider<'_> {
             .collect()
     }
 
-    fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
-        self.session
-            .query_limited_rows(|limit| self.cpp.ranges_limited(unit, limit))
-    }
-
     fn signature_metadata(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.session
             .query_limited_rows(|limit| self.cpp.signature_metadata_limited(unit, limit))
-    }
-
-    fn prepared_syntax(
-        &self,
-        token: QueryToken<'_>,
-        file: &ProjectFile,
-    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
-
-        if !self.session.scope_step() {
-            return None;
-        }
-        match self.cpp.prepared_syntax_limited_cancellable(
-            token,
-            file,
-            CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
-            self.session.cancellation(),
-        ) {
-            PreparedSyntaxLimitedOutcome::Available(_, prepared) => {
-                self.session.observe_cancellation().then_some(prepared)
-            }
-            PreparedSyntaxLimitedOutcome::Exceeded(_) => {
-                self.session.mark_scope_incomplete();
-                None
-            }
-            PreparedSyntaxLimitedOutcome::Cancelled => {
-                self.session.observe_cancellation();
-                None
-            }
-            PreparedSyntaxLimitedOutcome::Unavailable => None,
-        }
     }
 }
 
@@ -1778,73 +1603,31 @@ fn cpp_bounded_direct_ancestor_edges(
         return Vec::new();
     }
     let scope = AnalyzerQueryScope::new(provider.cpp);
-    let Some(prepared) = provider.prepared_syntax(scope.token(), owner.source()) else {
+    let dispatch = CppDispatch::new(provider.cpp, scope.token());
+    let Some(facts) = dispatch.source().declaration_source_properties(owner) else {
         return Vec::new();
     };
     let mut edges = Vec::new();
-    for range in provider.ranges(owner) {
-        if !provider.session.scope_step() {
-            return Vec::new();
-        }
-        let Some(declaration) = cpp_bounded_declaration_node_for_range(
-            prepared.tree().root_node(),
-            &range,
-            provider.session,
-        ) else {
-            continue;
-        };
-        let Some(owner_node) = cpp_bounded_class_declaration_node(
-            declaration,
-            owner,
-            prepared.source(),
-            provider.session,
-        ) else {
-            continue;
-        };
-        let mut cursor = owner_node.walk();
-        for child in owner_node.named_children(&mut cursor) {
+    for fact in facts {
+        for base in fact.bases {
             if !provider.session.scope_step() {
                 return Vec::new();
             }
-            if child.kind() != "base_class_clause" {
+            let Some(name) =
+                StructuredTypeName::new(base.components, fact.lexical_path.clone(), base.absolute)
+            else {
                 continue;
-            }
-            let mut is_virtual = false;
-            for index in 0..child.child_count() {
-                if !provider.session.scope_step() {
-                    return Vec::new();
-                }
-                let Some(candidate) = child.child(index) else {
-                    continue;
-                };
-                match candidate.kind() {
-                    "," => {
-                        is_virtual = false;
-                    }
-                    "virtual" => {
-                        is_virtual = true;
-                    }
-                    "type_identifier"
-                    | "qualified_identifier"
-                    | "scoped_type_identifier"
-                    | "template_type" => {
-                        if let Some(resolution) = cpp_bounded_type_candidates(
-                            provider,
-                            owner.source(),
-                            prepared.source(),
-                            candidate,
-                        ) {
-                            edges.extend(
-                                resolution
-                                    .candidates
-                                    .into_iter()
-                                    .map(|target| CppBoundedBaseEdge { target, is_virtual }),
-                            );
-                        }
-                        is_virtual = false;
-                    }
-                    _ => {}
-                }
+            };
+            if let Some(resolution) = cpp_bounded_type_candidates_for_name(provider, &name) {
+                edges.extend(
+                    resolution
+                        .candidates
+                        .into_iter()
+                        .map(|target| CppBoundedBaseEdge {
+                            target,
+                            is_virtual: base.is_virtual,
+                        }),
+                );
             }
         }
     }
@@ -1855,38 +1638,6 @@ fn cpp_bounded_direct_ancestor_edges(
     });
     edges.dedup();
     edges
-}
-
-fn cpp_bounded_class_declaration_node<'tree>(
-    declaration: Node<'tree>,
-    owner: &CodeUnit,
-    source: &str,
-    session: &ResolutionSession,
-) -> Option<Node<'tree>> {
-    let mut pending = vec![declaration];
-    while let Some(candidate) = pending.pop() {
-        if !session.scope_step() {
-            return None;
-        }
-        if matches!(
-            candidate.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) && candidate
-            .child_by_field_name("name")
-            .is_some_and(|name| cpp_node_text(name, source) == owner.identifier())
-        {
-            return Some(candidate);
-        }
-        for index in (0..candidate.named_child_count()).rev() {
-            if !session.scope_step() {
-                return None;
-            }
-            if let Some(child) = candidate.named_child(index) {
-                pending.push(child);
-            }
-        }
-    }
-    None
 }
 
 fn resolve_cpp_bounded_callable(
@@ -2078,13 +1829,7 @@ fn cpp_bounded_type_resolution_for_node(
             if definitions.status != DefinitionLookupStatus::Resolved {
                 return None;
             }
-            cpp_bounded_callable_return_type(
-                provider,
-                file,
-                source,
-                root,
-                definitions.definitions.as_slice(),
-            )
+            cpp_bounded_callable_return_type(provider, definitions.definitions.as_slice())
         }
         "field_expression" => {
             let definitions = resolve_cpp_bounded_member(provider, file, source, root, node);
@@ -2094,13 +1839,7 @@ fn cpp_bounded_type_resolution_for_node(
             if definitions.definitions.iter().all(CodeUnit::is_field) {
                 return cpp_bounded_field_type(provider, file, definitions.definitions.as_slice());
             }
-            cpp_bounded_callable_return_type(
-                provider,
-                file,
-                source,
-                root,
-                definitions.definitions.as_slice(),
-            )
+            cpp_bounded_callable_return_type(provider, definitions.definitions.as_slice())
         }
         "type_identifier"
         | "namespace_identifier"
@@ -2138,9 +1877,6 @@ fn cpp_bounded_field_type(
 
 fn cpp_bounded_callable_return_type(
     provider: &CppBoundedProvider<'_>,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
     definitions: &[CodeUnit],
 ) -> Option<CppBoundedTypeResolution> {
     if definitions.is_empty() {
@@ -2162,27 +1898,6 @@ fn cpp_bounded_callable_return_type(
             definition_resolved.push(cpp_bounded_type_candidates_for_name(provider, name)?);
         }
 
-        if definition_resolved.is_empty() && definition.source() == file {
-            for range in provider.ranges(definition) {
-                if !provider.session.scope_step() {
-                    return None;
-                }
-                let declaration =
-                    cpp_bounded_declaration_node_for_range(root, &range, provider.session)?;
-                let type_node = declaration.child_by_field_name("type").or_else(|| {
-                    provider
-                        .session
-                        .scope_step()
-                        .then(|| declaration.parent()?.child_by_field_name("type"))
-                        .flatten()
-                });
-                if let Some(type_node) = type_node {
-                    definition_resolved.push(cpp_bounded_type_candidates(
-                        provider, file, source, type_node,
-                    )?);
-                }
-            }
-        }
         if definition_resolved.is_empty() {
             return None;
         }
@@ -2871,22 +2586,8 @@ fn cpp_bounded_smallest_node<'tree>(
     }
 }
 
-fn cpp_bounded_declaration_node_for_range<'tree>(
-    root: Node<'tree>,
-    range: &Range,
-    session: &ResolutionSession,
-) -> Option<Node<'tree>> {
-    let mut node = cpp_bounded_smallest_node(root, range.start_byte, range.end_byte, session)?;
-    while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
-        if !session.scope_step() {
-            return None;
-        }
-        node = node.parent()?;
-    }
-    Some(node)
-}
-
-pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
+#[cfg(test)]
+fn parse_cpp_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -5151,59 +4852,11 @@ fn cpp_structural_alias_paths(
     if let Some(paths) = context.cpp_structural_alias_paths.get(unit) {
         return paths.clone();
     }
-    let Some(source) = context.cpp_indexed_source(unit.source()) else {
-        context
-            .cpp_structural_alias_paths
-            .insert(unit.clone(), Vec::new());
-        return Vec::new();
-    };
-    let Some(tree) = context.cpp_indexed_tree(unit.source()) else {
-        context
-            .cpp_structural_alias_paths
-            .insert(unit.clone(), Vec::new());
-        return Vec::new();
-    };
-    let root = tree.root_node();
-    let mut paths = Vec::new();
-    for range in analyzer.ranges(unit) {
-        let Some(mut declaration) =
-            smallest_named_node_covering(root, range.start_byte, range.end_byte)
-        else {
-            continue;
-        };
-        while !matches!(declaration.kind(), "alias_declaration" | "type_definition") {
-            let Some(parent) = declaration.parent() else {
-                break;
-            };
-            declaration = parent;
-        }
-        if !matches!(declaration.kind(), "alias_declaration" | "type_definition") {
-            continue;
-        }
-
-        let mut owners = Vec::new();
-        let mut current = declaration.parent();
-        while let Some(parent) = current {
-            if matches!(
-                parent.kind(),
-                "namespace_definition"
-                    | "class_specifier"
-                    | "struct_specifier"
-                    | "union_specifier"
-                    | "enum_specifier"
-            ) && let Some(name) = parent.child_by_field_name("name")
-            {
-                let name = cpp_node_text(name, &source).trim();
-                if !name.is_empty() {
-                    owners.push(name);
-                }
-            }
-            current = parent.parent();
-        }
-        owners.reverse();
-        owners.push(unit.identifier());
-        paths.push(owners.join("::"));
-    }
+    let mut paths: Vec<_> = cpp_canonical_declaration_properties(analyzer, unit)
+        .into_iter()
+        .flatten()
+        .map(|fact| fact.lexical_path.join("::"))
+        .collect();
     paths.sort();
     paths.dedup();
     context
@@ -5961,14 +5614,8 @@ fn resolve_cpp_call(
                 )
             })
             .filter(|candidate| {
-                ctx.analyzer
-                    .get_source(candidate, false)
-                    .is_some_and(|declaration| {
-                        cpp_field_declaration_names_function_type(
-                            &declaration,
-                            candidate.identifier(),
-                        )
-                    })
+                cpp_canonical_declaration_properties(ctx.analyzer, candidate)
+                    .is_some_and(|facts| facts.iter().any(|fact| fact.names_function_type))
                     || cpp_field_declared_type(ctx.analyzer, ctx.visibility, ctx.file, candidate)
                         .into_iter()
                         .flat_map(|field_type| {
@@ -5986,14 +5633,9 @@ fn resolve_cpp_call(
                             aliases
                         })
                         .any(|alias| {
-                            ctx.analyzer
-                                .get_source(&alias, false)
-                                .is_some_and(|declaration| {
-                                    cpp_alias_declaration_names_function_type(
-                                        &declaration,
-                                        alias.identifier(),
-                                    )
-                                })
+                            cpp_canonical_declaration_properties(ctx.analyzer, &alias).is_some_and(
+                                |facts| facts.iter().any(|fact| fact.names_function_type),
+                            )
                         })
             })
             .collect::<Vec<_>>();
@@ -7230,37 +6872,17 @@ fn cpp_is_unqualified_field(
         return false;
     };
     support.fqn(&parent_fqn).into_iter().any(|parent| {
-        parent
-            .signature()
-            .is_some_and(cpp_signature_is_unscoped_enum)
-            || analyzer
-                .signatures(&parent)
-                .iter()
-                .any(|signature| cpp_signature_is_unscoped_enum(signature))
+        cpp_canonical_declaration_properties(analyzer, &parent)
+            .into_iter()
+            .flatten()
+            .any(|fact| fact.enum_kind == CppEnumOwnerKind::Unscoped)
     })
-}
-
-fn cpp_signature_is_unscoped_enum(signature: &str) -> bool {
-    let signature = signature.trim_start();
-    signature.starts_with("enum ")
-        && !signature.starts_with("enum class ")
-        && !signature.starts_with("enum struct ")
 }
 
 fn cpp_unit_is_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
     analyzer
         .type_alias_provider()
         .is_some_and(|provider| provider.is_type_alias(unit))
-        || unit.signature().is_some_and(cpp_signature_is_type_alias)
-}
-
-fn cpp_signature_is_type_alias(signature: &str) -> bool {
-    let signature = signature.trim_start();
-    signature.starts_with("typedef ")
-        || signature.starts_with("using ") && signature.contains('=')
-        || signature.starts_with("template ")
-            && signature.contains(" using ")
-            && signature.contains('=')
 }
 
 /// The per-candidate attribution the C++ member walk records while it runs,
@@ -7715,9 +7337,16 @@ fn cpp_parameter_type_list(
     ctx: CppLookupCtx<'_, '_>,
     unit: &CodeUnit,
 ) -> Option<CppParameterTypeList> {
-    let signature = unit.signature()?;
-    let types = cpp_signature_param_types(signature)?;
-    let trailing = cpp_signature_trailing_qualifiers(signature).to_string();
+    let types = cpp_candidate_parameter_types(ctx.analyzer, unit)?;
+    let facts = cpp_canonical_declaration_properties(ctx.analyzer, unit)?;
+    let first = facts.first()?;
+    if !facts
+        .iter()
+        .all(|fact| fact.trailing_qualifiers == first.trailing_qualifiers)
+    {
+        return Some(CppParameterTypeList::Opaque);
+    }
+    let trailing = first.trailing_qualifiers.clone();
     if !types
         .iter()
         .any(|text| cpp_type_text_is_bare_identifier(text))
@@ -7739,10 +7368,12 @@ fn cpp_parameter_type_list(
             .visibility
             .object_macro_replacement_at(unit.source(), &text, range.start_byte)
         {
-            Some(replacement) => match cpp_signature_param_types(&format!("({replacement})")) {
-                Some(replacement_types) => expanded.extend(replacement_types),
-                None => return Some(CppParameterTypeList::Opaque),
-            },
+            Some(replacement) => {
+                match brokk_bifrost_cpp::graph::resolver::cpp_macro_parameter_types(&replacement) {
+                    Some(replacement_types) => expanded.extend(replacement_types),
+                    None => return Some(CppParameterTypeList::Opaque),
+                }
+            }
             None if ctx
                 .visibility
                 .names_a_macro_at(unit.source(), &text, range.start_byte) =>
@@ -7782,10 +7413,15 @@ fn cpp_member_using_declaration_bases(
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let Some(source) = analyzer.get_source(owner, false) else {
+    let Some(facts) = cpp_canonical_declaration_properties(analyzer, owner) else {
         return Vec::new();
     };
-    let scopes = cpp_member_using_declaration_scopes(&source, member);
+    let scopes: Vec<_> = facts
+        .iter()
+        .flat_map(|fact| &fact.member_usings)
+        .filter(|using| using.member == member)
+        .map(|using| using.scope.join("::"))
+        .collect();
     if scopes.is_empty() {
         return Vec::new();
     }
@@ -8183,9 +7819,14 @@ fn cpp_filter_candidates_by_call_arg_types(
         .iter()
         .map(|arg| arg.as_ref().map(CppType::as_arg_type))
         .collect();
-    cpp_filter_candidates_by_args(
+    cpp_filter_candidates_by_args_with_parameter_types(
         candidates,
         &shared_arg_types,
+        &|candidate| cpp_candidate_parameter_types(analyzer, candidate),
+        &|candidate| {
+            cpp_canonical_declaration_properties(analyzer, candidate)
+                .is_some_and(|facts| facts.iter().any(|fact| fact.callable_is_template))
+        },
         &|name| cpp_resolve_type_unit(analyzer, visibility, file, name),
         &|arg_type, param_type| cpp_type_assignable_to(analyzer, arg_type, param_type),
     )
@@ -8249,8 +7890,8 @@ fn cpp_callable_overload_identity_matches(
         && cpp_callable_definitions_share_identity_evidence_with_visibility(
             analyzer, token, graph, visibility, left, right,
         )
-        && (left.signature().and_then(cpp_signature_param_types)
-            == right.signature().and_then(cpp_signature_param_types)
+        && (cpp_candidate_parameter_types(analyzer, left)
+            == cpp_candidate_parameter_types(analyzer, right)
             || visibility.same_logical_callable(graph, left, right))
 }
 
@@ -8262,23 +7903,21 @@ fn cpp_filter_candidates_by_arity_strict(
     cpp_candidate_applicability(analyzer, &candidates, arity).winners
 }
 
+fn cpp_candidate_parameter_types(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Vec<String>> {
+    analyzer
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_parameter_types().map(<[String]>::to_vec))
+}
+
 fn cpp_known_callable_arity(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<crate::analyzer::CallableArity> {
-    if let Some(arity) = analyzer
+    analyzer
         .signature_metadata(unit)
         .into_iter()
         .find_map(|metadata| metadata.callable_arity())
-    {
-        return Some(arity);
-    }
-    let signature = unit.signature()?;
-    let open = signature.find('(')?;
-    signature[open + 1..].find(')')?;
-    Some(crate::analyzer::CallableArity::exact(cpp_signature_arity(
-        Some(signature),
-    )))
 }
 
 /// Whether `arg_type` is `param_type` or derives from it.
@@ -10906,8 +10545,22 @@ fn cpp_alias_target_unit(
     if !cpp_unit_is_type_alias(analyzer, unit) {
         return None;
     }
-    cpp_alias_target_texts(analyzer, unit)
-        .find_map(|rhs| cpp_resolve_type_unit_inner(analyzer, visibility, file, &rhs, seen))
+    cpp_canonical_declaration_properties(analyzer, unit)?
+        .into_iter()
+        .filter_map(|fact| {
+            let CppStructuredAliasTarget::Named {
+                components, global, ..
+            } = fact.alias_target?
+            else {
+                return None;
+            };
+            Some(if global {
+                format!("::{}", components.join("::"))
+            } else {
+                components.join("::")
+            })
+        })
+        .find_map(|head| cpp_resolve_type_unit_inner(analyzer, visibility, file, &head, seen))
 }
 
 /// Resolve the receiver type reached by `receiver->member` when `receiver` has a template
@@ -10922,41 +10575,63 @@ fn cpp_alias_arrow_target_unit(
     alias: &CodeUnit,
 ) -> Option<CodeUnit> {
     let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
-    cpp_alias_target_texts(ctx.analyzer, alias).find_map(|rhs| {
-        let head = rhs.split('<').next()?.trim();
-        let args = cpp_angle_group_items(&rhs);
-        let mut wrapper_seen = HashSet::default();
-        let wrapper = cpp_resolve_type_unit_inner(
-            ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            head,
-            &mut wrapper_seen,
-        )?;
-        let params = cpp_template_parameter_names(ctx.analyzer, &wrapper);
-        let arrow = cpp_member_candidates(ctx, token, vec![wrapper], "operator->", None, None)
-            .into_iter()
-            .next()?;
-        let return_text = cpp_function_return_type_text(&ctx_dispatch.source(), &arrow)?;
-        // `receiver->member` follows one level of pointer indirection from operator->'s result.
-        if cpp_type_text_pointer_depth(&return_text) < 1 {
-            return None;
-        }
-        let pointee = return_text
-            .trim()
-            .strip_suffix('*')
-            .unwrap_or(&return_text)
-            .trim();
-        let pointee = cpp_substitute_template_param(&params, &args, pointee);
-        let mut pointee_seen = HashSet::default();
-        cpp_resolve_type_unit_inner(
-            ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            &pointee,
-            &mut pointee_seen,
-        )
-    })
+    cpp_canonical_declaration_properties(ctx.analyzer, alias)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| {
+            let CppStructuredAliasTarget::Named {
+                components,
+                global,
+                arguments,
+            } = fact.alias_target?
+            else {
+                return None;
+            };
+            let head = if global {
+                format!("::{}", components.join("::"))
+            } else {
+                components.join("::")
+            };
+            let args = arguments
+                .unwrap_or_default()
+                .into_iter()
+                .map(|argument| argument.text)
+                .collect::<Vec<_>>();
+            Some((head, args))
+        })
+        .find_map(|(head, args)| {
+            let mut wrapper_seen = HashSet::default();
+            let wrapper = cpp_resolve_type_unit_inner(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                &head,
+                &mut wrapper_seen,
+            )?;
+            let params = cpp_template_parameter_names(ctx.analyzer, &wrapper);
+            let arrow = cpp_member_candidates(ctx, token, vec![wrapper], "operator->", None, None)
+                .into_iter()
+                .next()?;
+            let return_text = cpp_function_return_type_text(&ctx_dispatch.source(), &arrow)?;
+            // `receiver->member` follows one level of pointer indirection from operator->'s result.
+            if cpp_type_text_pointer_depth(&return_text) < 1 {
+                return None;
+            }
+            let pointee = return_text
+                .trim()
+                .strip_suffix('*')
+                .unwrap_or(&return_text)
+                .trim();
+            let pointee = cpp_substitute_template_param(&params, &args, pointee);
+            let mut pointee_seen = HashSet::default();
+            cpp_resolve_type_unit_inner(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                &pointee,
+                &mut pointee_seen,
+            )
+        })
 }
 
 /// Substitute a wrapper template parameter name appearing in `type_text` with the matching
@@ -10975,75 +10650,20 @@ fn cpp_substitute_template_param(params: &[String], args: &[String], type_text: 
 /// Names of the template parameters a class/alias unit declares, e.g. `["T"]` for
 /// `template <class T> class shared_ptr`. Empty when the unit is not a template.
 fn cpp_template_parameter_names(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
-    let signature = unit
-        .signature()
-        .map(str::to_string)
-        .or_else(|| analyzer.signatures(unit).first().cloned())
-        .unwrap_or_default();
-    let Some(group) = cpp_first_angle_group(&signature) else {
-        return Vec::new();
-    };
-    cpp_split_top_level_commas(group)
-        .filter_map(|param| cpp_trailing_identifier(param.split('=').next().unwrap_or(param)))
-        .collect()
-}
-
-/// Top-level comma-separated items inside the first balanced `<...>` group of `text`, e.g. the
-/// template arguments of `shared_ptr<NodeDef>`.
-fn cpp_angle_group_items(text: &str) -> Vec<String> {
-    cpp_first_angle_group(text)
-        .map(|group| {
-            cpp_split_top_level_commas(group)
-                .map(|item| item.to_string())
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
+    dispatch
+        .source()
+        .cpp
+        .and_then(|cpp| cpp.template_metadata(unit))
+        .map(|metadata| {
+            metadata
+                .parameters
+                .into_iter()
+                .map(|parameter| parameter.name)
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Contents of the first balanced `<...>` group in `text`, ignoring nested angle brackets.
-fn cpp_first_angle_group(text: &str) -> Option<&str> {
-    let open = text.find('<')?;
-    let mut depth = 0i32;
-    for (offset, ch) in text[open..].char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text[open + 1..open + offset].trim());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The trailing identifier of a template parameter declaration, e.g. `T` from `class T`.
-fn cpp_trailing_identifier(text: &str) -> Option<String> {
-    let name: String = text
-        .trim()
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    (!name.is_empty()).then_some(name)
-}
-
-fn cpp_alias_target_texts<'a>(
-    analyzer: &'a dyn IAnalyzer,
-    unit: &'a CodeUnit,
-) -> impl Iterator<Item = String> + 'a {
-    let mut signatures: Vec<String> = unit.signature().map(str::to_string).into_iter().collect();
-    signatures.extend(analyzer.signatures(unit));
-    let source = std::iter::once_with(move || analyzer.get_source(unit, false)).flatten();
-    signatures
-        .into_iter()
-        .chain(source)
-        .filter_map(|declaration| cpp_alias_declaration_target_text(&declaration))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11310,6 +10930,15 @@ fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
     }
     names.reverse();
     (!names.is_empty()).then(|| names.join("::"))
+}
+
+fn cpp_canonical_declaration_properties(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
+    dispatch.source().declaration_source_properties(unit)
 }
 
 #[cfg(test)]
@@ -11690,7 +11319,7 @@ struct holder {
         CPP_BINDINGS_BUILD_COUNT.with(|count| count.set(0));
         let analyzer = fixture.analyzer.analyzer();
         let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
         context.bounded_support.set_language(Language::Cpp);
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();

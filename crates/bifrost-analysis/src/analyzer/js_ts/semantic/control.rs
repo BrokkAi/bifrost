@@ -741,14 +741,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, None, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, None, stack)
+            }
             Work::LabeledStatement {
                 node,
                 label,
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, Some(label), stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, Some(label), stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -1436,6 +1442,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let condition = required_field(node, "condition")?;
                 let body = required_field(node, "body")?;
                 let body_entry = self.point(builder, body, Vec::new())?;
+                self.session
+                    .record_loop_site(builder, node, entry, body_entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -1474,6 +1482,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let body = required_field(node, "body")?;
                 let condition = required_field(node, "condition")?;
                 let condition_entry = self.point(builder, condition, Vec::new())?;
+                // A do body starts every iteration, so it is its own header.
+                self.session.record_loop_site(builder, node, entry, entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -2530,6 +2540,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
+        // Updates run before the condition, which starts every iteration.
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let initial_condition_target = condition
             .zip(increment)
             .filter(|(condition, increment)| {

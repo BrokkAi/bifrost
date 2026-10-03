@@ -542,11 +542,15 @@ pub struct CodeQueryPathSegment {
     pub target_count: Option<usize>,
 }
 
-/// What a candidate row points at. Two of the five shapes carry no workspace
+/// What a candidate row points at. Only the unit shape carries a workspace
 /// declaration, which is why `candidate-target` is partial by construction.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "candidate_kind", rename_all = "snake_case")]
 pub enum CodeQueryCandidateRef {
+    Modeled {
+        symbol_id: String,
+        name: String,
+    },
     Unit {
         unit: Box<CodeQueryDeclaration>,
     },
@@ -583,6 +587,7 @@ impl CodeQueryCandidateRef {
     /// publishes (issue #2515).
     pub const LABELS: &'static [&'static str] = &[
         "unit",
+        "modeled",
         "lexical",
         "binding",
         "import_binder",
@@ -594,6 +599,7 @@ impl CodeQueryCandidateRef {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Unit { .. } => "unit",
+            Self::Modeled { .. } => "modeled",
             Self::Lexical { .. } => "lexical",
             Self::Binding { .. } => "binding",
             Self::ImportBinder { .. } => "import_binder",
@@ -605,7 +611,8 @@ impl CodeQueryCandidateRef {
     pub fn name(&self) -> &str {
         match self {
             Self::Unit { unit } => &unit.fq_name,
-            Self::Lexical { name, .. }
+            Self::Modeled { name, .. }
+            | Self::Lexical { name, .. }
             | Self::Binding { name, .. }
             | Self::ImportBinder { name, .. }
             | Self::ExternalRoute { name } => name,

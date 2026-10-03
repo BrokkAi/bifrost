@@ -1,7 +1,6 @@
 use crate::call_match::{
     CppArgType, cpp_filter_candidates_by_args_with_parameter_types, cpp_forwarding_call_argument,
-    cpp_literal_arg_type, cpp_signature_param_types, cpp_type_text_pointer_depth,
-    normalize_cpp_type_name,
+    cpp_literal_arg_type, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use crate::declarations::{
     CppSentinelRecoveredClass, cpp_active_template_type_parameter, cpp_export_macro_token,
@@ -6252,7 +6251,9 @@ fn constructor_overload_selection(
         .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
-    candidates.retain(|unit| cpp_callable_arity(&ctx.analyzer, unit).accepts(arity));
+    candidates.retain(|unit| {
+        cpp_callable_arity(&ctx.analyzer, unit).is_none_or(|known| known.accepts(arity))
+    });
     if !candidates
         .iter()
         .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
@@ -6263,6 +6264,10 @@ fn constructor_overload_selection(
         candidates,
         &arg_types,
         &|candidate| cpp_callable_parameter_types(&ctx.analyzer, candidate),
+        &|candidate| {
+            ctx.visibility
+                .callable_is_template_declaration(&ctx.analyzer, candidate)
+        },
         &|name| ctx.visibility.resolve_type(ctx.file, name),
         &|left, right| same_visible_symbol(left, right),
     );
@@ -6591,7 +6596,9 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
     else {
         return true;
     };
-    candidates.retain(|unit| cpp_callable_arity(&ctx.analyzer, unit).accepts(arity));
+    candidates.retain(|unit| {
+        cpp_callable_arity(&ctx.analyzer, unit).is_none_or(|known| known.accepts(arity))
+    });
     if candidates.is_empty()
         || !candidates
             .iter()
@@ -6604,6 +6611,10 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
         candidates,
         &arg_types,
         &|candidate| cpp_callable_parameter_types(&ctx.analyzer, candidate),
+        &|candidate| {
+            ctx.visibility
+                .callable_is_template_declaration(&ctx.analyzer, candidate)
+        },
         &|name| ctx.visibility.resolve_type(ctx.file, name),
         &|left, right| same_visible_symbol(left, right),
     );
@@ -6887,13 +6898,7 @@ fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut Sc
         }
         declaration = ctx.ancestry.parent(candidate);
     }
-    let Some(declaration) = declaration else {
-        return;
-    };
-    let signature = node_text(declaration, ctx.source);
-    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
-        && !expected.accepts(signature_arity(Some(signature)))
-    {
+    if declaration.is_none() {
         return;
     }
     let linked_declaration = ctx
@@ -6917,6 +6922,7 @@ fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut Sc
                         candidate,
                         &ctx.spec.target,
                     ))
+                && callable_arity_matches_target(candidate, node, ctx)
         });
     if linked_declaration.is_none() {
         return;
@@ -7700,7 +7706,9 @@ fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     else {
         return true;
     };
-    candidates.retain(|unit| cpp_callable_arity(&ctx.analyzer, unit).accepts(arity));
+    candidates.retain(|unit| {
+        cpp_callable_arity(&ctx.analyzer, unit).is_none_or(|known| known.accepts(arity))
+    });
     if candidates.is_empty()
         || !candidates
             .iter()
@@ -7713,6 +7721,10 @@ fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         candidates,
         &arg_types,
         &|candidate| cpp_callable_parameter_types(&ctx.analyzer, candidate),
+        &|candidate| {
+            ctx.visibility
+                .callable_is_template_declaration(&ctx.analyzer, candidate)
+        },
         &|name| ctx.visibility.resolve_type(ctx.file, name),
         &|left, right| same_visible_symbol(left, right),
     );
@@ -7810,17 +7822,77 @@ fn function_definition_owner_lookup_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let definition = node_text(node, ctx.source);
     let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) else {
         return true;
     };
-    if !expected.accepts(signature_arity(Some(definition))) {
+    let Some(candidate) = canonical_callable_at_node(
+        node,
+        &ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        ctx.spec.kind,
+    ) else {
+        return false;
+    };
+    let Some(actual_arity) = cpp_callable_arity(&ctx.analyzer, &candidate) else {
+        return false;
+    };
+    if !expected.accepts(actual_arity.total()) {
         return false;
     }
-    let Some(target_signature) = ctx.spec.target.signature() else {
+    ctx.spec.param_types.as_ref().is_none_or(|expected| {
+        cpp_callable_parameter_types(&ctx.analyzer, &candidate)
+            .is_some_and(|actual| actual == *expected)
+    })
+}
+
+fn callable_arity_matches_target(candidate: &CodeUnit, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) else {
         return true;
     };
-    cpp_signature_param_types(definition) == cpp_signature_param_types(target_signature)
+    cpp_callable_arity(&ctx.analyzer, candidate)
+        .is_some_and(|actual| expected.accepts(actual.total()))
+}
+
+fn canonical_callable_at_node(
+    node: Node<'_>,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+    kind: TargetKind,
+) -> Option<CodeUnit> {
+    let name = callable_name_node(node)?;
+    let name_range = (name.start_byte(), name.end_byte());
+    let name_text = node_text(name, source);
+    for candidate in visibility.named_candidates(file, name_text, kind) {
+        if candidate.source() != file || !candidate.is_function() {
+            continue;
+        }
+        let Some(occurrences) = analyzer.declaration_source_occurrences(&candidate) else {
+            continue;
+        };
+        for occurrence in occurrences {
+            if occurrence
+                .name_range
+                .is_some_and(|range| (range.start_byte, range.end_byte) == name_range)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn callable_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let name = if node.kind() == "function_definition" {
+        function_definition_name_node(node)?
+    } else {
+        node.child_by_field_name("declarator")
+            .and_then(declarator_name_node)?
+    };
+    Some(function_terminal_node(name))
 }
 
 fn callable_node_matches(node: Node<'_>, expected: &str, source: &str) -> bool {
@@ -10577,7 +10649,15 @@ fn target_guided_qualified_namespace_function_type_resolution(
     }
 
     let function_name = node_text(function_terminal_node(function), source);
-    let definition_arity = signature_arity(Some(node_text(function_definition, source)));
+    let definition_unit = canonical_callable_at_node(
+        function_definition,
+        analyzer,
+        visibility,
+        file,
+        source,
+        TargetKind::FreeFunction,
+    )?;
+    let definition_arity = cpp_callable_arity(analyzer, &definition_unit)?.total();
     let declaration_proves_namespace = visibility
         .visible_identifier_candidates(file, function_name)
         .filter(|candidate| {
@@ -10585,7 +10665,10 @@ fn target_guided_qualified_namespace_function_type_resolution(
                 && type_owner_of(analyzer, candidate).is_none()
                 && candidate.package_name() == target_namespace
         })
-        .any(|candidate| cpp_callable_arity(analyzer, candidate).accepts(definition_arity));
+        .any(|candidate| {
+            cpp_callable_arity(analyzer, candidate)
+                .is_none_or(|known| known.accepts(definition_arity))
+        });
     if !declaration_proves_namespace {
         return None;
     }
@@ -11272,7 +11355,7 @@ fn using_binding_target_components_for_name(
         .visible_identifier_candidates(file, name)
         .filter(|candidate| {
             candidate.is_class()
-                || is_type_alias(candidate)
+                || declared_type_alias(&cpp_source, candidate)
                 || (candidate.is_function() && type_owner_of(&cpp_source, candidate).is_none())
         })
         .collect::<Vec<_>>();
@@ -11607,7 +11690,7 @@ fn binding_type_candidates(
             let mut candidates = visibility
                 .visible_identifier_candidates(file, name)
                 .filter(|candidate| {
-                    (candidate.is_class() || is_type_alias(candidate))
+                    (candidate.is_class() || declared_type_alias(analyzer, candidate))
                         && type_candidate_matches_lookup_components(
                             analyzer,
                             visibility,
@@ -11629,7 +11712,7 @@ fn binding_type_candidates(
                     target_unit,
                     reference_byte,
                 );
-                if (target_unit.is_class() || is_type_alias(target_unit))
+                if (target_unit.is_class() || declared_type_alias(analyzer, target_unit))
                     && expanded_target_name == target
                     && visibility.external_type_candidate_visible_at(
                         file,
@@ -11646,7 +11729,9 @@ fn binding_type_candidates(
             {
                 let visible_types = visibility
                     .visible_identifier_candidates(file, name)
-                    .filter(|candidate| candidate.is_class() || is_type_alias(candidate))
+                    .filter(|candidate| {
+                        candidate.is_class() || declared_type_alias(analyzer, candidate)
+                    })
                     .collect::<Vec<_>>();
                 let uniquely_names_target = !visible_types.is_empty()
                     && visible_types

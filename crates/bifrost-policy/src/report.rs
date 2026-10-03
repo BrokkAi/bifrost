@@ -1100,6 +1100,7 @@ pub enum PolicyReportDiagnosticCode {
     WorkspaceSnapshotDeadlineExceeded,
     DiffBaseDeadlineExceeded,
     DiffBaseUnreliable,
+    DiffBasePolicyUnqualified,
     SuppressionLoadFailed,
     SuppressionAuditRetentionExceeded,
     ScopeLoadFailed,
@@ -1741,14 +1742,74 @@ impl RetainedSize for PolicyDiffFixedFinding {
 
 /// Top-level audit of one diff-aware evaluation against a base revision.
 ///
-/// When `degraded` is true the base evaluation was unreliable: no per-finding
-/// diff decision exists, every head finding gates as if no diff base had been
-/// given, and a `diff-base-unreliable` report diagnostic states why.
+/// `unqualified_policies` records why each policy's base evidence was absent,
+/// incomplete, or stale. Their findings carry no diff decision and use the
+/// ordinary full gate. Other policies may still carry classifications from
+/// independently verified complete base evidence. `degraded` records an
+/// unreliable aggregate base verdict and keeps the overall scan fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyDiffUnqualifiedPolicy {
+    policy_id: PolicyId,
+    completion: String,
+    completion_detail: String,
+    diagnostics: Vec<String>,
+}
+
+impl PolicyDiffUnqualifiedPolicy {
+    pub(crate) fn new(
+        policy_id: PolicyId,
+        completion: impl Into<String>,
+        completion_detail: impl Into<String>,
+        mut diagnostics: Vec<String>,
+    ) -> Self {
+        diagnostics.sort_unstable();
+        diagnostics.dedup();
+        tighten_vec(&mut diagnostics);
+        let mut completion = completion.into();
+        let mut completion_detail = completion_detail.into();
+        completion = tight_string(completion);
+        completion_detail = tight_string(completion_detail);
+        Self {
+            policy_id,
+            completion,
+            completion_detail,
+            diagnostics,
+        }
+    }
+
+    pub fn policy_id(&self) -> &PolicyId {
+        &self.policy_id
+    }
+
+    pub fn completion(&self) -> &str {
+        &self.completion
+    }
+
+    pub fn completion_detail(&self) -> &str {
+        &self.completion_detail
+    }
+
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+}
+
+impl RetainedSize for PolicyDiffUnqualifiedPolicy {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.policy_id.as_str().len())
+            .saturating_add(self.completion.capacity())
+            .saturating_add(self.completion_detail.capacity())
+            .saturating_add(retained_extra(&self.diagnostics))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyDiffReview {
     base_revision: String,
     base_commit: String,
     degraded: bool,
+    unqualified_policies: Vec<PolicyDiffUnqualifiedPolicy>,
     new_count: u64,
     persisting_count: u64,
     fixed_count: u64,
@@ -1756,15 +1817,21 @@ pub struct PolicyDiffReview {
     fixed_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicyDiffCounts {
+    pub new: u64,
+    pub persisting: u64,
+    pub fixed: u64,
+}
+
 impl PolicyDiffReview {
     pub(crate) fn new(
         base_revision: String,
         base_commit: String,
         degraded: bool,
-        new_count: u64,
-        persisting_count: u64,
+        mut unqualified_policies: Vec<PolicyDiffUnqualifiedPolicy>,
+        counts: PolicyDiffCounts,
         mut fixed: Vec<PolicyDiffFixedFinding>,
-        fixed_count: u64,
     ) -> Self {
         assert!(
             fixed.len() <= MAX_DIFF_FIXED_FINDINGS,
@@ -1772,13 +1839,17 @@ impl PolicyDiffReview {
             fixed.len()
         );
         assert!(
-            fixed_count >= u64::try_from(fixed.len()).expect("bounded list length fits u64"),
-            "diff review fixed_count {fixed_count} is below the retained list length {}",
+            counts.fixed >= u64::try_from(fixed.len()).expect("bounded list length fits u64"),
+            "diff review fixed_count {} is below the retained list length {}",
+            counts.fixed,
             fixed.len()
         );
+        unqualified_policies.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
         assert!(
-            !degraded || (new_count == 0 && persisting_count == 0 && fixed.is_empty()),
-            "a degraded diff review carries no classification: new {new_count}, persisting {persisting_count}, fixed {fixed:?}"
+            unqualified_policies
+                .windows(2)
+                .all(|pair| pair[0].policy_id != pair[1].policy_id),
+            "diff review contains at most one unqualified entry per policy"
         );
         // Sorted by the caller, not here: the caller truncates to
         // `MAX_DIFF_FIXED_FINDINGS`, so ordering the list after truncation
@@ -1791,14 +1862,15 @@ impl PolicyDiffReview {
         );
         tighten_vec(&mut fixed);
         let fixed_truncated =
-            fixed_count > u64::try_from(fixed.len()).expect("bounded list length fits u64");
+            counts.fixed > u64::try_from(fixed.len()).expect("bounded list length fits u64");
         Self {
             base_revision,
             base_commit,
             degraded,
-            new_count,
-            persisting_count,
-            fixed_count,
+            unqualified_policies,
+            new_count: counts.new,
+            persisting_count: counts.persisting,
+            fixed_count: counts.fixed,
             fixed,
             fixed_truncated,
         }
@@ -1814,6 +1886,16 @@ impl PolicyDiffReview {
 
     pub const fn degraded(&self) -> bool {
         self.degraded
+    }
+
+    pub fn unqualified_policies(&self) -> &[PolicyDiffUnqualifiedPolicy] {
+        &self.unqualified_policies
+    }
+
+    pub fn policy_is_qualified(&self, policy_id: &PolicyId) -> bool {
+        self.unqualified_policies
+            .binary_search_by(|unqualified| unqualified.policy_id.cmp(policy_id))
+            .is_err()
     }
 
     pub const fn new_count(&self) -> u64 {
@@ -1857,6 +1939,10 @@ impl RetainedSize for PolicyDiffReview {
         size_of::<Self>()
             .saturating_add(self.base_revision.capacity())
             .saturating_add(self.base_commit.capacity())
+            .saturating_add(retained_vec_size_from_parts(
+                &self.unqualified_policies,
+                self.unqualified_policies.len(),
+            ))
             .saturating_add(retained_extra(&self.fixed))
     }
 }
@@ -3789,16 +3875,16 @@ fn validate_suppression_joins(
     Ok(())
 }
 
-/// A classifying (non-degraded) diff review and per-finding diff decisions
-/// exist exactly together: every retained finding carries a decision when the
-/// review classified the report, and none does otherwise.
+/// A finding carries a diff decision exactly when its policy has qualified
+/// base evidence. Partial reviews can therefore classify trustworthy policy
+/// rows without inventing decisions for unqualified policies.
 fn validate_diff_joins(
     runs: &[PolicyRun],
     diff: Option<&PolicyDiffReview>,
 ) -> Result<(), PolicyReportDocumentError> {
-    let classifying = diff.is_some_and(|review| !review.degraded());
     for finding in runs.iter().flat_map(PolicyRun::findings) {
-        match (classifying, finding.diff()) {
+        let qualified = diff.is_some_and(|review| review.policy_is_qualified(finding.policy_id()));
+        match (qualified, finding.diff()) {
             (true, None) => {
                 return Err(PolicyReportDocumentError::MissingDiffFindingDecision {
                     policy_id: finding.policy_id().clone(),
@@ -5156,10 +5242,13 @@ mod tests {
             "x".repeat(10_000),
             "0".repeat(40),
             false,
-            1,
-            0,
             Vec::new(),
-            1,
+            PolicyDiffCounts {
+                new: 1,
+                persisting: 0,
+                fixed: 1,
+            },
+            Vec::new(),
         );
         let review_extra = retained_extra(&review);
         assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);

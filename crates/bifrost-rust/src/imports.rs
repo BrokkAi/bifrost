@@ -4,6 +4,8 @@ use brokk_bifrost_core::analyzer::model::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::rust_facts::RustImportSourceOccurrences;
+use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
@@ -12,7 +14,7 @@ use std::borrow::Cow;
 use tree_sitter::Node;
 
 use crate::declarations::{rust_node_text, rust_package_name};
-use crate::graph_support::{RustSource, resolve_module_package};
+use crate::graph_support::{ReferenceContextResult, RustSource, resolve_module_package};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 use crate::syntax::{outer_attributes, unwrap_attributes};
 
@@ -71,18 +73,56 @@ pub fn rust_import_binding_name<'a>(import: &'a ImportInfo) -> RustImportBinding
 pub struct RustImportInfo {
     pub info: ImportInfo,
     pub visibility: RustVisibility,
-    pub path: Vec<String>,
-    /// An `extern crate` declaration binds the crate namespace only. It must
-    /// not produce the zero-prefix named edge that a normal `use item` emits.
-    pub is_extern_crate: bool,
-    /// Whether an `extern crate` declaration carries `#[macro_use]` and imports
-    /// the dependency's exported macros into the macro-use prelude.
-    /// Selective `#[macro_use(a, b)]` imports are intentionally unrepresented
-    /// and fall back to the gated boundary because this bit cannot carry names.
+    /// Whether an `extern crate` declaration carries a blanket `#[macro_use]`
+    /// attribute and imports the dependency's exported macros.
     pub is_macro_use: bool,
+    /// The exact token naming the imported entity before any `as` alias.
+    /// Wildcard imports have no single target token.
+    pub target_span: Option<Span>,
+    /// The leaf is `self` in a grouped import (`use a::m::{self}`). It names
+    /// the module the prefix reaches and binds only the type namespace: a
+    /// value or macro spelled like the module's last segment is not imported
+    /// (Rust Reference, "Use declarations", `self` imports). Its target token
+    /// is the `self` keyword itself.
+    pub module_self: bool,
+}
+
+/// Exact primary-tree syntax handles used to attach canonical source ids.
+/// These handles are transient and never leave the live parse tree.
+#[derive(Clone)]
+pub(crate) struct RustImportSourceNodes<'tree> {
+    pub(crate) declaration: Node<'tree>,
+    pub(crate) target: Option<Node<'tree>>,
+    pub(crate) alias: Option<Node<'tree>>,
+    pub(crate) lexical_scopes: Vec<Node<'tree>>,
+    pub(crate) owner_scope: Option<Node<'tree>>,
+    pub(crate) local_scope: Option<Node<'tree>>,
 }
 
 impl RustImportInfo {
+    /// The parser-owned path for this Rust import. Every projected Rust
+    /// import carries one; keeping the accessor checked prevents consumers
+    /// from silently falling back to the display snippet.
+    pub fn path(&self) -> &[String] {
+        self.info
+            .path
+            .as_ref()
+            .expect("Rust import projection must carry a structured path")
+            .segments
+            .as_slice()
+    }
+
+    /// Whether this event is an `extern crate` declaration. The distinction
+    /// is part of the structured path kind, not a second Rust-only flag.
+    pub fn is_extern_crate(&self) -> bool {
+        self.info
+            .path
+            .as_ref()
+            .expect("Rust import projection must carry a structured path")
+            .kind
+            == Some(StructuredImportPathKind::ExternCrate)
+    }
+
     pub fn binding_name(&self) -> RustImportBindingName<'_> {
         rust_import_binding_name(&self.info)
     }
@@ -104,25 +144,40 @@ pub enum RustImportOwner {
     },
 }
 
+#[derive(Clone)]
+struct RustImportOwnerProjection<'tree> {
+    owner_scope: Option<Node<'tree>>,
+    local_scope: Option<Node<'tree>>,
+    owner: RustImportOwner,
+}
+
 #[derive(Debug, Clone)]
 pub struct RustProjectedImport {
     pub import: RustImportInfo,
     pub owner: RustImportOwner,
     pub cfg_condition: RustCfgCondition,
+    /// The coordinated producer's per-leaf identity. Standalone legacy
+    /// projection helpers leave this unset because they have no source arena.
+    pub source_import_id: Option<SourceImportId>,
+    /// Set only after a primary coordinated event interns the exact syntax
+    /// handles through its shared source collector.
+    pub source_occurrences: Option<RustImportSourceOccurrences>,
 }
 
-pub fn rust_import_projection(
-    root: Node<'_>,
+pub(crate) fn rust_import_projection_with_source_nodes<'tree>(
+    root: Node<'tree>,
     source: &str,
     base_module: &str,
-) -> Vec<RustProjectedImport> {
+) -> Vec<(RustProjectedImport, RustImportSourceNodes<'tree>)> {
     let mut projected = Vec::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         let declaration = unwrap_attributes(node);
         if declaration.kind() == "extern_crate_declaration" {
-            if let Some(import) = rust_external_crate_import(node, source, base_module) {
-                projected.push(import);
+            if let Some((import, source_nodes)) =
+                rust_external_crate_import(node, source, base_module)
+            {
+                projected.push((import, source_nodes));
             }
             continue;
         }
@@ -130,12 +185,27 @@ pub fn rust_import_projection(
             let owner = rust_import_owner(declaration, source, base_module);
             let cfg_condition = rust_cfg_condition(node, source);
             projected.extend(
-                rust_imports_with_visibility_from_use_declaration(declaration, source)
+                rust_imports_with_visibility_from_use_declaration_with_sources(declaration, source)
                     .into_iter()
-                    .map(|import| RustProjectedImport {
-                        import,
-                        owner: owner.clone(),
-                        cfg_condition: cfg_condition.clone(),
+                    .map(|leaf| {
+                        let source_nodes = RustImportSourceNodes {
+                            declaration: node,
+                            target: leaf.target,
+                            alias: leaf.alias,
+                            lexical_scopes: leaf.lexical_scopes,
+                            owner_scope: owner.owner_scope,
+                            local_scope: owner.local_scope,
+                        };
+                        (
+                            RustProjectedImport {
+                                import: leaf.import,
+                                owner: owner.owner.clone(),
+                                cfg_condition: cfg_condition.clone(),
+                                source_import_id: None,
+                                source_occurrences: None,
+                            },
+                            source_nodes,
+                        )
                     }),
             );
             continue;
@@ -147,11 +217,22 @@ pub fn rust_import_projection(
     projected
 }
 
-fn rust_external_crate_import(
-    node: Node<'_>,
+pub fn rust_import_projection<'tree>(
+    root: Node<'tree>,
     source: &str,
     base_module: &str,
-) -> Option<RustProjectedImport> {
+) -> Vec<RustProjectedImport> {
+    rust_import_projection_with_source_nodes(root, source, base_module)
+        .into_iter()
+        .map(|(projected, _)| projected)
+        .collect()
+}
+
+fn rust_external_crate_import<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    base_module: &str,
+) -> Option<(RustProjectedImport, RustImportSourceNodes<'tree>)> {
     let declaration = unwrap_attributes(node);
     let name_node = declaration.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -172,7 +253,7 @@ fn rust_external_crate_import(
             alias,
             path: Some(StructuredImportPath {
                 segments: vec![name.to_string()],
-                kind: Some(StructuredImportPathKind::Namespace),
+                kind: Some(StructuredImportPathKind::ExternCrate),
                 lexical_prefixes: Vec::new(),
                 lexical_scopes: Vec::new(),
                 declaration_start_byte: declaration.start_byte(),
@@ -180,16 +261,30 @@ fn rust_external_crate_import(
             binder_span: Some(node_span(binder_node)),
         },
         visibility: rust_item_visibility(declaration, source),
-        path: vec![name.to_string()],
-        is_extern_crate: true,
         is_macro_use: rust_item_attribute(node, source, "macro_use")
             .is_some_and(|attribute| attribute.child_by_field_name("arguments").is_none()),
+        target_span: Some(node_span(name_node)),
+        module_self: false,
     };
-    Some(RustProjectedImport {
-        import,
-        owner: rust_import_owner(declaration, source, base_module),
-        cfg_condition: rust_cfg_condition(node, source),
-    })
+    let owner = rust_import_owner(declaration, source, base_module);
+    let source_nodes = RustImportSourceNodes {
+        declaration,
+        target: Some(name_node),
+        alias: alias_node,
+        lexical_scopes: Vec::new(),
+        owner_scope: owner.owner_scope,
+        local_scope: owner.local_scope,
+    };
+    Some((
+        RustProjectedImport {
+            import,
+            owner: owner.owner,
+            cfg_condition: rust_cfg_condition(node, source),
+            source_import_id: None,
+            source_occurrences: None,
+        },
+        source_nodes,
+    ))
 }
 
 /// Whether an item carries a preceding outer attribute with the exact path.
@@ -259,15 +354,24 @@ pub fn rust_module_extents(
     extents
 }
 
-fn rust_import_owner(node: Node<'_>, source: &str, base_module: &str) -> RustImportOwner {
+fn rust_import_owner<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    base_module: &str,
+) -> RustImportOwnerProjection<'tree> {
     let mut modules = Vec::new();
     let mut module_extent = None;
     let mut local_extent = None;
+    let mut owner_scope = None;
+    let mut local_scope = None;
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
             "block" | "function_item" | "closure_expression" | "async_block" => {
-                local_extent.get_or_insert((ancestor.start_byte(), ancestor.end_byte()));
+                if local_extent.is_none() {
+                    local_extent = Some((ancestor.start_byte(), ancestor.end_byte()));
+                    local_scope = Some(ancestor);
+                }
             }
             "mod_item" => {
                 if let Some(name) = ancestor
@@ -278,6 +382,7 @@ fn rust_import_owner(node: Node<'_>, source: &str, base_module: &str) -> RustImp
                     if module_extent.is_none() {
                         let body = ancestor.child_by_field_name("body").unwrap_or(ancestor);
                         module_extent = Some((body.start_byte(), body.end_byte()));
+                        owner_scope = Some(body);
                     }
                 }
             }
@@ -294,7 +399,7 @@ fn rust_import_owner(node: Node<'_>, source: &str, base_module: &str) -> RustImp
         owner.push_str(&module);
     }
     let module_extent = module_extent.unwrap_or((0, source.len()));
-    if let Some((start, end)) = local_extent {
+    let owner = if let Some((start, end)) = local_extent {
         RustImportOwner::LocalOnly {
             module: owner,
             module_start: module_extent.0,
@@ -308,6 +413,11 @@ fn rust_import_owner(node: Node<'_>, source: &str, base_module: &str) -> RustImp
             start: module_extent.0,
             end: module_extent.1,
         }
+    };
+    RustImportOwnerProjection {
+        owner_scope,
+        local_scope,
+        owner,
     }
 }
 
@@ -415,9 +525,7 @@ pub fn rust_imported_code_units(
     let package = rust_package_name(file);
     let mut resolved = HashSet::default();
     for import in imports {
-        if let Some(target_fq_name) =
-            resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
-        {
+        if let Some(target_fq_name) = resolve_rust_import_fq_name(file, &package, import) {
             resolved.extend(index.definitions(&target_fq_name));
         }
     }
@@ -432,7 +540,7 @@ pub fn rust_could_import_file(
 ) -> bool {
     let package = rust_package_name(source_file);
     imports.iter().any(|import| {
-        resolve_rust_import_fq_name(source_file, &package, &import.raw_snippet)
+        resolve_rust_import_fq_name(source_file, &package, import)
             .into_iter()
             .any(|fq_name| {
                 index
@@ -453,15 +561,40 @@ pub fn rust_imports_with_visibility_from_use_declaration(
     node: Node<'_>,
     source: &str,
 ) -> Vec<RustImportInfo> {
+    rust_imports_with_visibility_from_use_declaration_with_sources(node, source)
+        .into_iter()
+        .map(|leaf| leaf.import)
+        .collect()
+}
+
+pub(crate) struct RustImportProjectionLeaf<'tree> {
+    pub(crate) import: RustImportInfo,
+    pub(crate) target: Option<Node<'tree>>,
+    pub(crate) alias: Option<Node<'tree>>,
+    pub(crate) lexical_scopes: Vec<Node<'tree>>,
+}
+
+pub(crate) fn rust_imports_with_visibility_from_use_declaration_with_sources<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<RustImportProjectionLeaf<'tree>> {
     if node.kind() != "use_declaration" {
         return Vec::new();
     }
     let Some(argument) = node.child_by_field_name("argument") else {
         return Vec::new();
     };
+    let lexical_scope_nodes = rust_import_lexical_scope_nodes(node);
     let declaration = RustUseDeclaration {
-        visibility: import_visibility(node, source),
-        lexical_scopes: rust_import_lexical_scopes(node),
+        visibility: rust_item_visibility(node, source),
+        lexical_scopes: lexical_scope_nodes
+            .iter()
+            .map(|scope| StructuredImportScope {
+                start_byte: scope.start_byte(),
+                end_byte: scope.end_byte(),
+            })
+            .collect(),
+        lexical_scope_nodes,
         declaration_start_byte: node.start_byte(),
     };
     let mut imports = Vec::new();
@@ -469,15 +602,12 @@ pub fn rust_imports_with_visibility_from_use_declaration(
     imports
 }
 
-fn rust_import_lexical_scopes(node: Node<'_>) -> Vec<StructuredImportScope> {
+pub(crate) fn rust_import_lexical_scope_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let mut scopes = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(parent.kind(), "declaration_list" | "block") {
-            scopes.push(StructuredImportScope {
-                start_byte: parent.start_byte(),
-                end_byte: parent.end_byte(),
-            });
+            scopes.push(parent);
         }
         current = parent.parent();
     }
@@ -485,22 +615,28 @@ fn rust_import_lexical_scopes(node: Node<'_>) -> Vec<StructuredImportScope> {
     scopes
 }
 
-fn collect_rust_use_tree(
-    node: Node<'_>,
+fn collect_rust_use_tree<'tree>(
+    node: Node<'tree>,
     source: &str,
-    declaration: &RustUseDeclaration,
-    out: &mut Vec<RustImportInfo>,
+    declaration: &RustUseDeclaration<'tree>,
+    out: &mut Vec<RustImportProjectionLeaf<'tree>>,
 ) {
-    let mut pending = vec![(node, Vec::<String>::new())];
-    while let Some((node, prefix)) = pending.pop() {
+    let mut pending = vec![(node, Vec::<RustUsePathSegment<'tree>>::new(), false)];
+    while let Some((node, prefix, leading_absolute)) = pending.pop() {
         match node.kind() {
             "scoped_use_list" => {
                 let mut scoped_prefix = prefix;
+                let mut scoped_absolute = leading_absolute;
                 if let Some(path) = node.child_by_field_name("path") {
-                    scoped_prefix.extend(rust_use_path_segments(path, source));
+                    let path_is_absolute = rust_use_path_is_absolute(path);
+                    if path_is_absolute {
+                        scoped_prefix.clear();
+                    }
+                    scoped_prefix.extend(rust_use_path_segments_with_spans(path, source));
+                    scoped_absolute |= path_is_absolute;
                 }
                 if let Some(list) = node.child_by_field_name("list") {
-                    pending.push((list, scoped_prefix));
+                    pending.push((list, scoped_prefix, scoped_absolute));
                 }
             }
             "use_list" => {
@@ -510,7 +646,7 @@ fn collect_rust_use_tree(
                     children
                         .into_iter()
                         .rev()
-                        .map(|child| (child, prefix.clone())),
+                        .map(|child| (child, prefix.clone(), leading_absolute)),
                 );
             }
             "use_as_clause" => {
@@ -524,16 +660,23 @@ fn collect_rust_use_tree(
                 if alias.is_empty() {
                     continue;
                 }
-                let mut path = prefix;
+                let path_is_absolute = rust_use_path_is_absolute(path_node);
+                let mut path = if path_is_absolute { Vec::new() } else { prefix };
                 // In a grouped import, `self` denotes the entity named by the
                 // prefix rather than a literal trailing path component:
                 // `use crate::service::{self as svc}` binds `svc` to
                 // `crate::service`, not to `crate::service::self`.
-                if path_node.kind() != "self" || path.is_empty() {
-                    path.extend(rust_use_path_segments(path_node, source));
+                let module_self = path_node.kind() == "self" && !path.is_empty();
+                if !module_self {
+                    path.extend(rust_use_path_segments_with_spans(path_node, source));
                 }
-                let Some(identifier) = path.last().cloned() else {
+                let Some(identifier) = path.last().map(|segment| segment.name.clone()) else {
                     continue;
+                };
+                let target_node = if module_self {
+                    Some(path_node)
+                } else {
+                    path.last().map(|segment| segment.node)
                 };
                 out.push(declaration.leaf(
                     path,
@@ -541,35 +684,85 @@ fn collect_rust_use_tree(
                     Some(identifier),
                     Some(alias.to_string()),
                     Some(node_span(alias_node)),
+                    target_node,
+                    Some(alias_node),
+                    leading_absolute || path_is_absolute,
+                    module_self,
                 ));
             }
             "use_wildcard" => {
-                let mut path = prefix;
-                if let Some(path_node) = first_named_child(node) {
-                    path.extend(rust_use_path_segments(path_node, source));
+                let path_node = first_named_child(node);
+                let path_is_absolute = path_node.is_some_and(rust_use_path_is_absolute);
+                let mut path = if path_is_absolute { Vec::new() } else { prefix };
+                if let Some(path_node) = path_node {
+                    path.extend(rust_use_path_segments_with_spans(path_node, source));
                 }
                 if !path.is_empty() {
-                    out.push(declaration.leaf(path, true, None, None, None));
+                    out.push(declaration.leaf(
+                        path,
+                        true,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        leading_absolute || path_is_absolute,
+                        false,
+                    ));
                 }
             }
             "crate" | "identifier" | "metavariable" | "scoped_identifier" | "self" | "super" => {
-                let mut path = prefix;
+                let path_is_absolute = rust_use_path_is_absolute(node);
+                let mut path = if path_is_absolute { Vec::new() } else { prefix };
                 let prefix_was_empty = path.is_empty();
-                if node.kind() != "self" || prefix_was_empty {
-                    path.extend(rust_use_path_segments(node, source));
+                let module_self = node.kind() == "self" && !prefix_was_empty;
+                if !module_self {
+                    path.extend(rust_use_path_segments_with_spans(node, source));
                 }
-                let Some(identifier) = path.last().cloned() else {
+                let Some(identifier) = path.last().map(|segment| segment.name.clone()) else {
                     continue;
                 };
                 let binder_span = rust_use_leaf_binder_node(node, prefix_was_empty).map(node_span);
-                out.push(declaration.leaf(path, false, Some(identifier), None, binder_span));
+                let target_node = if module_self {
+                    Some(node)
+                } else {
+                    path.last().map(|segment| segment.node)
+                };
+                out.push(declaration.leaf(
+                    path,
+                    false,
+                    Some(identifier),
+                    None,
+                    binder_span,
+                    target_node,
+                    None,
+                    leading_absolute || path_is_absolute,
+                    module_self,
+                ));
             }
             _ => {}
         }
     }
 }
 
+#[derive(Clone)]
+struct RustUsePathSegment<'tree> {
+    name: String,
+    span: Span,
+    node: Node<'tree>,
+}
+
 fn rust_use_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    rust_use_path_segments_with_spans(node, source)
+        .into_iter()
+        .map(|segment| segment.name)
+        .collect()
+}
+
+fn rust_use_path_segments_with_spans<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<RustUsePathSegment<'tree>> {
     let mut segments = Vec::new();
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
@@ -585,7 +778,11 @@ fn rust_use_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
             "crate" | "identifier" | "type_identifier" | "metavariable" | "self" | "super" => {
                 let segment = rust_node_text(node, source).trim();
                 if !segment.is_empty() {
-                    segments.push(segment.to_string());
+                    segments.push(RustUsePathSegment {
+                        name: segment.to_string(),
+                        span: node_span(node),
+                        node,
+                    });
                 }
             }
             _ => {}
@@ -594,17 +791,30 @@ fn rust_use_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
     segments
 }
 
-fn import_visibility(node: Node<'_>, source: &str) -> RustVisibility {
-    let mut cursor = node.walk();
-    let visibility = node
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "visibility_modifier");
-    visibility
-        .map(|visibility| rust_visibility_from_modifier(visibility, source))
-        .unwrap_or(RustVisibility::Private)
+/// Whether a structured Rust use path starts with the grammar's root `::`
+/// anchor. A scoped identifier with no `path` field is exactly the tree-sitter
+/// representation of `::name`; walking its `path` fields reaches that root
+/// without inspecting source text.
+fn rust_use_path_is_absolute(mut node: Node<'_>) -> bool {
+    while node.kind() == "scoped_identifier" {
+        let Some(path) = node.child_by_field_name("path") else {
+            return true;
+        };
+        node = path;
+    }
+    false
 }
 
 pub fn rust_item_visibility(node: Node<'_>, source: &str) -> RustVisibility {
+    // Trait members and enum variant fields are accessible through their
+    // owner. Access to that owner is checked independently through its route.
+    if node
+        .parent()
+        .and_then(|body| body.parent())
+        .is_some_and(|owner| matches!(owner.kind(), "trait_item" | "enum_variant"))
+    {
+        return RustVisibility::Public;
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "visibility_modifier")
@@ -644,53 +854,81 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 /// visibility, the lexical scopes it sits in, and its start byte. One value is
 /// built per `use_declaration`, and every [`RustImportInfo`] the tree walk
 /// emits reads from it, so a leaf constructor only names what varies per leaf.
-struct RustUseDeclaration {
+struct RustUseDeclaration<'tree> {
     visibility: RustVisibility,
     lexical_scopes: Vec<StructuredImportScope>,
+    lexical_scope_nodes: Vec<Node<'tree>>,
     declaration_start_byte: usize,
 }
 
-impl RustUseDeclaration {
+impl<'tree> RustUseDeclaration<'tree> {
     /// One import this declaration introduces: `path` is the leaf's full
     /// segment list, and `binder_span` is the token spelling the bound name
     /// where the leaf has one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each leaf carries the independent AST and spelling projections"
+    )]
     fn leaf(
         &self,
-        path: Vec<String>,
+        path: Vec<RustUsePathSegment<'tree>>,
         is_wildcard: bool,
         identifier: Option<String>,
         alias: Option<String>,
         binder_span: Option<Span>,
-    ) -> RustImportInfo {
+        target_node: Option<Node<'tree>>,
+        alias_node: Option<Node<'tree>>,
+        leading_absolute: bool,
+        module_self: bool,
+    ) -> RustImportProjectionLeaf<'tree> {
+        assert_eq!(is_wildcard, target_node.is_none());
+        // The span keeps naming the imported entity by its path, so a
+        // `{self}` leaf spells its module's last prefix segment here while its
+        // target occurrence is the `self` token.
+        let target_span = if is_wildcard {
+            None
+        } else {
+            path.last().map(|segment| segment.span)
+        };
+        let path = path
+            .into_iter()
+            .map(|segment| segment.name)
+            .collect::<Vec<_>>();
         let rendered_path = path.join("::");
         let prefix = self.rendered_use_prefix();
+        let anchor = if leading_absolute { "::" } else { "" };
         let raw_snippet = if is_wildcard {
-            format!("{prefix}{rendered_path}::*;")
+            format!("{prefix}{anchor}{rendered_path}::*;")
         } else if let Some(alias) = &alias {
-            format!("{prefix}{rendered_path} as {alias};")
+            format!("{prefix}{anchor}{rendered_path} as {alias};")
         } else {
-            format!("{prefix}{rendered_path};")
+            format!("{prefix}{anchor}{rendered_path};")
         };
-        RustImportInfo {
-            info: ImportInfo {
-                raw_snippet,
-                is_wildcard,
-                is_global: false,
-                identifier,
-                alias,
-                path: Some(StructuredImportPath {
-                    segments: path.clone(),
-                    kind: Some(StructuredImportPathKind::Namespace),
-                    lexical_prefixes: Vec::new(),
-                    lexical_scopes: self.lexical_scopes.clone(),
-                    declaration_start_byte: self.declaration_start_byte,
-                }),
-                binder_span,
+        RustImportProjectionLeaf {
+            import: RustImportInfo {
+                info: ImportInfo {
+                    raw_snippet,
+                    is_wildcard,
+                    is_global: leading_absolute,
+                    identifier,
+                    alias,
+                    path: Some(StructuredImportPath {
+                        segments: path,
+                        kind: Some(StructuredImportPathKind::Namespace),
+                        lexical_prefixes: Vec::new(),
+                        lexical_scopes: self.lexical_scopes.clone(),
+                        declaration_start_byte: self.declaration_start_byte,
+                    }),
+                    binder_span,
+                },
+                visibility: self.visibility.clone(),
+                is_macro_use: false,
+                target_span,
+                module_self,
             },
-            visibility: self.visibility.clone(),
-            path,
-            is_extern_crate: false,
-            is_macro_use: false,
+            target: target_node,
+            alias: alias_node,
+            lexical_scopes: self.lexical_scope_nodes.clone(),
         }
     }
 
@@ -724,7 +962,7 @@ fn rust_use_leaf_binder_node(node: Node<'_>, prefix_was_empty: bool) -> Option<N
 }
 
 #[cfg(test)]
-mod tests {
+mod macro_use_tests {
     use super::*;
     use tree_sitter::Parser;
 
@@ -772,7 +1010,7 @@ mod tests {
         assert_eq!(imports[0].info.alias.as_deref(), Some("_"));
         assert_eq!(
             imports[0]
-                .path
+                .path()
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
@@ -844,17 +1082,45 @@ pub fn resolve_rust_import_package_scoped(
     source: &str,
     scope_start: usize,
     module_specifier: &str,
-) -> Option<String> {
+) -> ReferenceContextResult<Option<String>> {
     let segments = parse_symbol_path(Language::Rust, module_specifier);
-    let first = segments.first().map(String::as_str)?;
-    if !matches!(first, "self" | "super") {
+    if !matches!(segments.first().map(String::as_str), Some("self" | "super")) {
         return resolve_module_package(rust, token, file, module_specifier);
     }
     let file_package = rust_package_name(file);
     let lexical_package =
         crate::lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    resolve_rust_import_package_in_lexical_package(
+        rust,
+        token,
+        file,
+        &lexical_package,
+        module_specifier,
+    )
+}
+
+/// Resolve an import using an already established lexical module identity.
+/// Both live query syntax and canonical declaration contexts use this route.
+pub fn resolve_rust_import_package_in_lexical_package(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    lexical_package: &str,
+    module_specifier: &str,
+) -> ReferenceContextResult<Option<String>> {
+    let segments = parse_symbol_path(Language::Rust, module_specifier);
+    let Some(first) = segments.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(first, "self" | "super") {
+        return resolve_module_package(rust, token, file, module_specifier);
+    }
     let crate_package = rust_crate_root_package(file);
-    resolve_rust_module_segments_with_crate(&lexical_package, &crate_package, &segments)
+    Ok(resolve_rust_module_segments_with_crate(
+        lexical_package,
+        &crate_package,
+        &segments,
+    ))
 }
 
 /// Where a module specifier's resolved package is anchored, for persistence.
@@ -977,25 +1243,22 @@ pub fn resolve_rust_module_segments_with_crate<S: AsRef<str>>(
 pub fn resolve_rust_import_fq_name(
     source_file: &ProjectFile,
     package: &str,
-    raw_import: &str,
+    import: &ImportInfo,
 ) -> Option<String> {
-    let body = rust_import_body(raw_import)?;
-    let path = body
-        .rsplit_once(" as ")
-        .map(|(path, _)| path)
-        .unwrap_or(body)
-        .trim_end_matches("::*")
-        .trim();
-    let segments: Vec<_> = path
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
+    let path = import
+        .path
+        .as_ref()
+        .expect("Rust import resolution requires a structured path");
+    assert!(
+        !path.segments.is_empty(),
+        "Rust import structured path must contain at least one segment"
+    );
+    if path.kind == Some(StructuredImportPathKind::ExternCrate) {
         return None;
     }
 
     let crate_package = rust_crate_root_package(source_file);
-    resolve_rust_module_path_with_crate(package, &crate_package, path)
+    resolve_rust_module_segments_with_crate(package, &crate_package, &path.segments)
 }
 
 pub fn rust_external_module_route(path: &str) -> Option<(&str, Option<String>)> {
@@ -1059,22 +1322,217 @@ pub fn rust_crate_root_package(file: &ProjectFile) -> String {
     if let Some(paths) = crate::crate_naming::rust_crate_paths(file) {
         return paths.crate_root.join(".");
     }
-    rust_path_derived_crate_root_package(file)
+    crate::crate_naming::path_derived_crate_root_components(file.rel_path()).join(".")
 }
 
-/// Directory-derived crate root, kept verbatim for manifest-less trees.
-fn rust_path_derived_crate_root_package(file: &ProjectFile) -> String {
-    let rel = file.rel_path();
-    let mut components: Vec<_> = rel
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-    let Some(src_index) = components.iter().rposition(|component| component == "src") else {
-        return rust_package_name(file);
-    };
-    if src_index == 0 {
-        return String::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn grouped_use_projection_retains_target_and_alias_spans() {
+        let source = "use crate::service::{self as svc, run as execute, *};\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("set Rust grammar");
+        let tree = parser.parse(source, None).expect("parse grouped use");
+        let imports = rust_import_projection(tree.root_node(), source, "");
+
+        let svc = imports
+            .iter()
+            .find(|import| import.import.info.local_name() == Some("svc"))
+            .expect("self alias projection");
+        assert_eq!(svc.import.path(), ["crate", "service"]);
+        assert_eq!(
+            svc.import.target_span.map(|span| span.text(source)),
+            Some("service")
+        );
+        assert_eq!(
+            svc.import.info.binder_span.map(|span| span.text(source)),
+            Some("svc")
+        );
+
+        let execute = imports
+            .iter()
+            .find(|import| import.import.info.local_name() == Some("execute"))
+            .expect("named alias projection");
+        assert_eq!(execute.import.path(), ["crate", "service", "run"]);
+        assert_eq!(
+            execute.import.target_span.map(|span| span.text(source)),
+            Some("run")
+        );
+        assert_eq!(
+            execute
+                .import
+                .info
+                .binder_span
+                .map(|span| span.text(source)),
+            Some("execute")
+        );
+
+        let glob = imports
+            .iter()
+            .find(|import| import.import.info.is_wildcard)
+            .expect("glob projection");
+        assert_eq!(glob.import.path(), ["crate", "service"]);
+        assert_eq!(glob.import.target_span, None);
+        assert_eq!(glob.import.info.binder_span, None);
     }
-    components.truncate(src_index + 1);
-    components.join(".")
+
+    #[test]
+    fn leading_absolute_is_recorded_per_grouped_leaf() {
+        let source = "use {::root::absolute, local::relative};\nuse ::root::group::{one, two};\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("set Rust grammar");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse grouped absolute use");
+        let imports = rust_import_projection(tree.root_node(), source, "");
+
+        let described = imports
+            .iter()
+            .map(|import| {
+                (
+                    import.import.path().join("::"),
+                    import.import.info.is_global,
+                    import.import.info.raw_snippet.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            vec![
+                (
+                    "root::absolute".to_string(),
+                    true,
+                    "use ::root::absolute;".to_string(),
+                ),
+                (
+                    "local::relative".to_string(),
+                    false,
+                    "use local::relative;".to_string(),
+                ),
+                (
+                    "root::group::one".to_string(),
+                    true,
+                    "use ::root::group::one;".to_string(),
+                ),
+                (
+                    "root::group::two".to_string(),
+                    true,
+                    "use ::root::group::two;".to_string(),
+                ),
+            ]
+        );
+    }
+
+    fn structured_import(
+        raw_snippet: &str,
+        segments: &[&str],
+        kind: StructuredImportPathKind,
+        is_wildcard: bool,
+    ) -> ImportInfo {
+        ImportInfo {
+            raw_snippet: raw_snippet.to_string(),
+            is_wildcard,
+            is_global: false,
+            identifier: None,
+            alias: None,
+            path: Some(StructuredImportPath {
+                segments: segments
+                    .iter()
+                    .map(|segment| (*segment).to_string())
+                    .collect(),
+                kind: Some(kind),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: 0,
+            }),
+            binder_span: None,
+        }
+    }
+
+    #[test]
+    fn import_resolution_uses_structured_path_not_display_text() {
+        let temp = tempfile::tempdir().expect("temporary workspace root");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("absolute workspace root"),
+            "src/lib.rs",
+        );
+        let import = structured_import(
+            "use crate::display_text_is_not_authority::Wrong;",
+            &["crate", "actual", "Item"],
+            StructuredImportPathKind::Namespace,
+            false,
+        );
+
+        assert_eq!(
+            resolve_rust_import_fq_name(&file, "", &import),
+            Some("actual.Item".to_string())
+        );
+    }
+
+    #[test]
+    fn import_resolution_handles_roots_aliases_wildcards_and_extern_crates() {
+        let temp = tempfile::tempdir().expect("temporary workspace root");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("absolute workspace root"),
+            "src/lib.rs",
+        );
+        let cases = [
+            (
+                structured_import(
+                    "use crate::model::Item as Renamed;",
+                    &["crate", "model", "Item"],
+                    StructuredImportPathKind::Namespace,
+                    false,
+                ),
+                "app.inner",
+                Some("model.Item"),
+            ),
+            (
+                structured_import(
+                    "use self::model::*;",
+                    &["self", "model"],
+                    StructuredImportPathKind::Namespace,
+                    true,
+                ),
+                "app.inner",
+                Some("app.inner.model"),
+            ),
+            (
+                structured_import(
+                    "use super::model::Item;",
+                    &["super", "model", "Item"],
+                    StructuredImportPathKind::Namespace,
+                    false,
+                ),
+                "app.inner",
+                Some("app.model.Item"),
+            ),
+            (
+                structured_import(
+                    "extern crate model;",
+                    &["model"],
+                    StructuredImportPathKind::ExternCrate,
+                    false,
+                ),
+                "app.inner",
+                None,
+            ),
+        ];
+
+        for (import, package, expected) in cases {
+            assert_eq!(
+                resolve_rust_import_fq_name(&file, package, &import),
+                expected.map(str::to_string),
+                "structured import path {:?}",
+                import.path.as_ref().expect("test import path").segments
+            );
+        }
+    }
 }

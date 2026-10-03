@@ -20,7 +20,7 @@ use tree_sitter::Node;
 
 use crate::syntax::{
     csharp_type_node_segments, csharp_using_directive_is_global, csharp_using_directive_is_static,
-    csharp_using_directive_namespace_node,
+    csharp_using_directive_namespace_node, csharp_using_directive_target_node,
 };
 
 /// The namespace a plain `using` directive imports, from its structured path.
@@ -79,13 +79,7 @@ pub fn csharp_import_info_from_using_directive(
     }
 
     if csharp_using_directive_is_static(node) {
-        let mut cursor = node.walk();
-        let target = node.named_children(&mut cursor).find(|child| {
-            matches!(
-                child.kind(),
-                "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
-            )
-        })?;
+        let target = csharp_using_directive_target_node(node)?;
         let segments = csharp_type_node_segments(target, source);
         if segments.is_empty() {
             return None;
@@ -109,10 +103,7 @@ pub fn csharp_import_info_from_using_directive(
     if alias.is_empty() {
         return None;
     }
-    let mut cursor = node.walk();
-    let target_node = node.named_children(&mut cursor).find(|child| {
-        child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
-    })?;
+    let target_node = csharp_using_directive_target_node(node)?;
     let segments = csharp_type_node_segments(target_node, source);
     if segments.is_empty() {
         return None;
@@ -150,10 +141,7 @@ pub fn csharp_using_alias_from_node(node: Node<'_>, source: &str) -> Option<(Str
     if alias.is_empty() {
         return None;
     }
-    let mut cursor = node.walk();
-    let target_node = node.named_children(&mut cursor).find(|child| {
-        child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
-    })?;
+    let target_node = csharp_using_directive_target_node(node)?;
     let target = csharp_type_node_segments(target_node, source).join(".");
     (!target.is_empty()).then_some((alias, target))
 }

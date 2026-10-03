@@ -91,6 +91,34 @@ impl ExternalConversionIdentity {
         })
     }
 
+    pub(crate) fn model_declaration<'a>(
+        &self,
+        overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+    ) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+        let ExternalConversionProvenance::SemanticPack {
+            pack_id,
+            declaration_id,
+        } = &self.provenance
+        else {
+            return None;
+        };
+        if self.active_model_set_identity
+            != Some(StableDigest::sha256(
+                overlay.active_model_set_hash().as_bytes(),
+            ))
+        {
+            return None;
+        }
+        let matches = overlay.symbols_with_id(declaration_id);
+        let [symbol] = matches.records.as_slice() else {
+            return None;
+        };
+        (symbol.provenance.pack_id == *pack_id
+            && symbol.qualified_name == self.fqn
+            && !symbol.provenance.ambiguous)
+            .then_some(*symbol)
+    }
+
     pub fn fqn(&self) -> &str {
         &self.fqn
     }
@@ -328,6 +356,7 @@ pub enum ResolvedConversionType {
 pub enum ConversionKind {
     JavaIdentity,
     JavaPrimitiveWidening,
+    JavaReferenceWidening,
     JavaBoxing,
     JavaUnboxing,
     TypeScriptIdentity,
@@ -347,6 +376,7 @@ impl ConversionKind {
     pub const LABELS: &'static [&'static str] = &[
         "java_identity",
         "java_primitive_widening",
+        "java_reference_widening",
         "java_boxing",
         "java_unboxing",
         "typescript_identity",
@@ -366,6 +396,7 @@ impl ConversionKind {
         match self {
             Self::JavaIdentity => "java_identity",
             Self::JavaPrimitiveWidening => "java_primitive_widening",
+            Self::JavaReferenceWidening => "java_reference_widening",
             Self::JavaBoxing => "java_boxing",
             Self::JavaUnboxing => "java_unboxing",
             Self::TypeScriptIdentity => "typescript_identity",
@@ -394,6 +425,9 @@ pub enum ConversionUnknown {
     GenericSubstitution,
     UnsupportedConversion,
     UnsupportedExpression,
+    IncompleteHierarchy,
+    BudgetExhausted,
+    Cancelled,
     /// Another actual prevents establishing applicability of this signature.
     SignatureApplicability,
 }
@@ -408,6 +442,9 @@ impl ConversionUnknown {
         "generic_substitution",
         "unsupported_conversion",
         "unsupported_expression",
+        "incomplete_hierarchy",
+        "budget_exhausted",
+        "cancelled",
         "signature_applicability",
     ];
 
@@ -421,6 +458,9 @@ impl ConversionUnknown {
             Self::GenericSubstitution => "generic_substitution",
             Self::UnsupportedConversion => "unsupported_conversion",
             Self::UnsupportedExpression => "unsupported_expression",
+            Self::IncompleteHierarchy => "incomplete_hierarchy",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::Cancelled => "cancelled",
             Self::SignatureApplicability => "signature_applicability",
         }
     }
@@ -431,6 +471,7 @@ pub struct ArgumentTypeConversion {
     pub source: ResolvedConversionType,
     pub target: ResolvedConversionType,
     pub kind: ConversionKind,
+    pub hierarchy: Option<crate::analyzer::semantic_model::JavaHierarchyAnswer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +589,7 @@ impl CallArgumentConversion {
                 preservation: ValuePreservation::Preserving,
             },
             ConversionKind::JavaIdentity
+            | ConversionKind::JavaReferenceWidening
             | ConversionKind::TypeScriptIdentity
             | ConversionKind::TypeScriptStructuralAssignability
             | ConversionKind::RustIdentity
@@ -1133,6 +1175,7 @@ mod tests {
                     ConversionUnknown::UnresolvedSourceType,
                 );
                 fact.establish(ArgumentTypeConversion {
+                    hierarchy: None,
                     source: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
                     target: ResolvedConversionType::JavaPrimitive(if row.formal_index == Some(0) {
                         JavaPrimitive::Long
@@ -1251,6 +1294,7 @@ mod tests {
                     ConversionUnknown::UnresolvedSourceType,
                 );
                 fact.establish(ArgumentTypeConversion {
+                    hierarchy: None,
                     source: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
                     target: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
                     kind: ConversionKind::JavaIdentity,
@@ -1289,6 +1333,7 @@ mod tests {
     fn widening_that_rounds_values_does_not_claim_value_preservation() {
         let mut report = report();
         report.conversion_facts[0].establish(ArgumentTypeConversion {
+            hierarchy: None,
             source: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
             target: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Float),
             kind: ConversionKind::JavaPrimitiveWidening,
@@ -1313,6 +1358,7 @@ mod tests {
             &[
                 "java_identity",
                 "java_primitive_widening",
+                "java_reference_widening",
                 "java_boxing",
                 "java_unboxing",
                 "typescript_identity",
@@ -1339,6 +1385,9 @@ mod tests {
                 "generic_substitution",
                 "unsupported_conversion",
                 "unsupported_expression",
+                "incomplete_hierarchy",
+                "budget_exhausted",
+                "cancelled",
                 "signature_applicability",
             ]
         );

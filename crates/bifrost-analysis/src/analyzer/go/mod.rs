@@ -2,13 +2,27 @@ mod adapter;
 mod artifact;
 mod cache;
 mod clones;
-mod dependency_discovery;
+pub(crate) mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod handler_dispatch;
 mod imports;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_call_relations;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_points;
+#[cfg(test)]
+mod native_qualifier_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_rename;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_usages;
 pub(crate) mod package_identity;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod selected_reverse;
 mod semantic;
-mod type_identity_proof;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
+pub(crate) mod type_identity_proof;
 use crate::analyzer::Range;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -18,7 +32,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    LanguageEdgeFailure, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
@@ -54,14 +68,15 @@ pub(crate) use brokk_bifrost_go::declarations::{
     determine_go_package_name, go_structured_type_identity_bounded,
 };
 use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, GoGraphSource, build_go_edge_index_from_parsed, parse_go_workspace,
+    GoEdgeIndex, GoGraphBuildError, GoGraphSource, GoPackageClauseProvider, GoWorkspaceIndexes,
+    build_go_workspace_indexes,
 };
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
 pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 use brokk_bifrost_go::packages::{canonical_go_package_name, invalidate_nearest_go_module_cache};
 use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
-use cache::{GoMemoCaches, GoWorkspaceIndexes};
+use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
 pub use semantic::{
@@ -74,19 +89,112 @@ pub use type_identity_proof::{
     go_modeled_result_binding_type_identity_proof_work,
 };
 
-#[derive(Clone)]
 pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,
     memo_caches: GoMemoCaches,
+    native_context_profile: std::sync::RwLock<Option<[u8; 32]>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
+    for file in analyzer.get_analyzed_files() {
+        assert!(
+            analyzer
+                .inner
+                .write_live_file_to_store_for_test(&file)
+                .is_some(),
+            "persist selected Go source facts for {file}"
+        );
+    }
+}
+
+impl Clone for GoAnalyzer {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            memo_caches: self.memo_caches.clone(),
+            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+        }
+    }
 }
 
 crate::analyzer::impl_forward_query_provider!(GoAnalyzer);
 
+impl brokk_bifrost_go::source_facts::GoSourceFactProvider for GoAnalyzer {
+    fn go_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>> {
+        self.inner
+            .canonical_go_source_facts(file, &self.memo_caches.source_facts)
+    }
+}
+
 impl GoAnalyzer {
+    pub(crate) fn native_context_profile(&self) -> Option<[u8; 32]> {
+        *self
+            .native_context_profile
+            .read()
+            .expect("Go profile lock poisoned")
+    }
+
+    pub(crate) fn activate_native_context_profile(
+        &self,
+        snapshot: &crate::analyzer::store::WorkspaceSnapshotId,
+        profile: [u8; 32],
+    ) -> bool {
+        if self.inner.selected_workspace_snapshots().get("go") != Some(snapshot) {
+            return false;
+        }
+        *self
+            .native_context_profile
+            .write()
+            .expect("Go profile lock poisoned") = Some(profile);
+        true
+    }
+
+    fn refresh_source_inventory(&self) -> crate::analyzer::store::Result<()> {
+        use crate::analyzer::store::go_package_context::{
+            GoContextPublicationOutcome, source_inventory_profile,
+        };
+        let profile = source_inventory_profile();
+        if self
+            .native_context_profile()
+            .is_some_and(|active| active != profile)
+        {
+            return Ok(());
+        }
+        let Some(snapshot) = self.inner.selected_workspace_snapshots().get("go").cloned() else {
+            return Ok(());
+        };
+        match self.inner.analyzer_store().publish_go_source_context(
+            snapshot.clone(),
+            self.inner.project().root(),
+            &crate::CancellationToken::new(),
+        )? {
+            GoContextPublicationOutcome::Published(_) => {
+                assert!(self.activate_native_context_profile(&snapshot, profile));
+            }
+            GoContextPublicationOutcome::InputsChanged | GoContextPublicationOutcome::Cancelled => {
+            }
+        }
+        Ok(())
+    }
+
+    fn with_source_inventory(self) -> Self {
+        if let Err(error) = self.refresh_source_inventory() {
+            eprintln!("Go source inventory publication unavailable: {error}");
+        }
+        self
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self {
             inner: self.inner.clone_with_project(project),
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
         }
     }
 
@@ -100,7 +208,9 @@ impl GoAnalyzer {
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, GoAdapter, config),
             memo_caches: GoMemoCaches::new(memo_budget),
+            native_context_profile: std::sync::RwLock::new(None),
         }
+        .with_source_inventory()
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -118,10 +228,13 @@ impl GoAnalyzer {
             store_context,
             progress,
         )?;
-        Ok(Self {
+        let analyzer = Self {
             inner,
             memo_caches: GoMemoCaches::new(memo_budget),
-        })
+            native_context_profile: std::sync::RwLock::new(None),
+        };
+        analyzer.refresh_source_inventory()?;
+        Ok(analyzer)
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -203,25 +316,6 @@ impl GoAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
-    pub(crate) fn raw_supertypes(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.raw_supertypes_of(code_unit)
-    }
-
-    pub(crate) fn raw_supertypes_limited(
-        &self,
-        code_unit: &CodeUnit,
-        limit: usize,
-    ) -> LimitedQueryRows<String> {
-        self.inner.raw_supertypes_limited(code_unit, limit)
-    }
-
-    pub fn determine_package_name(&self, source: &str) -> String {
-        let Some(tree) = brokk_bifrost_go::parse::parse_go(source) else {
-            return String::new();
-        };
-        determine_go_package_name(tree.root_node(), source)
-    }
-
     pub(crate) fn canonical_package_name_from_tree(
         &self,
         file: &ProjectFile,
@@ -270,107 +364,92 @@ impl GoAnalyzer {
         self.inner.workspace_declaration_identities_authoritative()
     }
 
+    pub(crate) fn graph_inventory_complete(&self) -> bool {
+        self.inner.indexed_source_inventory_complete()
+            && self.workspace_declaration_identities_authoritative()
+    }
+
     #[doc(hidden)]
     pub fn workspace_path_index_build_count_for_test(&self) -> usize {
         self.memo_caches.workspace_path_index_build_count()
     }
 
-    pub(crate) fn usage_edge_index(&self) -> Arc<GoEdgeIndex> {
-        Arc::clone(&self.workspace_indexes().edges)
-    }
-
-    /// The workspace's Go type hierarchy and usage edge index, built together
-    /// from one parse of every Go file.
-    ///
-    /// Both indexes are whole-workspace derivations of the same ASTs, and a
-    /// Go usage scan reaches both in one request. Building them apart parsed
-    /// the workspace twice -- `GoHierarchyIndex::build` read and parsed every
-    /// Go file in a sequential loop while the edge index parsed the same files
-    /// again -- which is where most of a cold Go scan's single-threaded time
-    /// went (#1748). The edge pass behind dead code and the ICFG reached the
-    /// second of those parses until #3066 pointed it here.
-    ///
-    /// The build runs on the dedicated pool, so its parallel parse consumes no
-    /// worker of the global pool and a global-pool worker that reaches this
-    /// memo parks on the one build instead of duplicating it (#1772, and the
-    /// `PoolSafeMemo` rule the #549 deadlock set).
-    fn workspace_indexes(&self) -> Arc<GoWorkspaceIndexes> {
+    fn workspace_indexes(&self) -> Result<Arc<GoWorkspaceIndexes>, GoGraphBuildError> {
+        // Completeness is a cheap readiness check and must still guard a warm
+        // memo: an unavailable publication must not make an earlier index look
+        // authoritative. Enumerate files only to describe that failure.
+        if !self.graph_inventory_complete() {
+            let files: Vec<_> = self
+                .get_analyzed_files()
+                .into_iter()
+                .filter(|file| file_language(file) == Language::Go)
+                .collect();
+            return Err(GoGraphBuildError::from_files(files));
+        }
         self.memo_caches
             .workspace_indexes
-            .get_or_build_on_dedicated_pool(|| {
-                self.memo_caches
-                    .workspace_indexes_build_count
-                    .fetch_add(1, Ordering::Relaxed);
-                let _scope = crate::profiling::scope("go_workspace_indexes::build");
+            .get_or_try_build_on_dedicated_pool(|| {
+                // Keep workspace enumeration and its whole-language read on
+                // the cold build path. A warm root only borrows the shared
+                // canonical index; repeating `get_analyzed_files` here would
+                // record a broad Scope read in every root and invalidate roots
+                // for an edit to an unrelated Go file.
                 let files: Vec<_> = self
-                    .inner
                     .get_analyzed_files()
                     .into_iter()
                     .filter(|file| file_language(file) == Language::Go)
                     .collect();
-                let parsed = parse_go_workspace(self.project(), &files);
-                self.memo_caches
-                    .workspace_parse_count
-                    .fetch_add(parsed.len(), Ordering::Relaxed);
-                // Both index builds cross the import tier's storage, so the
-                // pass owns one request scope (issue #2423).
                 let scope = AnalyzerQueryScope::new(self);
-                let hierarchy = GoHierarchyIndex::build_from_parsed(
-                    scope.token(),
-                    &self.inner,
-                    self,
-                    &files,
-                    &parsed,
-                );
-                let edges = if parsed.is_empty() {
-                    GoEdgeIndex::default()
-                } else {
-                    let source = GoGraphSource {
-                        token: scope.token(),
-                        index: self,
-                        imports: self,
-                        type_aliases: self,
-                        workspace_paths: self.workspace_path_index(),
-                    };
-                    let parsed_refs: Vec<_> = parsed
-                        .iter()
-                        .map(|(file, parsed)| (file.clone(), parsed))
-                        .collect();
-                    build_go_edge_index_from_parsed(source, &parsed_refs)
+                let source = GoGraphSource {
+                    token: scope.token(),
+                    index: self,
+                    imports: self,
+                    type_aliases: self,
+                    workspace_paths: self.workspace_path_index(),
+                    package_clauses: self,
+                    source_facts: self,
                 };
-                GoWorkspaceIndexes {
-                    hierarchy: Arc::new(hierarchy),
-                    edges: Arc::new(edges),
+                self.memo_caches
+                    .workspace_indexes_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let result = build_go_workspace_indexes(source, &files);
+                if scope.store_error().is_some() {
+                    Err(GoGraphBuildError::from_files(files.clone()))
+                } else {
+                    if result.is_ok() {
+                        self.memo_caches
+                            .workspace_source_fact_load_count
+                            .fetch_add(files.len(), Ordering::Relaxed);
+                    }
+                    result
                 }
             })
     }
 
-    /// Workspace index builds this analyzer ran. One per generation is the
-    /// pinned cost.
+    pub(crate) fn usage_edge_index(&self) -> Result<Arc<GoEdgeIndex>, GoGraphBuildError> {
+        self.workspace_indexes()
+            .map(|indexes| Arc::clone(&indexes.edges))
+    }
+
+    #[doc(hidden)]
+    pub fn usage_edge_index_build_count_for_test(&self) -> usize {
+        self.memo_caches.workspace_indexes_build_count()
+    }
+
+    /// Build count for the shared source-authoritative hierarchy/edge product.
+    /// Both repeated inverse requests and hierarchy lookups reuse this one
+    /// memoized workspace build.
     #[doc(hidden)]
     pub fn workspace_indexes_build_count_for_test(&self) -> usize {
         self.memo_caches.workspace_indexes_build_count()
     }
 
-    /// Go files the workspace index builds parsed. One parse per Go file per
-    /// build is the pinned cost (#1748).
+    /// Canonical Go fact files consumed by completed shared workspace builds.
+    /// Workspace indexes use persisted source facts and do not perform a
+    /// parser pass, so this replaces the old parse-count assertion honestly.
     #[doc(hidden)]
-    pub fn workspace_parse_count_for_test(&self) -> usize {
-        self.memo_caches.workspace_parse_count()
-    }
-
-    pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
-        self.memo_caches.package_clause_names.get_or_init(|| {
-            self.get_analyzed_files()
-                .into_iter()
-                .filter(|file| file_language(file) == Language::Go)
-                .filter_map(|file| {
-                    let source = self.project().read_source(&file).ok()?;
-                    let package_name = self.determine_package_name(&source);
-                    (!package_name.is_empty()).then_some((file, package_name))
-                })
-                .collect()
-        })
+    pub fn workspace_source_fact_load_count_for_test(&self) -> usize {
+        self.memo_caches.workspace_source_fact_load_count()
     }
 
     pub fn format_test_module(path: impl AsRef<Path>) -> String {
@@ -404,6 +483,12 @@ impl GoAnalyzer {
     }
 }
 
+impl GoPackageClauseProvider for GoAnalyzer {
+    fn package_clause_of(&self, file: &ProjectFile) -> Option<String> {
+        GoAnalyzer::package_clause_of(self, file)
+    }
+}
+
 impl TypeAliasProvider for GoAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
@@ -411,30 +496,30 @@ impl TypeAliasProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
-    /// The workspace's Go type and member relations, from the one workspace
-    /// index build.
-    ///
-    /// Go has no background warm, so every caller here is on the request path.
-    /// [`Self::workspace_indexes`] runs that build on the dedicated pool,
-    /// which keeps it off the global request pool and lets a global-pool
-    /// worker that reaches the memo park on the one build instead of
-    /// duplicating it serially (#1772).
-    fn hierarchy_index(&self) -> Arc<GoHierarchyIndex> {
-        Arc::clone(&self.workspace_indexes().hierarchy)
+    /// Cache successful hierarchy builds; unavailable source publications are
+    /// retried so a transient store failure cannot become a permanent proof.
+    fn hierarchy_index(&self) -> Result<Arc<GoHierarchyIndex>, GoGraphBuildError> {
+        self.workspace_indexes()
+            .map(|indexes| Arc::clone(&indexes.hierarchy))
     }
 }
 
 impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.hierarchy_index().direct_ancestors(code_unit)
+        self.hierarchy_index()
+            .map(|index| index.direct_ancestors(code_unit))
+            .unwrap_or_default()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
-        self.hierarchy_index().direct_descendants(code_unit)
+        self.hierarchy_index()
+            .map(|index| index.direct_descendants(code_unit))
+            .unwrap_or_default()
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
-        self.hierarchy_index().supports(code_unit)
+        self.hierarchy_index()
+            .is_ok_and(|index| index.supports(code_unit))
     }
 }
 
@@ -478,7 +563,13 @@ impl crate::analyzer::usages::MemberFamilyProvider for GoAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        go_member_family(self, &self.hierarchy_index(), member, cancellation)
+        match self.hierarchy_index() {
+            Ok(index) => go_member_family(self, &index, member, cancellation),
+            Err(_) => crate::analyzer::usages::MemberFamilyAnswer::incomplete(
+                go_member_family_capability(member),
+                crate::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated,
+            ),
+        }
     }
 }
 
@@ -618,15 +709,6 @@ impl CodeUnitIndex for GoAnalyzer {
         self.inner.top_level_declarations(file)
     }
 
-    /// Forwarded so a whole-workspace ask reaches the inner analyzer's bulk
-    /// hydration instead of the trait default's per-file loop (#1748).
-    fn declarations_of_files(
-        &self,
-        files: &[ProjectFile],
-    ) -> crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> {
-        self.inner.declarations_of_files(files)
-    }
-
     fn summary_file_projection(
         &self,
         file: &ProjectFile,
@@ -664,6 +746,13 @@ impl CodeUnitIndex for GoAnalyzer {
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
+    }
+
+    fn declarations_of_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> {
+        self.inner.declarations_of_files(files)
     }
 
     fn declarations_sharing_name(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -887,25 +976,18 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let module_identity_changed = changed_files.iter().any(|file| {
-            file.rel_path()
-                .file_name()
-                .is_some_and(|name| name == "go.mod")
-        });
+        // Package facts are keyed by import path. A module-path change
+        // therefore rekeys every Go file below this manifest, including files
+        // absent from `changed_files`, and the inner update rebuilds for it
+        // (see `GoAdapter::workspace_package_identity_digest`). Invalidate
+        // first so neither path can reuse the old nearest-module answer.
         invalidate_nearest_go_module_cache();
-        let inner = if module_identity_changed {
-            // Package facts are keyed by import path. A module-path change
-            // therefore rekeys every Go file below this manifest, including
-            // files absent from `changed_files`. Invalidate before rebuilding
-            // so the projection cannot reuse the old nearest-module answer.
-            self.inner.update_all()
-        } else {
-            self.inner.update(changed_files)
-        };
         Self {
-            inner,
+            inner: self.inner.update(changed_files),
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
         }
+        .with_source_inventory()
     }
 
     fn update_all(&self) -> Self {
@@ -914,7 +996,9 @@ impl IAnalyzer for GoAnalyzer {
         Self {
             inner,
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
         }
+        .with_source_inventory()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -1034,13 +1118,16 @@ impl IAnalyzer for GoAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if !self.contains_tests(file) || file_language(file) != Language::Go {
             return Vec::new();
         }
-        let Ok(source) = self.inner.project().read_source(file) else {
+        let Some(source) = self.inner.file_source(file) else {
             return Vec::new();
         };
-        detect_go_test_assertion_smells(file, &source, &weights)
+        let imports = self.inner.import_info_of(token, file);
+        detect_go_test_assertion_smells(file, &source, &imports, &weights)
     }
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
@@ -1181,8 +1268,26 @@ static GO_USAGE_STRATEGY: GoUsageGraphStrategy = GoUsageGraphStrategy::new();
 pub(crate) struct GoSupport;
 
 impl LanguageSupport for GoSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_rollout_points(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::languages::StructuralReceiverResolver> {
+        Some(&native_points::GoNativeRolloutPoints)
+    }
+
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("go.mod" | "go.sum" | "go.work" | "go.work.sum")
+        ) || path.ends_with(std::path::Path::new("vendor/modules.txt"))
+    }
+
     fn language(&self) -> Language {
         Language::Go
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn package_separator(&self) -> &'static str {
@@ -1263,22 +1368,61 @@ impl LanguageEdgePass for GoEdgePass {
         EdgePassId::Go
     }
 
+    /// Go keeps the workspace-wide answer, because the Go answer is
+    /// workspace-wide: `graph_inventory_complete` is the readiness of the
+    /// indexed source inventory and of the workspace declaration identities,
+    /// and every Go edge -- rooted or not -- is read out of the one
+    /// `GoWorkspaceIndexes` those two build. A rooted Go request whose own
+    /// files are published still cannot be answered from an incomplete
+    /// inventory, so restricting the question to `request_files` would report
+    /// a complete graph the pass cannot produce. Restricting the *report* is
+    /// still right: the failure names the request's own Go files rather than
+    /// every analyzed file, so a caller reads the files it asked about.
+    fn input_failure(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        request_files: &[ProjectFile],
+    ) -> Option<LanguageEdgeFailure> {
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+        (!go.graph_inventory_complete()).then(|| LanguageEdgeFailure {
+            reason: "Go canonical graph input was unavailable",
+            files: request_files
+                .iter()
+                .filter(|file| file_language(file) == Language::Go)
+                .cloned()
+                .collect(),
+        })
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        // The scan's per-file declaration reads cross the import tier's
-        // storage, so the pass owns one request scope (issue #2423).
-        let _scope = AnalyzerQueryScope::new(ctx.analyzer);
-        crate::analyzer::usages::go_graph::build_rooted_go_usage_edges(
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        match crate::analyzer::usages::go_graph::build_rooted_go_usage_edges(
             ctx.analyzer,
+            token,
             ctx.fqns,
             ctx.keep_file,
-        )
-        .map(LanguageEdgeSites::Fqn)
+        ) {
+            Ok(Some(edges)) => Some(LanguageEdgeSites::Fqn(edges)),
+            Ok(None) => None,
+            Err(error) => Some(LanguageEdgeSites::Unavailable(LanguageEdgeFailure {
+                reason: "Go canonical graph input was unavailable",
+                files: error.unavailable_files,
+            })),
+        }
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        let _scope = AnalyzerQueryScope::new(ctx.analyzer);
-        build_go_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeWeights::Fqn)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        match build_go_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file) {
+            Ok(Some(weights)) => Some(LanguageEdgeWeights::Fqn(weights)),
+            Ok(None) => None,
+            Err(error) => Some(LanguageEdgeWeights::Unavailable(LanguageEdgeFailure {
+                reason: "Go canonical graph input was unavailable",
+                files: error.unavailable_files,
+            })),
+        }
     }
 }
 
@@ -1324,7 +1468,11 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
     }
 
     fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
-        routing.candidate.is_field() || go_implicit_entry_point(routing.candidate)
+        routing.candidate.is_field()
+            || matches!(
+                go_implicit_entry_point(routing.analyzer, routing.candidate),
+                None | Some(true)
+            )
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
@@ -1341,38 +1489,23 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let _scope = AnalyzerQueryScope::new(analyzer);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::Go,
             |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
             candidates,
         );
-        build_go_usage_edges(analyzer, &nodes, |_| true)
-            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+        match build_go_usage_edges(analyzer, token, &nodes, |_| true) {
+            Ok(Some(edges)) => Some(DeadCodeBulkEdges::Fqn(Arc::new(edges))),
+            Ok(None) | Err(_) => None,
+        }
     }
 }
 
 fn go_module_level_field(unit: &CodeUnit) -> bool {
     unit.is_field() && unit.short_name().starts_with("_module_.")
-}
-
-/// A `GoAnalyzer` over an inline single-module fixture, shared by the test
-/// modules of this analyzer.
-#[cfg(test)]
-pub(super) fn test_analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
-    use crate::analyzer::TestProject;
-
-    let root = tempfile::tempdir().unwrap().keep();
-    std::fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
-    for (path, source) in files {
-        let path = root.join(path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, source).unwrap();
-    }
-    GoAnalyzer::from_project(TestProject::new(root, Language::Go))
 }
 
 #[cfg(test)]
@@ -1382,318 +1515,149 @@ mod hierarchy_tests {
     //! `ImportAnalysisProvider` the hierarchy is built from.
     use super::*;
     use crate::analyzer::type_relations::TypeRelationKind;
+    use crate::analyzer::{OverlayProject, Project, TestProject};
+    use crate::inline_project::InlineTestProject;
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
-        super::test_analyzer(files)
+        let temp = tempdir().unwrap();
+        let root = temp.keep();
+        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+        for (path, source) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, source).unwrap();
+        }
+        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
     }
 
-    /// Same-suffix package directories (`a/pkg`, `b/pkg`) must each bind only
-    /// their own import path. The package table is indexed by every spelling
-    /// that can bind (#1748), and a suffix index whose keys did not come from
-    /// the same rule as the old scan would let `b/pkg` answer `a/pkg`'s
-    /// import, giving `Worker` the wrong method set.
     #[test]
-    fn same_suffix_package_directories_bind_only_their_own_import() {
-        let analyzer = analyzer(&[
-            (
-                "a/pkg/base.go",
-                "package pkg\ntype Base struct{}\nfunc (Base) Run() error { return nil }\n",
-            ),
-            (
-                "b/pkg/base.go",
-                "package pkg\ntype Base struct{}\nfunc (Base) Walk() error { return nil }\n",
-            ),
-            (
-                "app/worker.go",
-                "package app\n\nimport \"example.com/app/a/pkg\"\n\ntype Worker struct { pkg.Base }\ntype Runner interface { Run() error }\ntype Walker interface { Walk() error }\n",
-            ),
-        ]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
-
-        let satisfied: Vec<&str> = index
-            .relations()
-            .iter()
-            .filter(|relation| {
-                relation.kind == TypeRelationKind::StructuralSatisfaction
-                    && relation.from.identifier() == "Worker"
-            })
-            .map(|relation| relation.to.identifier())
-            .collect();
-        assert!(
-            satisfied.contains(&"Runner"),
-            "Worker embeds a/pkg.Base and must satisfy Runner: {satisfied:?}"
-        );
-        assert!(
-            !satisfied.contains(&"Walker"),
-            "Worker must not pick up b/pkg.Base's method set: {satisfied:?}"
-        );
-    }
-
-    /// Cost pin for #1748: the import pass probes the package table once per
-    /// import. The scan this replaced had no probe count at all -- it visited
-    /// every workspace file for every import of every file.
-    #[test]
-    fn hierarchy_build_probes_the_package_table_once_per_import() {
-        const PACKAGES: usize = 200;
-
-        let sources: Vec<(String, String)> = (0..PACKAGES)
-            .map(|index| {
-                (
-                    format!("pkg{index}/file.go"),
-                    format!(
-                        "package pkg{index}\n\nimport \"example.com/app/pkg{}\"\n\ntype Holder{index} struct {{ value pkg{}.Value }}\ntype Value struct{{}}\n",
-                        (index + 1) % PACKAGES,
-                        (index + 1) % PACKAGES
-                    ),
-                )
-            })
-            .collect();
-        let files: Vec<(&str, &str)> = sources
-            .iter()
-            .map(|(path, source)| (path.as_str(), source.as_str()))
-            .collect();
-        let analyzer = analyzer(&files);
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
-
+    fn graph_index_uses_the_canonical_overlay_package_clause_for_import_bindings() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "target/target.go",
+                "package disk\nfunc Target() {}\n",
+            )
+            .file(
+                "main.go",
+                "package main\n\nimport \"example.com/app/target\"\n\nfunc Run() { fresh.Target() }\n",
+            )
+            .build();
+        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+        assert!(overlay.set(
+            project.file("target/target.go").abs_path(),
+            "package fresh\nfunc Target() {}\n".to_owned(),
+        ));
+        let analyzer = GoAnalyzer::new(overlay as Arc<dyn Project>);
+        let index = analyzer
+            .usage_edge_index()
+            .expect("canonical package clause should make graph input complete");
+        let main = project.file("main.go");
+        let (namespace_packages, dot_packages) = index.namespace_packages(&main);
+        assert!(dot_packages.is_empty());
         assert_eq!(
-            index.package_lookups(),
-            PACKAGES,
-            "one probe per import, not one scan of {PACKAGES} files per import"
+            namespace_packages.get("fresh").cloned(),
+            Some(vec!["example.com/app/target".to_owned()]),
+            "import binding must use the overlay package clause"
         );
     }
 
-    /// A multi-package fixture that exercises every fact the hierarchy
-    /// states: value and pointer receivers, struct embedding by value and by
-    /// pointer, interface embedding, aliases on both sides of a relation,
-    /// promotion through embedding, and an interface carrying type terms.
-    fn parity_fixture() -> GoAnalyzer {
-        analyzer(&[
-            (
-                "base/engine.go",
-                "package base\n\
-                 type Engine struct{ id int }\n\
-                 func (Engine) Start() error { return nil }\n\
-                 func (engine *Engine) Stop() error { return nil }\n\
-                 type Named interface { Name() string }\n",
-            ),
-            (
-                "base/alias.go",
-                "package base\n\
-                 type EngineAlias = Engine\n\
-                 type Number interface { ~int | ~float64 }\n",
-            ),
-            (
-                "svc/service.go",
-                "package svc\n\n\
-                 import \"example.com/app/base\"\n\n\
-                 type Service struct { base.Engine\n label string }\n\
-                 func (Service) Name() string { return \"\" }\n\
-                 type Starter interface { Start() error }\n\
-                 type Stopper interface { Stop() error }\n\
-                 type Both interface { Starter\n Stopper }\n",
-            ),
-            (
-                "svc/pointer.go",
-                "package svc\n\n\
-                 import base \"example.com/app/base\"\n\n\
-                 type Ptr struct { *base.Engine }\n\
-                 type ServiceAlias = Service\n\
-                 func (holder *Ptr) Extra() error { return nil }\n",
-            ),
-            (
-                "app/wrapper.go",
-                "package app\n\n\
-                 import \"example.com/app/svc\"\n\n\
-                 type Wrapper struct { svc.Service }\n\
-                 type Runner interface { Start() error\n Name() string }\n\
-                 func (Wrapper) Extra() error { return nil }\n",
-            ),
-        ])
-    }
-
-    /// Parity for #1748: the build that parses once for both workspace
-    /// indexes, records every phase's sites in one walk per file, and reads
-    /// the workspace's declarations in one batch must state exactly what the
-    /// builder it replaced stated. The oracle is that builder, kept in
-    /// `brokk-bifrost-go` under `test-support`.
     #[test]
-    fn hierarchy_build_states_what_the_previous_builder_stated() {
-        let analyzer = parity_fixture();
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let oracle = GoHierarchyIndex::build_oracle(scope.token(), &analyzer.inner, &analyzer);
-        let index = analyzer.hierarchy_index();
-
-        assert!(
-            oracle.facts_text().contains("ancestors "),
-            "the fixture must state relations for the parity check to mean anything:\n{}",
-            oracle.facts_text()
-        );
-        assert_eq!(
-            oracle.facts_text(),
-            index.facts_text(),
-            "digest oracle={} new={}",
-            oracle.facts_digest(),
-            index.facts_digest()
-        );
-    }
-
-    /// Cost pin for #1748: one AST walk per file per build. The build used to
-    /// walk every file five times -- once to prefetch definitions, once for
-    /// type skeletons, once for their details, once for aliases and once for
-    /// methods.
-    #[test]
-    fn hierarchy_build_walks_each_file_once() {
-        let analyzer = parity_fixture();
-        let files = analyzer
-            .get_analyzed_files()
+    fn canonical_method_sets_preserve_array_lengths_channels_and_repeated_parameters() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file("types.go", "package app\n\
+                type Contract interface { Run(a,b [4]int, tail ...chan<- int) (int,error) }\n\
+                type Exact struct{}\n\
+                type DifferentLength struct{}\n\
+                type DifferentDirection struct{}\n\
+                func (Exact) Run(a,b [4]int, tail ...chan<- int) (int,error) { return 0,nil }\n\
+                func (DifferentLength) Run(a,b [5]int, tail ...chan<- int) (int,error) { return 0,nil }\n\
+                func (DifferentDirection) Run(a,b [4]int, tail ...<-chan int) (int,error) { return 0,nil }\n")
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let index = analyzer.hierarchy_index().unwrap();
+        let contract = analyzer
+            .get_all_declarations()
             .into_iter()
-            .filter(|file| file_language(file) == Language::Go)
-            .count();
-        assert_eq!(5, files, "fixture files");
-
-        let index = analyzer.hierarchy_index();
-
-        assert_eq!(
-            files,
-            index.file_traversals(),
-            "one walk per file, not one per phase"
+            .find(|unit| unit.is_class() && unit.identifier() == "Contract")
+            .unwrap();
+        let descendants = index.direct_descendants(&contract);
+        assert!(
+            descendants.iter().any(|unit| unit.identifier() == "Exact"),
+            "{descendants:?}"
+        );
+        assert!(
+            !descendants
+                .iter()
+                .any(|unit| matches!(unit.identifier(), "DifferentLength" | "DifferentDirection")),
+            "distinct source method sets must not compare equal: {descendants:?}"
         );
     }
 
-    /// Whole-workspace parity, run by hand against a real Go repository:
-    ///
-    /// ```text
-    /// BIFROST_GO_PARITY_ROOT=/path/to/kubernetes \
-    /// BIFROST_CACHE_ROOT=/path/to/store \
-    /// cargo nextest run -p brokk-bifrost-analysis --run-ignored all \
-    ///   -E 'test(go_hierarchy_parity_on_a_real_workspace)'
-    /// ```
-    ///
-    /// The inline fixture above states the same claim over a fixture small
-    /// enough to read; this states it over a workspace whose scale is what
-    /// #1748 is about, and prints both digests so a report can quote them.
     #[test]
-    #[ignore = "needs a real Go workspace in BIFROST_GO_PARITY_ROOT"]
-    fn go_hierarchy_parity_on_a_real_workspace() {
-        use crate::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
-        use brokk_bifrost_core::analyzer::project::FilesystemProject;
-
-        let root = std::env::var("BIFROST_GO_PARITY_ROOT")
-            .expect("BIFROST_GO_PARITY_ROOT names the workspace to check");
-        let project = Arc::new(FilesystemProject::new(Path::new(&root)).expect("open workspace"));
-        let workspace = WorkspaceAnalyzer::build_persisted_for_languages(
-            project,
-            AnalyzerConfig::default(),
-            &BTreeSet::from([Language::Go]),
-        )
-        .expect("build the persisted store");
-        let analyzer = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
-            .expect("the workspace has a Go analyzer");
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let oracle = GoHierarchyIndex::build_oracle(scope.token(), analyzer, analyzer);
-        let index = GoHierarchyIndex::build(scope.token(), analyzer, analyzer);
-        println!(
-            "go hierarchy parity root={root} oracle={} new={} traversals={} files={}",
-            oracle.facts_digest(),
-            index.facts_digest(),
-            index.file_traversals(),
-            analyzer
-                .get_analyzed_files()
-                .into_iter()
-                .filter(|file| file_language(file) == Language::Go)
-                .count(),
+    fn graph_index_reports_a_missing_canonical_package_clause() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file("broken.go", "// no package clause\nfunc Broken() {}\n")
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let error = match analyzer.usage_edge_index() {
+            Ok(_) => panic!("a missing package clause must not produce a complete graph"),
+            Err(error) => error,
+        };
+        assert!(
+            error.unavailable_files.contains(&project.file("broken.go")),
+            "missing package clause must identify the unavailable file: {error:?}"
         );
-        let oracle_text = oracle.facts_text();
-        let new_text = index.facts_text();
-        if oracle_text != new_text {
-            let oracle_lines: std::collections::BTreeSet<&str> = oracle_text.lines().collect();
-            let new_lines: std::collections::BTreeSet<&str> = new_text.lines().collect();
-            for line in oracle_lines.difference(&new_lines).take(20) {
-                println!("only in oracle: {line}");
-            }
-            for line in new_lines.difference(&oracle_lines).take(20) {
-                println!("only in new:    {line}");
-            }
-            panic!(
-                "facts differ: oracle={} new={}, oracle-only={} new-only={}",
-                oracle.facts_digest(),
-                index.facts_digest(),
-                oracle_lines.difference(&new_lines).count(),
-                new_lines.difference(&oracle_lines).count(),
+        for _ in 0..2 {
+            assert!(
+                analyzer.hierarchy_index().is_err(),
+                "unavailable canonical input must not cache an empty hierarchy"
             );
         }
     }
 
-    /// Cost pin for #1748: one parse per Go file per request, shared by both
-    /// workspace indexes. The hierarchy used to parse the workspace in a
-    /// sequential loop while the edge index parsed the same files again.
     #[test]
-    fn workspace_indexes_parse_each_go_file_once() {
-        let analyzer = parity_fixture();
-        let files = analyzer
-            .get_analyzed_files()
+    fn usage_graph_keeps_cross_file_receiver_method_in_canonical_inventory() {
+        use crate::analyzer::usages::{GoUsageGraphStrategy, UsageAnalyzer};
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "api/types.go",
+                "package api\n\ntype Worker struct{}\n",
+            )
+            .file(
+                "api/method.go",
+                "package api\n\nfunc (Worker) Run() {}\n",
+            )
+            .file(
+                "caller.go",
+                "package main\n\nimport \"example.com/app/api\"\n\nfunc call(worker api.Worker) { worker.Run() }\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let target = analyzer
+            .get_all_declarations()
             .into_iter()
-            .filter(|file| file_language(file) == Language::Go)
-            .count();
+            .find(|unit| unit.fq_name() == "example.com/app/api.Worker.Run")
+            .expect("receiver method should be indexed in its defining file");
+        let candidates = analyzer.get_analyzed_files().into_iter().collect();
+        let hits = GoUsageGraphStrategy::new()
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100)
+            .into_either()
+            .expect("cross-file receiver method should have a complete graph");
 
-        analyzer.hierarchy_index();
-        analyzer.usage_edge_index();
-
-        assert_eq!(
-            1,
-            analyzer.workspace_indexes_build_count_for_test(),
-            "both indexes come from one build"
-        );
-        assert_eq!(
-            files,
-            analyzer.workspace_parse_count_for_test(),
-            "one parse per Go file for both indexes, not one per index"
-        );
-    }
-
-    /// The Kubernetes-scale #1748 remainder: hierarchy construction knows
-    /// every type and alias name after parsing, so it resolves them with one
-    /// batched declaration read plus one definition batch for the alias names
-    /// -- not a rendered-definition transaction per type or alias, and not one
-    /// file-state read per file in `resolve_member_units`.
-    #[test]
-    fn hierarchy_build_reads_workspace_declarations_in_one_batch() {
-        let analyzer = analyzer(&[(
-            "service.go",
-            "package app\n\
-             type Runner interface { Run() error }\n\
-             type Worker struct{}\n\
-             type Helper struct{}\n\
-             type WorkerAlias = Worker\n\
-             func (Worker) Run() error { return nil }\n",
-        )]);
-        analyzer
-            .inner
-            .reset_definition_candidates_query_count_for_test();
-        analyzer
-            .inner
-            .reset_definition_prefetch_batch_count_for_test();
-
-        let index = analyzer.hierarchy_index();
-
-        assert!(index.relations().iter().any(|relation| {
-            relation.kind == TypeRelationKind::StructuralSatisfaction
-                && relation.from.identifier() == "Worker"
-                && relation.to.identifier() == "Runner"
-        }));
-        assert_eq!(
-            1,
-            analyzer.inner.definition_prefetch_batch_count_for_test(),
-            "one batch for the alias names, and none for the declared types"
-        );
-        assert_eq!(
-            0,
-            analyzer.inner.definition_candidates_query_count_for_test(),
-            "no per-type or per-alias definition point read"
-        );
+        assert_eq!(hits.len(), 1, "expected one caller: {hits:#?}");
+        let hit = hits.first().expect("one caller hit");
+        assert_eq!(hit.file, project.file("caller.go"));
+        assert_eq!(hit.enclosing.identifier(), "call");
     }
 
     #[test]
@@ -1704,7 +1668,16 @@ mod hierarchy_tests {
         )]);
         let scope = AnalyzerQueryScope::new(&analyzer);
         let token = scope.token();
-        let index = GoHierarchyIndex::build(token, &analyzer, &analyzer);
+        let index = GoHierarchyIndex::build(GoGraphSource {
+            token,
+            index: &analyzer,
+            imports: &analyzer,
+            type_aliases: &analyzer,
+            workspace_paths: analyzer.workspace_path_index(),
+            package_clauses: &analyzer,
+            source_facts: &analyzer,
+        })
+        .unwrap();
         assert!(index.relations().iter().any(|relation| {
             relation.kind == TypeRelationKind::StructuralSatisfaction
                 && relation.from.identifier() == "Worker"
@@ -1764,6 +1737,88 @@ mod hierarchy_tests {
             vec!["Pointer.Run".to_string(), "Worker.Run".to_string()],
             "a pointer receiver implements the interface for *Pointer, and its \
              body is still the code that runs"
+        );
+    }
+
+    #[test]
+    fn repeated_inline_interface_projections_keep_their_own_members() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "service.go",
+                "package app\n\
+                 type Outer struct {\n\
+                     A, B interface { Run() error }\n\
+                 }\n\
+                 type Worker struct{}\n\
+                 func (Worker) Run() error { return nil }\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "A", "Run")),
+            vec!["Worker.Run".to_string()]
+        );
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "B", "Run")),
+            vec!["Worker.Run".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_nominal_aliases_do_not_become_element_type_relations_or_poison_peers() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file(
+                "service.go",
+                "package app\n\
+                 type Runner interface { Run() error }\n\
+                 type Worker struct{}\n\
+                 func (Worker) Run() error { return nil }\n\
+                 type SliceAlias = []Worker\n\
+                 type TextAlias = string\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let index = analyzer.hierarchy_index().unwrap();
+        let slice_alias = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_field() && unit.identifier() == "SliceAlias")
+            .expect("slice alias declaration");
+        assert!(
+            index.direct_ancestors(&slice_alias).is_empty(),
+            "a slice alias must not inherit the element type's interface relations"
+        );
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "Runner", "Run")),
+            vec!["Worker.Run".to_string()],
+            "valid predeclared and non-nominal aliases must not make unrelated families incomplete"
+        );
+    }
+
+    #[test]
+    fn missing_workspace_alias_target_is_not_complete_empty_evidence() {
+        use crate::analyzer::structural::resolution::MemberFamilyOutcome;
+        use crate::analyzer::usages::MemberFamilyProvider;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+            .file("dep/types.go", "package dep\ntype Present struct{}\n")
+            .file(
+                "service.go",
+                "package app\nimport \"example.com/app/dep\"\n\
+                type Alias = dep.Missing\n\
+                type Runner interface { Run() }\n\
+                type Worker struct{}\nfunc (Worker) Run() {}\n",
+            )
+            .build();
+        let analyzer = GoAnalyzer::new(project.project_dyn());
+        let answer = analyzer.member_family(&member(&analyzer, "Runner", "Run"), None);
+        assert_eq!(
+            answer.outcome,
+            MemberFamilyOutcome::Incomplete,
+            "{answer:?}"
         );
     }
 
@@ -1938,87 +1993,5 @@ mod hierarchy_tests {
             vec!["Worker.Run".to_string()],
             "an unrelated interface in the same workspace still answers"
         );
-    }
-}
-
-#[cfg(test)]
-mod edge_index_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// The contract the #3066 switch rests on: the file set the Go edge pass
-    /// used to derive for itself (`analyzed_files_for_language`) is exactly
-    /// the file set the shared workspace index covers (`get_analyzed_files`
-    /// filtered to Go). Build-tagged files and `_test.go` files are ordinary
-    /// analyzed Go files to both rules, and the fixture carries both so a
-    /// future divergence in either rule fails here rather than silently
-    /// changing which files the dead-code and edge passes can see.
-    ///
-    /// Stated on kubernetes too, before the switch landed: 17,266 files and
-    /// the same fact digest either way
-    /// (`71ce49177e5189358b342254dca591a69f1b560d040b97ea2e60eed2f90d50b1`).
-    #[test]
-    fn the_shared_edge_index_covers_every_analyzed_go_file() {
-        let analyzer = test_analyzer(&[
-            (
-                "pkg/common.go",
-                "package pkg\n\
-                 type Widget struct{ id int }\n\
-                 func New() Widget { return Widget{} }\n\
-                 func (Widget) Name() string { return \"\" }\n",
-            ),
-            (
-                "pkg/platform_linux.go",
-                "//go:build linux\n\n\
-                 package pkg\n\n\
-                 type Platform struct{ Widget }\n\
-                 func Detect() Platform { return Platform{} }\n",
-            ),
-            (
-                "pkg/platform_darwin.go",
-                "//go:build darwin\n\n\
-                 package pkg\n\n\
-                 type Platform struct{ Widget }\n\
-                 func Detect() Platform { return Platform{} }\n",
-            ),
-            (
-                "pkg/pkg_test.go",
-                "package pkg\n\n\
-                 import \"testing\"\n\n\
-                 func TestNew(t *testing.T) { _ = New().Name() }\n",
-            ),
-            (
-                "app/app.go",
-                "package app\n\n\
-                 import \"example.com/app/pkg\"\n\n\
-                 func Run() string { return pkg.Detect().Name() }\n",
-            ),
-        ]);
-
-        let listed: BTreeSet<PathBuf> =
-            crate::analyzer::usages::common::analyzed_files_for_language(&analyzer, Language::Go)
-                .iter()
-                .map(|file| file.rel_path().to_path_buf())
-                .collect();
-        let indexed: BTreeSet<PathBuf> = analyzer
-            .usage_edge_index()
-            .files()
-            .map(|file| file.rel_path().to_path_buf())
-            .collect();
-
-        assert_eq!(
-            listed, indexed,
-            "the edge pass's file rule and the shared index must name the same files"
-        );
-        for file in [
-            "pkg/platform_linux.go",
-            "pkg/platform_darwin.go",
-            "pkg/pkg_test.go",
-        ] {
-            assert!(
-                listed.contains(Path::new(file)),
-                "the fixture must carry build-tagged and test files: {listed:?}"
-            );
-        }
     }
 }

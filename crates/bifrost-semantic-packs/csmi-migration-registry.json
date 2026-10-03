@@ -349,7 +349,7 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
-      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json",
+      "path": "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.deflate",
       "profiles": [],
       "reason": "No supported standard CSMI Go profile adapter provides exact declaration identity and applicability evidence.",
       "source_model": "crates/bifrost-semantic-packs/models/go-stdlib-errors.json"
@@ -1501,7 +1501,7 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "embedded_paths": [
         "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/manifest.json",
-        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json"
+        "crates/bifrost-semantic-packs/embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.deflate"
       ],
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "generated_semantic_model",

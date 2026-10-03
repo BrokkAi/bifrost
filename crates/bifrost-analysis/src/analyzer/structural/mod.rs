@@ -112,12 +112,13 @@ pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
     ALL_HIERARCHY_RELATIONS, ALL_HOISTING_CLASSES, ALL_MEMBER_DISPATCH_TIERS, ALL_PRECEDENCE_TIERS,
     ALL_REJECTION_REASONS, BindingActivation, BindingKind, BoundaryStatus,
-    CALLABLE_APPLICABILITY_ONLY_SUPPORT, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
-    DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY,
+    CALLABLE_APPLICABILITY_ONLY_SUPPORT, CandidateOutcome, CandidateOutcomeKind,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY,
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
     EnvironmentSupport, HierarchyRelation, HoistingClass, ImportActivation,
     LexicalEnvironmentSupport, MemberDispatchTier, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier,
-    RejectionReason, ScopeFormation, default_scope_formation,
+    RejectionReason, ResolutionCompletionKind, ResolutionCompletionReasonKind,
+    ResolutionGapOriginKind, ResolutionWitnessKind, ScopeFormation, default_scope_formation,
 };
 pub use routes::{
     ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,

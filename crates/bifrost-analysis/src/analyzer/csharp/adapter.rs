@@ -15,7 +15,6 @@ use brokk_bifrost_csharp::adapter::{
 use brokk_bifrost_csharp::declarations::parse_csharp_file;
 use brokk_bifrost_csharp::preprocessor::csharp_included_ranges;
 use brokk_bifrost_csharp::queries::CSHARP_QUERY_DIRECTORY;
-use brokk_bifrost_csharp::test_detection::csharp_contains_tests;
 use tree_sitter::Tree;
 
 use super::{csharp_normalize_full_name, csharp_source_identifier, strip_csharp_generic_arity};
@@ -24,6 +23,14 @@ use super::{csharp_normalize_full_name, csharp_source_identifier, strip_csharp_g
 pub(crate) struct CSharpAdapter;
 
 impl LanguageAdapter for CSharpAdapter {
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
     fn language(&self) -> Language {
         Language::CSharp
     }
@@ -101,11 +108,13 @@ impl LanguageAdapter for CSharpAdapter {
     fn contains_tests(
         &self,
         _file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-        _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+        _source: &str,
+        _tree: &Tree,
+        parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        csharp_contains_tests(tree.root_node(), source)
+        parsed
+            .contains_tests
+            .expect("C# primary producer records test classification")
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

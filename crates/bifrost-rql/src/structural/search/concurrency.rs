@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
-use super::{ProjectFile, Range, SemanticProcedureValue, WorkspaceAnalyzer};
+use super::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::analyzer::semantic::{
     AccessPath, AccessPathAtPoint, AccessPathRoot, AccessSelector, AllocationId, CallSiteHandle,
     CallSiteId, CallableTarget, CallableTargetResolution, CandidateCoverage, EvidenceCompleteness,
     ExecutionTiming, FreshObjectPublicationQuery, HeapOracle, IndexSelector,
-    IndexedLocationIdentity, MemoryLocationId, MemoryLocationKind, ObjectCardinality,
-    ObservationPhase, OracleCallContext, OracleLimits, PreparedWorkspaceDispatchPool,
-    ProcedureHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticEffect,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    ValueAtPoint, ValueFlowKind, ValueHandle, ValueId,
+    IndexedLocationIdentity, LocationResult, MemoryLocationId, MemoryLocationKind,
+    ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits, PointsToResult,
+    PreparedWorkspaceDispatchPool, ProcedureHandle, ProgramPointId, ProofStatus,
+    ScopedSemanticLocator, SemanticEffect, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, ValueAtPoint, ValueFlowKind, ValueHandle, ValueId,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledAtomicOperation, CompiledConcurrencyEffect,
@@ -56,7 +56,9 @@ pub(super) struct WorkspaceConcurrencyProvider<'a> {
     workspace: &'a WorkspaceAnalyzer,
     dispatch_sessions: PreparedWorkspaceDispatchPool<'a>,
     active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
+    provider_behavior_identity: crate::analyzer::semantic::IcfgProviderBehaviorIdentity,
     summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
+    query_cache: ProviderQueryCache<'a>,
     /// Declarations already named for a member locator, keyed by its file and
     /// span, so one lookup serves every access repeating it.
     member_identities: std::cell::RefCell<
@@ -82,6 +84,111 @@ pub(super) struct WorkspaceConcurrencyProvider<'a> {
     /// repeating it. `None` is retained when the declaration's type shape is not
     /// enough to prove either storage mode.
     reference_members: std::cell::RefCell<crate::hash::HashMap<(String, u32, u32), Option<bool>>>,
+    /// Resolution details for calls whose external model lookup remains open.
+    /// Entries are scoped to this provider/query and are retained only so an
+    /// affected conflict row can explain its `UnresolvedTarget` reason.
+    unresolved_call_details: std::cell::RefCell<
+        crate::hash::HashMap<
+            CallSiteHandle,
+            brokk_bifrost_flow::concurrency::UnresolvedCallDetails,
+        >,
+    >,
+}
+
+/// The race query's cache when the provider serves one query's roots;
+/// otherwise a cache that lives as long as this provider.
+enum ProviderQueryCache<'a> {
+    Owned(Box<WorkspaceConcurrencyQueryCache>),
+    Shared(&'a WorkspaceConcurrencyQueryCache),
+}
+
+/// Complete answers shared by every root of one race query. Each entry was
+/// paid for in full in that query before it was retained, so the store is
+/// bounded by the query's semantic budget and is dropped with the query.
+#[derive(Default)]
+pub(super) struct WorkspaceConcurrencyQueryCache {
+    flow: brokk_bifrost_flow::concurrency::ConcurrencyQueryCache,
+    /// Completed points-to answers to context-free queries, so one answer
+    /// serves every activation, step and root that repeats the query. See
+    /// [`context_free_heap_answer`].
+    context_free_pointees: ContextFreeHeapAnswers<ValueAtPoint, PointsToResult>,
+    /// Completed location answers to context-free queries, reused like
+    /// `context_free_pointees`.
+    context_free_locations: ContextFreeHeapAnswers<AccessPathAtPoint, LocationResult>,
+}
+
+impl WorkspaceConcurrencyQueryCache {
+    pub(super) fn flow_cache(&self) -> &brokk_bifrost_flow::concurrency::ConcurrencyQueryCache {
+        &self.flow
+    }
+}
+
+type ContextFreeHeapAnswers<Q, T> = std::cell::RefCell<
+    crate::hash::HashMap<
+        (crate::analyzer::semantic::IcfgProviderBehaviorIdentity, Q),
+        SemanticOutcome<T>,
+    >,
+>;
+
+/// Answer one heap-oracle query with an empty call context at most once per
+/// provider.
+///
+/// With no call context, the workspace oracle's answer is a function of the
+/// query and the immutable workspace snapshot the provider is bound to: its
+/// limits are fixed, and the budget's paid-artifact set changes only what a
+/// repeat is charged. Two inputs can still differ between calls, and neither
+/// is cached. An interrupted answer (budget or cancellation) describes the
+/// request, so only a completed answer is retained (`completed_replay`). An
+/// execution budget can run out inside the oracle and turn a later answer
+/// Unknown without reporting an interruption, so a request that carries one
+/// neither reads nor fills the cache.
+///
+/// A repeat is charged one nested entry, the complete-artifact hit
+/// convention. The provider is built for one root's query and dropped with
+/// it, and each retained answer was charged in full once in that query, so
+/// the retained count is bounded by the query's semantic budget.
+fn context_free_heap_answer<Q, T>(
+    answers: &ContextFreeHeapAnswers<Q, T>,
+    provider: crate::analyzer::semantic::IcfgProviderBehaviorIdentity,
+    query: &Q,
+    request: &mut SemanticRequest<'_>,
+    answer: impl FnOnce(&mut SemanticRequest<'_>) -> Result<SemanticOutcome<T>, SemanticProviderError>,
+) -> Result<SemanticOutcome<T>, SemanticProviderError>
+where
+    Q: Clone + Eq + std::hash::Hash,
+    T: Clone,
+{
+    let cacheable = request.execution_budget().is_none();
+    if !cacheable {
+        return answer(request);
+    }
+    let key = (provider, query.clone());
+    let cached = answers.borrow().get(&key).cloned();
+    if let Some(cached) = cached {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        let lookup = SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        };
+        return Ok(match request.budget.charge(lookup) {
+            Ok(()) => cached,
+            Err(exceeded) => SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: SemanticWork::default(),
+            },
+        });
+    }
+    let outcome = answer(request)?;
+    if let Some(replay) = outcome.completed_replay() {
+        answers.borrow_mut().insert(key, replay);
+    }
+    Ok(outcome)
 }
 
 impl<'a> WorkspaceConcurrencyProvider<'a> {
@@ -90,6 +197,14 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
         active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
         summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
     ) -> Self {
+        use crate::analyzer::semantic::IcfgProvider;
+
+        let provider_behavior_identity =
+            crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                workspace,
+                active_models.clone(),
+            )
+            .behavior_identity();
         Self {
             workspace,
             dispatch_sessions:
@@ -100,7 +215,9 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 )
                 .prepare_workspace_dispatch_pool(),
             active_models,
+            provider_behavior_identity,
             summaries,
+            query_cache: ProviderQueryCache::Owned(Box::default()),
             member_identities: std::cell::RefCell::default(),
             receiver_bindings: std::cell::RefCell::default(),
             parameter_bindings: std::cell::RefCell::default(),
@@ -108,7 +225,112 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             reference_free_parameters: std::cell::RefCell::default(),
             payload_boxing_parameters: std::cell::RefCell::default(),
             reference_members: std::cell::RefCell::default(),
+            unresolved_call_details: std::cell::RefCell::default(),
         }
+    }
+
+    pub(super) fn new_with_query_cache(
+        workspace: &'a WorkspaceAnalyzer,
+        active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
+        summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
+        query_cache: &'a WorkspaceConcurrencyQueryCache,
+    ) -> Self {
+        let mut provider = Self::new(workspace, active_models, summaries);
+        provider.query_cache = ProviderQueryCache::Shared(query_cache);
+        provider
+    }
+
+    fn query_cache(&self) -> &WorkspaceConcurrencyQueryCache {
+        match &self.query_cache {
+            ProviderQueryCache::Owned(cache) => cache,
+            ProviderQueryCache::Shared(cache) => cache,
+        }
+    }
+
+    fn remember_unresolved_call(
+        &self,
+        call: &CallSiteHandle,
+        callee: Option<String>,
+        cause: &'static str,
+    ) {
+        self.unresolved_call_details.borrow_mut().insert(
+            call.clone(),
+            brokk_bifrost_flow::concurrency::UnresolvedCallDetails {
+                callee: callee.map(String::into_boxed_str),
+                cause: cause.into(),
+            },
+        );
+    }
+
+    fn go_import_qualified_call_identity(
+        &self,
+        call: &CallSiteHandle,
+    ) -> Option<(String, String, u32)> {
+        let procedure = call.procedure();
+        let semantics = procedure.semantics();
+        let row = semantics.call_site(call.id())?;
+        if semantics.locator().language().semantic_pack_label() != "go" {
+            return None;
+        }
+        let mapping = semantics.source_mapping(row.source)?;
+        let call_span = mapping.locator.anchor().span();
+        let file = super::witness_projection::locator_file(self.workspace, &mapping.locator);
+        let providers = self.workspace.analyzer().structural_fact_providers();
+        let provider = providers
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Go)?;
+        let facts = provider.structural_facts(&file)?;
+        let mut call_ids = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.kind == crate::analyzer::structural::NormalizedKind::Call
+                    && node.range.start_byte == call_span.start_byte() as usize
+                    && node.range.end_byte == call_span.end_byte() as usize
+            })
+            .map(|(index, _)| {
+                u32::try_from(index).expect("validated structural node count fits u32")
+            });
+        let call_id = call_ids.next()?;
+        if call_ids.next().is_some() {
+            return None;
+        }
+        let callee_targets = facts
+            .role_targets(call_id, crate::analyzer::structural::Role::Callee)
+            .collect::<Vec<_>>();
+        let [callee] = callee_targets.as_slice() else {
+            return None;
+        };
+        let receiver_targets = facts
+            .role_targets(call_id, crate::analyzer::structural::Role::Receiver)
+            .collect::<Vec<_>>();
+        let [receiver] = receiver_targets.as_slice() else {
+            return None;
+        };
+        let package_alias = receiver.name?.text(facts.source()).to_owned();
+        let member = callee.name?.text(facts.source()).to_owned();
+        let query_scope = AnalyzerQueryScope::new(self.workspace.analyzer());
+        let imports = self
+            .workspace
+            .analyzer()
+            .import_analysis_provider()?
+            .import_info_of(query_scope.token(), &file);
+        let mut package_imports = imports.iter().filter(|import| {
+            import.local_name() == Some(package_alias.as_str())
+                && import
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.kind == Some(StructuredImportPathKind::Namespace))
+        });
+        let package_import = package_imports.next()?;
+        if package_imports.next().is_some() {
+            return None;
+        }
+        let package = package_import.path.as_ref()?.render_segments("/");
+        let parameter_count =
+            u32::try_from(row.arguments.len()).expect("validated Go call argument count fits u32");
+        Some((package, member, parameter_count))
     }
 
     fn actual_input(
@@ -495,10 +717,18 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             OracleCallContext::empty(),
         )
         .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-        let outcome = self
-            .workspace
-            .semantic_oracle_provider()
-            .pointees(&query, request)?;
+        let answers = &self.query_cache().context_free_pointees;
+        let outcome = context_free_heap_answer(
+            answers,
+            self.provider_behavior_identity,
+            &query,
+            request,
+            |request| {
+                self.workspace
+                    .semantic_oracle_provider()
+                    .pointees(&query, request)
+            },
+        )?;
         let Some(result) = outcome.available_value() else {
             return Ok(open_resolved_location());
         };
@@ -603,7 +833,9 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             ))
             .records
             .iter()
-            .any(|record| !record.concurrency_effects().is_empty())
+            .any(|record| {
+                record.no_concurrency_effects() || !record.concurrency_effects().is_empty()
+            })
     }
 
     fn procedure_has_concurrency_model(&self, procedure: &ProcedureHandle) -> bool {
@@ -698,58 +930,53 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
         }
         let outcome = self.dispatch_sessions.resolve_call(call, request)?;
         let Some(dispatch) = outcome.available_value() else {
+            if !matches!(
+                dispatch_open_reason(&outcome),
+                ConcurrencyOpenReason::BudgetExhausted
+            ) {
+                self.remember_unresolved_call(call, None, "unresolved_dispatch");
+            }
             return Ok(ConcurrencyAnswer::Open {
                 partial: None,
                 reasons: vec![dispatch_open_reason(&outcome)],
             });
         };
-        let Some(external_only) =
-            complete_exclusive_dispatch_is_external_only(outcome.is_complete(), dispatch)
-        else {
-            return Ok(ConcurrencyAnswer::Open {
-                partial: None,
-                reasons: vec![dispatch_open_reason(&outcome)],
-            });
-        };
-        // A complete source-only dispatch has no external procedure summary
-        // to consume.
-        if !external_only {
-            return Ok(ConcurrencyAnswer::Proven(None));
-        }
-        let mut targets = dispatch
-            .boundaries()
-            .iter()
-            .filter_map(|boundary| {
-                if let Some(target) = boundary.exact_external_target() {
-                    let (owner, member) =
-                        crate::analyzer::semantic::split_qualified_member(target.symbol())?;
-                    return Some((
-                        target.artifact().language().semantic_pack_label(),
-                        owner.to_owned(),
-                        member.to_owned(),
-                        target.has_receiver(),
-                        target.parameter_count(),
-                    ));
+        let target =
+            match complete_exclusive_dispatch_is_external_only(outcome.is_complete(), dispatch) {
+                Some(false) => return Ok(ConcurrencyAnswer::Proven(None)),
+                Some(true) => {
+                    let targets = external_call_targets(dispatch);
+                    let [target] = targets.as_slice() else {
+                        let cause = if targets.is_empty() {
+                            "no_resolved_declaration"
+                        } else {
+                            "dynamic_dispatch"
+                        };
+                        self.remember_unresolved_call(call, None, cause);
+                        return Ok(ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
+                        });
+                    };
+                    target.clone()
                 }
-                let target = boundary.unmaterialized_external_target()?;
-                Some((
-                    target.language().semantic_pack_label(),
-                    target.owner_fqn().to_owned(),
-                    target.member().to_owned(),
-                    target.has_receiver(),
-                    target.arity(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        targets.sort();
-        targets.dedup();
+                None => match self.go_resolver_owned_external_target(call, &outcome, dispatch) {
+                    Some(target) => target,
+                    None => {
+                        self.remember_unresolved_call(call, None, "dynamic_or_incomplete_dispatch");
+                        return Ok(ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons: vec![dispatch_open_reason(&outcome)],
+                        });
+                    }
+                },
+            };
         let Some(active) = self.active_models.as_ref() else {
-            return Ok(ConcurrencyAnswer::Open {
-                partial: None,
-                reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
-            });
-        };
-        let [target] = targets.as_slice() else {
+            self.remember_unresolved_call(
+                call,
+                Some(format!("{}.{}", target.1, target.2)),
+                "no_active_model_set",
+            );
             return Ok(ConcurrencyAnswer::Open {
                 partial: None,
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
@@ -759,7 +986,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             active
                 .active_models()
                 .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
-                    target.0, &target.1, &target.2, target.3, target.4,
+                    &target.0, &target.1, &target.2, target.3, target.4,
                 ));
         if matched.disposition == SemanticModelMatchDisposition::Conflict {
             return Ok(ConcurrencyAnswer::Open {
@@ -771,18 +998,60 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             // Declaration identity does not describe the external body's
             // effects. Only a selected complete summary can certify an empty
             // inventory; absence of that summary leaves the call open.
+            self.remember_unresolved_call(
+                call,
+                Some(format!("{}.{}", target.1, target.2)),
+                "unmodeled_external",
+            );
             return Ok(ConcurrencyAnswer::Open {
                 partial: None,
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
             });
         };
         if selected.record.completeness != Completeness::Complete {
+            self.remember_unresolved_call(
+                call,
+                Some(format!("{}.{}", target.1, target.2)),
+                "incomplete_external_model",
+            );
             return Ok(ConcurrencyAnswer::Open {
                 partial: None,
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
             });
         }
         Ok(ConcurrencyAnswer::Proven(Some(selected.record)))
+    }
+
+    fn go_resolver_owned_external_target(
+        &self,
+        call: &CallSiteHandle,
+        outcome: &SemanticOutcome<crate::analyzer::semantic::DispatchResult>,
+        dispatch: &crate::analyzer::semantic::DispatchResult,
+    ) -> Option<ExternalCallTarget> {
+        if outcome.is_complete()
+            || dispatch.coverage() != CandidateCoverage::Exhaustive
+            || !dispatch.candidates().is_empty()
+        {
+            return None;
+        }
+        let [boundary] = dispatch.boundaries() else {
+            return None;
+        };
+        if boundary.kind != crate::analyzer::semantic::DispatchBoundaryKind::External(None)
+            || boundary.proof != ProofStatus::Proven
+            || !matches!(boundary.completeness, EvidenceCompleteness::Partial(_))
+        {
+            return None;
+        }
+        let identity = boundary.external_callee_identity()?;
+        let (owner, member, parameter_count) = self.go_import_qualified_call_identity(call)?;
+        if identity.language() != Language::Go
+            || identity.owner_fqn() != owner
+            || identity.member() != member
+        {
+            return None;
+        }
+        Some(("go".to_owned(), owner, member, false, parameter_count))
     }
 
     fn exact_model_effects(
@@ -1545,13 +1814,15 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
                 self.workspace,
                 self.active_models.clone(),
             );
-        let projection = brokk_bifrost_flow::flow_state::procedure_continuation_projection(
-            &provider,
-            procedure,
-            &mut semantic_budget,
-            &mut cfg_budget,
-            request.cancellation,
-        );
+        let projection =
+            brokk_bifrost_flow::flow_state::procedure_continuation_projection_with_cache(
+                &provider,
+                procedure,
+                &mut semantic_budget,
+                &mut cfg_budget,
+                request.cancellation,
+                self.query_cache().flow_cache(),
+            );
         let mut work = semantic_budget.used();
         let cfg_work = cfg_budget.used();
         work.nested_entries += cfg_work.node_visits + cfg_work.edge_visits;
@@ -1565,15 +1836,7 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
     fn summary_behavior_identity(
         &self,
     ) -> Option<crate::analyzer::semantic::IcfgProviderBehaviorIdentity> {
-        use crate::analyzer::semantic::IcfgProvider;
-
-        Some(
-            crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-                self.workspace,
-                self.active_models.clone(),
-            )
-            .behavior_identity(),
-        )
+        Some(self.provider_behavior_identity)
     }
 
     fn complete_summary(
@@ -1700,6 +1963,56 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         }
     }
 
+    fn unresolved_call_details(
+        &self,
+        call: &CallSiteHandle,
+    ) -> Option<brokk_bifrost_flow::concurrency::UnresolvedCallDetails> {
+        let details = self.unresolved_call_details.borrow().get(call).cloned();
+        if details
+            .as_ref()
+            .is_some_and(|details| details.callee.is_some())
+        {
+            return details;
+        }
+        if let Some((owner, member, parameter_count)) = self.go_import_qualified_call_identity(call)
+        {
+            let cause = if self.active_models.is_none() {
+                "no_active_model_set"
+            } else if self.active_models.as_ref().is_some_and(|active| {
+                active
+                    .active_models()
+                    .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                        "go",
+                        &owner,
+                        &member,
+                        false,
+                        parameter_count,
+                    ))
+                    .records
+                    .iter()
+                    .any(|record| {
+                        record.record.completeness == Completeness::Complete
+                            && (record.record.no_concurrency_effects
+                                || !record.record.concurrency_effects.is_empty())
+                    })
+            }) {
+                "unresolved_dispatch"
+            } else {
+                "unmodeled_external"
+            };
+            return Some(brokk_bifrost_flow::concurrency::UnresolvedCallDetails {
+                callee: Some(format!("{owner}.{member}").into_boxed_str()),
+                cause: cause.into(),
+            });
+        }
+        Some(
+            details.unwrap_or_else(|| brokk_bifrost_flow::concurrency::UnresolvedCallDetails {
+                callee: None,
+                cause: "unresolved_dispatch".into(),
+            }),
+        )
+    }
+
     fn resolve_call(
         &self,
         call: &CallSiteHandle,
@@ -1721,6 +2034,23 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             && outcome.available_value().is_some_and(|result| {
                 complete_exclusive_dispatch_is_external_only(true, result).is_some()
             });
+        if !proven {
+            let (callee, cause) = outcome
+                .available_value()
+                .map(|dispatch| {
+                    let targets = external_call_targets(dispatch);
+                    match targets.as_slice() {
+                        [target] => (
+                            Some(format!("{}.{}", target.1, target.2)),
+                            "incomplete_dispatch",
+                        ),
+                        [] => (None, "unresolved_dispatch"),
+                        _ => (None, "dynamic_dispatch"),
+                    }
+                })
+                .unwrap_or((None, "unresolved_dispatch"));
+            self.remember_unresolved_call(call, callee, cause);
+        }
         Ok(if proven {
             ConcurrencyAnswer::Proven(partial)
         } else {
@@ -1756,12 +2086,18 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             return Ok(ConcurrencyAnswer::Proven(Vec::new()));
         }
         if let ConcurrencyAnswer::Open { reasons, .. } = targets {
-            // The workspace resolver's open answer fails the same exhaustive
-            // dispatch gate required by model lookup. Reuse that evidence.
-            return Ok(ConcurrencyAnswer::Open {
-                partial: Vec::new(),
-                reasons: reasons.clone(),
-            });
+            // The source-callable resolver may leave an external call open
+            // even when the separate declaration dispatch is exact. Let the
+            // latter consume only a complete external-only summary; absent or
+            // ambiguous summaries preserve the original open boundary.
+            let exact = self.exact_model_effects(call, request)?;
+            return match exact {
+                answer @ ConcurrencyAnswer::Proven(_) => Ok(answer),
+                _ => Ok(ConcurrencyAnswer::Open {
+                    partial: Vec::new(),
+                    reasons: reasons.clone(),
+                }),
+            };
         }
         self.exact_model_effects(call, request)
     }
@@ -2162,6 +2498,10 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
                     vec![AccessSelector::Index(selector)],
                 )
             }
+            MemoryLocationKind::Dereference { address } => (
+                AccessPathRoot::Value(value_handle(procedure, *address)?),
+                Vec::new(),
+            ),
             // The solver canonicalizes a static itself unless the producer
             // marked the location's identity unresolved, which only happens
             // for a value whose declaring file the producer may not read.
@@ -2181,10 +2521,18 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             OracleCallContext::empty(),
         )
         .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-        let outcome = self
-            .workspace
-            .semantic_oracle_provider()
-            .locations(&query, request)?;
+        let answers = &self.query_cache().context_free_locations;
+        let outcome = context_free_heap_answer(
+            answers,
+            self.provider_behavior_identity,
+            &query,
+            request,
+            |request| {
+                self.workspace
+                    .semantic_oracle_provider()
+                    .locations(&query, request)
+            },
+        )?;
         let Some(result) = outcome.available_value() else {
             return Ok(open_resolved_location());
         };
@@ -2314,6 +2662,45 @@ fn dispatch_open_reason(
         }
         _ => ConcurrencyOpenReason::UnresolvedTarget,
     }
+}
+
+type ExternalCallTarget = (String, String, String, bool, u32);
+
+fn external_call_targets(
+    dispatch: &crate::analyzer::semantic::DispatchResult,
+) -> Vec<ExternalCallTarget> {
+    let mut targets = dispatch
+        .boundaries()
+        .iter()
+        .filter_map(|boundary| {
+            if let Some(target) = boundary.exact_external_target() {
+                let (owner, member) =
+                    crate::analyzer::semantic::split_qualified_member(target.symbol())?;
+                return Some((
+                    target
+                        .artifact()
+                        .language()
+                        .semantic_pack_label()
+                        .to_owned(),
+                    owner.to_owned(),
+                    member.to_owned(),
+                    target.has_receiver(),
+                    target.parameter_count(),
+                ));
+            }
+            let target = boundary.unmaterialized_external_target()?;
+            Some((
+                target.language().semantic_pack_label().to_owned(),
+                target.owner_fqn().to_owned(),
+                target.member().to_owned(),
+                target.has_receiver(),
+                target.arity(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn dispatch_candidate_is_exact(candidate: &crate::analyzer::semantic::DispatchCandidate) -> bool {
@@ -2952,9 +3339,11 @@ fn exact_integer_input(call: &CallSiteHandle, input: &CompiledSummaryInput) -> O
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ConcurrentAccessConflictValue {
     pub(super) conflict: ConcurrentAccessConflict,
+    contexts: ConflictContextMerge,
+    pub(super) unresolved_calls: Vec<UnresolvedCallValue>,
     pub(super) id: String,
     pub(super) root_procedure_id: String,
     pub(super) file: ProjectFile,
@@ -2966,15 +3355,323 @@ pub(super) struct ConcurrentAccessConflictValue {
     pub(super) second_range: Range,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnresolvedCallValue {
+    pub(super) callee: Option<String>,
+    pub(super) reason: String,
+    pub(super) file: ProjectFile,
+    pub(super) range: Range,
+}
+
 impl ConcurrentAccessConflictValue {
     pub(super) fn file(&self) -> &ProjectFile {
         &self.file
     }
+
+    /// Fold another task context of the same row into this one.
+    ///
+    /// The row id names a root, a location, and two stable access sites, but
+    /// not the tasks that reach them, so one row can stand for several task
+    /// contexts (#3760). The merged row must be sound for every context:
+    ///
+    /// - A proven race in any context is the row: its own ordering,
+    ///   protection, task relation, proof, and coverage, regardless of the
+    ///   other contexts.
+    /// - Otherwise, if any context is not proven safe, the row is open. It
+    ///   carries the strongest race evidence among the open contexts, and the
+    ///   reasons of every open context.
+    /// - Only when every context is proven safe is the row proven safe. It
+    ///   claims happens-before ordering only if every context is ordered, or
+    ///   protection only if every context has the same modeled protection.
+    ///
+    /// The winning context is chosen by [`context_rank`], a total order over
+    /// fields this merge never changes, and the open evidence is a union, so
+    /// the result does not depend on the order in which contexts arrive.
+    pub(super) fn merge_context(&mut self, other: Self) {
+        assert_eq!(self.id, other.id, "only one row's contexts merge");
+        if is_open_context(&other.conflict) {
+            for call in &other.unresolved_calls {
+                if !self.unresolved_calls.contains(call) {
+                    self.unresolved_calls.push(call.clone());
+                }
+            }
+        }
+        self.contexts.merge(&other.contexts);
+        let projection = self.contexts.projected_evidence();
+        self.conflict = projection.conflict;
+        if !self
+            .conflict
+            .reasons
+            .contains(&ConcurrencyOpenReason::UnresolvedTarget)
+        {
+            self.unresolved_calls.clear();
+        }
+        self.first_file = projection.first_file;
+        self.first_range = projection.first_range;
+        self.second_file = projection.second_file;
+        self.second_range = projection.second_range;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictContextEvidence {
+    conflict: ConcurrentAccessConflict,
+    first_file: ProjectFile,
+    first_range: Range,
+    second_file: ProjectFile,
+    second_range: Range,
+}
+
+impl ConflictContextEvidence {
+    fn new(
+        conflict: &ConcurrentAccessConflict,
+        first_file: &ProjectFile,
+        first_range: Range,
+        second_file: &ProjectFile,
+        second_range: Range,
+    ) -> Self {
+        Self {
+            conflict: conflict.clone(),
+            first_file: first_file.clone(),
+            first_range,
+            second_file: second_file.clone(),
+            second_range,
+        }
+    }
+}
+
+/// Order-independent summary of the task contexts represented by one row id.
+/// It retains the strongest open and race witnesses, one deterministic
+/// representative, and conjunctions needed to make universal claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictContextMerge {
+    race_witness: Option<ConflictContextEvidence>,
+    open_witness: Option<ConflictContextEvidence>,
+    representative: ConflictContextEvidence,
+    all_ordered: bool,
+    any_open_ordering: bool,
+    common_protection: Option<brokk_bifrost_flow::concurrency::ConcurrentProtection>,
+    exhaustive: bool,
+    open_reasons: Vec<ConcurrencyOpenReason>,
+    open_calls: Vec<brokk_bifrost_flow::concurrency::UnresolvedCallOrigin>,
+}
+
+impl ConflictContextMerge {
+    fn single(
+        conflict: &ConcurrentAccessConflict,
+        first_file: &ProjectFile,
+        first_range: Range,
+        second_file: &ProjectFile,
+        second_range: Range,
+    ) -> Self {
+        let evidence = ConflictContextEvidence::new(
+            conflict,
+            first_file,
+            first_range,
+            second_file,
+            second_range,
+        );
+        let race_witness = is_proven_race(conflict).then(|| evidence.clone());
+        let open_witness = is_open_context(conflict).then(|| evidence.clone());
+        let mut open_reasons = if open_witness.is_some() {
+            conflict.reasons.clone()
+        } else {
+            Vec::new()
+        };
+        open_reasons.sort();
+        open_reasons.dedup();
+        let open_calls = if open_witness.is_some() {
+            conflict.unresolved_calls.clone()
+        } else {
+            Vec::new()
+        };
+        Self {
+            race_witness,
+            open_witness,
+            representative: evidence,
+            all_ordered: conflict.ordering
+                == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore,
+            any_open_ordering: conflict.ordering
+                == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Open,
+            common_protection: Some(conflict.protection),
+            exhaustive: conflict.exhaustive,
+            open_reasons,
+            open_calls,
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.race_witness =
+            strongest_context_evidence(self.race_witness.take(), other.race_witness.clone());
+        self.open_witness =
+            strongest_context_evidence(self.open_witness.take(), other.open_witness.clone());
+        if context_rank(&other.representative.conflict)
+            > context_rank(&self.representative.conflict)
+        {
+            self.representative = other.representative.clone();
+        }
+        self.all_ordered &= other.all_ordered;
+        self.any_open_ordering |= other.any_open_ordering;
+        self.common_protection = match (self.common_protection, other.common_protection) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            _ => None,
+        };
+        self.exhaustive &= other.exhaustive;
+        self.open_reasons.extend(other.open_reasons.iter().cloned());
+        self.open_reasons.sort();
+        self.open_reasons.dedup();
+        for call in &other.open_calls {
+            if !self.open_calls.contains(call) {
+                self.open_calls.push(call.clone());
+            }
+        }
+    }
+
+    fn projected_evidence(&self) -> ConflictContextEvidence {
+        use brokk_bifrost_flow::concurrency::{ConcurrentOrdering, ConcurrentProtection};
+
+        if let Some(witness) = &self.race_witness {
+            return witness.clone();
+        }
+        if let Some(witness) = &self.open_witness {
+            let mut conflict = witness.clone();
+            conflict.conflict.proven = false;
+            conflict.conflict.exhaustive = self.exhaustive;
+            conflict.conflict.reasons.clone_from(&self.open_reasons);
+            conflict
+                .conflict
+                .unresolved_calls
+                .clone_from(&self.open_calls);
+            return conflict;
+        }
+
+        let mut conflict = self.representative.clone();
+        conflict.conflict.ordering = if self.all_ordered {
+            ConcurrentOrdering::HappensBefore
+        } else if self.any_open_ordering {
+            ConcurrentOrdering::Open
+        } else {
+            ConcurrentOrdering::Unordered
+        };
+        conflict.conflict.protection = self.common_protection.unwrap_or(ConcurrentProtection::Open);
+        conflict.conflict.exhaustive = self.exhaustive;
+
+        let common_safe_protection = matches!(
+            conflict.conflict.protection,
+            ConcurrentProtection::CompatibleLock | ConcurrentProtection::AtomicOnly
+        );
+        if self.all_ordered || common_safe_protection {
+            conflict.conflict.proven = true;
+        } else {
+            // The individual contexts are safe, but one scalar ordering and
+            // protection pair cannot express their different proof bases.
+            // Preserve soundness rather than claiming a lock or ordering that
+            // does not hold for every context.
+            conflict.conflict.ordering = ConcurrentOrdering::Open;
+            conflict.conflict.protection = ConcurrentProtection::Open;
+            conflict.conflict.proven = false;
+            conflict.conflict.reasons = vec![ConcurrencyOpenReason::AmbiguousSynchronization];
+        }
+        conflict
+    }
+}
+
+fn strongest_context_evidence(
+    left: Option<ConflictContextEvidence>,
+    right: Option<ConflictContextEvidence>,
+) -> Option<ConflictContextEvidence> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if context_rank(&right.conflict) > context_rank(&left.conflict) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(context), None) | (None, Some(context)) => Some(context),
+        (None, None) => None,
+    }
+}
+
+fn is_proven_race(conflict: &ConcurrentAccessConflict) -> bool {
+    use brokk_bifrost_flow::concurrency::{ConcurrentOrdering, ConcurrentProtection};
+    conflict.proven
+        && conflict.ordering == ConcurrentOrdering::Unordered
+        && conflict.protection == ConcurrentProtection::Unprotected
+}
+
+fn is_proven_safe(conflict: &ConcurrentAccessConflict) -> bool {
+    use brokk_bifrost_flow::concurrency::{ConcurrentOrdering, ConcurrentProtection};
+    conflict.proven
+        && (conflict.ordering == ConcurrentOrdering::HappensBefore
+            || matches!(
+                conflict.protection,
+                ConcurrentProtection::CompatibleLock | ConcurrentProtection::AtomicOnly
+            ))
+}
+
+fn is_open_context(conflict: &ConcurrentAccessConflict) -> bool {
+    !is_proven_race(conflict) && !is_proven_safe(conflict)
+}
+
+/// How strongly one task context speaks for a race; the highest rank is the
+/// witness of a merged row.
+///
+/// The classes are, from highest: proven race, open, proven safe. Inside a
+/// class, less ordering and less protection rank higher, so an open row
+/// carries its strongest race evidence and a proven-safe row claims ordering
+/// only when every context is ordered. The rendered evidence fields make the
+/// order total for contexts sharing a row id, so the witness never depends on
+/// arrival order or run-local ids.
+fn context_rank(conflict: &ConcurrentAccessConflict) -> impl Ord {
+    use brokk_bifrost_flow::concurrency::{ConcurrentOrdering, ConcurrentProtection};
+    let class = if is_proven_race(conflict) {
+        2
+    } else if is_open_context(conflict) {
+        1
+    } else {
+        0
+    };
+    let ordering = match conflict.ordering {
+        ConcurrentOrdering::Unordered => 2,
+        ConcurrentOrdering::Open => 1,
+        ConcurrentOrdering::HappensBefore => 0,
+    };
+    let protection = match conflict.protection {
+        ConcurrentProtection::Unprotected => 3,
+        ConcurrentProtection::Open => 2,
+        ConcurrentProtection::CompatibleLock => 1,
+        ConcurrentProtection::AtomicOnly => 0,
+    };
+    let site = |site: &brokk_bifrost_flow::concurrency::ConcurrentAccessSite| {
+        (
+            super::semantic::procedure_wire_id(&site.procedure),
+            site.point.get(),
+            site.source.get(),
+            site.mode,
+            format!("{:?}", site.access_kind),
+        )
+    };
+    let first = site(&conflict.first);
+    let second = site(&conflict.second);
+    (
+        class,
+        ordering,
+        protection,
+        conflict.task_relation,
+        conflict.proven,
+        conflict.exhaustive,
+        conflict.reasons.clone(),
+        conflict.location.identity.clone(),
+        conflict.location.kind.clone(),
+        first,
+        second,
+    )
 }
 
 pub(super) fn project_conflict(
     workspace: &WorkspaceAnalyzer,
-    root: &SemanticProcedureValue,
+    root: &ProcedureHandle,
     conflict: ConcurrentAccessConflict,
 ) -> ConcurrentAccessConflictValue {
     let source_site = |site: &brokk_bifrost_flow::concurrency::ConcurrentAccessSite| {
@@ -2996,6 +3693,33 @@ pub(super) fn project_conflict(
     };
     let (first_file, first_range) = source_site(&conflict.first);
     let (second_file, second_range) = source_site(&conflict.second);
+    let unresolved_calls = conflict
+        .unresolved_calls
+        .iter()
+        .map(|origin| {
+            let procedure = origin.call.procedure();
+            let call = procedure
+                .semantics()
+                .call_site(origin.call.id())
+                .expect("validated unresolved call handle resolves");
+            let mapping = procedure
+                .semantics()
+                .source_mapping(call.source)
+                .expect("validated unresolved call has source mapping");
+            let span = mapping.locator.anchor().span();
+            UnresolvedCallValue {
+                callee: origin.details.callee.as_deref().map(str::to_owned),
+                reason: origin.details.cause.to_string(),
+                file: super::witness_projection::locator_file(workspace, &mapping.locator),
+                range: Range {
+                    start_byte: span.start_byte() as usize,
+                    end_byte: span.end_byte() as usize,
+                    start_line: span.start().line() as usize + 1,
+                    end_line: span.end().line() as usize + 1,
+                },
+            }
+        })
+        .collect();
     let anchor = conflict_anchor(&conflict);
     let mapping = anchor
         .procedure
@@ -3008,16 +3732,25 @@ pub(super) fn project_conflict(
     let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
         b"bifrost.code_query.concurrent_access_conflict.v1",
     );
-    digest.push(super::semantic::procedure_wire_id(&root.handle).as_bytes());
+    digest.push(super::semantic::procedure_wire_id(root).as_bytes());
     digest.push(conflict.location.identity.as_bytes());
     let mut sites = [stable_site(&conflict.first), stable_site(&conflict.second)];
     sites.sort();
     digest.push(sites[0].as_bytes());
     digest.push(sites[1].as_bytes());
+    let contexts = ConflictContextMerge::single(
+        &conflict,
+        &first_file,
+        first_range,
+        &second_file,
+        second_range,
+    );
     ConcurrentAccessConflictValue {
         conflict,
+        contexts,
+        unresolved_calls,
         id: digest.finish().to_string(),
-        root_procedure_id: super::semantic::procedure_wire_id(&root.handle),
+        root_procedure_id: super::semantic::procedure_wire_id(root),
         file,
         range: Range {
             start_byte: span.start_byte() as usize,
@@ -3205,6 +3938,231 @@ mod tests {
     }
 
     #[test]
+    fn repeated_context_free_heap_queries_match_recomputation_and_charge_one_lookup() {
+        use crate::analyzer::semantic::{SemanticBudget, SemanticExecutionBudget};
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                "package main\ntype cell struct{ n int }\nfunc run() {\n    c := &cell{}\n    c.n = 1\n}\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("main.go"),
+                &mut SemanticRequest::new(&mut materialization, &cancellation),
+            )
+            .expect("Go semantics materialize")
+            .available_value()
+            .expect("Go semantics are available")
+            .clone();
+        let procedure = artifact.procedures().iter().find_map(|procedure| {
+            let handle = artifact.procedure_handle(procedure.id())?;
+            handle.semantics().points().iter().find_map(|point| {
+                point.events.iter().find_map(|event| match event.effect {
+                    SemanticEffect::MemoryStore { location, .. }
+                        if matches!(
+                            handle.semantics().memory_location(location)?.kind,
+                            MemoryLocationKind::Field { .. }
+                        ) =>
+                    {
+                        Some((handle.clone(), point.id, location))
+                    }
+                    _ => None,
+                })
+            })
+        });
+        let (procedure, point, location) = procedure.expect("fixture stores a field");
+        let MemoryLocationKind::Field { base, .. } = procedure
+            .semantics()
+            .memory_location(location)
+            .expect("field location")
+            .kind
+        else {
+            unreachable!("selected a field store");
+        };
+        let nested = |budget: &SemanticBudget| budget.used().nested_entries;
+
+        let provider = WorkspaceConcurrencyProvider::new(&workspace, None, None);
+        let mut budget = SemanticBudget::default();
+        let first_value = provider
+            .resolved_value_at(
+                &procedure,
+                point,
+                base,
+                ObservationPhase::BeforeEffects,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap();
+        let first_location = provider
+            .resolved_location(
+                &procedure,
+                point,
+                location,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap();
+        let before = nested(&budget);
+        let repeated_value = provider
+            .resolved_value_at(
+                &procedure,
+                point,
+                base,
+                ObservationPhase::BeforeEffects,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap();
+        assert_eq!(nested(&budget) - before, 1, "a repeat is one lookup");
+        let before = nested(&budget);
+        let repeated_location = provider
+            .resolved_location(
+                &procedure,
+                point,
+                location,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap();
+        assert_eq!(nested(&budget) - before, 1, "a repeat is one lookup");
+
+        let fresh = WorkspaceConcurrencyProvider::new(&workspace, None, None);
+        let mut fresh_budget = SemanticBudget::default();
+        let recomputed_value = fresh
+            .resolved_value_at(
+                &procedure,
+                point,
+                base,
+                ObservationPhase::BeforeEffects,
+                &mut SemanticRequest::new(&mut fresh_budget, &cancellation),
+            )
+            .unwrap();
+        let recomputed_location = fresh
+            .resolved_location(
+                &procedure,
+                point,
+                location,
+                &mut SemanticRequest::new(&mut fresh_budget, &cancellation),
+            )
+            .unwrap();
+        assert!(
+            nested(&fresh_budget) > 2,
+            "the recomputation does the full work"
+        );
+        assert_eq!(repeated_value, first_value);
+        assert_eq!(repeated_value, recomputed_value);
+        assert_eq!(repeated_location, first_location);
+        assert_eq!(repeated_location, recomputed_location);
+        assert!(
+            matches!(recomputed_location, ConcurrencyAnswer::Proven(_)),
+            "the fixture's field has one proven location: {recomputed_location:?}"
+        );
+
+        // An execution budget can turn a later answer Unknown without an
+        // interruption, so such a request pays for its own answer.
+        let execution = SemanticExecutionBudget::new(usize::MAX, usize::MAX);
+        let mut limited_budget = SemanticBudget::default();
+        provider
+            .resolved_location(
+                &procedure,
+                point,
+                location,
+                &mut SemanticRequest::with_execution_budget(
+                    &mut limited_budget,
+                    &cancellation,
+                    &execution,
+                ),
+            )
+            .unwrap();
+        assert!(
+            nested(&limited_budget) > 1,
+            "a request with an execution budget bypasses the cache"
+        );
+    }
+
+    #[test]
+    fn a_later_root_reuses_the_query_cache_without_changing_its_report() {
+        use crate::analyzer::semantic::SemanticBudget;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                "package main\n\
+                 type cell struct{ n int }\n\
+                 func bump(c *cell) { c.n = c.n + 1 }\n\
+                 func first() { c := &cell{}; go bump(c); bump(c) }\n\
+                 func second() { c := &cell{}; go bump(c); bump(c) }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("main.go"),
+                &mut SemanticRequest::new(&mut materialization, &cancellation),
+            )
+            .expect("Go semantics materialize")
+            .available_value()
+            .expect("Go semantics are available")
+            .clone();
+        let procedure = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent().is_none()
+                        && procedure
+                            .locator()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("fixture has top-level function {name:?}"))
+        };
+        let solve = |root: &ProcedureHandle, cache: &WorkspaceConcurrencyQueryCache| {
+            let provider =
+                WorkspaceConcurrencyProvider::new_with_query_cache(&workspace, None, None, cache);
+            let mut budget = SemanticBudget::default();
+            let report =
+                brokk_bifrost_flow::concurrency::concurrent_access_conflicts_with_query_cache(
+                    &provider,
+                    root,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    cache.flow_cache(),
+                )
+                .expect("the fixture solves");
+            (report, budget.used().nested_entries)
+        };
+
+        let (fresh, fresh_cost) = solve(
+            &procedure("second"),
+            &WorkspaceConcurrencyQueryCache::default(),
+        );
+        let shared = WorkspaceConcurrencyQueryCache::default();
+        solve(&procedure("first"), &shared);
+        let (reused, reused_cost) = solve(&procedure("second"), &shared);
+
+        assert_eq!(
+            reused, fresh,
+            "a shared answer is the answer a fresh solve computes"
+        );
+        assert!(
+            fresh.conflicts.iter().any(|conflict| conflict.ordering
+                == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered),
+            "the fixture keeps its race: {fresh:#?}"
+        );
+        assert!(
+            reused_cost < fresh_cost,
+            "the later root pays less for answers the earlier root paid for: {reused_cost} vs {fresh_cost}"
+        );
+    }
+
+    #[test]
     fn repeated_concurrency_dispatch_reuses_source_and_retains_budget_reasons() {
         use crate::analyzer::semantic::SemanticBudget;
 
@@ -3354,7 +4312,12 @@ mod tests {
             "{effects:?}"
         );
 
-        for completeness in [None, Some("partial"), Some("complete")] {
+        for (completeness, no_concurrency_effects) in [
+            (None, false),
+            (Some("partial"), false),
+            (Some("complete"), false),
+            (Some("complete"), true),
+        ] {
             let mut pack_source = json!({
                 "schema_version": 2,
                 "pack_id": "test.go.external-effect-inventory",
@@ -3386,17 +4349,24 @@ mod tests {
                     }
                 }]
             });
+            if no_concurrency_effects {
+                pack_source["schema_version"] = json!(7);
+            }
             if let Some(completeness) = completeness {
+                let mut summary = json!({
+                    "id": "driver.open",
+                    "target": {"path": "driver.go", "symbol": "example.com/driver.Open()",
+                        "has_receiver": false, "parameter_count": 0},
+                    "completeness": completeness,
+                    "normal_continuation_absent": completeness == "partial",
+                    "transfers": [], "effects": [], "concurrency_effects": []
+                });
+                if no_concurrency_effects {
+                    summary["no_concurrency_effects"] = json!(true);
+                }
                 pack_source["shards"].as_array_mut().unwrap().push(json!({
                     "id": "effects", "activation": [{}],
-                    "payload": {"kind": "procedure_summaries", "summaries": [{
-                        "id": "driver.open",
-                        "target": {"path": "driver.go", "symbol": "example.com/driver.Open()",
-                            "has_receiver": false, "parameter_count": 0},
-                        "completeness": completeness,
-                        "normal_continuation_absent": completeness == "partial",
-                        "transfers": [], "effects": [], "concurrency_effects": []
-                    }]}
+                    "payload": {"kind": "procedure_summaries", "summaries": [summary]}
                 }));
             }
             let pack = compile_source(
@@ -4024,6 +4994,15 @@ func concrete() {
         proven: bool,
         exhaustive: bool,
         reasons: Vec<ConcurrencyOpenReason>,
+        unresolved_calls: Vec<StableUnresolvedCall>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct StableUnresolvedCall {
+        procedure: String,
+        call: u32,
+        callee: Option<Box<str>>,
+        cause: Box<str>,
     }
 
     fn stable_conflict(
@@ -4034,6 +5013,17 @@ func concrete() {
         let mut reasons = conflict.reasons.clone();
         reasons.sort();
         reasons.dedup();
+        let mut unresolved_calls = conflict
+            .unresolved_calls
+            .iter()
+            .map(|origin| StableUnresolvedCall {
+                procedure: super::super::semantic::procedure_wire_id(origin.call.procedure()),
+                call: origin.call.id().get(),
+                callee: origin.details.callee.clone(),
+                cause: origin.details.cause.clone(),
+            })
+            .collect::<Vec<_>>();
+        unresolved_calls.sort();
         StableConcurrentConflict {
             location: conflict.location.clone(),
             sites,
@@ -4043,6 +5033,7 @@ func concrete() {
             proven: conflict.proven,
             exhaustive: conflict.exhaustive,
             reasons,
+            unresolved_calls,
         }
     }
 
@@ -4201,10 +5192,10 @@ func distinctChannelRoot() {
     waitChannel(first)
 }
 
-func indirectWrite(target **cell) { *target = &cell{} }
+func indirectWrite(target **cell, ch chan *cell) { *target, _ = <-ch }
 func unsupportedGapRoot() {
     c := &cell{}
-    indirectWrite(&c)
+    indirectWrite(&c, nil)
     _ = c
 }
 
@@ -4212,9 +5203,9 @@ func recursiveWrite(c *cell, depth int) {
     c.n = 1
     if depth > 0 { recursiveWrite(c, depth-1) }
 }
-func recursiveAccessRoot() {
+func recursiveAccessRoot(depth int) {
     c := &cell{}
-    go recursiveWrite(c, 3)
+    go recursiveWrite(c, depth)
     c.n = 2
 }
 
@@ -4222,10 +5213,10 @@ func recursiveShift(first, second *cell, depth int) {
     first.n = 1
     if depth > 0 { recursiveShift(second, first, depth-1) }
 }
-func recursiveShiftRoot() {
+func recursiveShiftRoot(depth int) {
     first := &cell{}
     second := &cell{}
-    go recursiveShift(first, second, 3)
+    go recursiveShift(first, second, depth)
     second.n = 2
 }
 
@@ -4233,9 +5224,9 @@ func recursiveIndex(values []int, index int) {
     values[index] = 1
     if index > 0 { recursiveIndex(values, index-1) }
 }
-func recursiveIndexRoot() {
+func recursiveIndexRoot(index int) {
     values := make([]int, 2)
-    go recursiveIndex(values, 1)
+    go recursiveIndex(values, index)
     values[0] = 2
 }
 
@@ -4246,22 +5237,22 @@ func mutualIndexA(values []int, index, depth int) {
 func mutualIndexB(values []int, index, depth int) {
     if depth > 0 { mutualIndexA(values, index, depth-1) }
 }
-func mutualIndexRoot() {
+func mutualIndexRoot(depth int) {
     values := make([]int, 2)
-    go mutualIndexA(values, 0, 3)
+    go mutualIndexA(values, 0, depth)
     values[0] = 2
 }
 
-func mutualUnknownIndexRoot(index int) {
+func mutualUnknownIndexRoot(index, depth int) {
     values := make([]int, 2)
-    go mutualIndexA(values, index, 3)
+    go mutualIndexA(values, index, depth)
     values[0] = 2
 }
 
-func mutualDistinctIndexRoot() {
+func mutualDistinctIndexRoot(depth int) {
     values := make([]int, 2)
-    go mutualIndexA(values, 0, 3)
-    go mutualIndexA(values, 1, 3)
+    go mutualIndexA(values, 0, depth)
+    go mutualIndexA(values, 1, depth)
 }
 
 func mutualChangingIndexA(values []int, index, depth int) {
@@ -4271,9 +5262,9 @@ func mutualChangingIndexA(values []int, index, depth int) {
 func mutualChangingIndexB(values []int, index, depth int) {
     if depth > 0 { mutualChangingIndexA(values, index, depth-1) }
 }
-func mutualChangingIndexRoot() {
+func mutualChangingIndexRoot(index, depth int) {
     values := make([]int, 2)
-    go mutualChangingIndexA(values, 0, 3)
+    go mutualChangingIndexA(values, index, depth)
     values[1] = 2
 }
 
@@ -4285,9 +5276,9 @@ func mutualReassignedIndexB(values []int, index, depth int) {
     values[index] = 1
     if depth > 0 { mutualReassignedIndexA(values, index, depth-1) }
 }
-func mutualReassignedIndexRoot() {
+func mutualReassignedIndexRoot(index, depth int) {
     values := make([]int, 2)
-    go mutualReassignedIndexA(values, 0, 3)
+    go mutualReassignedIndexA(values, index, depth)
     values[1] = 2
 }
 
@@ -4298,9 +5289,9 @@ func mutualSliceShiftA(values []int, depth int) {
 func mutualSliceShiftB(values []int, depth int) {
     if depth > 0 { mutualSliceShiftA(values, depth-1) }
 }
-func mutualSliceShiftRoot() {
+func mutualSliceShiftRoot(depth int) {
     values := make([]int, 2)
-    go mutualSliceShiftA(values, 3)
+    go mutualSliceShiftA(values, depth)
     values[1] = 2
 }
 
@@ -4311,9 +5302,9 @@ func mutualArrayValueA(values [1]cell, depth int) {
 func mutualArrayValueB(values [1]cell, depth int) {
     if depth > 0 { mutualArrayValueA(values, depth-1) }
 }
-func mutualArrayValueRoot() {
+func mutualArrayValueRoot(depth int) {
     values := [1]cell{}
-    go mutualArrayValueA(values, 3)
+    go mutualArrayValueA(values, depth)
     values[0].n = 2
 }
 
@@ -4321,9 +5312,9 @@ func (c *cell) recursivePointerReceiver(depth int) {
     c.n = 1
     if depth > 0 { c.recursivePointerReceiver(depth-1) }
 }
-func recursivePointerReceiverRoot() {
+func recursivePointerReceiverRoot(depth int) {
     c := &cell{}
-    go c.recursivePointerReceiver(3)
+    go c.recursivePointerReceiver(depth)
     c.n = 2
 }
 
@@ -4331,9 +5322,9 @@ func (c cell) recursiveValueReceiver(depth int) {
     c.n = 1
     if depth > 0 { c.recursiveValueReceiver(depth-1) }
 }
-func recursiveValueReceiverRoot() {
+func recursiveValueReceiverRoot(depth int) {
     c := cell{}
-    go c.recursiveValueReceiver(3)
+    go c.recursiveValueReceiver(depth)
     c.n = 2
 }
 
@@ -4342,9 +5333,9 @@ func recursiveResult(c *cell, depth int) *cell {
     if depth > 0 { return recursiveResult(c, depth-1) }
     return c
 }
-func recursiveResultRoot() {
+func recursiveResultRoot(depth int) {
     c := &cell{}
-    go recursiveResult(c, 3)
+    go recursiveResult(c, depth)
     c.n = 2
 }
 
@@ -4353,9 +5344,9 @@ func recursiveValueResult(c cell, depth int) cell {
     if depth > 0 { return recursiveValueResult(c, depth-1) }
     return c
 }
-func recursiveValueResultRoot() {
+func recursiveValueResultRoot(depth int) {
     c := cell{}
-    go recursiveValueResult(c, 3)
+    go recursiveValueResult(c, depth)
     c.n = 2
 }
 
@@ -4374,7 +5365,7 @@ func recursiveFresh(depth int) {
     c.n = 1
     if depth > 0 { recursiveFresh(depth-1) }
 }
-func recursiveFreshRoot() { go recursiveFresh(3) }
+func recursiveFreshRoot(depth int) { go recursiveFresh(depth) }
 
 var recursiveEscaped *cell
 func recursivePublished(depth int) {
@@ -4382,7 +5373,7 @@ func recursivePublished(depth int) {
     recursiveEscaped = c
     if depth > 0 { recursivePublished(depth-1) }
 }
-func recursivePublishedRoot() { go recursivePublished(3) }
+func recursivePublishedRoot(depth int) { go recursivePublished(depth) }
 
 func mutualWrite(c *cell, depth int) {
     c.n = 1
@@ -4391,9 +5382,9 @@ func mutualWrite(c *cell, depth int) {
 func mutualForward(c *cell, depth int) {
     if depth > 0 { mutualWrite(c, depth-1) }
 }
-func mutualAccessRoot() {
+func mutualAccessRoot(depth int) {
     c := &cell{}
-    go mutualWrite(c, 3)
+    go mutualWrite(c, depth)
     c.n = 2
 }
 
@@ -4405,9 +5396,9 @@ func mutualResultWrite(c *cell, depth int) *cell {
 func mutualResultForward(c *cell, depth int) *cell {
     return mutualResultWrite(c, depth)
 }
-func mutualResultRoot() {
+func mutualResultRoot(depth int) {
     c := &cell{}
-    go mutualResultWrite(c, 3)
+    go mutualResultWrite(c, depth)
     c.n = 2
 }
 
@@ -4423,10 +5414,10 @@ func mutualPairResultForward(first, second *cell, depth int) (*cell, *cell) {
     returnedFirst, returnedSecond := mutualPairResultWrite(first, second, depth)
     return returnedFirst, returnedSecond
 }
-func mutualPairResultRoot() {
+func mutualPairResultRoot(depth int) {
     first := &cell{}
     second := &cell{}
-    go mutualPairResultWrite(first, second, 3)
+    go mutualPairResultWrite(first, second, depth)
     first.n = 2
 }
 
@@ -4442,10 +5433,10 @@ func mutualMixedResultForward(c *cell, copied cell, depth int) (*cell, cell) {
     returned, returnedCopy := mutualMixedResultWrite(c, copied, depth)
     return returned, returnedCopy
 }
-func mutualMixedResultRoot() {
+func mutualMixedResultRoot(depth int) {
     c := &cell{}
     copied := cell{}
-    go mutualMixedResultWrite(c, copied, 3)
+    go mutualMixedResultWrite(c, copied, depth)
     c.n = 2
 }
 
@@ -4457,10 +5448,10 @@ func mutualDirectTupleResultWrite(first, second *cell, depth int) (*cell, *cell)
 func mutualDirectTupleResultForward(first, second *cell, depth int) (*cell, *cell) {
     return mutualDirectTupleResultWrite(first, second, depth)
 }
-func mutualDirectTupleResultRoot() {
+func mutualDirectTupleResultRoot(depth int) {
     first := &cell{}
     second := &cell{}
-    go mutualDirectTupleResultWrite(first, second, 3)
+    go mutualDirectTupleResultWrite(first, second, depth)
     first.n = 2
 }
 
@@ -4474,10 +5465,10 @@ func mutualOpaqueTupleResultForward(opaque opaquePairTransform, first, second *c
     returnedFirst, returnedSecond := mutualOpaqueTupleResultWrite(opaque, first, second, depth)
     return opaque(returnedFirst, returnedSecond)
 }
-func mutualOpaqueTupleResultRoot(opaque opaquePairTransform) {
+func mutualOpaqueTupleResultRoot(opaque opaquePairTransform, depth int) {
     first := &cell{}
     second := &cell{}
-    go mutualOpaqueTupleResultWrite(opaque, first, second, 3)
+    go mutualOpaqueTupleResultWrite(opaque, first, second, depth)
     first.n = 2
 }
 
@@ -4493,10 +5484,10 @@ func mutualSwappedResultForward(first, second *cell, depth int) (*cell, *cell) {
     returnedFirst, returnedSecond := mutualSwappedResultWrite(first, second, depth)
     return returnedFirst, returnedSecond
 }
-func mutualSwappedResultRoot() {
+func mutualSwappedResultRoot(depth int) {
     first := &cell{}
     second := &cell{}
-    go mutualSwappedResultWrite(first, second, 3)
+    go mutualSwappedResultWrite(first, second, depth)
     first.n = 2
 }
 
@@ -4523,9 +5514,9 @@ func mutualValueResultWrite(c cell, depth int) cell {
 func mutualValueResultForward(c cell, depth int) cell {
     return mutualValueResultWrite(c, depth)
 }
-func mutualValueResultRoot() {
+func mutualValueResultRoot(depth int) {
     c := cell{}
-    go mutualValueResultWrite(c, 3)
+    go mutualValueResultWrite(c, depth)
     c.n = 2
 }
 
@@ -4549,10 +5540,10 @@ func mutualShiftWrite(first, second *cell, depth int) {
 func mutualShiftForward(first, second *cell, depth int) {
     if depth > 0 { mutualShiftWrite(first, second, depth-1) }
 }
-func mutualShiftRoot() {
+func mutualShiftRoot(depth int) {
     first := &cell{}
     second := &cell{}
-    go mutualShiftWrite(first, second, 3)
+    go mutualShiftWrite(first, second, depth)
     second.n = 2
 }
 "#,
@@ -6045,8 +7036,8 @@ func recursive(depth int) {
 }
 
 func unknownWrite(c *cell) { c.n = 2 }
-func root(c *cell) {
-    go recursive(3)
+func root(c *cell, depth int) {
+    go recursive(depth)
     go unknownWrite(c)
 }
 "#;
@@ -6063,8 +7054,8 @@ func recursive(depth int) {
 }
 
 func unknownWrite(c *cell) { c.n = 2 }
-func root(c *cell) {
-    go recursive(3)
+func root(c *cell, depth int) {
+    go recursive(depth)
     go unknownWrite(c)
 }
 "#;
@@ -6509,6 +7500,297 @@ func root() {
                 &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget
             ),
             "an open factory publication inventory cannot hide foreign effects: {report:#?}"
+        );
+    }
+
+    /// #3760: one row id can stand for several task contexts. The merged row
+    /// must not depend on the order in which the contexts arrive, and a race
+    /// in any context must survive an ordered context of the same site pair.
+    #[test]
+    fn merged_task_contexts_are_order_independent_and_keep_the_race() {
+        use brokk_bifrost_flow::concurrency::{ConcurrentOrdering, ConcurrentProtection};
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "fixture.go",
+                r#"package fixture
+
+type Pool struct{ stopped bool }
+
+func (p *Pool) Stopped() bool { return p.stopped }
+
+func Run() {
+	p := &Pool{}
+	_ = p.Stopped()
+	go func() {
+		_ = p.Stopped()
+	}()
+	go func() {
+		p.stopped = true
+	}()
+}
+"#,
+            )
+            .build();
+        let file = project.file("fixture.go");
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Go semantics materialize")
+            .available_value()
+            .expect("Go semantics are available")
+            .clone();
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == crate::analyzer::semantic::ProcedureKind::Function
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("Run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture root procedure");
+        let mut budget = crate::analyzer::semantic::SemanticBudget::new(
+            crate::analyzer::semantic::SemanticWork::default_limits(),
+        )
+        .expect("default semantic budgets are positive");
+        let summaries = brokk_bifrost_flow::typestate::project_production_semantic_summaries(
+            std::slice::from_ref(&root),
+            &workspace.icfg_provider(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("production summaries project");
+        let provider = WorkspaceConcurrencyProvider::new(&workspace, None, Some(summaries));
+        let mut budget = crate::analyzer::semantic::SemanticBudget::new(
+            crate::analyzer::semantic::SemanticWork::default_limits(),
+        )
+        .expect("default semantic budgets are positive");
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &root,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("concurrency report computes");
+        let values = report
+            .conflicts
+            .into_iter()
+            .map(|conflict| project_conflict(&workspace, &root, conflict))
+            .collect::<Vec<_>>();
+        let contexts = values
+            .iter()
+            .filter(|value| values.iter().filter(|other| other.id == value.id).count() > 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let [ordered, racing] = contexts.as_slice() else {
+            panic!("the read/write site pair has exactly two task contexts: {values:#?}");
+        };
+        let (ordered, racing) = if ordered.conflict.ordering == ConcurrentOrdering::HappensBefore {
+            (ordered.clone(), racing.clone())
+        } else {
+            (racing.clone(), ordered.clone())
+        };
+        assert_eq!(
+            (ordered.conflict.ordering, ordered.conflict.proven),
+            (ConcurrentOrdering::HappensBefore, true),
+            "the root read is ordered before the writer's spawn: {values:#?}"
+        );
+        assert_eq!(
+            (
+                racing.conflict.ordering,
+                racing.conflict.protection,
+                racing.conflict.proven
+            ),
+            (
+                ConcurrentOrdering::Unordered,
+                ConcurrentProtection::Unprotected,
+                true
+            ),
+            "the goroutine read races the write: {values:#?}"
+        );
+
+        let fold = |contexts: &[&ConcurrentAccessConflictValue]| {
+            let mut merged = contexts[0].clone();
+            for context in &contexts[1..] {
+                merged.merge_context((*context).clone());
+            }
+            merged
+        };
+        let forward = fold(&[&ordered, &racing]);
+        assert_eq!(
+            forward,
+            fold(&[&racing, &ordered]),
+            "the merge does not depend on arrival order"
+        );
+        assert_eq!(
+            forward.conflict, racing.conflict,
+            "a proven race is the row, whatever else reaches the site pair"
+        );
+
+        // An open context outranks the proven-safe one, and the proven race
+        // still outranks both, in every arrival order.
+        let mut open = ordered.clone();
+        open.conflict.ordering = ConcurrentOrdering::Open;
+        open.conflict.proven = false;
+        open.conflict.exhaustive = false;
+        open.conflict.reasons = vec![ConcurrencyOpenReason::UnknownLocation];
+        open.contexts = ConflictContextMerge::single(
+            &open.conflict,
+            &open.first_file,
+            open.first_range,
+            &open.second_file,
+            open.second_range,
+        );
+        let mut open_race = racing.clone();
+        open_race.conflict.proven = false;
+        open_race.conflict.exhaustive = false;
+        open_race.conflict.reasons = vec![ConcurrencyOpenReason::UnresolvedTarget];
+        open_race.contexts = ConflictContextMerge::single(
+            &open_race.conflict,
+            &open_race.first_file,
+            open_race.first_range,
+            &open_race.second_file,
+            open_race.second_range,
+        );
+        let orders: [[&ConcurrentAccessConflictValue; 3]; 6] = [
+            [&ordered, &open, &racing],
+            [&ordered, &racing, &open],
+            [&open, &ordered, &racing],
+            [&open, &racing, &ordered],
+            [&racing, &ordered, &open],
+            [&racing, &open, &ordered],
+        ];
+        for order in &orders {
+            let merged = fold(order);
+            assert_eq!(merged, fold(&[&open, &racing, &ordered]), "{order:#?}");
+            assert_eq!(merged.conflict, racing.conflict, "{order:#?}");
+        }
+
+        // Without a proven race the row is open: the open race is the witness
+        // and the reasons of every open context are retained.
+        let mut expected = open_race.clone();
+        expected.conflict.reasons = vec![
+            ConcurrencyOpenReason::UnresolvedTarget,
+            ConcurrencyOpenReason::UnknownLocation,
+        ];
+        expected.conflict.reasons.sort();
+        let orders: [[&ConcurrentAccessConflictValue; 3]; 6] = [
+            [&ordered, &open, &open_race],
+            [&ordered, &open_race, &open],
+            [&open, &ordered, &open_race],
+            [&open, &open_race, &ordered],
+            [&open_race, &ordered, &open],
+            [&open_race, &open, &ordered],
+        ];
+        let expected_row = fold(&orders[0]);
+        for order in &orders {
+            let merged = fold(order);
+            assert_eq!(merged, expected_row, "{order:#?}");
+            assert_eq!(merged.conflict, expected.conflict, "{order:#?}");
+        }
+
+        // A proven-safe row may claim ordering only if every context is
+        // ordered, and protection only if every context has that protection.
+        let mut protected = racing.clone();
+        protected.conflict.protection = ConcurrentProtection::CompatibleLock;
+        protected.contexts = ConflictContextMerge::single(
+            &protected.conflict,
+            &protected.first_file,
+            protected.first_range,
+            &protected.second_file,
+            protected.second_range,
+        );
+        assert_eq!(fold(&[&ordered, &ordered]).conflict, ordered.conflict);
+        let mixed_forward = fold(&[&ordered, &protected]);
+        let mixed_reverse = fold(&[&protected, &ordered]);
+        assert_eq!(mixed_forward, mixed_reverse);
+        assert_eq!(mixed_forward.conflict.ordering, ConcurrentOrdering::Open);
+        assert_eq!(
+            mixed_forward.conflict.protection,
+            ConcurrentProtection::Open
+        );
+        assert!(!mixed_forward.conflict.proven);
+        assert_eq!(
+            mixed_forward.conflict.reasons,
+            [ConcurrencyOpenReason::AmbiguousSynchronization]
+        );
+
+        // The selected race witness is stable when run-local task and
+        // invocation numbers change. Reasons affect the rendered row, so they
+        // rank before the stable site fields and cannot be overridden by ids.
+        let with_reason_and_ids =
+            |value: &ConcurrentAccessConflictValue,
+             reason: ConcurrencyOpenReason,
+             ids_from: &ConcurrentAccessConflictValue| {
+                let mut value = value.clone();
+                for site in [&mut value.conflict.first, &mut value.conflict.second] {
+                    let source = [&ids_from.conflict.first, &ids_from.conflict.second]
+                        .into_iter()
+                        .find(|candidate| candidate.mode == site.mode)
+                        .expect("the fixture has one site for each access mode");
+                    site.task = source.task;
+                    site.invocation = source.invocation;
+                }
+                value.conflict.reasons = vec![reason];
+                value.contexts = ConflictContextMerge::single(
+                    &value.conflict,
+                    &value.first_file,
+                    value.first_range,
+                    &value.second_file,
+                    value.second_range,
+                );
+                value
+            };
+        let unresolved =
+            with_reason_and_ids(&racing, ConcurrencyOpenReason::UnresolvedTarget, &ordered);
+        let unknown = with_reason_and_ids(&racing, ConcurrencyOpenReason::UnknownLocation, &racing);
+        let unresolved_renumbered =
+            with_reason_and_ids(&racing, ConcurrencyOpenReason::UnresolvedTarget, &racing);
+        let unknown_renumbered =
+            with_reason_and_ids(&racing, ConcurrencyOpenReason::UnknownLocation, &ordered);
+        let task_invocation_ids = |value: &ConcurrentAccessConflictValue| {
+            [
+                (
+                    value.conflict.first.task.get(),
+                    value.conflict.first.invocation.get(),
+                ),
+                (
+                    value.conflict.second.task.get(),
+                    value.conflict.second.invocation.get(),
+                ),
+            ]
+        };
+        assert_ne!(
+            task_invocation_ids(&unresolved),
+            task_invocation_ids(&unresolved_renumbered),
+            "the fixture supplies distinct run-local ids for the same sites"
+        );
+        let render_row = |contexts: &[&ConcurrentAccessConflictValue]| {
+            let merged = fold(contexts);
+            let mut cache = super::super::PipelineRenderCache::default();
+            let row = super::super::render::render_concurrent_access_conflict(
+                workspace.analyzer(),
+                &merged,
+                &mut cache,
+            );
+            serde_json::to_value(row).expect("rendered conflict row serializes")
+        };
+        assert_eq!(
+            render_row(&[&unresolved, &unknown]),
+            render_row(&[&unresolved_renumbered, &unknown_renumbered]),
+            "renumbering task contexts cannot change the rendered row"
         );
     }
 }

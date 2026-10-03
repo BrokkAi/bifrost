@@ -1,3 +1,4 @@
+use crate::primary::JsTsParsedFile;
 use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
@@ -64,12 +65,12 @@ pub fn trim_statement(text: &str) -> String {
 
 /// Adds a synthetic `default` CodeUnit for an anonymous `export default ...`
 /// declaration (function/class/object literal with no name of its own).
-pub fn add_default_export_unit(
+pub(crate) fn add_default_export_unit(
     file: &ProjectFile,
     source: &str,
     export: Node<'_>,
     kind: CodeUnitType,
-    parsed: &mut ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> CodeUnit {
     // The synthetic `default` name is a Type segment for a default-exported
     // class, a Member segment for a default-exported function/object (mirrors
@@ -296,14 +297,14 @@ pub fn program_scoped_field_identity(_file: &ProjectFile, name: &str) -> (String
 /// identity because script values use the shared program scope, while module
 /// values use the file scope (#1862).
 #[allow(clippy::too_many_arguments)]
-pub fn add_destructured_binder_units(
+pub(crate) fn add_destructured_binder_units(
     file: &ProjectFile,
     source: &str,
     pattern: Node<'_>,
     range_node: Node<'_>,
     parent: Option<&CodeUnit>,
     signature: &str,
-    parsed: &mut ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     top_level_identity: TopLevelFieldIdentity,
 ) {
     for binder in crate::syntax::pattern_binder_identifiers(pattern) {
@@ -323,9 +324,10 @@ pub fn add_destructured_binder_units(
         };
         let code_unit = CodeUnit::new_fq(file.clone(), CodeUnitType::Field, "", short_name, fq);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-        parsed.add_code_unit(
+        parsed.add_named_code_unit(
             code_unit.clone(),
             range_node,
+            binder,
             source,
             parent.cloned(),
             Some(top_level),

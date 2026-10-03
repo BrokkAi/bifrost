@@ -43,11 +43,38 @@ pub struct DefinitionByReferenceLookupResult {
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
 
+/// Report whether one definition lookup finished, and why it did not.
+///
+/// The diagnostic vocabulary names the reason whenever a resolver emitted a
+/// kind the public vocabulary knows. The status is the second source, and it is
+/// the authority on refusals: a lookup that reports `unavailable`, `cancelled`
+/// or `exceeded_budget` produced no answer, so it can never be complete, no
+/// matter which diagnostic kind carried the refusal. Without this, a resolver
+/// that refuses with a kind outside the vocabulary reports the contradiction
+/// `status: unavailable` with `complete: true` and no reason, which tells a
+/// consumer the absence was proved.
 pub(super) fn definition_result_completion(
+    status: &str,
     diagnostics: &[DefinitionDiagnostic],
 ) -> (bool, Option<DefinitionLookupIncompleteReason>) {
-    let incomplete_reason = definition_lookup_incomplete_reason(diagnostics);
+    let incomplete_reason = definition_lookup_incomplete_reason(diagnostics)
+        .or_else(|| definition_status_incomplete_reason(status));
     (incomplete_reason.is_none(), incomplete_reason)
+}
+
+/// The incomplete reason a lookup status carries on its own.
+///
+/// `no_definition`, `not_found` and `invalid_location` are answers about the
+/// request, so they stay complete. Refusals and partial answers stay incomplete.
+fn definition_status_incomplete_reason(status: &str) -> Option<DefinitionLookupIncompleteReason> {
+    match status {
+        "unavailable" | "incomplete" => {
+            Some(DefinitionLookupIncompleteReason::StructureUnavailable)
+        }
+        "cancelled" => Some(DefinitionLookupIncompleteReason::Cancelled),
+        "exceeded_budget" => Some(DefinitionLookupIncompleteReason::ResolutionBudget),
+        _ => None,
+    }
 }
 
 fn definition_lookup_diagnostics_completion(
@@ -153,7 +180,8 @@ pub(super) fn resolve_definition_context_query(
     let units = match resolve_definition_context_symbol(analyzer, token, &query.symbol) {
         Ok(units) => units,
         Err(diagnostics) => {
-            let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
+            let (complete, incomplete_reason) =
+                definition_result_completion("not_found", &diagnostics);
             return DefinitionByReferenceLookupResult {
                 query,
                 status: "not_found".to_string(),
@@ -383,11 +411,14 @@ pub(super) fn invalid_context_lookup(
     kind: &str,
     message: &str,
 ) -> DefinitionByReferenceLookupResult {
-    let (complete, incomplete_reason) = definition_result_completion(&[DefinitionDiagnostic {
-        claim: None,
-        kind: kind.to_string(),
-        message: message.to_string(),
-    }]);
+    let (complete, incomplete_reason) = definition_result_completion(
+        "invalid_location",
+        &[DefinitionDiagnostic {
+            claim: None,
+            kind: kind.to_string(),
+            message: message.to_string(),
+        }],
+    );
     DefinitionByReferenceLookupResult {
         query,
         status: "invalid_location".to_string(),
@@ -444,7 +475,7 @@ pub(super) fn collapse_context_outcomes(
                 }
             }
         }
-        result.complete = result.incomplete_reason.is_none();
+        result.complete &= result.incomplete_reason.is_none();
         return result;
     }
 
@@ -485,12 +516,18 @@ pub(super) fn render_definition_reference_lookup(
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionByReferenceLookupResult {
+    let terminal_incomplete = matches!(
+        outcome.status,
+        crate::analyzer::usages::get_definition::DefinitionLookupStatus::Incomplete
+            | crate::analyzer::usages::get_definition::DefinitionLookupStatus::Cancelled
+            | crate::analyzer::usages::get_definition::DefinitionLookupStatus::ExceededBudget(_)
+    );
     let incomplete_reason = definition_lookup_diagnostics_completion(&outcome.diagnostics).1;
-    if outcome.lexical_definition.is_some() {
+    if outcome.lexical_definition.is_some() && !terminal_incomplete {
         return DefinitionByReferenceLookupResult {
             query,
             status: "no_definition".to_string(),
-            complete: incomplete_reason.is_none(),
+            complete: incomplete_reason.is_none() && !terminal_incomplete,
             incomplete_reason,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
@@ -519,7 +556,11 @@ pub(super) fn render_definition_reference_lookup(
             ),
         });
     }
-    let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
+    let (mut complete, incomplete_reason) =
+        definition_result_completion(outcome.status.as_str(), &diagnostics);
+    if terminal_incomplete {
+        complete = false;
+    }
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),

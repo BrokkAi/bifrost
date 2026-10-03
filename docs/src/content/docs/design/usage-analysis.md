@@ -66,6 +66,16 @@ succeeds when the language resolver binds a structured reference candidate to a
 declaration identity. A best-effort binding remains unproven, and an unsupported
 operation or missing graph seed produces a typed diagnostic.
 
+Rust method searches may exclude ordinary field-access sites before resolving
+their receivers when source structure and provenance prove that those sites
+cannot name the method. Uncertainty about such a field's binding does not make
+the method search incomplete. This exclusion does not apply to speculative
+macro input or malformed syntax, and it does not remove independent gaps in
+the original file inventory. Resolving a guessed macro argument to a field
+does not prove that its unrepresented expansion cannot call the method; that
+uncertainty remains visible. Qualified references to method values remain
+candidates even when they are not calls.
+
 ### 4. Publish hits with their roles
 
 A usage hit carries its file, byte range, line, enclosing declaration,

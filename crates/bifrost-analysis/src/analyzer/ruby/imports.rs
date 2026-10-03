@@ -19,6 +19,43 @@ use brokk_bifrost_ruby::mixins::RubyOwnerRelationFact;
 use std::sync::Arc;
 
 impl RubyAnalyzer {
+    fn canonical_source_files(&self) -> Option<Vec<ProjectFile>> {
+        let files = self
+            .inner
+            .project()
+            .all_files_shared()
+            .map_err(|error| {
+                self.record_query_failure(crate::analyzer::store::StoreError::new(format!(
+                    "reading Ruby source inventory: {error}"
+                )));
+            })
+            .ok()?;
+        Some(
+            files
+                .iter()
+                .filter(|file| file_language(file) == Language::Ruby)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub(crate) fn canonical_sources_ready(&self) -> bool {
+        if self.source_readiness.get().is_some() {
+            return true;
+        }
+        let Some(files) = self.canonical_source_files() else {
+            return false;
+        };
+        if !files
+            .iter()
+            .all(|file| self.inner.canonical_ruby_source_facts(file).is_some())
+        {
+            return false;
+        }
+        self.source_readiness.get_or_init(|| ());
+        true
+    }
+
     /// Project files this file pulls in via supported Ruby require forms.
     pub(crate) fn required_files(
         &self,
@@ -37,6 +74,9 @@ impl RubyAnalyzer {
         &self,
         token: QueryToken<'_>,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        if !self.canonical_sources_ready() {
+            return Arc::new(HashMap::default());
+        }
         crate::analyzer::memoized_reverse_file_index(
             &self.reverse_import_index,
             || self.inner.all_files(),
@@ -66,6 +106,9 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        if !self.canonical_sources_ready() {
+            return Arc::new(HashSet::default());
+        }
         let units = Arc::new(ruby_effective_imported_code_units(self, token, file));
         self.imported_code_units
             .insert(file.clone(), Arc::clone(&units));
@@ -76,6 +119,9 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        if !self.canonical_sources_ready() {
+            return HashSet::default();
+        }
         let referencing = ruby_transitive_referencing_files_of(self, file);
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
@@ -83,7 +129,22 @@ impl ImportAnalysisProvider for RubyAnalyzer {
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(token, file)
+        self.import_info_of_checked(token, file).unwrap_or_default()
+    }
+
+    fn import_info_of_checked(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        self.inner.canonical_ruby_source_facts(file).map(|facts| {
+            facts
+                .loads
+                .into_iter()
+                .filter(|load| load.generic)
+                .map(|load| load.import)
+                .collect()
+        })
     }
 
     fn imported_files_from_infos(
@@ -91,7 +152,7 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        Some(ruby_imported_files_from_infos(file, imports))
+        ruby_imported_files_from_infos(self, file, imports)
     }
 }
 
@@ -105,9 +166,23 @@ impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
         self.inner.all_files()
     }
 
-    fn autoload_constant_files(&self) -> &HashMap<String, HashSet<ProjectFile>> {
-        self.autoload_constant_files
-            .get_or_init(|| build_autoload_constant_files(self))
+    fn source_files(&self) -> Option<Vec<ProjectFile>> {
+        self.canonical_source_files()
+    }
+
+    fn source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_core::analyzer::ruby_facts::RubyFileSourceInfo> {
+        self.inner.canonical_ruby_source_facts(file)
+    }
+
+    fn autoload_constant_files(&self) -> Option<&HashMap<String, HashSet<ProjectFile>>> {
+        if let Some(index) = self.autoload_constant_files.get() {
+            return Some(index);
+        }
+        let index = build_autoload_constant_files(self)?;
+        Some(self.autoload_constant_files.get_or_init(|| index))
     }
 
     fn has_zeitwerk_autoload_conventions(&self) -> bool {

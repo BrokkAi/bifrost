@@ -13,10 +13,11 @@
 
 use crate::hierarchy::extract_ts_supertypes;
 use crate::imports::{
-    parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
+    parse_commonjs_require_import_syntaxes_from_node, parse_es_import_syntaxes_from_node,
 };
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
+use crate::primary::JsTsParsedFile;
 use crate::providers::JsTsSource;
 use crate::syntax::{inline_object_type, js_program_is_external_module, ts_type_wrapper_operand};
 use brokk_bifrost_core::analyzer::ProjectFile;
@@ -32,13 +33,7 @@ use tree_sitter::{Node, Tree};
 /// including ambient and `declare global` bodies.
 pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
-    let mut parsed = ParsedFile::new(String::new());
-    if flow_dialect_blocks_extraction(file, root, source) {
-        // Flow is a JavaScript dialect, so this is all but unreachable from a
-        // `.ts` path. It is asked anyway because the graph and diagnostic
-        // surfaces ask it for both dialects, and the three must agree (#1786).
-        return parsed;
-    }
+    let blocked = flow_dialect_blocks_extraction(file, root, source);
     let module = module_code_unit(file);
     let top_level_field_identity = if js_program_is_external_module(root, source) {
         file_scoped_field_identity
@@ -47,93 +42,118 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
     };
     let mut module_has_imports = false;
     let exported_roots = ts_es_named_exported_roots(root, source);
-
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
-        match child.kind() {
-            "import_statement" => {
-                module_has_imports = true;
-                parsed
-                    .imports
-                    .extend(parse_es_import_infos_from_node(child, source));
+    crate::primary::parse_primary(
+        source,
+        tree,
+        &crate::structural::TYPESCRIPT_STRUCTURAL_SPEC,
+        |parsed, event| {
+            if blocked {
+                return;
             }
-            "expression_statement" => {
-                if let Some(namespace) = ts_internal_module_statement(child) {
-                    visit_ts_class_like(file, source, namespace, None, &mut parsed, false);
-                } else {
-                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                    if !imports.is_empty() {
-                        module_has_imports = true;
-                        parsed.imports.extend(imports);
+            match event {
+                crate::primary::PrimaryEvent::Enter {
+                    node: child,
+                    parent_kind,
+                    depth,
+                } => {
+                    if depth == 1 {
+                        match child.kind() {
+                            "import_statement" => {
+                                module_has_imports = true;
+                                parsed.add_import_syntaxes(parse_es_import_syntaxes_from_node(
+                                    child, source,
+                                ));
+                            }
+                            "expression_statement" => {
+                                if let Some(namespace) = ts_internal_module_statement(child) {
+                                    visit_ts_class_like(
+                                        file, source, namespace, None, parsed, false,
+                                    );
+                                } else {
+                                    let imports = parse_commonjs_require_import_syntaxes_from_node(
+                                        child, source,
+                                    );
+                                    if !imports.is_empty() {
+                                        module_has_imports = true;
+                                        parsed.add_import_syntaxes(imports);
+                                    }
+                                }
+                            }
+                            "export_statement" => {
+                                visit_ts_export(file, source, child, None, parsed, &exported_roots)
+                            }
+                            "ambient_declaration" => {
+                                visit_ts_ambient_declarations(
+                                    file,
+                                    source,
+                                    child,
+                                    None,
+                                    parsed,
+                                    false,
+                                    top_level_field_identity,
+                                );
+                            }
+                            "internal_module" if ts_is_global_internal_module(child, source) => {
+                                visit_ts_ambient_declarations(
+                                    file,
+                                    source,
+                                    child,
+                                    None,
+                                    parsed,
+                                    false,
+                                    program_scoped_field_identity,
+                                );
+                            }
+                            "class_declaration"
+                            | "abstract_class_declaration"
+                            | "interface_declaration"
+                            | "enum_declaration"
+                            | "internal_module" => {
+                                visit_ts_class_like(file, source, child, None, parsed, false);
+                            }
+                            "function_declaration" | "function_signature" => {
+                                visit_ts_function(file, source, child, None, parsed, false);
+                            }
+                            "lexical_declaration" | "variable_declaration" => {
+                                if matches!(
+                                    child.kind(),
+                                    "lexical_declaration" | "variable_declaration"
+                                ) {
+                                    let imports = parse_commonjs_require_import_syntaxes_from_node(
+                                        child, source,
+                                    );
+                                    if !imports.is_empty() {
+                                        module_has_imports = true;
+                                        parsed.add_import_syntaxes(imports);
+                                    }
+                                }
+                                visit_ts_value(
+                                    file,
+                                    source,
+                                    child,
+                                    None,
+                                    parsed,
+                                    false,
+                                    &exported_roots,
+                                    top_level_field_identity,
+                                );
+                            }
+                            "type_alias_declaration" => {
+                                visit_ts_type_alias(file, source, child, None, parsed, false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = parent_kind;
+                }
+                crate::primary::PrimaryEvent::Exit { node } => {
+                    if node.id() == root.id() && module_has_imports {
+                        parsed.add_code_unit(module.clone(), root, source, None, None);
                     }
                 }
             }
-            "export_statement" => {
-                visit_ts_export(file, source, child, None, &mut parsed, &exported_roots)
-            }
-            "ambient_declaration" => {
-                visit_ts_ambient_declarations(
-                    file,
-                    source,
-                    child,
-                    None,
-                    &mut parsed,
-                    false,
-                    top_level_field_identity,
-                );
-            }
-            "internal_module" if ts_is_global_internal_module(child, source) => {
-                visit_ts_ambient_declarations(
-                    file,
-                    source,
-                    child,
-                    None,
-                    &mut parsed,
-                    false,
-                    program_scoped_field_identity,
-                );
-            }
-            "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "internal_module" => {
-                visit_ts_class_like(file, source, child, None, &mut parsed, false);
-            }
-            "function_declaration" | "function_signature" => {
-                visit_ts_function(file, source, child, None, &mut parsed, false);
-            }
-            "type_alias_declaration" => {
-                visit_ts_type_alias(file, source, child, None, &mut parsed, false);
-            }
-            "lexical_declaration" | "variable_declaration" => {
-                let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                if !imports.is_empty() {
-                    module_has_imports = true;
-                    parsed.imports.extend(imports);
-                }
-                visit_ts_value(
-                    file,
-                    source,
-                    child,
-                    None,
-                    &mut parsed,
-                    false,
-                    &exported_roots,
-                    top_level_field_identity,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    if module_has_imports {
-        parsed.add_code_unit(module, root, source, None, None);
-    }
-
-    parsed
+        },
+    )
 }
 
 /// A type alias renders as its own signature line. TypeScript-only: no other
@@ -149,72 +169,69 @@ fn visit_ts_ambient_declarations(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
     top_level_field_identity: TopLevelFieldIdentity,
 ) {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    match definition.kind() {
-        "ambient_declaration" | "statement_block" => {
-            let mut cursor = definition.walk();
-            for child in definition.named_children(&mut cursor) {
-                visit_ts_ambient_declarations(
+    let mut pending = vec![(node, exported, top_level_field_identity)];
+    while let Some((node, exported, top_level_field_identity)) = pending.pop() {
+        let definition = if node.kind() == "export_statement" {
+            node.child_by_field_name("declaration").unwrap_or(node)
+        } else {
+            node
+        };
+        match definition.kind() {
+            "ambient_declaration" | "statement_block" => {
+                let mut cursor = definition.walk();
+                let start = pending.len();
+                pending.extend(
+                    definition
+                        .named_children(&mut cursor)
+                        .map(|child| (child, exported, top_level_field_identity)),
+                );
+                pending[start..].reverse();
+            }
+            "internal_module" if ts_is_global_internal_module(definition, source) => {
+                if let Some(body) = definition.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    let start = pending.len();
+                    pending.extend(body.named_children(&mut cursor).map(|child| {
+                        (
+                            child,
+                            false,
+                            program_scoped_field_identity as TopLevelFieldIdentity,
+                        )
+                    }));
+                    pending[start..].reverse();
+                }
+            }
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "internal_module" => {
+                visit_ts_class_like(file, source, definition, parent, parsed, exported);
+            }
+            "function_declaration" | "function_signature" => {
+                visit_ts_function(file, source, definition, parent, parsed, exported);
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                visit_ts_value(
                     file,
                     source,
-                    child,
+                    definition,
                     parent,
                     parsed,
                     exported,
+                    &HashSet::default(),
                     top_level_field_identity,
                 );
             }
-        }
-        "internal_module" if ts_is_global_internal_module(definition, source) => {
-            if let Some(body) = definition.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.named_children(&mut cursor) {
-                    visit_ts_ambient_declarations(
-                        file,
-                        source,
-                        child,
-                        parent,
-                        parsed,
-                        false,
-                        program_scoped_field_identity,
-                    );
-                }
+            "type_alias_declaration" => {
+                visit_ts_type_alias(file, source, definition, parent, parsed, exported);
             }
+            _ => {}
         }
-        "class_declaration"
-        | "abstract_class_declaration"
-        | "interface_declaration"
-        | "enum_declaration"
-        | "internal_module" => {
-            visit_ts_class_like(file, source, definition, parent, parsed, exported);
-        }
-        "function_declaration" | "function_signature" => {
-            visit_ts_function(file, source, definition, parent, parsed, exported);
-        }
-        "type_alias_declaration" => {
-            visit_ts_type_alias(file, source, definition, parent, parsed, exported);
-        }
-        "lexical_declaration" | "variable_declaration" => {
-            visit_ts_value(
-                file,
-                source,
-                definition,
-                parent,
-                parsed,
-                exported,
-                &HashSet::default(),
-                top_level_field_identity,
-            );
-        }
-        _ => {}
     }
 }
 
@@ -241,7 +258,7 @@ fn visit_ts_export(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported_roots: &HashSet<String>,
 ) {
     if let Some(declaration) = node.child_by_field_name("declaration") {
@@ -356,7 +373,7 @@ fn visit_ts_default_export_value(
     source: &str,
     export: Node<'_>,
     value: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     match value.kind() {
         "arrow_function" | "function_expression" | "generator_function" => {
@@ -398,7 +415,7 @@ fn visit_ts_default_export_function(
     source: &str,
     export: Node<'_>,
     function: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> CodeUnit {
     let code_unit = add_default_export_unit(
         file,
@@ -424,7 +441,7 @@ fn visit_ts_default_export_class(
     source: &str,
     export: Node<'_>,
     class: Node<'_>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> CodeUnit {
     let code_unit = add_default_export_unit(
         file,
@@ -450,7 +467,7 @@ fn visit_ts_class_like(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) -> Option<CodeUnit> {
     let mut first = None;
@@ -542,7 +559,7 @@ fn visit_ts_class_like_body<'tree>(
     class_like: Node<'tree>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) -> Vec<Node<'tree>> {
     let Some(body) = class_like.child_by_field_name("body") else {
         return Vec::new();
@@ -591,7 +608,7 @@ fn visit_ts_function(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) {
     let definition = if node.kind() == "export_statement" {
@@ -662,7 +679,7 @@ fn visit_ts_type_alias(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) {
     let definition = if node.kind() == "export_statement" {
@@ -714,7 +731,7 @@ fn visit_ts_value(
     source: &str,
     node: Node<'_>,
     parent: Option<&CodeUnit>,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
     exported_roots: &HashSet<String>,
     top_level_field_identity: TopLevelFieldIdentity,
@@ -801,9 +818,10 @@ fn visit_ts_value(
         let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
         let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
+        parsed.add_named_code_unit(
             code_unit.clone(),
             range_node,
+            name_node,
             source,
             parent.cloned(),
             Some(top_level.clone()),
@@ -883,7 +901,7 @@ fn visit_ts_type_alias_members(
     definition: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let Some(value) = definition.child_by_field_name("value") else {
         return;
@@ -1211,7 +1229,7 @@ fn visit_ts_return_surface_members(
     function: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let mut objects = Vec::new();
     collect_ts_return_object_literals(function, function.id(), &mut objects);
@@ -1236,7 +1254,7 @@ fn visit_ts_object_type_members(
     object_type: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     for index in 0..object_type.named_child_count() {
         let Some(child) = object_type.named_child(index) else {
@@ -1338,7 +1356,7 @@ fn visit_ts_object_literal_properties(
     object: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     for index in 0..object.named_child_count() {
         let Some(child) = object.named_child(index) else {
@@ -1475,7 +1493,7 @@ fn visit_ts_method(
     node: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let Some(name) = ts_member_name(node, source) else {
         return;
@@ -1543,7 +1561,7 @@ fn visit_ts_constructor_assigned_fields(
     constructor: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let mut stack = vec![constructor];
     while let Some(node) = stack.pop() {
@@ -1603,7 +1621,7 @@ fn visit_ts_field(
     node: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let Some(name) = ts_member_name(node, source) else {
         return;
@@ -1640,7 +1658,7 @@ fn visit_ts_enum_member(
     node: Node<'_>,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut JsTsParsedFile<'_>,
 ) {
     let name = if node.kind() == "enum_assignment" {
         node.child_by_field_name("name")

@@ -37,7 +37,6 @@
 //!   `-3` is `(prefix_expression (integer_literal))`. Only the outermost node
 //!   becomes a fact, so `{kind: numeric_literal}` yields one match per literal.
 
-use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
@@ -54,15 +53,16 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    first_named_child_of_kind, has_token_child, named_children,
+    first_named_child_of_kind, has_token_child, named_children, node_range,
 };
+use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 use crate::kotlin::syntax::{
@@ -134,6 +134,9 @@ pub const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("prefix_expression", NormalizedKind::NumericLiteral),
     ("boolean_literal", NormalizedKind::BooleanLiteral),
     ("null_literal", NormalizedKind::NullLiteral),
+    // A braced body is a `statements` node (the grammar has no `block`), and
+    // it is a scope: a `val` declared in it ends with it.
+    ("statements", NormalizedKind::Block),
     // control flow (`jump_expression` is refined to `throw` where it spells one)
     ("jump_expression", NormalizedKind::Return),
     ("catch_block", NormalizedKind::Catch),
@@ -324,11 +327,15 @@ fn kotlin_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             {
                 return Some(OccurrenceRole::DeclarationName);
             }
-            "variable_declaration"
-            | "function_value_parameter"
-            | "parameter"
-            | "catch_block"
-            | "for_statement" => return Some(OccurrenceRole::Binder),
+            // Only the declaring token itself: a name deeper inside a loop
+            // or catch body, or in a parameter's default value, is a read.
+            // A `for` variable and a lambda parameter are `variable_declaration`
+            // names, and a function parameter's name is inside its `parameter`;
+            // the other direct children of `for_statement` and
+            // `function_value_parameter` are reads.
+            "variable_declaration" | "parameter" | "catch_block" if current.id() == node.id() => {
+                return Some(OccurrenceRole::Binder);
+            }
             "call_expression" | "constructor_invocation" | "infix_expression" => break,
             _ => {}
         }
@@ -520,6 +527,97 @@ fn attach_import_modules(sink: &mut RoleSink<'_>, header: Node<'_>) {
     }
 }
 
+/// Kotlin derives its scope tree from the callable, class-like, loop, catch
+/// and block facts in [`KOTLIN_KIND_TABLE`], and every binder it classifies
+/// states an interval through [`kotlin_binding_activation`]. Import binders and
+/// the package clause are not derived; the member walk reports per-candidate
+/// callable applicability (#1478 M3).
+static KOTLIN_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport =
+    LexicalEnvironmentSupport::NONE
+        .supported(EnvironmentAxis::Scopes)
+        .supported(EnvironmentAxis::BindingIntervals)
+        .supported(EnvironmentAxis::CallableApplicability);
+
+/// The binding one Kotlin binder token introduces, and the interval it is in
+/// effect over.
+///
+/// - A function, constructor or lambda parameter is in effect over its whole
+///   callable (`ScopeWide`).
+/// - A `catch` parameter is in effect over the catch body, a `for` variable
+///   over the loop body, and a `when (val x = ..)` subject over the `when`.
+/// - A local `val`/`var` is in effect from the end of its declaration to the
+///   end of its block, so `val x = x` reads an outer `x`.
+/// - A property of a class body or of the file is in effect over that whole
+///   scope.
+/// - A property declared `by` a delegate states no interval: reading it calls
+///   the delegate's `getValue`, so it is not a binding whose value the
+///   environment can stand for.
+fn kotlin_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let binding = |kind, hoisting, activation| {
+        Some(BindingActivation {
+            kind,
+            hoisting,
+            activation,
+        })
+    };
+    let parent = binder.parent()?;
+    match parent.kind() {
+        "parameter" => binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope),
+        // The catch body is the block's own `statements`, absent when empty.
+        "catch_block" => binding(
+            BindingKind::CatchOrResource,
+            HoistingClass::DeclaredHead,
+            Range {
+                start_byte: binder.end_byte(),
+                end_byte: parent.end_byte(),
+                start_line: binder.end_position().row + 1,
+                end_line: parent.end_position().row + 1,
+            },
+        ),
+        "variable_declaration" => {
+            let mut owner = parent.parent()?;
+            if owner.kind() == "multi_variable_declaration" {
+                owner = owner.parent()?;
+            }
+            match owner.kind() {
+                "lambda_parameters" => {
+                    binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope)
+                }
+                "for_statement" => binding(
+                    BindingKind::LoopVariable,
+                    HoistingClass::DeclaredHead,
+                    node_range(first_named_child_of_kind(owner, "control_structure_body")?),
+                ),
+                "when_subject" => binding(
+                    BindingKind::Local,
+                    HoistingClass::DeclaredHead,
+                    node_range(owner.parent()?),
+                ),
+                "property_declaration" => {
+                    if first_named_child_of_kind(owner, "property_delegate").is_some() {
+                        return None;
+                    }
+                    if owner.parent()?.kind() != "statements" {
+                        return binding(BindingKind::Local, HoistingClass::ScopeWide, scope);
+                    }
+                    binding(
+                        BindingKind::Local,
+                        HoistingClass::SourceOrder,
+                        Range {
+                            start_byte: owner.end_byte(),
+                            end_byte: scope.end_byte,
+                            start_line: owner.end_position().row + 1,
+                            end_line: scope.end_line,
+                        },
+                    )
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl StructuralSpec for KotlinStructuralSpec {
     fn language(&self) -> Language {
         Language::Kotlin
@@ -590,10 +688,11 @@ impl StructuralSpec for KotlinStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        // Kotlin classifies no scopes, binding intervals, import binders or
-        // package clause, but its member walk does report per-candidate
-        // callable applicability (#1478 M3). The table states exactly that.
-        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
+        &KOTLIN_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        kotlin_binding_activation(binder, scope)
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

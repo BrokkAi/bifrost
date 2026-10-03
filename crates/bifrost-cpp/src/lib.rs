@@ -39,3 +39,13 @@ pub mod raii;
 pub mod reconcile;
 pub mod structural;
 pub mod test_detection;
+
+#[cfg(test)]
+mod source_fact_tests;
+
+pub mod source_facts;
+
+pub(crate) mod source_context;
+
+mod source_dependencies;
+mod source_projection;

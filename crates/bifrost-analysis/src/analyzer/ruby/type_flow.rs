@@ -156,7 +156,9 @@ fn workspace_member_lookup(
         },
         ruby,
     );
-    let visible = semantic.visible_files_from(class.source());
+    let Some(visible) = semantic.visible_files_from(class.source()) else {
+        return MemberLookup::Unknown(UnknownReason::UncertainFlow);
+    };
     if visible
         .iter()
         .any(|file| current_prepared(workspace, file).is_none())
@@ -354,6 +356,10 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             return ClassSeed::Unknown(UnknownReason::UncertainFlow);
         }
         match outcome.status {
+            TypeLookupStatus::Unavailable => ClassSeed::Unknown(UnknownReason::UncertainFlow),
+            TypeLookupStatus::Incomplete | TypeLookupStatus::Cancelled => {
+                ClassSeed::Unknown(UnknownReason::UncertainFlow)
+            }
             TypeLookupStatus::ExceededBudget(_) => {
                 ClassSeed::Unknown(UnknownReason::SemanticBudget)
             }

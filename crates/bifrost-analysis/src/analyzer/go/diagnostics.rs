@@ -19,7 +19,8 @@ use crate::analyzer::semantic_model::{DependencyDiscoveryEvidence, SemanticModel
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::go_graph::go_graph_source;
 use crate::analyzer::{
-    GoAnalyzer, IAnalyzer, Language, ProjectFile, SemanticDiagnosticReport, resolve_analyzer,
+    AnalyzerQueryScope, GoAnalyzer, IAnalyzer, Language, ProjectFile,
+    SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport, resolve_analyzer,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_go::diagnostics::{GoExternalEvidence, GoPackageSurface};
@@ -39,12 +40,34 @@ pub(crate) fn collect_go_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Go),
     };
+    let binding_scope = AnalyzerQueryScope::new(go);
     let bindings = resolve_go_import_bindings(
         go_graph_source(go, token),
         file,
-        go.package_clause_names(),
+        |target| go.package_clause_of(target),
         |import_path| external.packages().declared_package_name(import_path),
-    );
+    )
+    .map_err(|error| {
+        format!(
+            "Go package clauses unavailable for {:?}",
+            error.unavailable_files
+        )
+    })
+    .and_then(|bindings| match binding_scope.store_error() {
+        Some(error) => Err(format!("Go canonical import binding read failed: {error}")),
+        None => Ok(bindings),
+    });
+    let bindings = match bindings {
+        Ok(bindings) => bindings,
+        Err(detail) => {
+            let mut report = SemanticDiagnosticReport::new();
+            report.push_incomplete(
+                None,
+                vec![SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable { detail }],
+            );
+            return report;
+        }
+    };
     let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let report = brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
         &bindings, &support, &external, file, source,
@@ -541,6 +564,96 @@ func Run() {
         assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
         assert_eq!(GO_UNRECOGNIZED_PACKAGE_MEMBER, diagnostics[0].kind);
         assert!(diagnostics[0].message.contains("Missing"));
+    }
+
+    #[test]
+    fn go_canonical_package_clause_preserves_structured_package_cases() {
+        for (source, expected) in [
+            ("package main\n\nfunc main() {}", Some("main")),
+            (
+                "package mypkg\nimport \"fmt\"\nfunc Hello() { fmt.Println(\"Hello\") }",
+                Some("mypkg"),
+            ),
+            (
+                "// comment\npackage main /* another comment */",
+                Some("main"),
+            ),
+            ("func main() {}", None),
+            ("", None),
+        ] {
+            let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+                .file("source.go", source)
+                .build();
+            let analyzer = GoAnalyzer::from_project(project.project().clone());
+            let clause = analyzer.package_clause_of(&project.file("source.go"));
+            assert_eq!(
+                clause.as_deref().filter(|clause| !clause.is_empty()),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_semantic_diagnostics_read_canonical_overlay_package_clauses() {
+        use crate::analyzer::{IAnalyzer, OverlayProject, Project};
+        use std::sync::Arc;
+
+        let source = "package main\nimport \"example.com/app/postgres\"\nfunc Run() { fresh.Present(); fresh.Missing() }\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n")
+            .file("postgres/postgres.go", "package old\nfunc Present() {}\n")
+            .file("main.go", source)
+            .build();
+        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+        assert!(overlay.set(
+            project.file("postgres/postgres.go").abs_path(),
+            "package fresh /* canonical clause */\nfunc Present() {}\n".to_owned(),
+        ));
+        let analyzer = GoAnalyzer::new(overlay as Arc<dyn Project>);
+        let report = analyzer.semantic_diagnostics(&project.file("main.go"), source);
+        assert_eq!(report.diagnostics().len(), 1, "{report:#?}");
+        assert_eq!(report.diagnostics()[0].kind, GO_UNRECOGNIZED_PACKAGE_MEMBER);
+        assert!(
+            report.diagnostics()[0].message.contains("Missing"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn go_semantic_diagnostics_report_unavailable_workspace_package_clause() {
+        use crate::analyzer::{
+            IAnalyzer, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+            SemanticDiagnosticReportStatus,
+        };
+
+        let source =
+            "package main\nimport \"example.com/app/broken\"\nfunc Run() { broken.Missing() }\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n")
+            .file(
+                "broken/broken.go",
+                "// Missing the required package clause.\n",
+            )
+            .file("main.go", source)
+            .build();
+        let analyzer = GoAnalyzer::from_project(project.project().clone());
+        let report = analyzer.semantic_diagnostics(&project.file("main.go"), source);
+        assert_eq!(
+            report.status(),
+            SemanticDiagnosticReportStatus::Incomplete,
+            "{report:#?}"
+        );
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
+        assert!(
+            report.outcomes().iter().any(|outcome| {
+                matches!(outcome, SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                if reasons.iter().any(|reason| matches!(reason,
+                    SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable { detail }
+                        if detail.contains("broken.go"))))
+            }),
+            "{report:#?}"
+        );
     }
 
     #[test]

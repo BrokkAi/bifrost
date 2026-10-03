@@ -4,12 +4,12 @@ mod loop_facts;
 pub use assignment_facts::{
     OverwrittenLocalCandidate, OverwrittenLocalCandidates, OverwrittenLocalSourceKind,
     PlainAssignmentCandidate, PlainAssignmentCandidates, PlainAssignmentVerdict,
-    java_overwritten_local_candidates, js_ts_overwritten_local_candidates,
-    plain_assignment_candidates,
+    go_overwritten_local_candidates, java_overwritten_local_candidates,
+    js_ts_overwritten_local_candidates, plain_assignment_candidates,
+    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
 };
 pub use loop_facts::{
-    JavaLoopCandidate, JavaLoopCandidates, JavaLoopCoordinates, JavaLoopKind, JavaLoopSite,
-    java_loop_candidates,
+    LoopCandidate, LoopCandidates, LoopCoordinates, LoopKind, LoopSite, LoopSyntax, loop_candidates,
 };
 pub mod branch_boolean;
 mod clone_detection;
@@ -37,6 +37,7 @@ pub use go::{
     go_modeled_result_binding_type_identity_proof_work, reference_assertion_payload_type_is_exact,
     workspace_reference_assertion_accepts_payload,
 };
+pub mod go_scalar_binding;
 mod i_analyzer;
 mod index_warmer;
 pub mod invalidation;
@@ -49,19 +50,44 @@ mod kotlin;
 pub(crate) mod languages;
 pub mod lexical_definitions;
 mod multi_analyzer;
+// Test-accessible native adapters precede the approved language cutovers.
+#[cfg(any(test, feature = "test-support"))]
+mod native_points;
+#[cfg(any(test, feature = "test-support"))]
+pub use native_points::{NativeTypeProbe, probe_native_definition, probe_native_type};
 pub mod packs_document;
 mod php;
+#[cfg(test)]
+mod producer_cost_probe_tests;
 mod python;
 pub mod read_ledger;
 pub mod read_verification;
 pub mod reference_candidates;
 pub(crate) mod relational_frontier;
+// The native engine lands before the first language route so its algebra can
+// be tested independently. Remove this allowance when the Java spike becomes
+// its first non-test caller.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod resolution;
 mod ruby;
 mod rust;
 pub(crate) use rust::crate_identity::RustOverlayCrates;
 pub(crate) use rust::generated_model::{
     is_generated_function as is_rust_generated_function,
     resolve_generated_functions as resolve_rust_generated_functions,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use rust::selected_reverse::{
+    RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
+};
+#[cfg(test)]
+pub(crate) use rust::selected_shadow::{
+    RustSelectedReferenceIndex, selected_rust_native_usage_consumer_shadow,
+    selected_rust_relevance_graph_shadow,
+};
+#[cfg(test)]
+pub(crate) use rust::{
+    RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
 };
 pub(crate) mod scala;
 pub mod semantic;
@@ -136,9 +162,8 @@ pub use config::{
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
-    cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
-    node_text as cpp_node_text,
+    CppCallableUnitRole, cpp_callable_definitions_share_identity_evidence,
+    cpp_header_body_files_are_related, node_text as cpp_node_text,
 };
 pub use cpp::{
     cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
@@ -158,9 +183,8 @@ pub use csharp::external::{
 pub use analyzer_definition_lookup::{AnalyzerDefinitionLookup, DefinitionLookupMemo};
 pub(crate) use analyzer_definition_lookup::{ForwardQueryProvider, impl_forward_query_provider};
 pub(crate) use csharp::{
-    csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
-    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_source_identifier,
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
+    csharp_member_name, csharp_normalize_full_name, csharp_source_identifier,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
 pub use fq_name::FqName;
@@ -176,6 +200,19 @@ pub(crate) use brokk_bifrost_go::packages::{
 /// Re-exported because those types are public and a consumer outside this
 /// crate cannot otherwise name the type of a field it holds.
 pub use git2::Oid;
+#[cfg(any(test, feature = "test-support"))]
+pub use go::native_call_relations::{GoNativeCallRelations, go_native_incoming_calls};
+#[cfg(any(test, feature = "test-support"))]
+pub use go::native_rename::{GoNativeRenameProvider, go_native_rename};
+#[cfg(any(test, feature = "test-support"))]
+pub use go::native_usages::GoNativeUsageStrategy;
+#[cfg(any(test, feature = "test-support"))]
+pub use go::persist_live_go_sources_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use go::selected_reverse::{
+    GoNativeSelectedInverseProvider, GoNativeSelectedReferenceIndex, GoSelectedReverseOutcome,
+    go_selected_inverse_for,
+};
 pub use go::{
     GoAnalyzer, GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage,
     resolve_go_semantic_pack_dependencies,
@@ -191,7 +228,22 @@ pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
 pub use index_warmer::IndexWarmer;
-pub use java::{JavaAnalyzer, JavaCallResultUse, JavaCallResultUseIndex, JavaCallResultUseOpen};
+#[cfg(any(test, feature = "test-support"))]
+pub use java::native_call_relations::{JavaNativeCallRelations, java_native_incoming_calls};
+#[cfg(any(test, feature = "test-support"))]
+pub use java::native_rename::{JavaNativeRenameProvider, java_native_rename};
+#[cfg(any(test, feature = "test-support"))]
+pub use java::native_usages::JavaNativeUsageStrategy;
+#[cfg(any(test, feature = "test-support"))]
+pub use java::selected_reverse::{
+    JavaNativeSelectedInverseProvider, JavaNativeSelectedReferenceIndex,
+    JavaSelectedReverseOutcome, java_selected_inverse_for,
+};
+pub use java::{
+    JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
+    JavaCallResultUseIndex, JavaCallResultUseOpen, JavaLocalAssignmentConversionProver,
+    JavaLocalAssignmentEvidence, resolve_java_annotation_type,
+};
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use js_ts::{
@@ -223,7 +275,7 @@ pub use model::{
 };
 pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
-pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer, is_language_configuration_input};
 pub use php::{
     ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDeclarationStubPackProducer,
     PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies,
@@ -241,6 +293,7 @@ pub use project::{
     ProjectSourceOrigin, ProjectSourceSnapshot, SubsetCoverage, TestProject,
     WorkspaceFileListingCache, collect_workspace_files,
 };
+pub use python::runtime_artifact as python_runtime_artifact;
 pub(crate) use python::{
     ModuleBindingEventKind, ModuleBindingTimeline, resolve_fqn_candidates,
     resolve_module_code_unit, retain_modules_for_importer, usage_resolve_module_files,
@@ -262,6 +315,10 @@ pub use read_verification::{
     ProcedureDispatchReadCallError, ReadVerdict, SummaryAnswers, WorkspaceFactIndex,
     analysis_epoch_digest, procedure_dispatch_read_call, replay_lookup,
     verify_procedure_dispatch_read, verify_read_set, verify_read_set_for_artifact,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use resolution::{
+    reset_reverse_fact_evaluation_count_for_test, reverse_fact_evaluation_count_for_test,
 };
 pub use ruby::RubyAnalyzer;
 pub use ruby::{

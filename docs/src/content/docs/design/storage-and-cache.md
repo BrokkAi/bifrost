@@ -64,6 +64,14 @@ This projection is the main isolation boundary:
 - replacing a path-to-content mapping does not require rewriting global facts
   for content that is still reusable elsewhere.
 
+Source files and retained configuration inputs share this revision selection.
+Their roles remain explicit: only source inputs own declaration and package
+projection rows. Cargo manifests retain their exact bytes independently of
+parsed source facts, so an older revision remains interpretable after reopening
+the cache. Changing a manifest advances the workspace revision without replacing
+unchanged source publications. Cargo interpretation is derived from those
+selected bytes; parsed manifest tables are not a second durable authority.
+
 Scoped sessions share the repository's content facts but select their files
 through a unique session projection. They never reconcile their partial file
 listing under the live workspace's identity. The projection remains available
@@ -188,7 +196,10 @@ The separate catalog has its own lifecycle:
 
 - analyzer databases remain scoped to a repository's source and workspace
   projections;
-- an explicitly shared semantic-pack root can reuse an identical generated
+- default persistent catalogs reuse exact generated productions through a
+  separate user-owned machine cache, copying only the requested production;
+- workspace models and activation state remain in the repository catalog;
+- an explicitly shared semantic-pack root can also reuse an identical generated
   dependency pack across otherwise unrelated repositories;
 - pack objects can be staged, validated, and atomically published without
   entering the analyzer writer pipeline; and

@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { SUPPORTED_TARGETS } from "../../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 
+import { required, toCamelCase } from "./cli-argument-helpers.mjs";
+import { escapeRegExp, sameMinorSeries } from "./release-version.mjs";
+
 const supportedTargetSet = new Set(SUPPORTED_TARGETS);
 
 const options = parseArgs(process.argv.slice(2));
@@ -64,28 +67,4 @@ function parseArgs(args) {
     options[toCamelCase(key.slice(2))] = value;
   }
   return options;
-}
-
-function toCamelCase(value) {
-  return value.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
-}
-
-function required(value, name) {
-  if (!value) {
-    throw new Error(`Missing required --${name}`);
-  }
-  return value;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function sameMinorSeries(left, right) {
-  const leftParts = String(left ?? "").split(".");
-  const rightParts = String(right ?? "").split(".");
-  return leftParts.length >= 2
-    && rightParts.length >= 2
-    && leftParts[0] === rightParts[0]
-    && leftParts[1] === rightParts[1];
 }

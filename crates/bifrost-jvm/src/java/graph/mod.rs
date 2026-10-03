@@ -19,7 +19,7 @@ use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{
-    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, ProjectFile, RelationalDefinitionFrontier,
+    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, RelationalDefinitionFrontier,
     RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
     RelationalName,
 };
@@ -44,13 +44,7 @@ pub struct JavaGraphSource<'a> {
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     /// Request-local store answers for structured graph questions.
     pub relational_definitions: &'a dyn RelationalDefinitionFrontier,
-    pub import_statements: &'a ImportStatementAccess<'a>,
 }
-
-/// See [`JavaGraphSource::import_statements`]: the raw `import` statement text
-/// of a file, which `IAnalyzer` answers from persisted per-file state rather
-/// than from the structured import facts.
-pub type ImportStatementAccess<'a> = dyn Fn(&ProjectFile) -> Vec<String> + Sync + 'a;
 
 impl JavaGraphSource<'_> {
     /// Every direct child of `owner` named `identifier`, read from the

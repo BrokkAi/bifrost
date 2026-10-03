@@ -1100,6 +1100,14 @@ pub trait ConcurrencyProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<ConcurrencyAnswer<Vec<ResolvedConcurrencyEffect>>, SemanticProviderError>;
 
+    /// Structured context for an open external-call boundary. This is queried
+    /// only when `modeled_effects` returns `UnresolvedTarget`; providers can
+    /// name a resolved external callee or explain why target/model resolution
+    /// did not close.
+    fn unresolved_call_details(&self, _call: &CallSiteHandle) -> Option<UnresolvedCallDetails> {
+        None
+    }
+
     /// Independent, exhaustive model certificate for an external call that
     /// cannot change or publish ordinary heap storage. Synchronization effects
     /// alone never provide this guarantee; missing certificates remain false.
@@ -1253,6 +1261,21 @@ pub struct ConcurrentAccessConflict {
     pub proven: bool,
     pub exhaustive: bool,
     pub reasons: Vec<ConcurrencyOpenReason>,
+    /// Call boundaries that contribute an unresolved-target reason to this
+    /// row. The call handle preserves its source location for result renderers.
+    pub unresolved_calls: Vec<UnresolvedCallOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedCallDetails {
+    pub callee: Option<Box<str>>,
+    pub cause: Box<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedCallOrigin {
+    pub call: CallSiteHandle,
+    pub details: UnresolvedCallDetails,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1507,32 +1530,40 @@ impl Invocations {
     }
 
     fn recursively_calls(&self, caller: InvocationId, target: &ProcedureHandle) -> bool {
+        self.recursive_call_ancestor(caller, target).is_some()
+    }
+
+    /// The nearest activation of `target` on `caller`'s own task chain,
+    /// `caller` included: the retained activation a synchronous recursive
+    /// call to `target` re-enters.
+    fn recursive_call_ancestor(
+        &self,
+        caller: InvocationId,
+        target: &ProcedureHandle,
+    ) -> Option<InvocationId> {
         let task = self.entries[caller.0 as usize].context.task;
         let mut current = caller;
         loop {
             let entry = &self.entries[current.0 as usize];
             if entry.context.task != task {
-                return false;
+                return None;
             }
             if entry.context.procedure == *target {
-                return true;
+                return Some(current);
             }
-            let Some((parent, _)) = entry.caller else {
-                return false;
-            };
-            current = parent;
+            current = entry.caller?.0;
         }
     }
 
     // Only an ancestral task-spawn edge closes this expansion. Equal targets
     // in sibling invocations and ordinary synchronous calls are distinct.
-    fn repeats_spawn_edge(
+    fn repeated_spawn_ancestor(
         &self,
         caller: InvocationId,
         call: CallSiteId,
         target: &ProcedureHandle,
         request: &mut SolveRequest<'_, '_>,
-    ) -> Result<bool, ConcurrencyOpenReason> {
+    ) -> Result<Option<InvocationId>, ConcurrencyOpenReason> {
         let caller_procedure = &self.entries[caller.0 as usize].context.procedure;
         let mut current = caller;
         loop {
@@ -1549,7 +1580,7 @@ impl Invocations {
             }
             let entry = &self.entries[current.0 as usize];
             let Some((parent, edge)) = entry.caller else {
-                return Ok(false);
+                return Ok(None);
             };
             let parent_entry = &self.entries[parent.0 as usize];
             if entry.context.task != parent_entry.context.task
@@ -1557,7 +1588,7 @@ impl Invocations {
                 && parent_entry.context.procedure == *caller_procedure
                 && entry.context.procedure == *target
             {
-                return Ok(true);
+                return Ok(Some(current));
             }
             current = parent;
         }
@@ -1760,6 +1791,7 @@ struct OpenCallEffects {
     call: CallSiteId,
     point: ProgramPointId,
     reason: ConcurrencyOpenReason,
+    unresolved_call: Option<UnresolvedCallOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -1772,6 +1804,7 @@ struct Access {
     field_alias_domain: Option<FieldAliasDomain>,
     local_identity: bool,
     reasons: Vec<ConcurrencyOpenReason>,
+    unresolved_calls: Vec<UnresolvedCallOrigin>,
     atomic: bool,
     storage_origin: Option<CanonicalConcurrencyLocation>,
 }
@@ -1798,6 +1831,14 @@ struct OmittedRecursiveCall {
     caller: ContextKey,
     call: CallSiteId,
     target: ProcedureHandle,
+    boundary_is_closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OmittedRecursiveSpawn {
+    caller: ContextKey,
+    call: CallSiteId,
+    ancestor: InvocationId,
     boundary_is_closed: bool,
 }
 
@@ -3059,6 +3100,7 @@ impl LocationClasses {
 pub(crate) struct SolveRequest<'a, 'b> {
     semantic: &'a mut SemanticRequest<'b>,
     provider: Option<&'a dyn ConcurrencyProvider>,
+    query_cache: SolveCache<'a>,
     projections: HashMap<
         ProcedureHandle,
         Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>,
@@ -3072,6 +3114,17 @@ pub(crate) struct SolveRequest<'a, 'b> {
         std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>,
     >,
     control_reasons: Vec<ConcurrencyOpenReason>,
+    /// Procedures whose invocations keep plain CFG reachability in this solve,
+    /// because an earlier attempt found an omitted recursive generation that
+    /// could enter one of them with different scalar arguments.
+    unspecialized_procedures: HashSet<ProcedureHandle>,
+    /// The entry facts each specialized invocation's reachability was
+    /// derived with.
+    specialized_entry_facts: HashMap<ContextKey, Vec<ScalarEntryFact>>,
+    /// Procedures whose specialization an omitted recursive generation made
+    /// unsound. A nonempty list abandons the attempt and restarts the solve
+    /// with these procedures unspecialized.
+    invalid_specializations: Vec<ProcedureHandle>,
     /// Positive type certificates only, owned by this solve's exact handles.
     /// Runtime box stability is checked separately for every invocation.
     assertion_payload_types: HashSet<(ValueHandle, ValueHandle)>,
@@ -3102,19 +3155,252 @@ struct ControlQueries {
     dominators: Option<crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>>,
 }
 
+/// Answers of one concurrency query that are functions of immutable
+/// procedure semantics alone.
+///
+/// A specialization restart abandons an attempt's invocations and
+/// reachability, not these, so `concurrent_access_conflicts` hands them to the
+/// next attempt and drops them when it returns. They never outlive the one
+/// root's query. Each entry was charged its full computation cost once in
+/// that query, so the retained size is bounded by the query's semantic
+/// budget.
+#[derive(Default)]
+struct PureAnswers {
+    /// Scalar derivations keyed by procedure and entry facts sorted by
+    /// formal. Every derivation here uses default call effects and typing.
+    scalar_derivations:
+        HashMap<(ProcedureHandle, Vec<ScalarEntryFact>), std::rc::Rc<ScalarStateDerivation>>,
+    /// Per procedure, the definitions `incoming_callable_target` follows.
+    callable_inputs: HashMap<ProcedureHandle, std::rc::Rc<CallableInputs>>,
+}
+
+/// Completed reusable answers owned by one RQL race query and shared by its
+/// per-root solves. Each entry is inserted only after its complete computation
+/// was charged to that query, so the shared store cannot outlive the budget
+/// that bounds it.
+#[derive(Default)]
+pub struct ConcurrencyQueryCache {
+    pure_answers: std::cell::RefCell<PureAnswers>,
+    points_before_call:
+        std::cell::RefCell<HashMap<PointsBeforeCallKey, std::rc::Rc<HashSet<ProgramPointId>>>>,
+    continuation_projections: std::cell::RefCell<
+        HashMap<
+            (ProcedureHandle, IcfgProviderBehaviorIdentity),
+            crate::flow_state::ProcedureContinuationProjection,
+        >,
+    >,
+    pub(crate) nonreturn_discoveries: crate::flow_state::WorkspaceNonreturnDiscoveryCache,
+}
+
+/// The race query's cache when a caller supplies one; otherwise a cache that
+/// lives for this one solve.
+enum SolveCache<'a> {
+    Owned(Box<ConcurrencyQueryCache>),
+    Shared(&'a ConcurrencyQueryCache),
+}
+
+impl ConcurrencyQueryCache {
+    pub(crate) fn continuation_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        provider: IcfgProviderBehaviorIdentity,
+    ) -> Option<crate::flow_state::ProcedureContinuationProjection> {
+        self.continuation_projections
+            .borrow()
+            .get(&(procedure.clone(), provider))
+            .cloned()
+    }
+
+    pub(crate) fn retain_continuation_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        provider: IcfgProviderBehaviorIdentity,
+        projection: crate::flow_state::ProcedureContinuationProjection,
+    ) {
+        assert_eq!(
+            projection.procedure(),
+            procedure,
+            "a continuation projection belongs to its procedure key"
+        );
+        assert!(
+            projection.reasons().is_empty(),
+            "only complete continuation projections are reusable"
+        );
+        self.continuation_projections
+            .borrow_mut()
+            .insert((procedure.clone(), provider), projection);
+    }
+}
+
+/// For each value of one procedure that has exactly one definition, and
+/// that definition is a local, parameter or receiver flow with complete
+/// reference evidence: its source value, point and event position. A value
+/// that is also assigned or loaded, or that has a second flow, has no entry.
+type CallableInputs = HashMap<ValueId, (ValueId, ProgramPointId, usize)>;
+
+/// The callable inputs of `procedure`, built once per query. Building scans
+/// every event and is charged one entry per event; a repeat is charged as
+/// one lookup.
+#[track_caller]
+fn callable_inputs(
+    request: &mut SolveRequest<'_, '_>,
+    procedure: &ProcedureHandle,
+) -> Result<std::rc::Rc<CallableInputs>, ConcurrencyOpenReason> {
+    let cached = request
+        .query_cache()
+        .pure_answers
+        .borrow()
+        .callable_inputs
+        .get(procedure)
+        .cloned();
+    if let Some(inputs) = cached {
+        charge_concurrency_work(request, 1)?;
+        return Ok(inputs);
+    }
+    let semantics = procedure.semantics();
+    charge_concurrency_work(
+        request,
+        semantics
+            .points()
+            .iter()
+            .map(|point| point.events.len())
+            .sum(),
+    )?;
+    let mut definitions = HashMap::<ValueId, Option<(ValueId, ProgramPointId, usize)>>::default();
+    for point in semantics.points() {
+        for (position, event) in point.events.iter().enumerate() {
+            match event.effect {
+                SemanticEffect::Assignment { target, .. }
+                | SemanticEffect::MemoryLoad { result: target, .. } => {
+                    definitions.insert(target, None);
+                }
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind,
+                } => {
+                    let followed = matches!(
+                        kind,
+                        crate::analyzer::semantic::ValueFlowKind::Local
+                            | crate::analyzer::semantic::ValueFlowKind::Parameter
+                            | crate::analyzer::semantic::ValueFlowKind::Receiver
+                    ) && reference_evidence_is_complete(semantics, event.evidence);
+                    match definitions.entry(target) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(followed.then_some((source, point.id, position)));
+                        }
+                        Entry::Occupied(mut slot) => {
+                            slot.insert(None);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let inputs = std::rc::Rc::new(
+        definitions
+            .into_iter()
+            .filter_map(|(value, input)| Some((value, input?)))
+            .collect::<CallableInputs>(),
+    );
+    request
+        .query_cache()
+        .pure_answers
+        .borrow_mut()
+        .callable_inputs
+        .insert(procedure.clone(), inputs.clone());
+    Ok(inputs)
+}
+
+/// The scalar derivation of `procedure` seeded with `entry_facts`, computed
+/// once per query. The first computation is charged points x (values + 1);
+/// a repeat is charged as one lookup, the complete-artifact hit convention.
+#[track_caller]
+fn scalar_derivation(
+    request: &mut SolveRequest<'_, '_>,
+    procedure: &ProcedureHandle,
+    mut entry_facts: Vec<ScalarEntryFact>,
+) -> Result<std::rc::Rc<ScalarStateDerivation>, ConcurrencyOpenReason> {
+    entry_facts.sort_unstable_by_key(|fact| fact.target);
+    assert!(
+        entry_facts
+            .windows(2)
+            .all(|pair| pair[0].target != pair[1].target),
+        "scalar entry facts contain at most one fact per formal"
+    );
+    let key = (procedure.clone(), entry_facts);
+    let cached = request
+        .query_cache()
+        .pure_answers
+        .borrow()
+        .scalar_derivations
+        .get(&key)
+        .cloned();
+    if let Some(derivation) = cached {
+        assert_eq!(
+            derivation.procedure(),
+            procedure.id(),
+            "a cached derivation belongs to its key's procedure"
+        );
+        charge_concurrency_work(request, 1)?;
+        return Ok(derivation);
+    }
+    let semantics = procedure.semantics();
+    charge_concurrency_work(
+        request,
+        semantics
+            .points()
+            .len()
+            .saturating_mul(semantics.values().len().saturating_add(1)),
+    )?;
+    let derivation = std::rc::Rc::new(ScalarStateDerivation::derive_with_entry_facts(
+        procedure,
+        ScalarCallEffects::default(),
+        &key.1,
+    ));
+    request
+        .query_cache()
+        .pure_answers
+        .borrow_mut()
+        .scalar_derivations
+        .insert(key, derivation.clone());
+    Ok(derivation)
+}
+
 impl<'a, 'b> SolveRequest<'a, 'b> {
     pub(crate) fn raw(semantic: &'a mut SemanticRequest<'b>) -> Self {
         Self {
             semantic,
             provider: None,
+            query_cache: SolveCache::Owned(Box::default()),
             projections: HashMap::default(),
             invocation_projections: HashMap::default(),
             invocation_reachability: HashMap::default(),
             prepared_callback_targets: HashMap::default(),
             callable_projections: HashMap::default(),
             control_reasons: Vec::new(),
+            unspecialized_procedures: HashSet::default(),
+            specialized_entry_facts: HashMap::default(),
+            invalid_specializations: Vec::new(),
             assertion_payload_types: HashSet::default(),
             control_queries: HashMap::default(),
+        }
+    }
+
+    fn raw_with_query_cache(
+        semantic: &'a mut SemanticRequest<'b>,
+        query_cache: &'a ConcurrencyQueryCache,
+    ) -> Self {
+        let mut request = Self::raw(semantic);
+        request.query_cache = SolveCache::Shared(query_cache);
+        request
+    }
+
+    fn query_cache(&self) -> &ConcurrencyQueryCache {
+        match &self.query_cache {
+            SolveCache::Owned(cache) => cache,
+            SolveCache::Shared(cache) => cache,
         }
     }
 
@@ -3208,6 +3494,13 @@ enum ControlScopeKey {
     Invocation(ContextKey),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PointsBeforeCallKey {
+    scope: ControlScopeKey,
+    call: ProgramPointId,
+    provider: Option<IcfgProviderBehaviorIdentity>,
+}
+
 trait ControlScope {
     fn procedure(&self) -> &ProcedureHandle;
     fn key(&self) -> ControlScopeKey;
@@ -3285,15 +3578,21 @@ macro_rules! with_concurrency_graph {
     }};
 }
 
+/// The points one invocation can execute: forward reachability in its
+/// control projection, narrowed by the guards its exact scalar arguments
+/// decide. Every consumer of an invocation's accesses, calls, spawns, and
+/// summary events reads this one set, so an arm the arguments rule out
+/// contributes none of them.
 fn invocation_reachable_points(
     context: &ContextKey,
+    invocations: &Invocations,
     request: &mut SolveRequest<'_, '_>,
 ) -> Result<std::rc::Rc<HashSet<ProgramPointId>>, ConcurrencyOpenReason> {
     if let Some(points) = request.invocation_reachability.get(context) {
         return Ok(points.clone());
     }
     use crate::analyzer::semantic::cfg_algorithms::forward_reachability;
-    let points = with_concurrency_graph!(request, context, |graph| {
+    let mut points = with_concurrency_graph!(request, context, |graph| {
         bounded_cfg_query(request, |cfg_request| {
             forward_reachability(
                 graph,
@@ -3303,6 +3602,21 @@ fn invocation_reachable_points(
             .map(|reachable| reachable.iter(graph).collect::<HashSet<_>>())
         })
     })?;
+    let entry_facts = if request
+        .unspecialized_procedures
+        .contains(&context.procedure)
+    {
+        Vec::new()
+    } else {
+        invocation_guard_deciding_entry_facts(invocations, context.invocation)
+    };
+    if !entry_facts.is_empty() {
+        let derivation = scalar_derivation(request, &context.procedure, entry_facts.clone())?;
+        points.retain(|point| derivation.is_reachable(*point));
+        request
+            .specialized_entry_facts
+            .insert(context.clone(), entry_facts);
+    }
     let points = std::rc::Rc::new(points);
     request
         .invocation_reachability
@@ -3315,20 +3629,49 @@ pub fn concurrent_access_conflicts(
     root: &ProcedureHandle,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ConcurrentAccessReport, SemanticProviderError> {
-    let mut solve = SolveRequest::raw(request);
-    solve.provider = Some(provider);
-    let mut report = solve_concurrent_access_conflicts(provider, root, &mut solve)?;
-    if !solve.control_reasons.is_empty() {
+    let query_cache = ConcurrencyQueryCache::default();
+    concurrent_access_conflicts_with_query_cache(provider, root, request, &query_cache)
+}
+
+/// Solve one root while reusing complete answers from the caller's one-query
+/// cache. RQL owns that cache alongside its shared semantic budget and passes
+/// the same instance for every root in the query.
+pub fn concurrent_access_conflicts_with_query_cache(
+    provider: &impl ConcurrencyProvider,
+    root: &ProcedureHandle,
+    request: &mut SemanticRequest<'_>,
+    query_cache: &ConcurrencyQueryCache,
+) -> Result<ConcurrentAccessReport, SemanticProviderError> {
+    let mut unspecialized_procedures = HashSet::default();
+    let (mut report, control_reasons) = loop {
+        let mut solve = SolveRequest::raw_with_query_cache(request, query_cache);
+        solve.provider = Some(provider);
+        solve.unspecialized_procedures = std::mem::take(&mut unspecialized_procedures);
+        let report = solve_concurrent_access_conflicts(provider, root, &mut solve)?;
+        if solve.invalid_specializations.is_empty() {
+            break (report, solve.control_reasons);
+        }
+        unspecialized_procedures = std::mem::take(&mut solve.unspecialized_procedures);
+        for procedure in std::mem::take(&mut solve.invalid_specializations) {
+            assert!(
+                solve
+                    .specialized_entry_facts
+                    .keys()
+                    .any(|context| context.procedure == procedure),
+                "only a specialized procedure is invalidated: {procedure:?}"
+            );
+            unspecialized_procedures.insert(procedure);
+        }
+    };
+    if !control_reasons.is_empty() {
         for conflict in &mut report.conflicts {
             conflict.proven = false;
             conflict.exhaustive = false;
-            conflict
-                .reasons
-                .extend(solve.control_reasons.iter().cloned());
+            conflict.reasons.extend(control_reasons.iter().cloned());
             conflict.reasons.sort();
             conflict.reasons.dedup();
         }
-        report.reasons.extend(solve.control_reasons);
+        report.reasons.extend(control_reasons);
         report.reasons.sort();
         report.reasons.dedup();
     }
@@ -3407,6 +3750,7 @@ fn solve_concurrent_access_conflicts(
     let mut binding_cardinalities = HashMap::default();
     let mut omitted_recursive_effects = false;
     let mut omitted_recursive_calls = Vec::new();
+    let mut omitted_recursive_spawns = Vec::new();
     let mut closed_recursive_calls = HashSet::default();
     let mut effect_free_closures = HashMap::default();
     let mut omitted_call_effects = false;
@@ -3546,7 +3890,7 @@ fn solve_concurrent_access_conflicts(
                 .insert(context.clone(), projection);
             request.invocation_reachability.remove(&context);
         }
-        let reachable_points = invocation_reachable_points(&context, request);
+        let reachable_points = invocation_reachable_points(&context, &invocations, request);
         let reachable_points = match reachable_points {
             Ok(points) => points,
             Err(reason) => {
@@ -4837,6 +5181,7 @@ fn solve_concurrent_access_conflicts(
                     field_alias_domain,
                     local_identity,
                     reasons,
+                    unresolved_calls: Vec::new(),
                     atomic: false,
                     storage_origin: None,
                 });
@@ -4930,16 +5275,27 @@ fn solve_concurrent_access_conflicts(
             model_reasons_by_task
                 .entry(context.task)
                 .or_default()
-                .extend(
-                    model_resolution_reasons
-                        .into_iter()
-                        .map(|reason| OpenCallEffects {
-                            invocation: context.invocation,
-                            call: call.id,
-                            point: call.point,
-                            reason,
-                        }),
-                );
+                .extend(model_resolution_reasons.into_iter().map(|reason| {
+                    let unresolved_call =
+                        (reason == ConcurrencyOpenReason::UnresolvedTarget).then(|| {
+                            UnresolvedCallOrigin {
+                                call: call_handle.clone(),
+                                details: provider.unresolved_call_details(&call_handle).unwrap_or(
+                                    UnresolvedCallDetails {
+                                        callee: None,
+                                        cause: "unresolved_call_target".into(),
+                                    },
+                                ),
+                            }
+                        });
+                    OpenCallEffects {
+                        invocation: context.invocation,
+                        call: call.id,
+                        point: call.point,
+                        reason,
+                        unresolved_call,
+                    }
+                }));
             let modeled_spawns = bound_effects
                 .iter()
                 .filter_map(|(_, effect)| match effect {
@@ -5145,23 +5501,38 @@ fn solve_concurrent_access_conflicts(
                 };
                 for (target_index, target) in targets.into_iter().enumerate() {
                     spawned_any_task = true;
-                    match invocations.repeats_spawn_edge(
+                    match invocations.repeated_spawn_ancestor(
                         context.invocation,
                         call.id,
                         &target,
                         request,
                     ) {
-                        Ok(true) => {
-                            // The omitted activation supplies neither bindings nor
-                            // a certificate about its heap/synchronization effects.
-                            report
-                                .reasons
-                                .push(ConcurrencyOpenReason::RecursiveExpansion);
-                            omitted_recursive_effects = true;
+                        Ok(Some(ancestor)) => {
+                            let invalid = recursive_cycle_invalid_specializations(
+                                &invocations,
+                                request,
+                                context.invocation,
+                                call.id,
+                                ancestor,
+                            );
+                            if !invalid.is_empty() {
+                                request.invalid_specializations = invalid;
+                                return Ok(report);
+                            }
+                            omitted_recursive_spawns.push(OmittedRecursiveSpawn {
+                                caller: context.clone(),
+                                call: call.id,
+                                ancestor,
+                                boundary_is_closed: detached
+                                    && exact_target
+                                    && call_effects_closed
+                                    && call_has_no_modeled_effects
+                                    && summary_call_matches,
+                            });
                             omitted_call_effects = true;
                             continue;
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(reason) => {
                             report.reasons.push(reason);
                             report.reasons.sort();
@@ -5351,6 +5722,20 @@ fn solve_concurrent_access_conflicts(
                             }
                         };
                         if !effect_free {
+                            let ancestor = invocations
+                                .recursive_call_ancestor(context.invocation, &target)
+                                .expect("a recursive call has a retained ancestor");
+                            let invalid = recursive_cycle_invalid_specializations(
+                                &invocations,
+                                request,
+                                context.invocation,
+                                call.id,
+                                ancestor,
+                            );
+                            if !invalid.is_empty() {
+                                request.invalid_specializations = invalid;
+                                return Ok(report);
+                            }
                             omitted_recursive_calls.push(OmittedRecursiveCall {
                                 caller: context.clone(),
                                 call: call.id,
@@ -5557,6 +5942,24 @@ fn solve_concurrent_access_conflicts(
         report.reasons.sort();
         report.reasons.dedup();
         return Ok(report);
+    }
+    for omitted in &omitted_recursive_spawns {
+        if recursive_spawn_accesses_are_covered(
+            provider,
+            &mut synchronization_subjects,
+            &invocations,
+            &tasks,
+            &summary_effect_free_call_targets,
+            omitted,
+            request,
+        )? {
+            closed_calls.insert((omitted.caller.invocation, omitted.call));
+        } else {
+            omitted_recursive_effects = true;
+            report
+                .reasons
+                .push(ConcurrencyOpenReason::RecursiveExpansion);
+        }
     }
     for omitted in &omitted_recursive_calls {
         let call = omitted
@@ -5818,6 +6221,7 @@ fn solve_concurrent_access_conflicts(
                 call: call_id,
                 point: call,
                 reason,
+                unresolved_call,
             } in reasons
             {
                 debug_assert_eq!(
@@ -5959,6 +6363,9 @@ fn solve_concurrent_access_conflicts(
                     };
                     if !noninterfering {
                         access.reasons.push(reason.clone());
+                        if let Some(unresolved_call) = unresolved_call {
+                            access.unresolved_calls.push(unresolved_call.clone());
+                        }
                     }
                 }
             }
@@ -6348,7 +6755,7 @@ fn propagate_memory_payload_identities(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
-        let reachable = match invocation_reachable_points(context, request) {
+        let reachable = match invocation_reachable_points(context, invocations, request) {
             Ok(points) => points,
             Err(reason) => {
                 classes.identity_reasons.push(reason);
@@ -7341,12 +7748,6 @@ fn recursive_call_preserves_inputs(
     provider: &impl ConcurrencyProvider,
     request: &mut SolveRequest<'_, '_>,
 ) -> Option<InvocationId> {
-    use crate::analyzer::semantic::SemanticValueKind;
-    enum RecursiveInputIdentity {
-        Value,
-        Backing,
-    }
-
     if call.invocation_mode != CallInvocationMode::Ordinary
         || !call.execution_timing.is_synchronous()
         || target.semantics().lexical_parent().is_some()
@@ -7364,6 +7765,41 @@ fn recursive_call_preserves_inputs(
                 && invocations.contains(entry.context.invocation, caller.invocation)
         })
         .expect("a recursive target has a retained ancestor");
+    call_reference_input_ancestor(
+        classes,
+        invocations,
+        tasks,
+        caller,
+        call,
+        &ancestor.context,
+        provider,
+        request,
+    )
+}
+
+/// Compare stable reference inputs against one exact retained invocation.
+/// This does not certify the omitted invocation's effects or task ordering.
+#[allow(clippy::too_many_arguments)]
+fn call_reference_input_ancestor(
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    caller: &ContextKey,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    ancestor: &ContextKey,
+    provider: &impl ConcurrencyProvider,
+    request: &mut SolveRequest<'_, '_>,
+) -> Option<InvocationId> {
+    use crate::analyzer::semantic::SemanticValueKind;
+    enum RecursiveInputIdentity {
+        Value,
+        Backing,
+    }
+
+    let target = &ancestor.procedure;
+    if target.semantics().lexical_parent().is_some() {
+        return None;
+    }
     let call_event = caller
         .procedure
         .semantics()
@@ -7423,8 +7859,8 @@ fn recursive_call_preserves_inputs(
             return None;
         }
         let formal = LocalSynchronizationSubject::Value {
-            task: ancestor.context.task,
-            invocation: ancestor.context.invocation,
+            task: ancestor.task,
+            invocation: ancestor.invocation,
             procedure: target.clone(),
             value: formal.id,
         };
@@ -7454,7 +7890,7 @@ fn recursive_call_preserves_inputs(
             return None;
         }
     }
-    Some(ancestor.context.invocation)
+    Some(ancestor.invocation)
 }
 
 /// Publication creates aliases outside the retained local/capture equations.
@@ -7519,7 +7955,7 @@ fn field_container_is_unpublished(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
-        let reachable = match invocation_reachable_points(context, request) {
+        let reachable = match invocation_reachable_points(context, invocations, request) {
             Ok(points) => points,
             Err(reason) => {
                 classes.identity_reasons.push(reason);
@@ -7790,7 +8226,7 @@ fn channel_transport_is_retained(
         let context = &entry.context;
         let semantics = context.procedure.semantics();
         let reachable = match charge_concurrency_work(request, 1)
-            .and_then(|()| invocation_reachable_points(context, request))
+            .and_then(|()| invocation_reachable_points(context, invocations, request))
         {
             Ok(reachable) => reachable,
             Err(reason) => {
@@ -8746,7 +9182,7 @@ fn propagate_reference_identities(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
-        let reachable = match invocation_reachable_points(context, request) {
+        let reachable = match invocation_reachable_points(context, invocations, request) {
             Ok(points) => points,
             Err(reason) => {
                 classes.identity_reasons.push(reason);
@@ -9349,7 +9785,7 @@ fn reference_source_is_stable(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
-        let reachable = match invocation_reachable_points(context, request) {
+        let reachable = match invocation_reachable_points(context, invocations, request) {
             Ok(points) => points,
             Err(reason) => {
                 classes.identity_reasons.push(reason);
@@ -10982,6 +11418,7 @@ fn append_atomic_accesses(
                 field_alias_domain: None,
                 local_identity: false,
                 reasons: location.reasons.clone(),
+                unresolved_calls: Vec::new(),
                 atomic: true,
                 storage_origin,
             });
@@ -11146,6 +11583,13 @@ fn incoming_callable_target(
     let mut use_event = semantics.point(call.point).expect("owned call point").events.iter()
         .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
         .expect("call invocation event");
+    let inputs = match callable_inputs(request, &context.procedure) {
+        Ok(inputs) => inputs,
+        Err(reason) => {
+            request.control_reasons.push(reason);
+            return None;
+        }
+    };
     let mut visited = HashSet::default();
     loop {
         if !visited.insert(value) {
@@ -11159,39 +11603,7 @@ fn incoming_callable_target(
         )) {
             return Some(target.clone());
         }
-        let mut input = None;
-        for point in semantics.points() {
-            for (position, event) in point.events.iter().enumerate() {
-                if let Err(reason) = charge_concurrency_work(request, 1) {
-                    request.control_reasons.push(reason);
-                    return None;
-                }
-                match event.effect {
-                    SemanticEffect::Assignment { target, .. } if target == value => return None,
-                    SemanticEffect::MemoryLoad { result, .. } if result == value => return None,
-                    SemanticEffect::ValueFlow {
-                        source,
-                        target,
-                        kind,
-                    } if target == value => {
-                        if input.is_some()
-                            || !matches!(
-                                kind,
-                                crate::analyzer::semantic::ValueFlowKind::Local
-                                    | crate::analyzer::semantic::ValueFlowKind::Parameter
-                                    | crate::analyzer::semantic::ValueFlowKind::Receiver
-                            )
-                            || !reference_evidence_is_complete(semantics, event.evidence)
-                        {
-                            return None;
-                        }
-                        input = Some((source, point.id, position));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let (source, point, position) = input?;
+        let (source, point, position) = *inputs.get(&value)?;
         let precedes = if point == use_point {
             position < use_event
         } else {
@@ -11374,6 +11786,24 @@ fn canonicalize_access(
                 canonical: None,
                 resolved_location: ResolvedConcurrencyLocation::unknown(),
                 reasons: Vec::new(),
+                index_alias_domain: None,
+                field_alias_domain: None,
+            })
+        }
+        MemoryLocationKind::Dereference { address } => {
+            let (resolved_location, mut reasons) = provider
+                .resolved_value(&context.procedure, point, *address, request)?
+                .into_parts();
+            let canonical = resolved_location.exact_candidate().cloned();
+            if canonical.is_none() {
+                reasons.push(ConcurrencyOpenReason::UnknownLocation);
+            }
+            reasons.sort();
+            reasons.dedup();
+            Ok(CanonicalizedAccess {
+                canonical,
+                resolved_location,
+                reasons,
                 index_alias_domain: None,
                 field_alias_domain: None,
             })
@@ -11582,16 +12012,23 @@ fn name_member_declarations(
     }
 }
 
+/// One exact scalar constant carried along the analyzed invocation chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainedScalar {
+    Integer(u128),
+    Boolean(bool),
+}
+
 /// Resolve an exact scalar through the analyzed invocation ancestry. Each
 /// procedure-local step must be immutable and each call edge must bind the
 /// same positional parameter. A root formal or unavailable edge stays open.
-fn invocation_scalar_integer(
+fn invocation_scalar_constant(
     invocations: &Invocations,
     mut invocation: InvocationId,
     mut value: ValueId,
-) -> Option<u128> {
+) -> Option<ChainedScalar> {
     let mut visited = HashSet::default();
-    let mut offset = ScalarIntegerValue::unsigned(0);
+    let mut offset = None::<ScalarIntegerValue>;
     loop {
         if !visited.insert((invocation, value)) {
             return None;
@@ -11600,15 +12037,21 @@ fn invocation_scalar_integer(
         match crate::typestate::direct_scalar_source(current.context.procedure.semantics(), value)?
         {
             crate::typestate::DirectScalarSource::UnsignedInteger(integer) => {
-                let result = ScalarIntegerValue::unsigned(integer).checked_add(offset)?;
-                return (!result.negative()).then_some(result.magnitude());
+                let result = ScalarIntegerValue::unsigned(integer)
+                    .checked_add(offset.unwrap_or(ScalarIntegerValue::unsigned(0)))?;
+                return (!result.negative()).then_some(ChainedScalar::Integer(result.magnitude()));
+            }
+            crate::typestate::DirectScalarSource::Boolean(boolean) => {
+                return offset.is_none().then_some(ChainedScalar::Boolean(boolean));
             }
             crate::typestate::DirectScalarSource::IntegerOffset {
                 source,
                 offset: next,
             } => {
-                offset = ScalarIntegerValue::new(next.negative(), next.magnitude())
-                    .checked_add(offset)?;
+                offset = Some(
+                    ScalarIntegerValue::new(next.negative(), next.magnitude())
+                        .checked_add(offset.unwrap_or(ScalarIntegerValue::unsigned(0)))?,
+                );
                 value = source;
             }
             crate::typestate::DirectScalarSource::Port(SummaryPort::Parameter(ordinal)) => {
@@ -11634,6 +12077,17 @@ fn invocation_scalar_integer(
             )
             | crate::typestate::DirectScalarSource::ConstantString(_) => return None,
         }
+    }
+}
+
+fn invocation_scalar_integer(
+    invocations: &Invocations,
+    invocation: InvocationId,
+    value: ValueId,
+) -> Option<u128> {
+    match invocation_scalar_constant(invocations, invocation, value)? {
+        ChainedScalar::Integer(integer) => Some(integer),
+        ChainedScalar::Boolean(_) => None,
     }
 }
 
@@ -11702,14 +12156,155 @@ fn invocation_scalar_entry_facts(
         .pairs
         .into_iter()
         .filter_map(|(formal, actual)| {
-            invocation_scalar_integer(invocations, bindings.caller, actual).map(|value| {
-                ScalarEntryFact {
-                    target: formal,
-                    fact: exact_scalar_fact(value),
-                }
-            })
+            chained_entry_fact(invocations, bindings.caller, formal, actual)
         })
         .collect()
+}
+
+fn chained_entry_fact(
+    invocations: &Invocations,
+    caller: InvocationId,
+    formal: ValueId,
+    actual: ValueId,
+) -> Option<ScalarEntryFact> {
+    let fact = match invocation_scalar_constant(invocations, caller, actual)? {
+        ChainedScalar::Integer(integer) => exact_scalar_fact(integer),
+        ChainedScalar::Boolean(true) => ScalarFact::True,
+        ChainedScalar::Boolean(false) => ScalarFact::False,
+    };
+    Some(ScalarEntryFact {
+        target: formal,
+        fact,
+    })
+}
+
+/// The chained exact entry facts of the formals one invocation's guards
+/// test, or none unless at least one of them decides such a guard. This is
+/// the demand gate for specializing an invocation's control: a scalar
+/// derivation is paid for only where a known argument can rule out an arm.
+/// A guard that tests a local copied from a formal does not open the gate.
+fn invocation_guard_deciding_entry_facts(
+    invocations: &Invocations,
+    invocation: InvocationId,
+) -> Vec<ScalarEntryFact> {
+    let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+    let guards = crate::scalar_state::formal_guards(procedure);
+    if guards.is_empty() {
+        return Vec::new();
+    }
+    let Some(bindings) = invocation_formal_bindings(invocations, invocation) else {
+        return Vec::new();
+    };
+    let entry_facts = bindings
+        .pairs
+        .into_iter()
+        .filter(|(formal, _)| guards.iter().any(|(_, guarded)| guarded == formal))
+        .filter_map(|(formal, actual)| {
+            chained_entry_fact(invocations, bindings.caller, formal, actual)
+        })
+        .collect::<Vec<_>>();
+    let semantics = procedure.semantics();
+    let decides = guards.iter().any(|(predicate, formal)| {
+        entry_facts.iter().any(|entry| {
+            entry.target == *formal
+                && crate::scalar_state::guard_decides(semantics, *predicate, entry.fact)
+        })
+    });
+    if decides { entry_facts } else { Vec::new() }
+}
+
+/// The procedures whose control specialization an omitted recursive cycle
+/// makes unsound. The retained activations from `ancestor` through `caller`
+/// stand for every omitted generation of the cycle that `caller`'s `call`
+/// closes, so a pruned arm must stay pruned in each generation. That holds
+/// for the ancestor when every seeded formal is forwarded unchanged around
+/// the cycle. Any other specialized member is rejected: its next generation's
+/// arguments are not checked.
+fn recursive_cycle_invalid_specializations(
+    invocations: &Invocations,
+    request: &SolveRequest<'_, '_>,
+    caller: InvocationId,
+    call: CallSiteId,
+    ancestor: InvocationId,
+) -> Vec<ProcedureHandle> {
+    let mut invalid = Vec::new();
+    let mut current = caller;
+    loop {
+        let entry = &invocations.entries[current.0 as usize];
+        if let Some(entry_facts) = request.specialized_entry_facts.get(&entry.context)
+            && (current != ancestor
+                || !entry_facts.iter().all(|fact| {
+                    recursive_cycle_forwards_formal(
+                        invocations,
+                        caller,
+                        call,
+                        ancestor,
+                        fact.target,
+                    )
+                }))
+        {
+            invalid.push(entry.context.procedure.clone());
+        }
+        if current == ancestor {
+            return invalid;
+        }
+        current = entry
+            .caller
+            .expect("a recursive ancestor is on its caller's chain")
+            .0;
+    }
+}
+
+/// Whether the argument `caller`'s `call` passes for `ancestor`'s `formal` is
+/// that same formal, forwarded unchanged through every activation between.
+fn recursive_cycle_forwards_formal(
+    invocations: &Invocations,
+    caller: InvocationId,
+    call: CallSiteId,
+    ancestor: InvocationId,
+    formal: ValueId,
+) -> bool {
+    let crate::analyzer::semantic::SemanticValueKind::Parameter {
+        ordinal: target, ..
+    } = invocations.entries[ancestor.0 as usize]
+        .context
+        .procedure
+        .semantics()
+        .value(formal)
+        .expect("a seeded formal belongs to its procedure")
+        .kind
+    else {
+        panic!("scalar entry facts seed only parameters");
+    };
+    let mut invocation = caller;
+    let mut call = call;
+    let mut ordinal = target;
+    loop {
+        let semantics = invocations.entries[invocation.0 as usize]
+            .context
+            .procedure
+            .semantics();
+        let Some(argument) = semantics
+            .call_site(call)
+            .expect("a cycle call belongs to its caller")
+            .arguments
+            .get(ordinal as usize)
+        else {
+            return false;
+        };
+        let Some(crate::typestate::DirectScalarSource::Port(SummaryPort::Parameter(next))) =
+            crate::typestate::direct_scalar_source(semantics, argument.value)
+        else {
+            return false;
+        };
+        if invocation == ancestor {
+            return next == target;
+        }
+        (invocation, call) = invocations.entries[invocation.0 as usize]
+            .caller
+            .expect("a recursive ancestor is on its caller's chain");
+        ordinal = next;
+    }
 }
 
 /// Entry facts that also read the caller's own scalar derivation.
@@ -11722,7 +12317,7 @@ fn invocation_scalar_entry_facts(
 /// one value, so it is never wider than the derived range that contains it.
 fn invocation_derived_entry_facts(
     invocations: &Invocations,
-    derivations: &HashMap<InvocationId, ScalarStateDerivation>,
+    derivations: &HashMap<InvocationId, std::rc::Rc<ScalarStateDerivation>>,
     invocation: InvocationId,
 ) -> Vec<ScalarEntryFact> {
     let Some(bindings) = invocation_formal_bindings(invocations, invocation) else {
@@ -11839,8 +12434,12 @@ type ScalarIndexRanges = HashMap<(InvocationId, ProgramPointId, ValueId), IndexR
 /// checked offsets, so it decides the element or proves the range it lies in.
 ///
 /// Only an element-identified access with no literal index needs an answer,
-/// and one derivation serves all of them in its invocation. Each derivation
-/// is charged against the solve budget like any other retained work.
+/// and one derivation serves all of them in its invocation. An invocation is
+/// seeded with its caller's facts only when a parameter can change the
+/// demanded values (`ParameterDependence`); the caller is then derived for
+/// the actuals it binds, under the same test. An index a loop or local
+/// computes by itself is therefore derived once, without entry facts, and no
+/// ancestor is derived for it.
 fn prove_scalar_index_ranges(
     accesses: &[Access],
     invocations: &Invocations,
@@ -11871,43 +12470,66 @@ fn prove_scalar_index_ranges(
             .or_default()
             .push((access.site.point, index));
     }
-    // An index the producer could not name usually arrives as an argument, so
-    // the accessing invocation can only be seeded once every ancestor has its
-    // own derivation. A callee is always pushed after its caller, so sorting
-    // by invocation identity puts each caller before the callees it binds.
-    let mut required = undecided.keys().copied().collect::<HashSet<_>>();
-    let mut ancestors = required.iter().copied().collect::<Vec<_>>();
-    while let Some(invocation) = ancestors.pop() {
+    let mut dependence =
+        HashMap::<ProcedureHandle, crate::scalar_state::ParameterDependence>::default();
+    let mut required = HashSet::<InvocationId>::default();
+    let mut seeded = HashSet::<InvocationId>::default();
+    let mut pending = undecided
+        .iter()
+        .map(|(invocation, sites)| (*invocation, sites.iter().map(|(_, index)| *index).collect()))
+        .collect::<Vec<(InvocationId, Vec<ValueId>)>>();
+    while let Some((invocation, demanded)) = pending.pop() {
         charge_concurrency_work(request, 1)?;
-        if let Some((caller, _)) = invocations.entries[invocation.0 as usize].caller
-            && required.insert(caller)
-        {
-            ancestors.push(caller);
+        required.insert(invocation);
+        if seeded.contains(&invocation) {
+            continue;
         }
+        let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+        let dependence = match dependence.entry(procedure.clone()) {
+            Entry::Occupied(known) => known.into_mut(),
+            Entry::Vacant(slot) => {
+                charge_concurrency_work(
+                    request,
+                    procedure
+                        .semantics()
+                        .points()
+                        .iter()
+                        .map(|point| point.events.len())
+                        .sum(),
+                )?;
+                slot.insert(crate::scalar_state::ParameterDependence::new(procedure))
+            }
+        };
+        if !dependence.any(demanded) {
+            continue;
+        }
+        let Some(bindings) = invocation_formal_bindings(invocations, invocation) else {
+            continue;
+        };
+        seeded.insert(invocation);
+        pending.push((
+            bindings.caller,
+            bindings.pairs.iter().map(|(_, actual)| *actual).collect(),
+        ));
     }
+    // A callee is always pushed after its caller, so sorting by invocation
+    // identity derives each seeding caller before the callees it binds.
     let mut ordered = required.into_iter().collect::<Vec<_>>();
     ordered.sort_unstable_by_key(|invocation| invocation.get());
 
-    let mut derivations = HashMap::<InvocationId, ScalarStateDerivation>::default();
+    let mut derivations = HashMap::<InvocationId, std::rc::Rc<ScalarStateDerivation>>::default();
     for invocation in ordered {
-        let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
-        let semantics = procedure.semantics();
-        charge_concurrency_work(
-            request,
-            semantics
-                .points()
-                .len()
-                .saturating_mul(semantics.values().len().saturating_add(1)),
-        )?;
-        let entry_facts = invocation_derived_entry_facts(invocations, &derivations, invocation);
-        derivations.insert(
-            invocation,
-            ScalarStateDerivation::derive_with_entry_facts(
-                procedure,
-                ScalarCallEffects::default(),
-                &entry_facts,
-            ),
-        );
+        let entry_facts = if seeded.contains(&invocation) {
+            invocation_derived_entry_facts(invocations, &derivations, invocation)
+        } else {
+            Vec::new()
+        };
+        let procedure = invocations.entries[invocation.0 as usize]
+            .context
+            .procedure
+            .clone();
+        let derivation = scalar_derivation(request, &procedure, entry_facts)?;
+        derivations.insert(invocation, derivation);
     }
 
     let mut ranges = ScalarIndexRanges::default();
@@ -12196,6 +12818,179 @@ fn summary_dependency_matches_target(
         SummaryDependencyKey::Complete(key) => summary.key() == key.as_ref(),
         SummaryDependencyKey::Recursive(identity) => summary.key().identity() == identity.as_ref(),
     }
+}
+
+/// Close only a complete access-only spawn cycle with invariant boundary
+/// identities. Retained adjacent generations supply the access pairs; this
+/// certificate does not merge tasks or add ordering between generations.
+#[allow(clippy::too_many_arguments)]
+fn recursive_spawn_accesses_are_covered(
+    provider: &impl ConcurrencyProvider,
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    targets: &HashMap<(InvocationId, CallSiteId), ProcedureHandle>,
+    omitted: &OmittedRecursiveSpawn,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, SemanticProviderError> {
+    if !omitted.boundary_is_closed {
+        return Ok(false);
+    }
+    let ancestor = &invocations.entries[omitted.ancestor.0 as usize].context;
+    let call = omitted
+        .caller
+        .procedure
+        .semantics()
+        .call_site(omitted.call)
+        .expect("omitted spawn belongs to its caller");
+    if call_reference_input_ancestor(
+        classes,
+        invocations,
+        tasks,
+        &omitted.caller,
+        call,
+        ancestor,
+        provider,
+        request,
+    )
+    .is_none()
+    {
+        return Ok(false);
+    }
+    let Some(summary) = provider.complete_summary(&ancestor.procedure) else {
+        return Ok(false);
+    };
+    let Some(group) = summary.recursive_group() else {
+        return Ok(false);
+    };
+    let mut contexts = Vec::new();
+    let mut summaries = Vec::new();
+    let mut members = HashSet::default();
+    let mut current = omitted.caller.invocation;
+    let mut next_call = omitted.call;
+    loop {
+        if let Err(reason) = charge_concurrency_work(request, 1) {
+            classes.identity_reasons.push(reason);
+            return Ok(false);
+        }
+        let context = &invocations.entries[current.0 as usize].context;
+        let Some(summary) = provider.complete_summary(&context.procedure) else {
+            return Ok(false);
+        };
+        if summary.recursive_group() != Some(group)
+            || !members.insert(summary.key().identity().clone())
+        {
+            return Ok(false);
+        }
+        contexts.push((context, next_call));
+        summaries.push(summary);
+        if current == omitted.ancestor {
+            break;
+        }
+        let Some((parent, edge)) = invocations.entries[current.0 as usize].caller else {
+            return Ok(false);
+        };
+        current = parent;
+        next_call = edge;
+    }
+    if members.len() != group.member_count() as usize
+        || !validate_recursive_summary_batch(&summaries)
+            .is_ok_and(|validated| validated.group == group)
+    {
+        return Ok(false);
+    }
+    for ((context, edge), summary) in contexts.into_iter().zip(summaries) {
+        let semantics = context.procedure.semantics();
+        let call = semantics
+            .call_site(edge)
+            .expect("retained cycle call belongs to caller");
+        let Some(target) = targets.get(&(context.invocation, edge)) else {
+            return Ok(false);
+        };
+        let Some(target_summary) = provider.complete_summary(target) else {
+            return Ok(false);
+        };
+        if semantics.call_sites().len() != 1
+            || !members.contains(target_summary.key().identity())
+            || summary.composition_root() != summary.key()
+            || !summary.completeness().is_complete()
+            || !summary.transfers().is_empty()
+        {
+            return Ok(false);
+        }
+        let covered_calls = HashSet::default();
+        if !recursive_access_source_gaps_are_closed(&context.procedure, call, &covered_calls) {
+            return Ok(false);
+        }
+        let mut saw_call = false;
+        let mut accesses = HashSet::default();
+        for effect in summary.effects() {
+            if let Err(reason) = charge_concurrency_work(request, 1) {
+                classes.identity_reasons.push(reason);
+                return Ok(false);
+            }
+            if !effect.evidence().is_proven() || !effect.evidence().is_complete() {
+                return Ok(false);
+            }
+            match effect.key() {
+                SummaryEffectKey::Call {
+                    event,
+                    callee,
+                    witness,
+                } => {
+                    if saw_call
+                        || callee.identity() != target_summary.key().identity()
+                        || !matches!(callee.as_ref(), SummaryDependencyKey::Recursive(_))
+                        || live_summary_call(&context.procedure, *event, *witness) != Some(edge)
+                    {
+                        return Ok(false);
+                    }
+                    saw_call = true;
+                }
+                SummaryEffectKey::Concurrency(effect) => {
+                    let SummaryConcurrencyEffectKind::Access {
+                        location,
+                        must_hold,
+                        ..
+                    } = effect.kind()
+                    else {
+                        return Ok(false);
+                    };
+                    let pending = PendingSummaryEffect {
+                        context: context.clone(),
+                        effect: effect.clone(),
+                    };
+                    let Ok(source) = source_summary_access(&pending) else {
+                        return Ok(false);
+                    };
+                    if effect.execution().timing() != ExecutionTiming::SameEvaluation
+                        || !must_hold.is_empty()
+                        || !matches!(crate::typestate::direct_concurrency_path(&context.procedure, source.location),
+                            crate::typestate::DirectConcurrencyPath::Boundary(source) if &source == location)
+                        || !recursive_access_path_is_invariant(&context.procedure, call, location)
+                        || !accesses.insert(effect.event())
+                    {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        if !saw_call
+            || !recursive_access_source_inventory_is_closed(
+                &context.procedure,
+                call,
+                &accesses,
+                &HashSet::default(),
+                &HashSet::default(),
+                &RecursiveResultTransition::None,
+                &covered_calls,
+            )
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Certify the finite fixed point for one synchronous recursive access SCC.
@@ -12810,7 +13605,9 @@ fn recursive_synchronization_executes_exactly_once(
         return Ok(false);
     }
 
+    // The countdown certificate ranks integer inputs only.
     let mut entry_facts = invocation_scalar_entry_facts(invocations, context.invocation);
+    entry_facts.retain(|entry| matches!(entry.fact, ScalarFact::Integer(_)));
     let Some(mut scalar_values) = scalar_entry_values(&entry_facts) else {
         return Ok(false);
     };
@@ -13083,7 +13880,7 @@ fn recursive_access_source_gap_is_closed(
         (
             SemanticCapability::ExceptionalControlFlow
             | SemanticCapability::ExceptionalCallContinuation,
-            SemanticGapSubject::Point,
+            SemanticGapSubject::Point | SemanticGapSubject::Value(_),
         ) => gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit,
         (SemanticCapability::NormalControlFlow, SemanticGapSubject::Point) => {
             gap.discharge == SemanticGapDischarge::RetainedControlTopology
@@ -13100,6 +13897,11 @@ fn recursive_access_source_gap_is_closed(
                     )
                 })
                 })
+        }
+        (SemanticCapability::ConcurrentSpawn, SemanticGapSubject::Point) => {
+            call.invocation_mode == CallInvocationMode::Detached
+                && gap.point == call.point
+                && gap.discharge == SemanticGapDischarge::RetainedControlTopology
         }
         (SemanticCapability::Calls, SemanticGapSubject::CallSite(candidate)) => {
             candidate == call.id || covered_calls.contains(&candidate)
@@ -14225,6 +15027,7 @@ fn append_summary_accesses(
             field_alias_domain,
             local_identity,
             reasons,
+            unresolved_calls: Vec::new(),
             atomic: false,
             storage_origin: None,
         });
@@ -15185,6 +15988,18 @@ fn compare_accesses(
             let proven = reasons.is_empty()
                 && ordering != ConcurrentOrdering::Open
                 && protection != ConcurrentProtection::Open;
+            let mut unresolved_calls = Vec::new();
+            if reasons.contains(&ConcurrencyOpenReason::UnresolvedTarget) {
+                for unresolved_call in first
+                    .unresolved_calls
+                    .iter()
+                    .chain(&second.unresolved_calls)
+                {
+                    if !unresolved_calls.contains(unresolved_call) {
+                        unresolved_calls.push(unresolved_call.clone());
+                    }
+                }
+            }
             report.conflicts.push(ConcurrentAccessConflict {
                 location,
                 first: first.site.clone(),
@@ -15195,6 +16010,7 @@ fn compare_accesses(
                 proven,
                 exhaustive: reasons.is_empty(),
                 reasons,
+                unresolved_calls,
             });
         }
     }
@@ -15273,6 +16089,11 @@ fn compare_accesses(
         };
         reasons.sort();
         reasons.dedup();
+        let unresolved_calls = if reasons.contains(&ConcurrencyOpenReason::UnresolvedTarget) {
+            access.unresolved_calls.clone()
+        } else {
+            Vec::new()
+        };
         report.conflicts.push(ConcurrentAccessConflict {
             location,
             first: access.site.clone(),
@@ -15283,6 +16104,7 @@ fn compare_accesses(
             proven: reasons.is_empty() && protection != ConcurrentProtection::Open,
             exhaustive: reasons.is_empty(),
             reasons,
+            unresolved_calls,
         });
     }
 }
@@ -18951,6 +19773,7 @@ fn invocation_sync_map_key(
                 | SummaryPort::Heap(_),
             )
             | crate::typestate::DirectScalarSource::UnsignedInteger(_)
+            | crate::typestate::DirectScalarSource::Boolean(_)
             | crate::typestate::DirectScalarSource::IntegerOffset { .. } => return None,
         }
     }
@@ -19448,6 +20271,7 @@ fn projected_point_dominates(
 
 /// CFG algorithms use the solve's cancellation token and debit their actual
 /// visits, including visits performed before an exhausted or cancelled query.
+#[track_caller]
 fn bounded_cfg_query<T>(
     request: &mut SemanticRequest<'_>,
     query: impl FnOnce(
@@ -19464,6 +20288,7 @@ fn bounded_cfg_query<T>(
     if request.cancellation.is_cancelled() {
         return Err(ConcurrencyOpenReason::BudgetExhausted);
     }
+    let used_before = request.budget.used().nested_entries;
     let mut budget = CfgAlgorithmBudget::uniform(request.budget.remaining().nested_entries / 2);
     let result = query(&mut CfgAlgorithmRequest::new(
         &mut budget,
@@ -19485,14 +20310,75 @@ fn bounded_cfg_query<T>(
         Err(CfgAlgorithmError::InvalidNode(node)) => {
             panic!("validated concurrency CFG contains invalid node {node:?}")
         }
-        Err(CfgAlgorithmError::Cancelled { .. } | CfgAlgorithmError::ExceededBudget(_)) => {
+        Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
+            // The traversal allowance is carved from the remaining nested
+            // entries, so report its refusal as a refusal of that lane.
+            request.budget.record_allowance_refusal(
+                crate::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+                used_before.saturating_add(exceeded.limit),
+                used_before.saturating_add(exceeded.attempted),
+            );
             Err(ConcurrencyOpenReason::BudgetExhausted)
         }
+        Err(CfgAlgorithmError::Cancelled { .. }) => Err(ConcurrencyOpenReason::BudgetExhausted),
     }
 }
 
 /// Reusable ordering proof for one call in an immutable procedure artifact.
 fn points_strictly_before_call(
+    scope: &impl ControlScope,
+    call: ProgramPointId,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<HashSet<ProgramPointId>, ConcurrencyOpenReason> {
+    if request.cancellation.is_cancelled() {
+        return Err(ConcurrencyOpenReason::BudgetExhausted);
+    }
+    // An invocation scope names run-local task and invocation numbers, so its
+    // answer is not keyed by anything another root can share.
+    let scope_key = scope.key();
+    let cache_key = match (&scope_key, request.provider) {
+        (ControlScopeKey::Invocation(_), _) => None,
+        (_, Some(provider)) => {
+            provider
+                .summary_behavior_identity()
+                .map(|provider| PointsBeforeCallKey {
+                    scope: scope_key,
+                    call,
+                    provider: Some(provider),
+                })
+        }
+        (_, None) => Some(PointsBeforeCallKey {
+            scope: scope_key,
+            call,
+            provider: None,
+        }),
+    };
+    if let Some(key) = &cache_key {
+        let cached = request
+            .query_cache()
+            .points_before_call
+            .borrow()
+            .get(key)
+            .cloned();
+        if let Some(points) = cached {
+            charge_concurrency_work(request, 1)?;
+            return Ok((*points).clone());
+        }
+    }
+    let points = points_strictly_before_call_uncached(scope, call, request)?;
+    if let Some(key) = cache_key
+        && !request.cancellation.is_cancelled()
+    {
+        request
+            .query_cache()
+            .points_before_call
+            .borrow_mut()
+            .insert(key, std::rc::Rc::new(points.clone()));
+    }
+    Ok(points)
+}
+
+fn points_strictly_before_call_uncached(
     scope: &impl ControlScope,
     call: ProgramPointId,
     request: &mut SolveRequest<'_, '_>,
@@ -19765,6 +20651,7 @@ fn point_reaches_uncached(
     })
 }
 
+#[track_caller]
 fn charge_concurrency_work(
     request: &mut SemanticRequest<'_>,
     entries: usize,
@@ -20627,7 +21514,9 @@ func root() {
 
     #[test]
     fn source_summary_gap_requires_an_exact_omitted_access() {
-        let fixture = Fixture::new("package sample\nfunc clear(target *error) { *target = nil }\n");
+        let fixture = Fixture::new(
+            "package sample\nfunc clear(target *error, ch chan error) { *target, _ = <-ch }\n",
+        );
         let artifact = fixture.artifact();
         let procedure = artifact
             .procedures()
@@ -22058,6 +22947,7 @@ func root() {}
             field_alias_domain: None,
             local_identity: false,
             reasons: Vec::new(),
+            unresolved_calls: Vec::new(),
             atomic: false,
             storage_origin: Some(canonical.clone()),
         };
@@ -22592,20 +23482,20 @@ func helper() {}
             )
             .unwrap();
         for (caller, call, expected) in [
-            (parent.invocation, calls[0].id, false),
-            (first.invocation, calls[0].id, true),
-            (sibling.invocation, calls[0].id, true),
-            (first.invocation, calls[1].id, false),
-            (synchronous.invocation, calls[0].id, false),
+            (parent.invocation, calls[0].id, None),
+            (first.invocation, calls[0].id, Some(first.invocation)),
+            (sibling.invocation, calls[0].id, Some(sibling.invocation)),
+            (first.invocation, calls[1].id, None),
+            (synchronous.invocation, calls[0].id, None),
         ] {
             assert_eq!(
-                invocations.repeats_spawn_edge(caller, call, &root, &mut request),
+                invocations.repeated_spawn_ancestor(caller, call, &root, &mut request),
                 Ok(expected)
             );
         }
         let mut bounded = SemanticBudget::uniform(1).unwrap();
         assert_eq!(
-            invocations.repeats_spawn_edge(
+            invocations.repeated_spawn_ancestor(
                 first.invocation,
                 calls[1].id,
                 &root,
@@ -22615,7 +23505,8 @@ func helper() {}
         );
         cancellation.cancel();
         assert_eq!(
-            invocations.repeats_spawn_edge(first.invocation, calls[0].id, &root, &mut request,),
+            invocations
+                .repeated_spawn_ancestor(first.invocation, calls[0].id, &root, &mut request,),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
     }
@@ -22909,5 +23800,404 @@ func exclusive(flag bool) {
             ]
         );
         assert_eq!(location.exact_candidate(), None);
+    }
+
+    #[test]
+    fn chained_boolean_arguments_open_the_control_specialization_gate() {
+        let fixture = Fixture::new(
+            r#"package sample
+
+func stopped(stop bool, count int) {
+    if stop { return }
+    _ = count
+}
+
+func relay(stop bool, count int) { stopped(stop, count) }
+
+func forwarded() { relay(true, 3) }
+
+func permissions(mode int, stop bool) {
+    if stop { return }
+    _ = mode
+}
+
+func unknownStop(stop bool) { permissions(420, stop) }
+"#,
+        );
+        let artifact = fixture.artifact();
+        let named = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure.lexical_parent().is_none()
+                        && procedure
+                            .locator()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("fixture procedure")
+        };
+        let formal = |procedure: &ProcedureHandle, wanted: u32| {
+            procedure
+                .semantics()
+                .values()
+                .iter()
+                .find(|value| {
+                    matches!(
+                        value.kind,
+                        crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. }
+                            if ordinal == wanted
+                    )
+                })
+                .expect("fixture formal")
+                .id
+        };
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::new(SemanticWork::default_limits()).unwrap();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        let mut invocations = Invocations::default();
+        // Each procedure is called through its caller's only call site.
+        let mut chain = |procedures: &[ProcedureHandle], invocations: &mut Invocations| {
+            let mut previous = None::<(InvocationId, &ProcedureHandle)>;
+            for procedure in procedures {
+                let edge = previous.map(|(invocation, caller)| {
+                    let [call] = caller.semantics().call_sites() else {
+                        panic!("fixture caller has one call site");
+                    };
+                    (invocation, call.id)
+                });
+                let context = invocations
+                    .push(TaskId(0), procedure.clone(), edge, &mut request)
+                    .unwrap();
+                previous = Some((context.invocation, procedure));
+            }
+            previous.expect("nonempty chain").0
+        };
+
+        let stopped = named("stopped");
+        let reached = chain(
+            &[named("forwarded"), named("relay"), stopped.clone()],
+            &mut invocations,
+        );
+        let stop = ScalarEntryFact {
+            target: formal(&stopped, 0),
+            fact: ScalarFact::True,
+        };
+        let entry_facts = invocation_scalar_entry_facts(&invocations, reached);
+        assert!(entry_facts.contains(&stop), "{entry_facts:?}");
+        assert!(
+            entry_facts.contains(&ScalarEntryFact {
+                target: formal(&stopped, 1),
+                fact: exact_scalar_fact(3),
+            }),
+            "{entry_facts:?}"
+        );
+        assert_eq!(
+            invocation_guard_deciding_entry_facts(&invocations, reached),
+            [stop],
+            "only the formal a guard tests is seeded"
+        );
+
+        let permissions = named("permissions");
+        let reached = chain(
+            &[named("unknownStop"), permissions.clone()],
+            &mut invocations,
+        );
+        assert_eq!(
+            invocation_scalar_entry_facts(&invocations, reached),
+            [ScalarEntryFact {
+                target: formal(&permissions, 0),
+                fact: exact_scalar_fact(420),
+            }]
+        );
+        assert!(
+            invocation_guard_deciding_entry_facts(&invocations, reached).is_empty(),
+            "an integer argument that decides no guard pays for no derivation"
+        );
+    }
+
+    fn fixture_procedure(artifact: &Arc<SemanticArtifact>, name: &str) -> ProcedureHandle {
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure.lexical_parent().is_none()
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap_or_else(|| panic!("fixture has procedure {name:?}"))
+    }
+
+    /// The dynamic element indexes one procedure writes.
+    fn element_indexes(procedure: &ProcedureHandle) -> Vec<ValueId> {
+        procedure
+            .semantics()
+            .memory_locations()
+            .iter()
+            .filter_map(|location| match location.kind {
+                MemoryLocationKind::Index {
+                    index: Some(index),
+                    constant_index: None,
+                    ..
+                } => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scalar_index_demand_walks_to_callers_only_for_parameter_dependent_indexes() {
+        let fixture = Fixture::new(
+            r#"package sample
+
+func fromParameter(values []int, at int) { values[at] = 1 }
+
+func fromCopiedParameter(values []int, at int) {
+    i := at
+    values[i] = 1
+}
+
+func fromRange(values []int) {
+    for i := range values { values[i] = 1 }
+}
+
+func fromLocal(values []int) {
+    i := 2
+    i += 1
+    values[i] = 1
+}
+
+func selectedByParameter(values []int, stop bool) {
+    i := 0
+    if stop { i = 1 }
+    values[i] = 1
+}
+"#,
+        );
+        let artifact = fixture.artifact();
+        for (name, dependent) in [
+            ("fromParameter", true),
+            ("fromCopiedParameter", true),
+            ("fromRange", false),
+            ("fromLocal", false),
+            ("selectedByParameter", true),
+        ] {
+            let procedure = fixture_procedure(&artifact, name);
+            let indexes = element_indexes(&procedure);
+            assert!(!indexes.is_empty(), "{name} writes a dynamic element");
+            assert_eq!(
+                crate::scalar_state::ParameterDependence::new(&procedure).any(indexes),
+                dependent,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_derivation_reuse_matches_recomputation_and_charges_one_lookup() {
+        let fixture = Fixture::new(
+            r#"package sample
+
+func selected(values []int, first int, stop bool) {
+    i := first
+    if stop { i = 3 }
+    values[i] = 1
+}
+"#,
+        );
+        let artifact = fixture.artifact();
+        let procedure = fixture_procedure(&artifact, "selected");
+        let semantics = procedure.semantics();
+        let formal = |wanted: u32| {
+            semantics
+                .values()
+                .iter()
+                .find(|value| {
+                    matches!(
+                        value.kind,
+                        crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. }
+                            if ordinal == wanted
+                    )
+                })
+                .expect("fixture formal")
+                .id
+        };
+        let first = ScalarEntryFact {
+            target: formal(1),
+            fact: exact_scalar_fact(2),
+        };
+        let stop = ScalarEntryFact {
+            target: formal(2),
+            fact: ScalarFact::False,
+        };
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::new(SemanticWork::default_limits()).unwrap();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+
+        let used = |request: &SolveRequest<'_, '_>| request.budget.used().nested_entries;
+        let before = used(&request);
+        let computed = scalar_derivation(&mut request, &procedure, vec![first, stop]).unwrap();
+        let full = semantics.points().len() * (semantics.values().len() + 1);
+        assert_eq!(
+            used(&request) - before,
+            full,
+            "a first derivation pays in full"
+        );
+
+        let before = used(&request);
+        let reused = scalar_derivation(&mut request, &procedure, vec![stop, first]).unwrap();
+        assert!(
+            std::rc::Rc::ptr_eq(&computed, &reused),
+            "entry-fact order does not change the key"
+        );
+        assert_eq!(used(&request) - before, 1, "a repeat is one lookup");
+
+        let fresh = ScalarStateDerivation::derive_with_entry_facts(
+            &procedure,
+            ScalarCallEffects::default(),
+            &[first, stop],
+        );
+        for point in semantics.points() {
+            assert_eq!(reused.is_reachable(point.id), fresh.is_reachable(point.id));
+            for value in semantics.values() {
+                assert_eq!(
+                    reused.fact_at(point.id, value.id),
+                    fresh.fact_at(point.id, value.id),
+                    "{point:?} {value:?}"
+                );
+            }
+        }
+        let [index] = element_indexes(&procedure)[..] else {
+            panic!("fixture writes one dynamic element");
+        };
+        let write = semantics
+            .points()
+            .iter()
+            .find(|point| {
+                point.events.iter().any(|event| {
+                    matches!(event.effect, SemanticEffect::MemoryStore { location, .. }
+                        if matches!(semantics.memory_location(location).map(|row| &row.kind),
+                            Some(MemoryLocationKind::Index { .. })))
+                })
+            })
+            .expect("fixture stores the element");
+        assert_eq!(
+            reused.fact_at(write.id, index),
+            exact_scalar_fact(2),
+            "the reused derivation keeps the seeded answer"
+        );
+
+        let before = used(&request);
+        let unseeded = scalar_derivation(&mut request, &procedure, Vec::new()).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&computed, &unseeded));
+        assert_eq!(
+            used(&request) - before,
+            full,
+            "other entry facts are another key"
+        );
+    }
+
+    /// The per-value scan `incoming_callable_target` performed before the
+    /// per-procedure table: the one followed flow that defines `value`.
+    fn scanned_callable_input(
+        semantics: &crate::analyzer::semantic::ProcedureSemantics,
+        value: ValueId,
+    ) -> Option<(ValueId, ProgramPointId, usize)> {
+        let mut input = None;
+        for point in semantics.points() {
+            for (position, event) in point.events.iter().enumerate() {
+                match event.effect {
+                    SemanticEffect::Assignment { target, .. } if target == value => return None,
+                    SemanticEffect::MemoryLoad { result, .. } if result == value => return None,
+                    SemanticEffect::ValueFlow {
+                        source,
+                        target,
+                        kind,
+                    } if target == value => {
+                        if input.is_some()
+                            || !matches!(
+                                kind,
+                                crate::analyzer::semantic::ValueFlowKind::Local
+                                    | crate::analyzer::semantic::ValueFlowKind::Parameter
+                                    | crate::analyzer::semantic::ValueFlowKind::Receiver
+                            )
+                            || !reference_evidence_is_complete(semantics, event.evidence)
+                        {
+                            return None;
+                        }
+                        input = Some((source, point.id, position));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        input
+    }
+
+    #[test]
+    fn callable_inputs_match_the_per_value_scan_and_charge_one_lookup_on_repeat() {
+        let fixture = Fixture::new(
+            r#"package sample
+
+func apply(f func()) {
+    g := f
+    g()
+}
+
+func reassigned(f func(), h func()) {
+    g := f
+    g = h
+    g()
+}
+
+func captured(f func()) {
+    run := func() { f() }
+    go run()
+}
+"#,
+        );
+        let artifact = fixture.artifact();
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::new(SemanticWork::default_limits()).unwrap();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        let mut followed = 0;
+        for procedure in artifact.procedures() {
+            let procedure = artifact
+                .procedure_handle(procedure.id())
+                .expect("fixture procedure handle");
+            let semantics = procedure.semantics();
+            let events = semantics
+                .points()
+                .iter()
+                .map(|point| point.events.len())
+                .sum::<usize>();
+            let before = request.budget.used().nested_entries;
+            let inputs = callable_inputs(&mut request, &procedure).unwrap();
+            assert_eq!(request.budget.used().nested_entries - before, events);
+            for value in semantics.values() {
+                let expected = scanned_callable_input(semantics, value.id);
+                followed += usize::from(expected.is_some());
+                assert_eq!(inputs.get(&value.id).copied(), expected, "{value:?}");
+            }
+            let before = request.budget.used().nested_entries;
+            let repeated = callable_inputs(&mut request, &procedure).unwrap();
+            assert!(std::rc::Rc::ptr_eq(&inputs, &repeated));
+            assert_eq!(request.budget.used().nested_entries - before, 1);
+        }
+        assert!(followed > 0, "the fixture has a followed local flow");
     }
 }

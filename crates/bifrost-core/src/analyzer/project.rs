@@ -3,6 +3,7 @@ use crate::analyzer::{Language, ProjectFile};
 use crate::gitblob;
 use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
+use git2::{ObjectType, Oid};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -214,26 +215,50 @@ pub enum ProjectSourceOrigin {
     Overlay(OverlayRevision),
 }
 
-/// Immutable source text and its origin captured by one project read.
+/// Immutable decoded source, original content identity, and origin from one read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSourceSnapshot {
     source: Arc<str>,
+    oid: Oid,
     origin: ProjectSourceOrigin,
 }
 
 impl ProjectSourceSnapshot {
+    /// Capture text supplied by a custom source reader, identified by its UTF-8 bytes.
     pub fn disk(source: impl Into<Arc<str>>) -> Self {
+        let source = source.into();
         Self {
-            source: source.into(),
+            oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .expect("hashing project source text"),
+            source,
             origin: ProjectSourceOrigin::Disk,
         }
     }
 
+    /// Decode disk or revision bytes while retaining their exact blob identity.
+    pub fn disk_bytes(bytes: Vec<u8>) -> io::Result<Self> {
+        let oid = Oid::hash_object(ObjectType::Blob, &bytes).expect("hashing project source bytes");
+        let source = decode_source_bytes(bytes)?.into();
+        Ok(Self {
+            source,
+            oid,
+            origin: ProjectSourceOrigin::Disk,
+        })
+    }
+
     pub fn overlay(source: impl Into<Arc<str>>, revision: OverlayRevision) -> Self {
+        let source = source.into();
         Self {
-            source: source.into(),
+            oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .expect("hashing project overlay text"),
+            source,
             origin: ProjectSourceOrigin::Overlay(revision),
         }
+    }
+
+    /// The original bytes' blob identity, before any lossy source decoding.
+    pub const fn oid(&self) -> Oid {
+        self.oid
     }
 
     pub fn source(&self) -> &str {
@@ -387,6 +412,14 @@ pub trait Project: Send + Sync {
     /// without a listing cache ignore it.
     fn invalidate_cached_file_listing(&self) {}
 
+    /// Update a cached whole-workspace listing for one created, removed or
+    /// renamed path without walking the workspace. Returns `false` when the
+    /// project cannot decide that path alone, and the caller then invalidates
+    /// the listing instead. Projects without a listing cache return `false`.
+    fn update_cached_listing_for_path(&self, _rel_path: &Path) -> bool {
+        false
+    }
+
     /// Read the source text of `file`. Default reads from disk and admits
     /// legacy non-UTF-8 text lossily while rejecting NUL-bearing binary data.
     /// The LSP server overrides this via `OverlayProject` to serve unsaved
@@ -404,23 +437,17 @@ pub trait Project: Send + Sync {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<String>> {
-        let mut source = Vec::new();
-        let read_limit = u64::try_from(max_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        std::fs::File::open(file.abs_path())?
-            .take(read_limit)
-            .read_to_end(&mut source)?;
-        if source.len() > max_bytes {
-            return Ok(None);
-        }
-        decode_source_bytes(source).map(Some)
+        read_disk_source_bytes_limited(file, max_bytes)?
+            .map(decode_source_bytes)
+            .transpose()
     }
 
     /// Capture source text and its disk/overlay identity in one read.
     ///
-    /// Ordinary projects are disk-backed. Overlay projects override this so
-    /// the text and its opaque revision are cloned under the same read lock.
+    /// The default preserves custom `read_source` implementations and hashes
+    /// their supplied UTF-8 text. Disk-backed projects override this to retain
+    /// the raw byte identity before decoding. Overlay projects capture their
+    /// text and opaque revision under the same read lock.
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
         self.read_source(file).map(ProjectSourceSnapshot::disk)
     }
@@ -464,6 +491,33 @@ pub trait Project: Send + Sync {
     fn analysis_generation(&self) -> u64 {
         0
     }
+}
+
+fn read_disk_source_snapshot(file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    ProjectSourceSnapshot::disk_bytes(std::fs::read(file.abs_path())?)
+}
+
+fn read_disk_source_snapshot_limited(
+    file: &ProjectFile,
+    max_bytes: usize,
+) -> io::Result<Option<ProjectSourceSnapshot>> {
+    read_disk_source_bytes_limited(file, max_bytes)?
+        .map(ProjectSourceSnapshot::disk_bytes)
+        .transpose()
+}
+
+fn read_disk_source_bytes_limited(
+    file: &ProjectFile,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut source = Vec::new();
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    std::fs::File::open(file.abs_path())?
+        .take(read_limit)
+        .read_to_end(&mut source)?;
+    Ok((source.len() <= max_bytes).then_some(source))
 }
 
 /// Decode source bytes the way every disk-backed [`Project`] does: legacy
@@ -540,6 +594,18 @@ impl TestProject {
 }
 
 impl Project for TestProject {
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        read_disk_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        read_disk_source_snapshot_limited(file, max_bytes)
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -692,6 +758,46 @@ impl WorkspaceFileListingCache {
         Ok(files)
     }
 
+    /// Record one path's membership in the cached listing without walking.
+    ///
+    /// Returns `false` when the caller must invalidate instead: the listing
+    /// holds files under a path that is being removed (a directory went away,
+    /// and this path alone cannot say which of its files remain). When no
+    /// fresh listing is cached there is nothing to update: the next
+    /// [`Self::files`] walks anyway, so that also succeeds.
+    pub fn update_path(&self, file: &ProjectFile, listed: bool) -> bool {
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let generation = self.generation.load(Ordering::Acquire);
+        let Some(cached) = slot
+            .as_mut()
+            .filter(|cached| cached.generation == generation)
+        else {
+            return true;
+        };
+        if cached.files.contains(file) == listed {
+            return true;
+        }
+        if !listed
+            && cached
+                .files
+                .iter()
+                .any(|listed| listed.rel_path().starts_with(file.rel_path()) && listed != file)
+        {
+            return false;
+        }
+        let mut files = (*cached.files).clone();
+        if listed {
+            files.insert(file.clone());
+        } else {
+            files.remove(file);
+        }
+        cached.files = Arc::new(files);
+        true
+    }
+
     /// Number of filesystem walks this cache has performed. The observable
     /// complexity signal for regression tests: calls minus walks is the cache's
     /// hit count.
@@ -814,6 +920,18 @@ impl FilesystemProject {
 }
 
 impl Project for FilesystemProject {
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        read_disk_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        read_disk_source_snapshot_limited(file, max_bytes)
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -845,6 +963,36 @@ impl Project for FilesystemProject {
                 .take_initial_listing()
                 .map_or_else(|| collect_workspace_files(&self.root).map(Arc::new), Ok),
         }
+    }
+
+    fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
+        let Some(cache) = &self.cached_listing else {
+            return false;
+        };
+        let absolute = self.root.join(rel_path);
+        if absolute.is_dir() {
+            return false;
+        }
+        let Some(repo) = crate::gitblob::discover(&self.root) else {
+            return false;
+        };
+        let Some(workdir) = repo
+            .workdir()
+            .and_then(|workdir| workdir.canonicalize().ok())
+            .map(|workdir| workdir.normalize())
+        else {
+            return false;
+        };
+        let Ok(workdir_rel) = absolute.strip_prefix(&workdir) else {
+            return false;
+        };
+        let Ok(listed) = crate::gitblob::working_tree_path_is_listed(&repo, workdir_rel) else {
+            return false;
+        };
+        cache.update_path(
+            &ProjectFile::new(self.root.clone(), rel_path.to_path_buf()),
+            listed,
+        )
     }
 
     fn invalidate_cached_file_listing(&self) {
@@ -981,6 +1129,18 @@ impl FileSetProject {
 }
 
 impl Project for FileSetProject {
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        read_disk_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        read_disk_source_snapshot_limited(file, max_bytes)
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -1120,6 +1280,18 @@ impl MultiRootProject {
 }
 
 impl Project for MultiRootProject {
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        read_disk_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        read_disk_source_snapshot_limited(file, max_bytes)
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -1813,6 +1985,10 @@ impl Project for OverlayProject {
         self.delegate.invalidate_cached_file_listing();
     }
 
+    fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
+        self.delegate.update_cached_listing_for_path(rel_path)
+    }
+
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         self.read_source_snapshot(file)
             .map(|snapshot| snapshot.source().to_owned())
@@ -2010,6 +2186,25 @@ mod tests {
 
         let expected = "void run(); // first \u{FFFD} then second\n";
         assert_eq!(expected, project.read_source(&file).unwrap());
+        let snapshot = project.read_source_snapshot(&file).unwrap();
+        assert_eq!(snapshot.source(), expected);
+        assert_eq!(
+            snapshot.oid(),
+            Oid::hash_object(ObjectType::Blob, source).unwrap()
+        );
+        assert_ne!(snapshot.oid(), ProjectSourceSnapshot::disk(expected).oid());
+        assert_eq!(
+            project
+                .read_source_snapshot_limited(&file, source.len())
+                .unwrap(),
+            Some(snapshot)
+        );
+        assert!(
+            project
+                .read_source_snapshot_limited(&file, source.len() - 1)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             Some(expected.to_string()),
             project.read_source_limited(&file, source.len()).unwrap()
@@ -2020,6 +2215,62 @@ mod tests {
                 .read_source_limited(&file, source.len() - 1)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn source_snapshot_defaults_preserve_custom_readers() {
+        struct CustomSourceProject {
+            delegate: TestProject,
+            reads: AtomicUsize,
+        }
+
+        impl Project for CustomSourceProject {
+            fn root(&self) -> &Path {
+                self.delegate.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.delegate.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.delegate.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+                self.delegate.file_by_rel_path(rel_path)
+            }
+            fn read_source(&self, _file: &ProjectFile) -> io::Result<String> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok("class Custom {}".to_owned())
+            }
+            fn read_source_limited(
+                &self,
+                file: &ProjectFile,
+                max_bytes: usize,
+            ) -> io::Result<Option<String>> {
+                let source = self.read_source(file)?;
+                Ok((source.len() <= max_bytes).then_some(source))
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "Custom.java", "class Disk {}");
+        let project = CustomSourceProject {
+            delegate: TestProject::new(&root, Language::Java),
+            reads: AtomicUsize::new(0),
+        };
+        let expected = ProjectSourceSnapshot::disk("class Custom {}");
+        assert_eq!(project.read_source_snapshot(&file).unwrap(), expected);
+        assert_eq!(project.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            project
+                .read_source_snapshot_limited(&file, expected.source().len())
+                .unwrap(),
+            Some(expected)
+        );
+        assert_eq!(project.reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -2034,6 +2285,17 @@ mod tests {
         assert_eq!(
             io::ErrorKind::InvalidData,
             project.read_source(&file).unwrap_err().kind()
+        );
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            project.read_source_snapshot(&file).unwrap_err().kind()
+        );
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            project
+                .read_source_snapshot_limited(&file, source.len())
+                .unwrap_err()
+                .kind()
         );
         assert_eq!(
             io::ErrorKind::InvalidData,
@@ -2564,6 +2826,10 @@ mod tests {
         let disk = overlay.read_source_snapshot(&file).unwrap();
         assert_eq!(disk.source(), disk_source);
         assert_eq!(disk.origin(), ProjectSourceOrigin::Disk);
+        assert_eq!(
+            disk.oid(),
+            Oid::hash_object(ObjectType::Blob, disk_source.as_bytes()).unwrap()
+        );
         assert!(
             overlay
                 .read_source_snapshot_limited(&file, disk_source.len() - 1)
@@ -2597,6 +2863,12 @@ mod tests {
         };
 
         assert_eq!(first.source(), repeated.source());
+        assert_eq!(first.oid(), repeated.oid());
+        assert_ne!(first.oid(), middle.oid());
+        assert_eq!(
+            first.oid(),
+            Oid::hash_object(ObjectType::Blob, repeated_source.as_bytes()).unwrap()
+        );
         assert!(first_revision < middle_revision);
         assert!(middle_revision < repeated_revision);
         assert_ne!(first_revision, repeated_revision);

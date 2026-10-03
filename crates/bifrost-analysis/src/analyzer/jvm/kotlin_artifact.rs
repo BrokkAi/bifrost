@@ -500,6 +500,7 @@ fn entry_facts(
             visibility,
             is_abstract: kind == TypeKind::Interface || modifier_present(node, source, "abstract"),
             is_sealed: modifier_present(node, source, "sealed"),
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters: type_parameters(node, source),
             type_parameter_constraints: Vec::new(),
@@ -693,6 +694,7 @@ fn entry_facts(
                 return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
             });
             members.push(MemberFact {
+                non_overridable: None,
                 ambient_use: None,
                 id,
                 owner: owner_id.clone(),
@@ -734,6 +736,7 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
@@ -2073,7 +2076,7 @@ private fun hidden(): Unit = Unit
             pack_version: "2.2.0".to_owned(),
             ecosystem: "maven".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
                     name: "kotlin".to_owned(),
                     requirement: "=2.2.0".to_owned(),

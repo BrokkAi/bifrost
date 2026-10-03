@@ -4,14 +4,14 @@ use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
     CSharpMemberName, CSharpRelationalGenericCall, csharp_attribute_type_names,
-    csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
-    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
-    csharp_source_identifier, csharp_type_leftmost_identifier, csharp_type_node_identity,
-    csharp_type_reference_root, csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_callable_arity, csharp_callable_arity_from_metadata, csharp_conditional_member_access,
+    csharp_member_name, csharp_normalize_full_name, csharp_source_identifier,
+    csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    CallableArity, ClassLikeKind, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -36,7 +36,6 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceEngine, SymbolResolution,
 };
-use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -88,6 +87,86 @@ fn resolution_summary_rows<T>(
     }
 }
 
+/// Return one generic arity only when every metadata alternative publishes the
+/// same type-parameter count. An absent or conflicting row is unknown, so a
+/// caller filtering an explicit generic invocation fails closed.
+fn unique_metadata_type_parameter_arity(metadata: &[SignatureMetadata]) -> Option<usize> {
+    let mut arity = None;
+    for metadata in metadata {
+        let candidate = metadata.type_parameters().len();
+        if arity.is_some_and(|existing| existing != candidate) {
+            return None;
+        }
+        arity = Some(candidate);
+    }
+    arity
+}
+
+/// Return one declared type spelling only when every metadata alternative has
+/// that same spelling. Selecting the first row would turn overload or overlay
+/// disagreement into a false proof.
+fn unique_metadata_return_type_text(metadata: &[SignatureMetadata]) -> Option<String> {
+    let mut return_type = None;
+    for metadata in metadata {
+        let candidate = metadata.return_type_text()?.to_string();
+        if return_type
+            .as_deref()
+            .is_some_and(|existing| existing != candidate.as_str())
+        {
+            return None;
+        }
+        return_type = Some(candidate);
+    }
+    return_type
+}
+
+/// Resolve every metadata alternative and return a result only when all rows
+/// resolve to the same type. This keeps bounded lookup ambiguity visible to
+/// callers instead of allowing `find_map` to select an arbitrary row.
+fn unique_resolved_metadata_type(
+    metadata: &[SignatureMetadata],
+    mut resolve: impl FnMut(&SignatureMetadata) -> Option<String>,
+) -> Option<String> {
+    let mut resolved = None;
+    for metadata in metadata {
+        let candidate = resolve(metadata)?;
+        if resolved
+            .as_deref()
+            .is_some_and(|existing| existing != candidate.as_str())
+        {
+            return None;
+        }
+        resolved = Some(candidate);
+    }
+    resolved
+}
+
+fn method_generic_arity_for_unit(
+    csharp: &dyn CSharpSource,
+    unit: &CodeUnit,
+    session: Option<&ResolutionSession>,
+) -> Option<usize> {
+    let metadata = resolution_query_limited_rows(
+        session,
+        |limit| csharp.signature_metadata_limited(unit, limit),
+        || csharp.signature_metadata(unit),
+    );
+    unique_metadata_type_parameter_arity(&metadata)
+}
+
+fn callable_arity_for_unit(
+    csharp: &dyn CSharpSource,
+    unit: &CodeUnit,
+    session: Option<&ResolutionSession>,
+) -> Option<CallableArity> {
+    let metadata = resolution_query_limited_rows(
+        session,
+        |limit| csharp.signature_metadata_limited(unit, limit),
+        || csharp.signature_metadata(unit),
+    );
+    csharp_callable_arity_from_metadata(&metadata)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Type,
@@ -135,9 +214,13 @@ impl TargetSpec {
             owner,
             member_name: target.identifier().to_string(),
             callable_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
-                .then(|| csharp_callable_arity(graph.index, target)),
+                .then(|| csharp_callable_arity(graph.index, target))
+                .flatten(),
             generic_arity: (kind == TargetKind::Method)
-                .then(|| csharp_method_generic_arity(target.signature())),
+                .then(|| {
+                    unique_metadata_type_parameter_arity(&graph.index.signature_metadata(target))
+                })
+                .flatten(),
             is_extension_method: kind == TargetKind::Method && is_extension_method(graph, target),
         })
     }
@@ -837,20 +920,11 @@ pub fn usage_direct_base(
 }
 
 fn csharp_is_class_base_declaration(graph: &CSharpGraphSource<'_>, candidate: &CodeUnit) -> bool {
-    let language = tree_sitter_c_sharp::LANGUAGE.into();
-    let Some(parsed) = parse_tree_sitter_file(
-        candidate.source(),
-        crate::preprocessor::csharp_parse_spec(&language),
-    ) else {
-        return false;
-    };
-    graph.index.ranges(candidate).into_iter().any(|range| {
-        parsed
-            .tree
-            .root_node()
-            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-            .is_some_and(|node| matches!(node.kind(), "class_declaration" | "record_declaration"))
-    })
+    let metadata = graph.index.signature_metadata(candidate);
+    !metadata.is_empty()
+        && metadata
+            .iter()
+            .all(|metadata| metadata.class_like_kind() == Some(ClassLikeKind::Class))
 }
 
 fn forward_class_unit_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Option<CodeUnit> {
@@ -1272,7 +1346,7 @@ fn member_declared_type_fq_name_inner(
             || csharp.signature_metadata(&unit),
         );
         let resolved = if let Some(session) = session {
-            let resolved = metadata.iter().find_map(|metadata| {
+            let resolved = unique_resolved_metadata_type(&metadata, |metadata| {
                 let identity = metadata.return_type_identity()?;
                 resolve_structured_member_type_fq_name_in_session(
                     csharp,
@@ -1285,10 +1359,7 @@ fn member_declared_type_fq_name_inner(
             })?;
             Some(resolved)
         } else {
-            let declared_type = metadata
-                .iter()
-                .find_map(|metadata| metadata.return_type_text().map(str::to_string))
-                .or_else(|| member_declared_type(csharp, &unit));
+            let declared_type = unique_metadata_return_type_text(&metadata);
             declared_type.and_then(|declared_type| {
                 resolve_member_type_fq_name(
                     csharp,
@@ -1310,9 +1381,9 @@ fn member_declared_type_fq_name_inner(
 }
 
 /// Resolve the type named by a method's declared return type, so a call
-/// receiver (`GetFoo().Member`) can be typed by the callee. The stored member
-/// `signature()` keeps only the parameter list, so read the return type from the
-/// full signature text (`signatures`), which is `Return Name(params) { … }`.
+/// receiver (`GetFoo().Member`) can be typed by the callee. The declaration
+/// metadata carries both the written return type and its structured identity;
+/// every metadata alternative must resolve to the same type.
 #[allow(clippy::too_many_arguments)]
 pub fn method_return_type_fq_name_for_arity(
     csharp: &dyn CSharpSource,
@@ -1415,7 +1486,7 @@ fn method_return_type_fq_name_for_arity_inner(
         if !unit.is_function() {
             continue;
         }
-        let callable_arity = resolution_query(session, || csharp_callable_arity(csharp, &unit))?;
+        let callable_arity = callable_arity_for_unit(csharp, &unit, session)?;
         if arity.is_some_and(|call_arity| !callable_arity.accepts(call_arity)) {
             continue;
         }
@@ -1464,7 +1535,7 @@ fn callable_return_type_fq_name(
         .flatten()
         .unwrap_or_else(|| owner_fallback.clone());
     if let Some(session) = session {
-        return metadata.iter().find_map(|metadata| {
+        return unique_resolved_metadata_type(&metadata, |metadata| {
             resolve_structured_method_return_type_fq_name_in_session(
                 csharp,
                 token,
@@ -1480,10 +1551,7 @@ fn callable_return_type_fq_name(
     {
         return Some(substituted);
     }
-    let declared_type = metadata
-        .iter()
-        .find_map(|metadata| metadata.return_type_text().map(str::to_string))
-        .or_else(|| method_return_type(csharp, unit))?;
+    let declared_type = unique_metadata_return_type_text(&metadata)?;
     resolve_member_type_fq_name(
         csharp,
         token,
@@ -1647,7 +1715,7 @@ fn substituted_method_type_parameter(
     explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
     let arguments = explicit_type_arguments?;
-    metadata.iter().find_map(|metadata| {
+    unique_resolved_metadata_type(metadata, |metadata| {
         let return_type = metadata.bare_return_type_parameter()?;
         metadata
             .type_parameters()
@@ -2116,29 +2184,6 @@ fn unique_logical_type_fq_name(
         return None;
     }
     graph_support::first_logical_type_fqn(candidates)
-}
-
-fn member_declared_type(csharp: &dyn CSharpSource, member: &CodeUnit) -> Option<String> {
-    let signatures = csharp.signatures(member);
-    let signature = member
-        .signature()
-        .or_else(|| signatures.first().map(String::as_str))?;
-    type_text_before_name(signature, member.identifier())
-}
-
-/// A method's declared return type, read from the full signature
-/// (`Return Name(params) { … }`); constructors, whose signature starts at the
-/// name, yield `None`.
-fn method_return_type(csharp: &dyn CSharpSource, method: &CodeUnit) -> Option<String> {
-    let signatures = csharp.signatures(method);
-    let signature = signatures.first().map(String::as_str)?;
-    type_text_before_name(signature, method.identifier())
-}
-
-/// Extract the (normalized) type token that precedes `name` in a declaration
-/// signature — the field/parameter type or a method's return type.
-fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
-    csharp_signature_return_type(signature, name)
 }
 
 /// What the binding seeder settled about a local's or parameter's declared
@@ -3597,9 +3642,9 @@ fn visible_extension_method_candidates_inner(
             if !resolution_scope_step(session) {
                 return Vec::new();
             }
-            if explicit_generic_arity
-                .is_some_and(|arity| csharp_method_generic_arity(unit.signature()) != arity)
-            {
+            if explicit_generic_arity.is_some_and(|arity| {
+                method_generic_arity_for_unit(csharp, &unit, session) != Some(arity)
+            }) {
                 continue;
             }
             let receiver = if usage {
@@ -3668,10 +3713,8 @@ fn visible_extension_method_candidates_inner(
             .iter()
             .filter(|candidate| {
                 resolution_scope_step(session)
-                    && resolution_query(session, || {
-                        csharp_callable_arity(graph.index, candidate).accepts(declared_arity)
-                    })
-                    .unwrap_or(false)
+                    && callable_arity_for_unit(csharp, candidate, session)
+                        .is_none_or(|arity| arity.accepts(declared_arity))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4417,27 +4460,31 @@ pub fn filter_call_argument_method_candidates(
     call_arity: usize,
     explicit_generic_arity: Option<usize>,
 ) -> Vec<CodeUnit> {
-    filter_call_argument_method_candidates_with_arities(
+    filter_call_argument_method_candidates_with_metadata(
         candidates,
         call_arity,
         explicit_generic_arity,
-        |candidate| csharp_callable_arity(csharp, candidate),
+        |candidate| csharp.signature_metadata(candidate),
     )
 }
 
-pub fn filter_call_argument_method_candidates_with_arities(
+pub fn filter_call_argument_method_candidates_with_metadata(
     candidates: impl IntoIterator<Item = CodeUnit>,
     call_arity: usize,
     explicit_generic_arity: Option<usize>,
-    callable_arity: impl Fn(&CodeUnit) -> CallableArity,
+    signature_metadata: impl Fn(&CodeUnit) -> Vec<SignatureMetadata>,
 ) -> Vec<CodeUnit> {
     let mut methods = candidates
         .into_iter()
         .filter(|candidate| {
-            candidate.is_function()
-                && explicit_generic_arity
-                    .is_none_or(|arity| csharp_method_generic_arity(candidate.signature()) == arity)
-                && callable_arity(candidate).accepts(call_arity)
+            if !candidate.is_function() {
+                return false;
+            }
+            let metadata = signature_metadata(candidate);
+            explicit_generic_arity
+                .is_none_or(|arity| unique_metadata_type_parameter_arity(&metadata) == Some(arity))
+                && csharp_callable_arity_from_metadata(&metadata)
+                    .is_some_and(|arity| arity.accepts(call_arity))
         })
         .collect::<Vec<_>>();
     methods.sort();
@@ -4570,16 +4617,14 @@ pub fn nearest_member_candidates_for_owner_inner(
                 }
                 if !explicit_generic_arity.is_none_or(|arity| {
                     candidate.is_function()
-                        && csharp_method_generic_arity(candidate.signature()) == arity
+                        && method_generic_arity_for_unit(csharp, &candidate, session) == Some(arity)
                 }) {
                     continue;
                 }
                 let accepts_arity = call_arity.is_none_or(|arity| {
                     candidate.is_function()
-                        && resolution_query(session, || {
-                            csharp_callable_arity(graph.index, &candidate).accepts(arity)
-                        })
-                        .unwrap_or(false)
+                        && callable_arity_for_unit(csharp, &candidate, session)
+                            .is_none_or(|declared| declared.accepts(arity))
                 });
                 if accepts_arity {
                     members.push(candidate);

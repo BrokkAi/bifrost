@@ -25,6 +25,22 @@ pub fn unwrap_attributes(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
+/// The containing syntax node outside an attribute wrapper owned by `node`.
+/// Payload and wrapper expose the same attributes, so ancestry consumers must
+/// cross that boundary once rather than applying its predicates twice.
+pub fn parent_outside_attributes(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if ATTRIBUTE_WRAPPER_KINDS.contains(&parent.kind())
+            && unwrap_attributes(parent) == unwrap_attributes(node)
+        {
+            node = parent;
+        } else {
+            return Some(parent);
+        }
+    }
+    None
+}
+
 /// Return the outer `attribute_item`s attached to `node`.
 ///
 /// `node` may be either the wrapper written by the grammar or the item returned

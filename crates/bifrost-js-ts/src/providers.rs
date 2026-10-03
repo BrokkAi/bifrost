@@ -21,7 +21,8 @@
 //! `analyzer/js_ts/providers.rs`, calling the uncached functions here.
 
 use crate::hierarchy::resolve_direct_ancestors;
-use crate::imports::{import_info_tokens, resolve_js_ts_import_paths};
+use crate::imports::{import_info_tokens, resolve_js_ts_import_info_paths};
+use crate::source_facts::JsTsFileSourceFacts;
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::ImportInfo;
@@ -57,6 +58,21 @@ use crate::graph::resolver::JsTsUsageIndex;
 /// [`TypeHierarchyProvider`] never exposes, and `import_statements` reads
 /// the raw import statement text the module skeleton renders.
 pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+    /// Source identities independently of parse-product readiness. Missing
+    /// inventory support cannot establish a complete workspace graph.
+    fn source_file_inventory(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
+        brokk_bifrost_core::analyzer::query_batch::QueryBatch::incomplete(Vec::new(), 0)
+    }
+
+    /// Published source-owned facts for one analyzed file. An unavailable
+    /// publication is a graph-build failure; callers must not reparse the
+    /// file to synthesize a substitute.
+    fn source_facts(&self, _file: &ProjectFile) -> Option<Arc<JsTsFileSourceFacts>> {
+        None
+    }
+
     /// The analyzer's shared alias resolver. Returned by handle so a caller
     /// that must own one (the receiver-fact provider) shares this instance's
     /// config memo instead of constructing a resolver whose memo starts cold.
@@ -90,27 +106,6 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// rendering, which the alias skeleton must not double up on.
     fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
 
-    /// The aliased type of a TypeScript type-alias declaration, read from the
-    /// `type_alias_declaration`'s AST `value` field. `None` when the unit is
-    /// not an alias or the analyzer holds no syntax tree for its file.
-    ///
-    /// The signature string cannot answer this: splitting it at the first
-    /// `=` hits a type-parameter default's `=` instead of the alias's own
-    /// assignment (#2227).
-    fn type_alias_value_text(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
-    /// A member field's declared type, read from the `property_signature`'s
-    /// AST `type` annotation. `None` when the unit has no annotation or the
-    /// analyzer holds no syntax tree for its file.
-    ///
-    /// The signature string cannot answer this: splitting it on `,` cuts a
-    /// multi-argument generic like `Map<string, number>` in half (#2227).
-    fn member_type_annotation_text(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
     /// Run one synchronous resolution step against a step-local bounded
     /// definition lookup. A file scan keeps the callback open for its complete
     /// AST walk, so its receiver provider and nested resolvers share one memo
@@ -122,7 +117,8 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     );
 
     /// The analyzer-cached JS/TS resolution index for this source's own language,
-    /// built on first use. `None` only when `cancellation` fires mid-build.
+    /// built on first use. `None` means cancellation or unavailable canonical
+    /// source publication; callers must report the structured failure.
     ///
     /// The memo cell behind it is a `PoolSafeMemo` on the analysis-side cache
     /// bucket; this is the product, not the cell.
@@ -159,8 +155,7 @@ pub fn resolve_imported_code_units(
     let alias_resolver = host.alias_resolver();
     let mut resolved = HashSet::default();
     for import in imports {
-        for target in
-            resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))
+        for target in resolve_js_ts_import_info_paths(file, &import, language, Some(alias_resolver))
         {
             let top_level = host.top_level_declarations(&target);
             if import.is_wildcard {
@@ -222,12 +217,7 @@ pub fn imported_files_from_infos(
         imports
             .iter()
             .flat_map(|import| {
-                resolve_js_ts_import_paths(
-                    file,
-                    &import.raw_snippet,
-                    language,
-                    Some(alias_resolver),
-                )
+                resolve_js_ts_import_info_paths(file, import, language, Some(alias_resolver))
             })
             .collect(),
     )
@@ -270,7 +260,7 @@ pub fn resolve_import_target_files(
     host.import_info_of(token, file)
         .iter()
         .flat_map(|import| {
-            resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))
+            resolve_js_ts_import_info_paths(file, import, language, Some(alias_resolver))
         })
         .collect()
 }

@@ -1,6 +1,8 @@
+use crate::analyzer::is_language_configuration_input;
 use crate::hash::HashSet;
 use crate::path_normalization::NormalizePath;
 use crate::{BIFROST_IGNORE_FILE_NAME, Project, ProjectFile};
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{
     Config, Event, EventKind, PathOp, PollWatcher, RecommendedWatcher, Watcher, recommended_watcher,
 };
@@ -158,17 +160,27 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
         return;
     }
 
-    // Any real change may add or remove listed paths, or alter what the
-    // listing means (`.gitignore` edits, git index updates), so drop the
-    // session's cached workspace listing before classification below --
-    // `classify_project_path` consults `is_gitignored`, which refills the
-    // cache from the now-current filesystem state. Events touching only the
-    // analyzer's own SQLite state are exempt, exactly like the snapshot: those
-    // writes follow every analyzed change, and letting them drop the listing
-    // would defeat the cache during normal operation.
-    if paths
+    // A change that may add or remove listed paths, or alter what the listing
+    // means (`.gitignore` edits), drops the session's cached workspace listing
+    // before classification below -- `classify_project_path` consults
+    // `is_gitignored`, which refills the cache from the now-current filesystem
+    // state, and a refill walks the whole worktree and runs its dirty-path
+    // scan. A content write to an existing file changes neither: the listing
+    // is membership, not content. Keeping the listing for those is what keeps
+    // an editor's save proportional to the file; before, each save paid two
+    // whole-worktree walks in this handler before its path reached the pending
+    // set (gate 13 defect 3). Events touching only the analyzer's own SQLite
+    // state are exempt, exactly like the snapshot: those writes follow every
+    // analyzed change, and letting them drop the listing would defeat the
+    // cache during normal operation.
+    let project_paths = paths
         .iter()
-        .any(|path| !is_internal_state_path(project.as_ref(), path))
+        .copied()
+        .filter(|path| !is_internal_state_path(project.as_ref(), path))
+        .collect::<Vec<_>>();
+    if listing_may_change(&event, &project_paths)
+        && !project_paths.is_empty()
+        && !update_listing_incrementally(project.as_ref(), &event, &project_paths)
     {
         project.invalidate_cached_file_listing();
     }
@@ -198,6 +210,47 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     if saw_refresh_fallback_path && triggers_refresh_fallback(&event) {
         mark_full_refresh(pending);
     }
+}
+
+/// Whether an event can change the workspace listing's membership. Content
+/// and metadata writes cannot, unless the written file is an ignore file whose
+/// rules decide membership. Every other kind (create, remove, rename, and the
+/// backend's unclassified `Any`/`Other`) can.
+fn listing_may_change(event: &Event, paths: &[&Path]) -> bool {
+    let content_write = matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+    );
+    !content_write
+        || paths
+            .iter()
+            .any(|path| path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME)))
+}
+
+const GITIGNORE_FILE_NAME: &str = ".gitignore";
+
+/// Update the cached listing for a create, remove or rename by deciding each
+/// named path alone, instead of dropping the listing and walking the
+/// worktree. An editor that saves through a temporary file and a rename
+/// produces exactly these events, one path each. Returns `false`, and the
+/// caller drops the listing, for any other kind, a `.gitignore` (its rules
+/// change membership elsewhere), a path outside the root, or a path the
+/// project cannot decide alone (a directory, a workspace outside git).
+fn update_listing_incrementally(project: &dyn Project, event: &Event, paths: &[&Path]) -> bool {
+    let membership_event = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::File | CreateKind::Any)
+            | EventKind::Remove(RemoveKind::File | RemoveKind::Any)
+            | EventKind::Modify(ModifyKind::Name(_))
+    );
+    membership_event
+        && paths.iter().all(|path| {
+            let path = path.to_path_buf().normalize();
+            path.file_name() != Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
+                && path
+                    .strip_prefix(project.root())
+                    .is_ok_and(|rel_path| project.update_cached_listing_for_path(rel_path))
+        })
 }
 
 /// Event kinds that can invalidate more than the paths they name, so a path
@@ -341,10 +394,13 @@ fn watch_project_paths(
 ) -> Result<(), String> {
     let recursive_roots = watch_roots(project, claimed_files)?;
     let mut operations = Vec::new();
-    if !recursive_roots.iter().any(|path| path == project.root()) {
-        operations.push(PathOp::watch_non_recursive(project.root()));
-    }
 
+    // Recursive roots cover only directories that hold analyzed sources. A
+    // configuration input often sits above all of them (`crates/x/Cargo.toml`
+    // over `crates/x/src`, a nested `go.mod` or `tsconfig.json`), so each
+    // directory holding one gets its own non-recursive watch, as does each
+    // directory holding a `.bifrostignore`, and the root.
+    let languages = project.analyzer_languages();
     let mut configuration_directories = crate::hash::HashSet::default();
     configuration_directories.insert(project.root().to_path_buf());
     for file in project
@@ -355,6 +411,9 @@ fn watch_project_paths(
             .rel_path()
             .file_name()
             .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+            || languages
+                .iter()
+                .any(|language| is_language_configuration_input(*language, &file))
         {
             let directory = file
                 .abs_path()
@@ -597,6 +656,48 @@ mod tests {
         );
     }
 
+    /// A language's configuration input often sits one directory above every
+    /// source file it governs (`crates/x/Cargo.toml` over `crates/x/src`), so
+    /// no recursive source root covers it. An edit to it must still reach
+    /// the pending delta, or the analyzer keeps the old crate, module or
+    /// path-alias layout until a restart (#3755).
+    #[test]
+    fn polling_watcher_delivers_nested_configuration_edits() {
+        for (manifest, files) in [
+            (
+                "crates/x/Cargo.toml",
+                &["Cargo.toml", "crates/x/Cargo.toml", "crates/x/src/lib.rs"][..],
+            ),
+            ("svc/go.mod", &["svc/go.mod", "svc/pkg/foo.go"][..]),
+            (
+                "packages/web/tsconfig.json",
+                &["packages/web/tsconfig.json", "packages/web/src/index.ts"][..],
+            ),
+        ] {
+            let (_temp, project) = project_with_files(files);
+            let manifest_path = project.root().join(manifest);
+            let watcher =
+                ProjectChangeWatcher::start_polling_for_tests(Arc::clone(&project)).unwrap();
+
+            fs::write(&manifest_path, "updated configuration\n").unwrap();
+            for _ in 0..100 {
+                if watcher.has_pending() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let delta = watcher.take_changed_files();
+            assert!(
+                delta
+                    .files
+                    .iter()
+                    .any(|file| file.abs_path() == manifest_path),
+                "the watcher must deliver the edit to {manifest}: {delta:?}"
+            );
+        }
+    }
+
     #[test]
     fn watch_roots_fall_back_to_project_root_when_no_analyzable_files_exist() {
         let temp = TempDir::new().unwrap();
@@ -760,6 +861,150 @@ mod tests {
             cache.files().unwrap().contains(&extra),
             "a watcher event must drop the cached listing"
         );
+    }
+
+    /// Gate 13 defect 3: a content write to a listed file changes the file,
+    /// not the listing, so the watcher keeps the listing (no worktree walk)
+    /// and still hands the file to the next snapshot. A write to a
+    /// `.gitignore` can change membership, so it still drops the listing.
+    #[test]
+    fn content_writes_keep_the_cached_listing_and_still_report_the_file() {
+        use crate::WorkspaceFileListingCache;
+        use notify::event::DataChange;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+        cache.files().unwrap();
+        let walks = cache.walk_count();
+
+        let main = ProjectFile::new(root.clone(), "src/main.rs");
+        fs::write(main.abs_path(), "fn main() { let edited = 1; }\n").unwrap();
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        ] {
+            handle_event(
+                &project,
+                &pending,
+                Event::new(kind).add_path(main.abs_path()),
+            );
+        }
+        cache.files().unwrap();
+        assert_eq!(
+            cache.walk_count(),
+            walks,
+            "a content write must not walk the worktree"
+        );
+        let state = pending.lock().unwrap();
+        assert!(
+            state.files.contains(&main),
+            "the written file is still reported"
+        );
+        assert!(!state.requires_full_refresh);
+        drop(state);
+
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(root.join(".gitignore")),
+        );
+        cache.files().unwrap();
+        assert_eq!(
+            cache.walk_count(),
+            walks + 1,
+            "a .gitignore write can change membership and must drop the listing"
+        );
+    }
+
+    /// An editor that saves through a temporary file writes `name.tmp` and
+    /// renames it over `name`. Both paths are decided alone, so the save walks
+    /// nothing, the saved file is still reported, and the temporary file is
+    /// listed while it exists and gone after the rename. A new ignored file is
+    /// decided the same way and stays out of the listing.
+    #[test]
+    fn a_rename_save_walks_nothing_and_still_reports_the_file() {
+        use crate::WorkspaceFileListingCache;
+        use notify::event::{DataChange, RenameMode};
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        let repository = git2::Repository::init(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(std::path::Path::new("src/main.rs")).unwrap();
+        index.add_path(std::path::Path::new(".gitignore")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+        cache.files().unwrap();
+        let walks = cache.walk_count();
+
+        let main = ProjectFile::new(root.clone(), "src/main.rs");
+        let temp_file = ProjectFile::new(root.clone(), "src/main.rs.tmp");
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        fs::write(temp_file.abs_path(), "fn main() { let saved = 1; }\n").unwrap();
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Create(CreateKind::File)).add_path(temp_file.abs_path()),
+        );
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(temp_file.abs_path()),
+        );
+        assert!(cache.files().unwrap().contains(&temp_file));
+        fs::rename(temp_file.abs_path(), main.abs_path()).unwrap();
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(temp_file.abs_path())
+                .add_path(main.abs_path()),
+        );
+        let listing = cache.files().unwrap();
+        assert!(listing.contains(&main));
+        assert!(!listing.contains(&temp_file));
+
+        let log = ProjectFile::new(root.clone(), "src/run.log");
+        fs::write(log.abs_path(), "log\n").unwrap();
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Create(CreateKind::File)).add_path(log.abs_path()),
+        );
+        assert!(
+            !cache.files().unwrap().contains(&log),
+            "an ignored file is not listed"
+        );
+
+        assert_eq!(
+            cache.walk_count(),
+            walks,
+            "a rename save must not walk the worktree"
+        );
+        let state = pending.lock().unwrap();
+        assert!(
+            state.files.contains(&main),
+            "the saved file is still reported"
+        );
+        assert!(!state.requires_full_refresh);
     }
 
     /// Issue #1848. `git status` -- which every workspace listing runs -- writes

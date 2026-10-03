@@ -276,13 +276,19 @@ fn record_usage_index_scope(host: &dyn JsTsMemoSource) {
 /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for the host's
 /// language. Built once per cache bucket and reused until `update`/`update_all`
 /// installs a fresh bucket.
-pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
+pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.language();
-    let index = host.memo_caches().jsts_usage_index.get_or_build(
-        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
-        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
-    );
-    record_usage_index_scope(host);
+    let index = host
+        .memo_caches()
+        .jsts_usage_index
+        .get_or_try_build(
+            || build_jsts_usage_index(host, host.alias_resolver(), language, true).ok_or(()),
+            || build_jsts_usage_index(host, host.alias_resolver(), language, false).ok_or(()),
+        )
+        .ok();
+    if index.is_some() {
+        record_usage_index_scope(host);
+    }
     index
 }
 
@@ -294,13 +300,21 @@ pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex>
 /// plugin calls this orchestration-specific entry point before its fan-out, so
 /// the memo can safely use the parallel builder without any scan task being
 /// able to re-enter the in-flight cell.
-pub(crate) fn jsts_usage_index_for_parallel_scan(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
+pub(crate) fn jsts_usage_index_for_parallel_scan(
+    host: &dyn JsTsMemoSource,
+) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.language();
-    let index = host.memo_caches().jsts_usage_index.get_or_build_parallel(
-        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
-        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
-    );
-    record_usage_index_scope(host);
+    let index = host
+        .memo_caches()
+        .jsts_usage_index
+        .get_or_try_build(
+            || build_jsts_usage_index(host, host.alias_resolver(), language, true).ok_or(()),
+            || build_jsts_usage_index(host, host.alias_resolver(), language, false).ok_or(()),
+        )
+        .ok();
+    if index.is_some() {
+        record_usage_index_scope(host);
+    }
     index
 }
 

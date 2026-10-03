@@ -63,7 +63,7 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 /// Bumped for #3664: a capture slot whose enclosing procedure publishes no
 /// binding now carries a typed `Captures` gap instead of failing the
 /// capture-contract validator.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v7";
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v10";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -290,6 +290,7 @@ fn kotlin_capabilities() -> SemanticCapabilities {
 mod control;
 mod inventory;
 mod syntax;
+pub(crate) use syntax::PROCEDURE_SYNTAX_ROLES;
 #[cfg(test)]
 mod tests;
 mod values;
@@ -365,6 +366,9 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// Locals declared `by` a delegate. Reading or assigning one calls the
+    /// delegate's `getValue` or `setValue`, which is not a binding access.
+    delegated_locals: HashSet<ValueId>,
     /// Nested callables a bare name in this body can denote: a local `fun`, or
     /// a lambda bound to a local `val`. These are the only Kotlin callees whose
     /// target is provable without whole-program dispatch.

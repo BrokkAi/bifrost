@@ -43,6 +43,12 @@ macro_rules! forward_relational_definition_batch {
             crate::analyzer::RelationalDefinitionLookup::batch(&self.inner, requests, cancellation)
         }
 
+        fn source_file_inventory(
+            &self,
+        ) -> crate::analyzer::QueryBatch<crate::analyzer::ProjectFile> {
+            self.inner.source_file_inventory()
+        }
+
         fn workspace_declarations_with_primary_ranges(
             &self,
             cancellation: &crate::CancellationToken,
@@ -1172,7 +1178,52 @@ impl AnalyzerQueryContext {
     }
 }
 
+/// Enumerate source identities independently of persisted parse-product readiness.
+pub(crate) fn project_source_file_inventory(
+    analyzer: &(impl IAnalyzer + ?Sized),
+) -> QueryBatch<ProjectFile> {
+    let project = analyzer.project();
+    let listed = match project.all_files_shared() {
+        Ok(files) => files,
+        Err(error) => {
+            analyzer.record_query_failure(StoreError::new(format!(
+                "listing source inventory under {:?}: {error}",
+                project.root()
+            )));
+            return QueryBatch::incomplete(Vec::new(), 0);
+        }
+    };
+    let mut inventory = QueryBatch::complete(Vec::new(), listed.len());
+    for language in analyzer.languages() {
+        if super::languages::language_support(language).is_none() {
+            continue;
+        }
+        match project.analyzable_files_from(&listed, language) {
+            Ok(files) => inventory.rows.extend(files),
+            Err(error) => {
+                analyzer.record_query_failure(StoreError::new(format!(
+                    "listing {language:?} source inventory under {:?}: {error}",
+                    project.root()
+                )));
+                inventory.complete = false;
+            }
+        }
+    }
+    inventory.rows.sort();
+    inventory.rows.dedup();
+    inventory
+}
+
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    /// Source files owned by this analyzer, including files whose parse products
+    /// are unavailable. Listing failures preserve available identities and mark
+    /// the batch incomplete. This inventory must not hydrate declarations, read
+    /// source text, or retry publication. Concrete analyzers retain any adopted
+    /// extension identities from their selected source snapshot.
+    fn source_file_inventory(&self) -> QueryBatch<ProjectFile> {
+        project_source_file_inventory(self)
+    }
+
     /// Test-only counter hooks, quarantined behind one accessor so the
     /// analyzer contract does not carry twenty-one instrumentation methods in
     /// every build. The accessor is feature-gated rather than the hooks being a
@@ -2701,8 +2752,30 @@ pub(crate) fn usage_answer_digest(
     overload: &CodeUnit,
 ) -> crate::analyzer::semantic::ids::StableDigest {
     let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(USAGE_ANSWER_DOMAIN);
+    if let FuzzyResult::Incomplete { diagnostics, .. } = result {
+        hasher.value(b"semantic_incomplete");
+        let mut reasons = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    &diagnostic.fq_name,
+                    &diagnostic.strategy,
+                    &diagnostic.reason_kind,
+                    &diagnostic.reason,
+                )
+            })
+            .collect::<Vec<_>>();
+        reasons.sort();
+        for (fq_name, strategy, reason_kind, reason) in reasons {
+            hasher.field(fq_name, strategy.as_bytes());
+            hasher.field(reason_kind, reason.as_bytes());
+        }
+    }
     match result {
         FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Incomplete {
             hits_by_overload, ..
         }
         | FuzzyResult::Ambiguous {

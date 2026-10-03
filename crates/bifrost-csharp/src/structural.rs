@@ -1,7 +1,6 @@
 //! C# structural spec for `query_code`.
 
 use crate::syntax::{csharp_conditional_member_access, csharp_member_name};
-use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
@@ -20,12 +19,14 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -33,8 +34,9 @@ pub struct CSharpStructuralSpec;
 
 pub static CSHARP_STRUCTURAL_SPEC: CSharpStructuralSpec = CSharpStructuralSpec;
 
-static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
-    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::Binder);
 
 pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("invocation_expression", NormalizedKind::Call),
@@ -59,6 +61,10 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("using_directive", NormalizedKind::Import),
     ("attribute", NormalizedKind::Decorator),
     ("identifier", NormalizedKind::Identifier),
+    // A lambda's unparenthesized parameter (`x => ..`) is its own token kind.
+    ("implicit_parameter", NormalizedKind::Identifier),
+    // A block is a local declaration space.
+    ("block", NormalizedKind::Block),
     ("generic_name", NormalizedKind::Identifier),
     ("qualified_name", NormalizedKind::Identifier),
     ("alias_qualified_name", NormalizedKind::Identifier),
@@ -187,6 +193,155 @@ fn csharp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
     csharp_member_name(member_name)
         .is_some_and(|member| member.identifier.id() == node.id())
         .then_some(OccurrenceRole::MemberPosition)
+}
+
+/// C# derives its scope tree from the callable, class-like, loop, catch and
+/// block facts in [`CSHARP_KIND_TABLE`], and every binder it classifies states
+/// an interval through [`csharp_binding_activation`] or declines. Import
+/// binders and the package clause are not derived; the member walk reports
+/// per-candidate callable applicability (#1478 M3).
+static CSHARP_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport =
+    LexicalEnvironmentSupport::NONE
+        .supported(EnvironmentAxis::Scopes)
+        .supported(EnvironmentAxis::BindingIntervals)
+        .supported(EnvironmentAxis::CallableApplicability);
+
+/// The pattern and designation kinds whose `name` field declares a variable.
+const CSHARP_PATTERN_BINDERS: &[&str] = &[
+    "declaration_pattern",
+    "var_pattern",
+    "recursive_pattern",
+    "list_pattern",
+    "tuple_pattern",
+    "parenthesized_variable_designation",
+];
+
+/// The LINQ clauses that introduce a range variable.
+const CSHARP_QUERY_BINDERS: &[&str] = &[
+    "from_clause",
+    "let_clause",
+    "join_clause",
+    "join_into_clause",
+    "query_continuation",
+];
+
+/// Whether `node` is the token that declares a C# local, parameter, pattern
+/// or query variable. A field's declarator names a member, not a binding.
+fn csharp_is_binder(node: Node<'_>) -> bool {
+    if node.kind() == "implicit_parameter" {
+        return true;
+    }
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let named = |field: &str| parent.child_by_field_name(field) == Some(node);
+    match parent.kind() {
+        "variable_declarator" => {
+            named("name")
+                && parent
+                    .parent()
+                    .and_then(|declaration| declaration.parent())
+                    .is_some_and(|owner| {
+                        !matches!(
+                            owner.kind(),
+                            "field_declaration" | "event_field_declaration"
+                        )
+                    })
+        }
+        "parameter" | "catch_declaration" | "declaration_expression" | "from_clause" => {
+            named("name")
+        }
+        "foreach_statement" => named("left"),
+        // A designation lists every name it declares in its `name` field.
+        kind if CSHARP_PATTERN_BINDERS.contains(&kind) => {
+            let mut cursor = parent.walk();
+            parent
+                .children_by_field_name("name", &mut cursor)
+                .any(|name| name.id() == node.id())
+        }
+        // A let, join, into or continuation clause names its variable with
+        // the first identifier after its keyword; its expressions follow.
+        kind if CSHARP_QUERY_BINDERS.contains(&kind) => {
+            let mut cursor = parent.walk();
+            parent.named_children(&mut cursor).find(|child| {
+                child.kind() == "identifier" && parent.child_by_field_name("type") != Some(*child)
+            }) == Some(node)
+        }
+        _ => false,
+    }
+}
+
+/// The binding one C# binder token introduces, and the interval it is in
+/// effect over.
+///
+/// A C# local's scope is its whole enclosing block (its declaration space);
+/// using it before its declarator is an error, not a reference to an outer
+/// binding, and a nested block may not redeclare the name. So a local, an
+/// `out var` and a pattern variable are `ScopeWide` over the scope that
+/// declares them. Parameters are `ScopeWide` over their callable. A
+/// `using`/`fixed` resource is in effect over its statement, a catch variable
+/// over its catch clause, and a `foreach` variable over the loop body. A LINQ
+/// range variable states no interval: its scope is the rest of the query,
+/// which this adapter does not model, so the file reports incomplete.
+fn csharp_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let binding = |kind, hoisting, activation| {
+        Some(BindingActivation {
+            kind,
+            hoisting,
+            activation,
+        })
+    };
+    if binder.kind() == "implicit_parameter" {
+        return binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope);
+    }
+    let parent = binder.parent()?;
+    match parent.kind() {
+        "parameter" => binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope),
+        "catch_declaration" => binding(
+            BindingKind::CatchOrResource,
+            HoistingClass::DeclaredHead,
+            node_range(parent.parent()?),
+        ),
+        "foreach_statement" => binding(
+            BindingKind::LoopVariable,
+            HoistingClass::DeclaredHead,
+            node_range(parent.child_by_field_name("body")?),
+        ),
+        "variable_declarator" => {
+            let statement = parent.parent()?.parent()?;
+            if matches!(statement.kind(), "using_statement" | "fixed_statement") {
+                return binding(
+                    BindingKind::CatchOrResource,
+                    HoistingClass::DeclaredHead,
+                    node_range(statement),
+                );
+            }
+            binding(BindingKind::Local, HoistingClass::ScopeWide, scope)
+        }
+        "declaration_expression" => binding(BindingKind::Local, HoistingClass::ScopeWide, scope),
+        kind if CSHARP_PATTERN_BINDERS.contains(&kind) => {
+            // A deconstructing `foreach` binds its loop variables.
+            let foreach = std::iter::successors(Some(parent), |node| node.parent())
+                .take_while(|node| {
+                    CSHARP_PATTERN_BINDERS.contains(&node.kind())
+                        || node.kind() == "declaration_expression"
+                        || node.kind() == "foreach_statement"
+                })
+                .find(|node| node.kind() == "foreach_statement");
+            match foreach {
+                Some(foreach) => binding(
+                    BindingKind::LoopVariable,
+                    HoistingClass::DeclaredHead,
+                    node_range(foreach.child_by_field_name("body")?),
+                ),
+                None => binding(BindingKind::PatternBinder, HoistingClass::ScopeWide, scope),
+            }
+        }
+        _ => None,
+    }
 }
 
 fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
@@ -361,10 +516,11 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        // C# classifies no scopes, binding intervals, import binders or
-        // package clause, but its member walk reports per-candidate callable
-        // applicability (#1478 M3). The per-axis table states exactly that.
-        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
+        &CSHARP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        csharp_binding_activation(binder, scope)
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
@@ -390,6 +546,8 @@ impl StructuralSpec for CSharpStructuralSpec {
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = csharp_member_position(node) {
             sink.occurrence_role(node, role);
+        } else if csharp_is_binder(node) {
+            sink.occurrence_role(node, OccurrenceRole::Binder);
         }
 
         match kind {

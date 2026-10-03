@@ -12,7 +12,7 @@ use super::{
     AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
     HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
     candidate_row_from_row, candidate_row_from_row_at, hydrate_candidate_rows, hydrate_unit_fq,
-    require_generation_map, signature_metadata_from_row, signature_metadata_value_columns_sql,
+    require_generation_map, signature_metadata_projection_from_row,
 };
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
@@ -27,6 +27,22 @@ const CANDIDATE_COLUMNS: &str =
      units.normalized_fqn_tail";
 
 const SET_QUERY_MIN_REQUESTS: usize = 64;
+
+// This is deliberately separate from `content_sql`: the ordinary relational
+// views are ready-only and therefore cannot witness a matching blob that was
+// excluded by the source-facts readiness boundary. The candidate view keeps
+// that row with a persisted availability bit for this bounded preflight.
+pub(super) const CALLABLE_CANDIDATE_AVAILABILITY_SQL: &str = "SELECT EXISTS(
+     SELECT 1
+     FROM callable_candidate_definition_names AS names
+     WHERE names.lang = ?1
+       AND names.prefix = ?2
+       AND names.tail = ?3
+       AND names.exact_parent_tail = ?4
+       AND names.identifier = ?5
+       AND names.visibility_available = 0
+     LIMIT 1
+   )";
 
 fn content_sql(view: &str, predicate: &str) -> String {
     format!(
@@ -776,9 +792,8 @@ fn set_structural_member_values<A: LanguageAdapter>(
 /// path row, which is why every shape that carries a prefix returns `None` in
 /// that case instead of issuing a query that is provably empty.
 ///
-/// `VisibleMembers` shares `StructuralMembers`' predicate: the extra arm of
-/// `live_visible_members` joins `unit_visibility_containers` on `unit_key`, and
-/// a path row's `unit_key` is NULL, so that arm never produces one.
+/// Path-derived `VisibleMembers` shares `StructuralMembers`' predicate. The
+/// content-backed view also projects language-specific visibility containers.
 ///
 /// `PackageTypes` and `PackageTypesInPackage` add `names.kind = 0` because the
 /// path arm of `live_package_types` carries `WHERE symbols.kind = 0`.
@@ -1410,7 +1425,7 @@ fn callable_metadata(
     if row.get::<_, Option<String>>(base)?.is_none() {
         Ok(None)
     } else {
-        signature_metadata_from_row(row, base).map(Some)
+        signature_metadata_projection_from_row(row, base).map(Some)
     }
 }
 
@@ -1421,27 +1436,33 @@ fn callable_values<A: LanguageAdapter>(
     storage_languages: &[String],
     request: &RelationalDefinitionRequest,
 ) -> Result<Vec<RelationalCallableFact>> {
-    let (prefix, _, _) = render_name(adapter, &request.name);
+    let (prefix, tail, _) = render_name(adapter, &request.name);
     let (parent, identifier) = tail_parent_and_identifier(adapter, &request.name);
     let candidate_sql = content_sql(
         "live_definition_exact_names",
         "names.prefix = ?2 AND names.exact_parent_tail = ?3 AND names.identifier = ?4",
     );
-    // The metadata projection comes from the one shared column list, not a
-    // second copy of it: `signature_metadata_from_row` decodes positionally
-    // from that order, so a column added to the schema and forgotten here
-    // makes every read of this relation fail at run time rather than at
-    // compile time.
-    let metadata_columns = signature_metadata_value_columns_sql("facts");
+    let metadata_columns = super::signature_metadata_projection_columns_sql("facts");
     let fact_sql = format!(
-        "SELECT facts.ordinal, facts.text, {metadata_columns}
+        "SELECT facts.ordinal, facts.text,
+                {metadata_columns}, facts.pairing_available
          FROM live_callable_facts AS facts
          WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND facts.unit_key = ?3
-         ORDER BY facts.ordinal"
+         ORDER BY facts.ordinal, facts.metadata_ordinal"
     );
     let mut facts = Vec::new();
     for lang in storage_languages {
+        let visibility_unavailable = tx
+            .prepare_cached(CALLABLE_CANDIDATE_AVAILABILITY_SQL)?
+            .query_row(params![lang, &prefix, &tail, &parent, &identifier], |row| {
+                row.get::<_, bool>(0)
+            })?;
+        if visibility_unavailable {
+            return Err(StoreError::new(format!(
+                "canonical declaration visibility is unavailable for callable candidates in {lang}"
+            )));
+        }
         let candidates =
             query_content_candidates(tx, &candidate_sql, lang, &[&prefix, &parent, &identifier])?;
         for (candidate, rel_path) in candidates {
@@ -1457,6 +1478,13 @@ fn callable_values<A: LanguageAdapter>(
             }
             let mut statement = tx.prepare_cached(&fact_sql)?;
             let rows = statement.query_map(params![locator.0, locator.1, locator.2], |row| {
+                if row.get::<_, Option<bool>>(3 + super::SIGNATURE_METADATA_VALUE_COLUMNS.len())?
+                    != Some(true)
+                {
+                    return Err(super::rusqlite_error_from_store(StoreError::new(
+                        "callable signature/metadata pairing is unavailable",
+                    )));
+                }
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1765,11 +1793,12 @@ impl AnalyzerStore {
 mod tests {
     use rusqlite::params;
 
+    use super::super::REVISIONED_WORKSPACE_VIEWS_SQL;
     use super::{
-        AnalyzerStore, EXACT_PATH_REQUEST, NORMALIZED_PATH_REQUEST, PACKAGE_EXISTS_SQL,
-        STRUCTURAL_MEMBER_PATH_REQUEST, batched_content_sql, batched_definition_order_sql,
-        batched_path_sql, content_sql, path_view_predicate, path_view_sql, render_name,
-        scanned_content_sql, split_view_sources,
+        AnalyzerStore, CALLABLE_CANDIDATE_AVAILABILITY_SQL, EXACT_PATH_REQUEST,
+        NORMALIZED_PATH_REQUEST, PACKAGE_EXISTS_SQL, STRUCTURAL_MEMBER_PATH_REQUEST,
+        batched_content_sql, batched_definition_order_sql, batched_path_sql, content_sql,
+        path_view_predicate, path_view_sql, render_name, scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -1784,6 +1813,48 @@ mod tests {
     // store with no planner statistics and once with the statistics captured
     // from real corpus stores, because production carries the latter (#3016).
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    #[test]
+    fn callable_candidate_preflight_seeks_stable_and_anchored_name_indexes() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        connection
+            .execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
+            .expect("install revisioned candidate views");
+        let mut statement = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {CALLABLE_CANDIDATE_AVAILABILITY_SQL}"
+            ))
+            .expect("prepare callable candidate availability plan");
+        let plan = statement
+            .query_map(params!["java", "demo", "Widget", "demo", "Widget"], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("read callable candidate availability plan")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect callable candidate availability plan");
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_code_units_stable_parent_identifier")),
+            "stable callable candidates must seek the stable name index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_code_units_anchored_parent_identifier")),
+            "anchored callable candidates must seek the anchored name index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_workspace_file_anchor_rows_package")),
+            "anchored callable candidates must seek the package anchor index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN units") && !detail.contains("SCAN anchors")),
+            "callable candidate preflight must not scan name or anchor rows: {plan:#?}"
+        );
+    }
 
     #[test]
     fn package_exists_query_seeks_exact_live_membership() {
@@ -1844,13 +1915,26 @@ mod tests {
         // starts from the one requested package instead of walking every file
         // version of the snapshot, which is the same "narrow by name before
         // revision membership" property `definition_point_queries_seek_split_
-        // view_indexes` pins for the definition views. The old assertion named
-        // one index rather than the property, so it is widened here rather
-        // than the query being changed.
+        // view_indexes` pins for the definition views. Migration 104 added
+        // input_kind to the shared workspace-file-version key. Under the
+        // captured statistics SQLite can therefore use the generated unique
+        // index, which is still a bounded lookup on workspace, language,
+        // generation, and input kind. Pin the access property rather than one
+        // physical index name. SQLite can also render the exact unique
+        // (file_version_id, lang) lookup as an index seek rather than as an
+        // INTEGER PRIMARY KEY seek.
         assert!(
             plan.iter().any(|detail| {
                 detail.contains("idx_workspace_file_versions_snapshot_blob")
                     || detail.contains("SEARCH versions USING INTEGER PRIMARY KEY")
+                    || (detail.starts_with("SEARCH versions USING")
+                        && detail.contains("file_version_id=?")
+                        && detail.contains("lang=?"))
+                    || (detail.contains("sqlite_autoindex_workspace_file_versions_1")
+                        && detail.contains("workspace_id=?")
+                        && detail.contains("lang=?")
+                        && detail.contains("generation=?")
+                        && detail.contains("input_kind=?"))
             }),
             "exact package membership must reach revision membership by a key {state}: {plan:#?}"
         );

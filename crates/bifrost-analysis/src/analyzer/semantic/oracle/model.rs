@@ -1881,6 +1881,11 @@ fn access_path_matches_memory_location(
                 && access_root_matches_value(path.root(), base.value())
                 && selector_matches
         }),
+        MemoryLocationKind::Dereference { address } => base.is_some_and(|base| {
+            base.value().id() == *address
+                && path.selectors().is_empty()
+                && access_root_matches_value(path.root(), base.value())
+        }),
         MemoryLocationKind::LexicalCell { .. } => {
             base.is_none()
                 && path.selectors().is_empty()

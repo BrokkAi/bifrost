@@ -1029,7 +1029,6 @@ pub fn binding_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::structural::resolution::ALL_ENVIRONMENT_AXES;
     use crate::analyzer::{AnalyzerConfig, Project, TestProject, WorkspaceAnalyzer};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2109,43 +2108,6 @@ mod tests {
             reached(&env, "value", fixture.at("value\nend")).kind,
             BindingKind::Local,
             "an unsupported import axis must not stop binding-of from answering"
-        );
-    }
-
-    /// An adapter that declares no environment support reports every axis
-    /// incomplete. An empty row set from such a file must never read as "this
-    /// file has no bindings".
-    ///
-    /// This guard used to point at Scala, which now derives every producer
-    /// axis (#1597), and then at PHP, which derives them all as of #2962. Go
-    /// still declares `NO_LEXICAL_ENVIRONMENT_SUPPORT`.
-    #[test]
-    fn an_adapter_without_environment_support_reports_incomplete_not_empty_complete() {
-        let source = "package widget\n\nfunc Render(label string) int {\n\treturn len(label)\n}\n";
-        let fixture = Fixture::new(Language::Go, "widget/widget.go", source);
-        let env = fixture.environment();
-
-        assert!(env.scopes.is_empty());
-        assert!(env.bindings.is_empty());
-        match &env.completeness {
-            EnvironmentCompleteness::Incomplete {
-                unsupported_axes, ..
-            } => assert_eq!(
-                unsupported_axes.as_slice(),
-                ENVIRONMENT_PRODUCER_AXES,
-                "every producer axis is unsupported for Go"
-            ),
-            EnvironmentCompleteness::Complete => {
-                panic!("an adapter with no environment support must never report Complete")
-            }
-        }
-        for &axis in ALL_ENVIRONMENT_AXES {
-            assert!(!env.completeness.covers(axis), "{axis} claimed covered");
-        }
-        assert_eq!(
-            binding_of(&env, "label", 40, None),
-            BindingOfOutcome::Incomplete(EnvironmentAxis::Scopes),
-            "an uncovered environment refuses to answer instead of guessing"
         );
     }
 

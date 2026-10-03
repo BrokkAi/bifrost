@@ -183,9 +183,12 @@ The repository is organized around the public product surfaces:
   [`bifrost_searchtools/`](bifrost_searchtools/) expose or package the analyzer.
 - **Documentation and examples:** [`docs/`](docs/) is the documentation site;
   [`examples/`](examples/) contains runnable examples.
-- **Analysis data and project defaults:** [`semantic-packs/`](semantic-packs/)
-  contains shipped semantic knowledge; [`.bifrost/`](.bifrost/) contains
-  project-level analysis defaults.
+- **Open analysis content:**
+  [`BrokkAi/bifrost-packs`](https://github.com/BrokkAi/bifrost-packs) is the home
+  for open semantic packs and policy rules, including contributions, generation,
+  and independently versioned releases. The engine retains pack tooling and
+  existing embedded content during the v0.13.0 transition; [`.bifrost/`](.bifrost/)
+  contains project-level analysis defaults.
 - **Development support:** [`benchmark/`](benchmark/) covers reproducible
   measurements; [`scripts/`](scripts/) and [`tools/`](tools/) hold maintenance
   and release helpers. Root manifests plus `.github/`, `.cargo/`, and `.config/`
@@ -215,3 +218,7 @@ GitHub contributor graph does not reflect everyone who helped build the project.
 
 For local development, test commands, repository-local Python workflow, and
 release tagging, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Contribute open semantic models and policies to
+[`Bifrost-packs`](https://github.com/BrokkAi/bifrost-packs). Engine, parser,
+catalog, and policy-evaluation improvements belong here.

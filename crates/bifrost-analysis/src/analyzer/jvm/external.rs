@@ -82,7 +82,7 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 /// and may disagree, so a cycle is possible; the visited set already stops one,
 /// and this bounds the work of a wide but acyclic hierarchy as well.
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
-const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v1";
+const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v2";
 const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
 /// Domain of the read-free identity of one JDK's selected JMOD set.
 const JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-source-identity/v1";
@@ -188,7 +188,12 @@ impl JavaArtifactFacts {
             }
             let is_static = fact.is_static;
             let is_constant = fact.member_kind == MemberKind::Constant;
-            let shape = external_call_shape(fact.member_kind, is_static, fact.signature.as_ref());
+            let shape = external_call_shape(
+                fact.member_kind,
+                is_static,
+                fact.signature.as_ref(),
+                fact.non_overridable,
+            );
             let shapes_incomplete = callable_shape_is_incomplete(
                 fact.member_kind,
                 fact.signature.as_ref(),
@@ -920,16 +925,53 @@ fn resolved_jdk_dependency(
         }],
         artifacts: source_archive
             .map(|path| {
-                ResolvedDependencyArtifact::file(
+                let identity = jdk_source_zip_identity(&path);
+                let artifact = ResolvedDependencyArtifact::file(
                     DependencyArtifactRole::Sources,
                     ExternalArtifactKind::JdkSourceZip,
                     path,
-                )
+                );
+                match identity {
+                    Some(identity) => artifact.with_source_identity(identity),
+                    None => artifact,
+                }
             })
             .into_iter()
             .collect(),
         scope: DependencyScope::Unknown,
         declared_by: None,
+    }
+}
+
+// Include file replacement and metadata change identity, not just length/mtime:
+// an installer may preserve the archive's timestamp. Platforms without a
+// change-time identity retain the exact-read path.
+fn jdk_source_zip_identity(path: &Path) -> Option<ArtifactSourceIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canonical = path.canonicalize().ok()?;
+        let metadata = fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.jdk-source-zip-state.v1");
+        digest.push(canonical.as_os_str().as_encoded_bytes());
+        digest.push(&metadata.dev().to_le_bytes());
+        digest.push(&metadata.ino().to_le_bytes());
+        digest.push(&metadata.len().to_le_bytes());
+        digest.push(&metadata.mtime().to_le_bytes());
+        digest.push(&metadata.mtime_nsec().to_le_bytes());
+        digest.push(&metadata.ctime().to_le_bytes());
+        digest.push(&metadata.ctime_nsec().to_le_bytes());
+        Some(ArtifactSourceIdentity::from_digest(
+            digest.finish().to_string(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -1352,7 +1394,7 @@ fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> Artifac
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: dependency
                 .evidence
                 .toolchain
@@ -1622,6 +1664,7 @@ fn equivalent_java_member_fact(left: &MemberFact, right: &MemberFact) -> bool {
         && left.is_static == right.is_static
         && left.is_abstract == right.is_abstract
         && left.is_virtual == right.is_virtual
+        && left.non_overridable == right.non_overridable
         && equivalent_java_signature(left.signature.as_ref(), right.signature.as_ref())
         && left.aliases == right.aliases
 }
@@ -1783,12 +1826,15 @@ impl JvmExternalDeclarationIndex {
         config: &JvmAnalyzerConfig,
         project: &dyn Project,
     ) -> Arc<Self> {
-        let discovery = resolve_jvm_semantic_pack_dependencies(
-            config,
-            project,
-            &DependencyPackLimits::default(),
-            None,
-        );
+        let discovery = {
+            let _timing = crate::profiling::scope("jvm_external_index.discovery");
+            resolve_jvm_semantic_pack_dependencies(
+                config,
+                project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        };
         let artifacts: Vec<ResolvedJvmArtifact> = discovery
             .dependencies
             .iter()
@@ -1804,6 +1850,7 @@ impl JvmExternalDeclarationIndex {
         if let Some(index) = memo.lock().expect("external index memo poisoned").get(&key) {
             return Arc::clone(index);
         }
+        let _timing = crate::profiling::scope("jvm_external_index.build_from_artifacts");
         let mut index = Self::build_from_artifacts(artifacts);
         index.production_diagnostics.extend(diagnostics);
         let index = Arc::new(index);
@@ -1961,6 +2008,7 @@ impl JvmExternalDeclarationIndex {
                     digest.push(&(member.call_shapes.len() as u64).to_le_bytes());
                     for shape in &member.call_shapes {
                         digest.push(&shape.parameter_count.to_le_bytes());
+                        digest.push(&[u8::from(shape.non_overridable.is_some())]);
                         digest.push(if shape.is_static {
                             b"static-shape"
                         } else {
@@ -1971,13 +2019,13 @@ impl JvmExternalDeclarationIndex {
                         } else {
                             b"fixed"
                         });
-                        match shape.declared_return_type_fqn() {
-                            Some(return_type) => {
-                                digest.push(b"shape-named-return");
-                                digest.push(return_type.as_bytes());
-                            }
-                            None => digest.push(b"shape-no-named-return"),
-                        }
+                        // Argument conversion consumes the complete return term,
+                        // including arrays and generic arguments. A class-name
+                        // digest would alias distinct conversion behavior.
+                        digest.push(
+                            &serde_json::to_vec(&shape.returns)
+                                .expect("structured return types serialize"),
+                        );
                     }
                 }
             }
@@ -2303,8 +2351,12 @@ impl JvmExternalDeclarationIndex {
                 }
                 let is_static = member.is_static;
                 let is_constant = member.member_kind == MemberKind::Constant;
-                let shape =
-                    external_call_shape(member.member_kind, is_static, member.signature.as_ref());
+                let shape = external_call_shape(
+                    member.member_kind,
+                    is_static,
+                    member.signature.as_ref(),
+                    member.non_overridable,
+                );
                 let shapes_incomplete = callable_shape_is_incomplete(
                     member.member_kind,
                     member.signature.as_ref(),
@@ -2449,7 +2501,7 @@ impl JvmExternalDeclarationIndex {
                 pack_version: env!("CARGO_PKG_VERSION").to_owned(),
                 ecosystem: "maven".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
@@ -2507,7 +2559,7 @@ impl JvmExternalDeclarationIndex {
                 pack_version: env!("CARGO_PKG_VERSION").to_owned(),
                 ecosystem: "maven".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
@@ -2952,7 +3004,10 @@ impl<'a> JvmExternalDeclarations<'a> {
                         call_shapes_incomplete = true;
                         continue;
                     };
-                    if !symbol.callable_family_complete {
+                    if !symbol.callable_family_complete
+                        && symbol.provenance.completeness
+                            != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                    {
                         call_shapes_incomplete = true;
                     }
                     let Some(parameter_count) = u32::try_from(signature.parameters.len()).ok()
@@ -2961,6 +3016,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                         continue;
                     };
                     call_shapes.push(JvmExternalCallShape {
+                        non_overridable: symbol.non_overridable,
                         parameter_count,
                         is_static: symbol.is_static,
                         variadic: signature
@@ -3089,6 +3145,7 @@ pub(crate) struct JvmExternalMember {
 /// One callable overload retained beside the collapsed member name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JvmExternalCallShape {
+    non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
     parameter_count: u32,
     is_static: bool,
     variadic: bool,
@@ -3104,6 +3161,15 @@ struct JvmExternalCallShape {
 }
 
 impl JvmExternalMember {
+    pub(crate) fn non_overridable_at(
+        &self,
+        value_receiver: bool,
+        arity: usize,
+    ) -> Option<crate::analyzer::semantic_model::NonOverridableEvidence> {
+        self.applicable_shape(value_receiver, arity)
+            .and_then(|shape| shape.non_overridable)
+    }
+
     pub(crate) fn jdk_artifact_sha256(&self) -> Option<&str> {
         self.jdk_artifact_sha256.as_deref()
     }
@@ -3187,6 +3253,18 @@ impl JvmExternalMember {
             .declared_return_type_fqn()
     }
 
+    /// Preserve the selected declaration's full return term for conversion.
+    /// Arrays and generic terms must not be reduced to a displayed class name.
+    pub(crate) fn applicable_return_type(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<&TypeRef> {
+        self.applicable_shape(instance_receiver, arity)?
+            .returns
+            .as_ref()
+    }
+
     /// The one recorded overload this written arity and receiver shape select.
     ///
     /// `None` when the surface did not record a complete overload family, when
@@ -3255,6 +3333,7 @@ fn external_call_shape(
     kind: MemberKind,
     is_static: bool,
     signature: Option<&Signature>,
+    non_overridable: Option<crate::analyzer::semantic_model::NonOverridableEvidence>,
 ) -> Option<JvmExternalCallShape> {
     if !callable_member_kind(kind) {
         return None;
@@ -3262,6 +3341,7 @@ fn external_call_shape(
     let signature = signature?;
     let parameter_count = u32::try_from(signature.parameters.len()).ok()?;
     Some(JvmExternalCallShape {
+        non_overridable,
         parameter_count,
         is_static,
         variadic: signature
@@ -4367,6 +4447,76 @@ mod tests {
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
     #[test]
+    fn selected_external_return_preserves_array_shape_and_overload_uncertainty() {
+        let returned = TypeRef::Array {
+            element: Box::new(TypeRef::Named {
+                name: "java.lang.String".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }),
+        };
+        let mut member = JvmExternalMember {
+            fqn: "example.Factory.values".to_owned(),
+            declaring_package: "example".to_owned(),
+            visibility: JvmVisibility::Public,
+            returns: Some(returned.clone()),
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: vec![JvmExternalCallShape {
+                non_overridable: None,
+                parameter_count: 0,
+                is_static: true,
+                variadic: false,
+                returns: Some(returned.clone()),
+            }],
+            call_shapes_incomplete: false,
+        };
+        assert_eq!(member.applicable_return_type(false, 0), Some(&returned));
+        assert_eq!(member.applicable_return_type_fqn(false, 0), None);
+        assert_eq!(member.applicable_return_type(true, 0), None);
+        assert_eq!(member.applicable_return_type(false, 1), None);
+        member.call_shapes_incomplete = true;
+        assert_eq!(member.applicable_return_type(false, 0), None);
+        member.call_shapes_incomplete = false;
+        member.call_shapes.push(member.call_shapes[0].clone());
+        assert_eq!(member.applicable_return_type(false, 0), None);
+    }
+
+    #[test]
+    fn external_return_array_element_changes_behavior_identity() {
+        let root = tempfile::tempdir().expect("temporary class jar directory");
+        let mut identities = Vec::new();
+        for (name, descriptor) in [
+            ("strings.jar", "()[Ljava/lang/String;"),
+            ("integers.jar", "()[Ljava/lang/Integer;"),
+        ] {
+            let jar = root.path().join(name);
+            write_test_class_jar(
+                &jar,
+                &[TestClassFile {
+                    internal_name: "example/Factory",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "values",
+                        descriptor,
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                }],
+            );
+            let index = probe_index(&jar);
+            assert!(
+                index.production_diagnostics().is_empty(),
+                "{:?}",
+                index.production_diagnostics()
+            );
+            identities.push(index.dispatch_behavior_identity());
+        }
+        assert_ne!(identities[0], identities[1]);
+    }
+
+    #[test]
     #[ignore = "requires BIFROST_JDK_HOME pointing to a pinned JDK installation"]
     fn pinned_jdk_home_preparation_is_cached() {
         use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
@@ -4726,7 +4876,13 @@ mod tests {
             fs::canonicalize(source_archive).unwrap()
         );
 
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            crate::analyzer::semantic_model::CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
         let prepared = prepare_dependency_semantic_packs(
             &catalog,
             &JvmDependencyPackAdapter,
@@ -4741,6 +4897,47 @@ mod tests {
             DependencyPackPreparationStatus::Generated
         );
         assert!(prepared.packs[0].evidence.artifact_sha256.is_some());
+        drop(catalog);
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            crate::analyzer::semantic_model::CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let again = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let reused = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &again.dependencies,
+            &limits,
+            None,
+        );
+        assert!(reused.complete, "{:#?}", reused.diagnostics);
+        assert_eq!(reused.profile.generated_packs, 0);
+        assert_eq!(reused.profile.reused_packs, 1);
+        #[cfg(unix)]
+        assert_eq!(reused.profile.artifacts_read, 0);
+        assert_eq!(reused.packs[0].evidence, prepared.packs[0].evidence);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_zip_identity_detects_replacement_with_preserved_length_and_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("src.zip");
+        fs::write(&path, b"first archive").unwrap();
+        let before = jdk_source_zip_identity(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = root.path().join("replacement.zip");
+        fs::write(&replacement, b"other archive").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert_ne!(jdk_source_zip_identity(&path).unwrap(), before);
     }
 
     #[test]

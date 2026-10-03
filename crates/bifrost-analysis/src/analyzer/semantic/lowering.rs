@@ -17,16 +17,16 @@ use super::{
     CallContinuationKind, CallInvocationMode, CallSiteId, CallableTargetResolution,
     CancellationToken, CaptureBinding, CaptureId, CaptureMode, CaptureSource, ControlContinuation,
     ControlEdge, ControlEdgeKind, Evidence, EvidenceCompleteness, EvidenceId, ExecutionTiming,
-    FormalMultiplicity, GuardArm, GuardFactParts, GuardId, GuardPredicate, MemoryAccessKind,
-    MemoryLocation, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ProcedureId,
-    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
-    SemanticGap, SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind,
-    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole,
-    SemanticValue, SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
-    SourceMappingKind, SourcePosition, SourceSpan, StructuralNodeIdentity, SwitchCaseFactParts,
-    SwitchEdgeParts, SwitchFactId, SwitchFactKind, SwitchFactParts, SwitchSelectorDomain,
-    ValueFlowKind, ValueId,
+    FormalMultiplicity, GuardArm, GuardFactParts, GuardId, GuardPredicate, LoopSite,
+    MemoryAccessKind, MemoryLocation, MemoryLocationId, MemoryLocationKind, MemoryValueCopy,
+    ProcedureId, ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite, SemanticCapability,
+    SemanticEffect, SemanticEvent, SemanticGap, SemanticGapDischarge, SemanticGapId,
+    SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind, SemanticWork,
+    SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition, SourceSpan,
+    StatementEntrySite, StructuralNodeIdentity, SwitchCaseFactParts, SwitchEdgeParts, SwitchFactId,
+    SwitchFactKind, SwitchFactParts, SwitchSelectorDomain, ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -950,6 +950,58 @@ impl<'a> ProcedureLoweringSession<'a> {
         let occurrence = self.next_source_occurrence(range.start, range.end);
         let anchor = source_anchor(node, occurrence).map_err(ProcedureLoweringError::Invalid)?;
         self.add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    /// Attest that lowering enters the source statement `node` at `entry`.
+    ///
+    /// The entry point normally carries the statement's own exact mapping. A
+    /// loop body can instead enter at its loop's point, and cleanup can
+    /// specialize one statement for several completion paths; in those cases a
+    /// fresh exact mapping for the statement keeps its source identity. The
+    /// producer, not a range search, attests the entry.
+    pub(crate) fn record_statement_entry(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+        entry: ProgramPointId,
+    ) -> Result<(), ProcedureLoweringError> {
+        let point_metadata = self.metadata(entry)?;
+        let mapping = builder.source_mapping(point_metadata.source);
+        let span = mapping.locator.anchor().span();
+        let source = if mapping.kind == SourceMappingKind::Exact
+            && span.start_byte() as usize == node.start_byte()
+            && span.end_byte() as usize == node.end_byte()
+        {
+            point_metadata
+        } else {
+            self.add_node_mapping(builder, node)?
+        };
+        builder.add_statement_entry(StatementEntrySite {
+            source: source.source,
+            evidence: source.evidence,
+            point: entry,
+        })?;
+        Ok(())
+    }
+
+    /// Attest one source loop: `header` is the point each new iteration
+    /// re-enters and `body` is the body's entry. The mapping names the loop
+    /// statement itself, since its entry point can be shared with a label.
+    pub(crate) fn record_loop_site(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+        header: ProgramPointId,
+        body: ProgramPointId,
+    ) -> Result<(), ProcedureLoweringError> {
+        let source = self.add_node_mapping(builder, node)?;
+        builder.add_loop_site(LoopSite {
+            source: source.source,
+            evidence: source.evidence,
+            header,
+            body,
+        })?;
+        Ok(())
     }
 
     pub(crate) fn add_point(

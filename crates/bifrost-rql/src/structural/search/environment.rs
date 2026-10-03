@@ -712,7 +712,8 @@ pub(super) fn public_candidate_hop(
 pub(super) fn candidate_unit(candidate: &TraceCandidateRef) -> Option<&crate::analyzer::CodeUnit> {
     match candidate {
         TraceCandidateRef::Unit(unit) => Some(unit),
-        TraceCandidateRef::Lexical(_)
+        TraceCandidateRef::Modeled { .. }
+        | TraceCandidateRef::Lexical(_)
         | TraceCandidateRef::Binding { .. }
         | TraceCandidateRef::ImportBinder { .. }
         | TraceCandidateRef::ExternalRoute { .. } => None,

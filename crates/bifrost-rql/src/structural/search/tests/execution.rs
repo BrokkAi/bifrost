@@ -78,6 +78,30 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
             "class App { void run(String value) { value.trim(); String kept = value.trim(); } void cleanup(String value) { try { System.out.println(value); } finally { value.trim(); } } }",
         )
         .file(
+            "src/Lambdas.java",
+            "class Lambdas { Runnable discarded(String value) { return () -> value.trim(); } java.util.function.Supplier<String> retained(String value) { return () -> value.trim(); } }",
+        )
+        .file(
+            "src/SourceTargets.java",
+            "class SourceTargets { interface Base<T> { T get(); } interface Runnable extends Base<String> {} interface Action { void run(); default int size() { return 1; } static int factory() { return 1; } } Runnable retained(String value) { return () -> value.trim(); } Action discarded(String value) { return () -> value.trim(); } }",
+        )
+        .file(
+            "src/StatusTargets.java",
+            "import java.nio.file.Files; import java.nio.file.Path; class StatusTargets { interface Action { void run() throws Exception; } interface Query { boolean run() throws Exception; } Action discarded(Path path) { return () -> Files.deleteIfExists(path); } Query retained(Path path) { return () -> Files.deleteIfExists(path); } }",
+        )
+        .file(
+            "src/Streams.java",
+            "class Streams { void run(java.util.stream.Stream<String> values, String value) { values.map(item -> item.trim()); values.forEach(ignored -> value.trim()); } }",
+        )
+        .file(
+            "src/Arguments.java",
+            "class Arguments { void run(String value) { Targets.consume(() -> value.trim()); Targets.retain(() -> value.trim()); } }",
+        )
+        .file(
+            "src/Targets.java",
+            "class Targets { static void consume(Runnable action) {} static void retain(java.util.function.Supplier<String> action) {} }",
+        )
+        .file(
             "src/DeleteApp.java",
             "import java.nio.file.Files; import java.nio.file.Path; class DeleteApp { void run(Path path) { Files.deleteIfExists(path); boolean deleted = Files.deleteIfExists(path); } }",
         )
@@ -99,7 +123,31 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
     for (path, source) in [
         (
             "java.base/module-info.java",
-            "module java.base { exports java.lang; exports java.nio.file; }",
+            "module java.base { exports java.lang; exports java.nio.file; exports java.util.function; exports java.util.stream; }",
+        ),
+        (
+            "java.base/java/lang/Object.java",
+            "package java.lang; public class Object { public boolean equals(Object other) { return this == other; } public int hashCode() { return 0; } public String toString() { return \"\"; } }",
+        ),
+        (
+            "java.base/java/lang/Runnable.java",
+            "package java.lang; public interface Runnable { void run(); }",
+        ),
+        (
+            "java.base/java/util/function/Supplier.java",
+            "package java.util.function; public interface Supplier<T> { T get(); }",
+        ),
+        (
+            "java.base/java/util/function/Function.java",
+            "package java.util.function; public interface Function<T, R> { R apply(T value); }",
+        ),
+        (
+            "java.base/java/util/function/Consumer.java",
+            "package java.util.function; public interface Consumer<T> { void accept(T value); }",
+        ),
+        (
+            "java.base/java/util/stream/Stream.java",
+            "package java.util.stream; public interface Stream<T> { <R> Stream<R> map(java.util.function.Function<? super T, ? extends R> mapper); void forEach(java.util.function.Consumer<? super T> action); }",
         ),
         (
             "java.base/java/lang/String.java",
@@ -213,7 +261,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &query,
     );
-    assert_eq!(result.results.len(), 4, "{}", result.render_text());
+    assert_eq!(result.results.len(), 12, "{}", result.render_text());
     let mut positive = 0;
     let mut retained = 0;
     for item in &result.results {
@@ -246,7 +294,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
             other => panic!("unexpected result-use classification: {other}"),
         }
     }
-    assert_eq!((positive, retained), (2, 1));
+    assert_eq!((positive, retained), (6, 5));
     assert!(result.results.iter().any(|item| matches!(&item.value, CodeQueryResultValue::CallResultObligation { value } if value.arm_count > 1 && value.modeled_arm_count == value.arm_count && !value.terminal)), "{result:#?}");
 
     let status_query = CodeQuery::from_source(
@@ -258,7 +306,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &status_query,
     );
-    assert_eq!(status.results.len(), 2, "{}", status.render_text());
+    assert_eq!(status.results.len(), 4, "{}", status.render_text());
     let discarded = status
         .results
         .iter()
@@ -283,7 +331,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &filter,
     );
-    assert_eq!(filtered.results.len(), 1, "{}", filtered.render_text());
+    assert_eq!(filtered.results.len(), 2, "{}", filtered.render_text());
 }
 
 #[test]
@@ -1697,7 +1745,8 @@ fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
     assert_eq!(profile.cache.seed_result.hits, 0);
     assert_eq!(profile.cache.seed_result.complete_builds, 2);
     assert_eq!(profile.cache.seed_structural_facts.lookups, 2);
-    assert_eq!(profile.cache.seed_structural_facts.extractions, 1);
+    assert_eq!(profile.cache.seed_structural_facts.extractions, 0);
+    assert_eq!(profile.cache.seed_structural_facts.persisted_hydrations, 1);
     assert_eq!(profile.cache.seed_structural_facts.memory_hits, 1);
     assert_eq!(profile.cache.seed_structural_facts.replayed_files, 1);
     let seed_observations = profile
@@ -1709,6 +1758,13 @@ fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
     assert_eq!(seed_observations[0].branch, vec![0]);
     assert_eq!(
         seed_observations[0].cache.seed_structural_facts.extractions,
+        0
+    );
+    assert_eq!(
+        seed_observations[0]
+            .cache
+            .seed_structural_facts
+            .persisted_hydrations,
         1
     );
     assert_eq!(
@@ -5841,16 +5897,13 @@ fn exact_procedure_dialect_filter_selects_c_before_assignment_projection() {
 }
 
 #[test]
-fn assignment_relations_report_unsupported_rust_obligations() {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "main.rs",
-            "fn check() { let mut value = 1; value = value; }",
-        )
+fn assignment_relations_report_unsupported_ruby_obligations() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("main.rb", "def check\n  value = 1\n  value = value\nend\n")
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "languages": ["rust"],
+        "languages": ["ruby"],
         "match": { "kind": "function", "name": "check" },
         "steps": [{ "op": "procedure_of" }, { "op": "assignment_relations" }],
         "result_detail": "full"
@@ -6353,6 +6406,135 @@ fn find_concurrent_relation(
             predicate(value).then_some(value.as_ref())
         })
         .unwrap_or_else(|| panic!("expected concurrent relation was absent: {result:#?}"))
+}
+
+/// #3760: the root task's read of `p.stopped` is ordered before the writer's
+/// spawn, but the first goroutine's read of the same site is not. Both task
+/// contexts share one row, and that row must report the race.
+#[test]
+fn go_concurrent_access_row_reports_a_race_from_any_task_context() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "fixture.go",
+            r#"package fixture
+
+type Pool struct{ stopped bool }
+
+func (p *Pool) Stopped() bool { return p.stopped }
+
+func Run() {
+	p := &Pool{}
+	_ = p.Stopped()
+	go func() {
+		_ = p.Stopped()
+	}()
+	go func() {
+		p.stopped = true
+	}()
+}
+
+func read(p *Pool, done chan struct{}) {
+	_ = p.stopped
+	close(done)
+}
+
+func Joined() {
+	p := &Pool{}
+	first := make(chan struct{})
+	second := make(chan struct{})
+	go read(p, first)
+	go read(p, second)
+	<-first
+	<-second
+	p.stopped = true
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let run = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("concurrent access conflict query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{result:#?}"
+        );
+        result
+    };
+    let read_against_write = |result: &CodeQueryResult, read_line: usize, write_line: usize| {
+        let pair = |value: &CodeQueryConcurrentAccessConflict| {
+            let mut pair = [
+                (value.first_access, value.first_range.start_line),
+                (value.second_access, value.second_range.start_line),
+            ];
+            pair.sort();
+            pair
+        };
+        let item = result
+            .results
+            .iter()
+            .find(|item| {
+                let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                    panic!("concurrent_access_conflicts returns its typed row: {item:#?}");
+                };
+                pair(value) == [("read", read_line), ("write", write_line)]
+            })
+            .unwrap_or_else(|| panic!("the read/write row is present: {result:#?}"));
+        assert_eq!(
+            item.provenance.len(),
+            2,
+            "two task contexts reach the site pair: {result:#?}"
+        );
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            unreachable!("checked above");
+        };
+        value.clone()
+    };
+
+    let racing = run("Run");
+    let value = read_against_write(&racing, 5, 14);
+    assert_eq!(
+        (
+            value.verdict,
+            value.ordering,
+            value.protection,
+            value.proof,
+            value.coverage
+        ),
+        (
+            "conflict",
+            "unordered",
+            "unprotected",
+            "proven",
+            "exhaustive"
+        ),
+        "the goroutine's read races the write even though the root's read is ordered: {racing:#?}"
+    );
+    assert!(value.reasons.is_empty(), "{racing:#?}");
+
+    // Near miss: the root joins both reading goroutines before it writes, so
+    // every context is ordered and the row stays ordered and proven.
+    let joined = run("Joined");
+    let value = read_against_write(&joined, 19, 31);
+    assert_eq!(
+        (value.verdict, value.ordering, value.proof, value.coverage),
+        ("ordered", "happens_before", "proven", "exhaustive"),
+        "{joined:#?}"
+    );
 }
 
 #[test]
@@ -8738,9 +8920,9 @@ func summarizedCopiedAddressMutex() {
     _ = value
     (&second).Unlock()
 }
-func summarizedRecursiveAtomic() {
+func summarizedRecursiveAtomic(depth int) {
     var value int64
-    go recursiveAtomicWrite(&value, 3)
+    go recursiveAtomicWrite(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func effectFreeRecursiveLeaf() {}
@@ -8751,9 +8933,9 @@ func recursiveAtomicWithHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicWithHelper(value, depth-1) }
 }
-func summarizedRecursiveAtomicWithHelper() {
+func summarizedRecursiveAtomicWithHelper(depth int) {
     var value int64
-    go recursiveAtomicWithHelper(&value, 3)
+    go recursiveAtomicWithHelper(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 type continuationCell struct { value int }
@@ -8912,9 +9094,9 @@ func recursiveAtomicAfterNonReturningHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicAfterNonReturningHelper(value, depth-1) }
 }
-func summarizedRecursiveNonReturningHelper() {
+func summarizedRecursiveNonReturningHelper(depth int) {
     var value int64
-    go recursiveAtomicAfterNonReturningHelper(&value, 3)
+    go recursiveAtomicAfterNonReturningHelper(&value, depth)
     _ = value
 }
 func cyclicEmptyHelper() { cyclicEmptyHelper() }
@@ -8923,9 +9105,9 @@ func recursiveAtomicAfterCyclicHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicAfterCyclicHelper(value, depth-1) }
 }
-func summarizedRecursiveCyclicHelper() {
+func summarizedRecursiveCyclicHelper(depth int) {
     var value int64
-    go recursiveAtomicAfterCyclicHelper(&value, 3)
+    go recursiveAtomicAfterCyclicHelper(&value, depth)
     _ = value
 }
 func mutatingRecursiveHelper(value *int64) { *value = 2 }
@@ -8934,9 +9116,9 @@ func recursiveAtomicWithMutatingHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicWithMutatingHelper(value, depth-1) }
 }
-func summarizedRecursiveAtomicWithMutatingHelper() {
+func summarizedRecursiveAtomicWithMutatingHelper(depth int) {
     var value int64
-    go recursiveAtomicWithMutatingHelper(&value, 3)
+    go recursiveAtomicWithMutatingHelper(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func unresolvedRecursiveHelper() { missingRecursiveHelper() }
@@ -8945,9 +9127,9 @@ func recursiveAtomicWithUnknownHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicWithUnknownHelper(value, depth-1) }
 }
-func summarizedRecursiveAtomicWithUnknownHelper() {
+func summarizedRecursiveAtomicWithUnknownHelper(depth int) {
     var value int64
-    go recursiveAtomicWithUnknownHelper(&value, 3)
+    go recursiveAtomicWithUnknownHelper(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func recursiveAtomicWithDeferredHelper(value *int64, depth int) {
@@ -8955,9 +9137,9 @@ func recursiveAtomicWithDeferredHelper(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicWithDeferredHelper(value, depth-1) }
 }
-func summarizedRecursiveAtomicWithDeferredHelper() {
+func summarizedRecursiveAtomicWithDeferredHelper(depth int) {
     var value int64
-    go recursiveAtomicWithDeferredHelper(&value, 3)
+    go recursiveAtomicWithDeferredHelper(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func publishingRecursiveHelper(value *int64, queue chan *int64) { queue <- value }
@@ -8966,24 +9148,24 @@ func recursiveAtomicWithPublishingHelper(value *int64, queue chan *int64, depth 
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveAtomicWithPublishingHelper(value, queue, depth-1) }
 }
-func summarizedRecursiveAtomicWithPublishingHelper() {
+func summarizedRecursiveAtomicWithPublishingHelper(depth int) {
     var value int64
     queue := make(chan *int64, 4)
-    go recursiveAtomicWithPublishingHelper(&value, queue, 3)
+    go recursiveAtomicWithPublishingHelper(&value, queue, depth)
     _ = atomic.LoadInt64(&value)
 }
-func summarizedRecursiveMixedAtomic() {
+func summarizedRecursiveMixedAtomic(depth int) {
     var value int64
-    go recursiveAtomicWrite(&value, 3)
+    go recursiveAtomicWrite(&value, depth)
     _ = value
 }
 func recursiveChangingAtomic(value *int64, depth int) {
     atomic.StoreInt64(value, 1)
     if depth > 0 { recursiveChangingAtomic(new(int64), depth-1) }
 }
-func summarizedRecursiveChangingAtomic() {
+func summarizedRecursiveChangingAtomic(depth int) {
     var value int64
-    go recursiveChangingAtomic(&value, 3)
+    go recursiveChangingAtomic(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func recursiveUnknownAtomic(value *int64, depth int) {
@@ -8991,9 +9173,9 @@ func recursiveUnknownAtomic(value *int64, depth int) {
     unknownAtomicBoundary()
     if depth > 0 { recursiveUnknownAtomic(value, depth-1) }
 }
-func summarizedRecursiveUnknownAtomic() {
+func summarizedRecursiveUnknownAtomic(depth int) {
     var value int64
-    go recursiveUnknownAtomic(&value, 3)
+    go recursiveUnknownAtomic(&value, depth)
     _ = atomic.LoadInt64(&value)
 }
 func summarizedDistinctAtomic() {
@@ -12352,6 +12534,119 @@ func rootReachablePublication(stop bool) {
 }
 
 #[test]
+fn go_recurring_tasks_preserve_identity_and_generation_order() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+import "sync"
+type cell struct { mu sync.Mutex; n int }
+func direct(c *cell) { c.n = 1; direct(c) }
+func beforeSpawn(c *cell) { c.n = 1; go beforeSpawn(c) }
+func afterSpawn(c *cell) { go afterSpawn(c); c.n = 1 }
+func fresh(c *cell) { c.n = 1; go fresh(&cell{}) }
+func locked(c *cell) {
+    go locked(c)
+    c.mu.Lock()
+    c.n = 1
+    c.mu.Unlock()
+}
+func directControl() {
+    c := &cell{}
+    go direct(c)
+    go func() { c.n = 2 }()
+}
+func externalSibling() {
+    c := &cell{}
+    go beforeSpawn(c)
+    go func() { c.n = 2 }()
+}
+func serialGenerations() { go beforeSpawn(&cell{}) }
+func overlappingGenerations() { go afterSpawn(&cell{}) }
+func privateGenerations() { go fresh(&cell{}) }
+func protectedGenerations() { go locked(&cell{}) }
+func mutualA(c *cell) { c.n = 1; go mutualB(c) }
+func mutualB(c *cell) { go mutualA(c) }
+func mutualSibling() {
+    c := &cell{}
+    go mutualA(c)
+    go func() { c.n = 2 }()
+}
+func swapping(c, other *cell) { c.n = 1; go swapping(other, c) }
+func changedInputs() {
+    c := &cell{}
+    go swapping(c, &cell{})
+    go func() { c.n = 2 }()
+}
+func branching(c *cell) { c.n = 1; go branching(c); go branching(c) }
+func multipleSpawns() { go branching(&cell{}) }
+func stopped(c *cell, stop bool) {
+    if stop { return }
+    go stopped(c, stop)
+    c.n = 1
+}
+func earlyReturn() {
+    c := &cell{}
+    go stopped(c, true)
+    go func() { c.n = 2 }()
+}
+func relayStop(c *cell, stop bool) { go stopped(c, stop) }
+func forwardedReturn() {
+    c := &cell{}
+    go relayStop(c, true)
+    go func() { c.n = 2 }()
+}
+func forwardedRun() {
+    c := &cell{}
+    go relayStop(c, false)
+    go func() { c.n = 2 }()
+}
+
+
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in [
+        "serialGenerations",
+        "privateGenerations",
+        "protectedGenerations",
+        "earlyReturn",
+        "forwardedReturn",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_unordered_unprotected_conflicts(&result);
+    }
+    for root in [
+        "directControl",
+        "externalSibling",
+        "overlappingGenerations",
+        "mutualSibling",
+        "forwardedRun",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
+    for root in ["changedInputs", "multipleSpawns"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_ne!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{root}: {result:#?}"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == CodeQueryDiagnosticCode::SemanticAnalysisPartial),
+            "{root}: {result:#?}"
+        );
+        assert_no_proven_unordered_unprotected_conflicts(&result);
+    }
+}
+
+#[test]
 fn go_channel_received_capture_preserves_payload_type_and_identity() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -14695,12 +14990,15 @@ func recursiveJoin() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let shared = go_invocation_conflicts(&workspace, "sharedRoot");
-    assert_conflict_or_explicit_open(&shared);
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "closed invariant access-only task cycle",
+    );
     assert!(
         !shared.results.is_empty(),
         "shared object must retain candidate pairs: {shared:#?}"
     );
-    for root in ["sharedRoot", "freshRoot", "copiedRoot", "recursiveJoin"] {
+    for root in ["freshRoot", "copiedRoot", "recursiveJoin"] {
         let result = go_invocation_conflicts(&workspace, root);
         assert_ne!(
             result.completion(),
@@ -14996,6 +15294,134 @@ func directRoot() {
 }
 
 #[test]
+#[ignore = "requires finite recursive activation expansion for distinct scalar inputs; not part of demand-driven control specialization (#2901)"]
+fn go_synchronous_recursive_relay_finite_depth_proves_ordering() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func relay(start, finish chan struct{}, depth int) {
+    if depth > 0 { relay(start, finish, depth - 1); return }
+    <-start
+    close(finish)
+}
+func directRelay(start, finish chan struct{}) { <-start; close(finish) }
+func recursiveRoot(depth int) {
+    n := 0
+    start := make(chan struct{})
+    finish := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(start) }()
+    go relay(start, finish, depth)
+    go func() { <-finish; n = 2; close(done) }()
+    <-done
+    _ = n
+}
+func finiteRoot() { recursiveRoot(5) }
+func directRoot() {
+    n := 0
+    start := make(chan struct{})
+    finish := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(start) }()
+    go directRelay(start, finish)
+    go func() { <-finish; n = 2; close(done) }()
+    <-done
+    _ = n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let finite = go_invocation_conflicts(&workspace, "finiteRoot");
+    assert_eq!(
+        finite.completion(),
+        CodeQueryCompletion::Complete,
+        "{finite:#?}"
+    );
+    assert!(!finite.results.is_empty(), "{finite:#?}");
+    for item in &finite.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("typed concurrency row: {item:#?}");
+        };
+        assert_eq!(value.proof, "proven", "{finite:#?}");
+        assert_eq!(value.coverage, "exhaustive", "{finite:#?}");
+        assert_eq!(value.ordering, "happens_before", "{finite:#?}");
+    }
+}
+
+#[test]
+#[ignore = "requires finite recursive activation expansion for distinct scalar inputs; not part of demand-driven control specialization (#2901)"]
+fn go_finite_recursive_results_preserve_activation_identity() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func identity(c *cell, depth int) *cell {
+    if depth > 0 { return identity(c, depth-1) }
+    return c
+}
+func fresh(c *cell, depth int) *cell {
+    if depth > 0 { return fresh(&cell{}, depth-1) }
+    return c
+}
+func copied(c cell, depth int) cell {
+    if depth > 0 { return copied(c, depth-1) }
+    return c
+}
+func swap(first, second *cell, depth int) *cell {
+    if depth > 0 { return swap(second, first, depth-1) }
+    return first
+}
+func sharedRoot() {
+    c := &cell{}
+    go func() { got := identity(c, 3); got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func freshRoot() {
+    c := &cell{}
+    go func() { got := fresh(c, 3); got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func copiedRoot() {
+    c := cell{}
+    go func() { got := copied(c, 3); got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func swappedSharedRoot() {
+    first := &cell{}
+    second := &cell{}
+    go func() { got := swap(first, second, 1); got.n = 1 }()
+    go func() { second.n = 2 }()
+}
+func swappedDistinctRoot() {
+    first := &cell{}
+    second := &cell{}
+    go func() { got := swap(first, second, 1); got.n = 1 }()
+    go func() { first.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in ["sharedRoot", "swappedSharedRoot"] {
+        assert_proven_exhaustive_sibling_conflicts(&go_invocation_conflicts(&workspace, root), 1);
+    }
+    for root in ["freshRoot", "swappedDistinctRoot"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{root}: {result:#?}"
+        );
+    }
+    let copied = go_invocation_conflicts(&workspace, "copiedRoot");
+    assert_no_proven_conflicts_with_explicit_evidence(&copied);
+}
+
+#[test]
 fn go_recursive_channel_payload_proves_exact_countdown() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -15038,6 +15464,49 @@ func valueRoot() {
             .iter()
             .any(|diagnostic| diagnostic.message.contains("RecursiveExpansion")),
         "distinct copied field storage must not hide incomplete recursive coverage: {value:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires finite recursive activation expansion for distinct scalar inputs; not part of demand-driven control specialization (#2901)"]
+fn go_recursive_channel_value_copy_countdown_resolves_completely() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func recursiveSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { recursiveSend(ch, c, depth - 1); return }
+    ch <- c
+}
+func recursiveSendValue(ch chan cell, c cell, depth int) {
+    if depth > 0 { recursiveSendValue(ch, c, depth - 1); return }
+    ch <- c
+}
+func pointerRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go recursiveSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func valueRoot() {
+    ch := make(chan cell)
+    c := cell{}
+    go recursiveSendValue(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let value = go_invocation_conflicts(&workspace, "valueRoot");
+    assert_no_proven_conflicts_with_explanation(&value);
+    assert_eq!(
+        value.completion(),
+        CodeQueryCompletion::Complete,
+        "the finite value-copy activation is represented without aliasing its caller: {value:#?}"
     );
 }
 
@@ -15131,6 +15600,16 @@ func cyclicRoot() {
     ] {
         let result = go_invocation_conflicts(&workspace, root);
         assert_no_proven_conflicts_with_explicit_evidence(&result);
+        if matches!(root, "doubleRoot" | "cyclicRoot") {
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("UnknownLocation")),
+                "represented sends with unresolved cardinality remain explicitly incomplete: {result:#?}"
+            );
+            continue;
+        }
         assert!(
             result.results.iter().any(|item| {
                 let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
@@ -15577,6 +16056,125 @@ func lookalikeContext(ctx localContext) (err error) {
 }
 
 #[test]
+fn go_known_scalar_arguments_prune_only_the_arms_they_decide() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func stopped(c *cell, stop bool) {
+    if stop { return }
+    go stopped(c, stop)
+    c.n = 1
+}
+func earlyReturn() {
+    c := &cell{}
+    go stopped(c, true)
+    go func() { c.n = 2 }()
+}
+func running() {
+    c := &cell{}
+    go stopped(c, false)
+    go func() { c.n = 2 }()
+}
+func reassigned(c *cell, stop bool) {
+    stop = false
+    if stop { return }
+    c.n = 1
+}
+func reassignedRoot() {
+    c := &cell{}
+    go reassigned(c, true)
+    go func() { c.n = 2 }()
+}
+func captured(c *cell, stop bool) {
+    reset := func() { stop = false }
+    reset()
+    if stop { return }
+    c.n = 1
+}
+func capturedRoot() {
+    c := &cell{}
+    go captured(c, true)
+    go func() { c.n = 2 }()
+}
+func permissions(c *cell, mode int, stop bool) {
+    if stop { return }
+    c.n = mode
+}
+func permissionsRoot(stop bool) {
+    c := &cell{}
+    go permissions(c, 420, stop)
+    go func() { c.n = 2 }()
+}
+func countdown(c *cell, depth int) {
+    if depth > 0 { go countdown(c, depth-1); return }
+    c.n = 1
+}
+func countdownRoot() {
+    c := &cell{}
+    go countdown(c, 2)
+    go func() { c.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let pruned = go_invocation_conflicts(&workspace, "earlyReturn");
+    assert_eq!(
+        pruned.completion(),
+        CodeQueryCompletion::Complete,
+        "{pruned:#?}"
+    );
+    assert!(pruned.diagnostics.is_empty(), "{pruned:#?}");
+    for item in &pruned.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("typed concurrency row: {item:#?}");
+        };
+        assert_ne!(
+            value.verdict, "conflict",
+            "a known argument that returns early removes the write: {pruned:#?}"
+        );
+        assert!(
+            !value
+                .reasons
+                .iter()
+                .any(|reason| reason == "recursive_expansion"),
+            "the pruned recursive spawn leaves no recursion residue: {pruned:#?}"
+        );
+    }
+
+    // An argument that decides the other arm, a formal overwritten or
+    // captured before its guard, and an integer argument no guard tests all
+    // keep the write.
+    for root in [
+        "running",
+        "reassignedRoot",
+        "capturedRoot",
+        "permissionsRoot",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
+
+    // Each deeper generation of the countdown writes the field, so the
+    // outer activations' pruned write must survive their omitted recursion.
+    let countdown = go_invocation_conflicts(&workspace, "countdownRoot");
+    assert!(
+        countdown.results.iter().any(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("typed concurrency row: {item:#?}");
+            };
+            value.verdict == "conflict"
+                && value.first_access == "write"
+                && value.second_access == "write"
+        }),
+        "{countdown:#?}"
+    );
+}
+
+#[test]
 fn go_unresolved_effects_cross_synchronous_calls() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -15721,13 +16319,125 @@ func insideExpression(cb func() int) {
     );
 }
 
+/// Once one Go race root exhausts the query's shared semantic budget, the
+/// diagnostic names that root, the internal dimension, and the code that
+/// asked for the refused charge. Later roots say the budget was already
+/// exhausted instead of blaming whichever phase asked next.
+#[test]
+fn go_race_budget_exhaustion_names_the_first_root_and_charge_site() {
+    // Enough for the first root's summaries, not for its solve.
+    const NESTED_ENTRIES: usize = 3_000;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func write(c *cell, v int) { c.n = v }
+func firstRoot() {
+    c := &cell{}
+    go write(c, 1)
+    go write(c, 2)
+    write(c, 3)
+}
+func secondRoot() {
+    c := &cell{}
+    go write(c, 4)
+    write(c, 5)
+}
+func thirdRoot() {
+    c := &cell{}
+    go write(c, 6)
+    write(c, 7)
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "concurrent_access_conflicts" }],
+        "result_detail": "full"
+    }))
+    .unwrap();
+    let defaults = CodeQueryExecutionLimits::default();
+    let default_rows = semantic::semantic_budget_limits(defaults.semantic);
+    let limits = CodeQueryExecutionLimits {
+        semantic: CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                if dimension == SemanticBudgetDimension::NestedEntries {
+                    NESTED_ENTRIES
+                } else {
+                    default_rows.get(dimension)
+                }
+            })),
+            ..defaults.semantic
+        },
+        ..defaults
+    };
+    let result = super::super::execute_internal(
+        workspace.analyzer(),
+        Some(&workspace),
+        &query,
+        limits,
+        None,
+        None,
+        false,
+    )
+    .result;
+    let exhausted = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+        .collect::<Vec<_>>();
+    let [first, later @ ..] = exhausted.as_slice() else {
+        panic!("a root exhausts the shared budget: {result:#?}");
+    };
+    let [attributed] = first.exhausted_roots.as_slice() else {
+        panic!("the first exhaustion is attributed: {first:#?}");
+    };
+    assert_eq!(
+        attributed.procedure.as_deref(),
+        Some("firstRoot"),
+        "{first:#?}"
+    );
+    assert_eq!(attributed.lane, "semantic/nested_entries", "{first:#?}");
+    let site = attributed
+        .stage
+        .as_deref()
+        .unwrap_or_else(|| panic!("the charge site is named: {first:#?}"));
+    assert!(site.contains("bifrost-flow/src/concurrency"), "{first:#?}");
+    let charge = attributed
+        .charge
+        .unwrap_or_else(|| panic!("the refused charge is carried: {first:#?}"));
+    assert!(charge.attempted > charge.limit, "{first:#?}");
+    assert!(first.message.contains(&attributed.render()), "{first:#?}");
+    assert!(!later.is_empty(), "later roots still report: {result:#?}");
+    for diagnostic in later
+        .iter()
+        .copied()
+        .chain(result.diagnostics.iter().filter(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("concurrency summary projection")
+        }))
+    {
+        assert!(
+            diagnostic.message.contains("already exhausted at")
+                && diagnostic.message.contains(&attributed.render()),
+            "a later root names the earlier exhaustion: {diagnostic:#?}"
+        );
+        assert!(diagnostic.exhausted_roots.is_empty(), "{diagnostic:#?}");
+    }
+}
+
 /// Inline reads must not repeatedly pay for a whole invocation inventory.
 /// The unknown call still prevents proving the holder's reference payload.
 #[test]
 fn go_field_payload_budget_skips_unprovable_and_inline_loads() {
     let reads = "    sum += h.n\n".repeat(256);
     let source = format!(
-        "package main\ntype cell struct {{ n int }}\ntype holder struct {{ n int; p *cell }}\nfunc unknown(h *holder)\nfunc manyInlineReads() int {{\n    h := &holder{{p: &cell{{}}}}\n    unknown(h)\n    sum := 0\n{reads}    go func() {{ h.p.n = 1 }}()\n    go func() {{ h.p.n = 2 }}()\n    return sum\n}}\n"
+        "package main\ntype cell struct {{ n int }}\ntype holder struct {{ n int; p *cell }}\nfunc unknown(h *holder)\nfunc manyInlineReads(stop bool) int {{\n    if stop {{ return 0 }}\n    h := &holder{{p: &cell{{}}}}\n    unknown(h)\n    sum := 0\n{reads}    go func() {{ h.p.n = 1 }}()\n    go func() {{ h.p.n = 2 }}()\n    return sum\n}}\n"
     );
     let project = InlineTestProject::with_language(Language::Go)
         .file("main.go", &source)
@@ -19742,6 +20452,189 @@ fn python_absent_member_rows_report_the_finding_and_its_origin() {
         result.results.is_empty(),
         "a partial class set produces no finding: {result:#?}"
     );
+}
+
+#[test]
+fn absent_member_finding_proof_filter_uses_the_strongest_tier_across_roots() {
+    let (_project, workspace) = type_flow_workspace_with_source(concat!(
+        "class C:\n    pass\n\n",
+        "def access(value):\n    return value.missing\n\n",
+        "def conditional_root(value):\n",
+        "    if value:\n",
+        "        return access(C())\n",
+        "    return access(value)\n\n",
+        "def proven_root():\n",
+        "    return access(C())\n",
+    ));
+    let run = |proof: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["python"],
+            "match": { "kind": "function" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "absent_member", "finding_proof": proof }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("absent-member query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let conditional_root_query = CodeQuery::from_json(&json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "conditional_root" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member", "finding_proof": "any" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("conditional-root absent-member query");
+    let conditional_root = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &conditional_root_query,
+    );
+    let [conditional_root_item] = conditional_root.results.as_slice() else {
+        panic!("the conditional root reaches one absent-member finding: {conditional_root:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: conditional_root_finding,
+    } = &conditional_root_item.value
+    else {
+        panic!("absent_member returns its typed row: {conditional_root_item:#?}");
+    };
+    assert_eq!(conditional_root_finding.proof, "conditional");
+    assert_eq!(conditional_root_finding.remainders, ["root_parameter"]);
+
+    let conditional = run("conditional");
+    assert!(
+        conditional.results.is_empty(),
+        "the later proven root upgrades the same site/class pair: {conditional:#?}"
+    );
+
+    let proven = run("proven");
+    let [proven_item] = proven.results.as_slice() else {
+        panic!("the proven filter returns one merged finding: {proven:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: proven_finding,
+    } = &proven_item.value
+    else {
+        panic!("absent_member returns its typed row: {proven_item:#?}");
+    };
+    assert_eq!(proven_finding.member, "missing");
+    assert_eq!(proven_finding.range.start_line, 5);
+    assert_eq!(proven_finding.proof, "proven");
+
+    let any = run("any");
+    let [any_item] = any.results.as_slice() else {
+        panic!("the any filter returns one merged finding: {any:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding { value: any_finding } = &any_item.value else {
+        panic!("absent_member returns its typed row: {any_item:#?}");
+    };
+    assert_eq!(any_finding.id, proven_finding.id);
+    assert_eq!(any_finding.class, proven_finding.class);
+    assert_eq!(any_finding.proof, "proven");
+}
+
+#[test]
+fn absent_member_repeat_collapses_before_the_merged_proof_filter() {
+    let (_project, workspace) = type_flow_workspace_with_source(concat!(
+        "class C:\n    pass\n\n",
+        "def access(value, repeat):\n",
+        "    value.missing\n",
+        "    if repeat:\n",
+        "        value.missing\n\n",
+        "def conditional_root(value):\n",
+        "    if value:\n",
+        "        return access(C(), True)\n",
+        "    return access(value, True)\n\n",
+        "def proven_root():\n",
+        "    return access(C(), True)\n",
+    ));
+    let run = |root: Option<&str>, proof: &str| {
+        let mut matcher = json!({ "kind": "function" });
+        if let Some(root) = root {
+            matcher["name"] = json!(root);
+        }
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["python"],
+            "match": matcher,
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "absent_member", "finding_proof": proof }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("absent-member query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let conditional_root = run(Some("conditional_root"), "any");
+    let [conditional_root_item] = conditional_root.results.as_slice() else {
+        panic!("the conditional root collapses its repeat: {conditional_root:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: conditional_root_finding,
+    } = &conditional_root_item.value
+    else {
+        panic!("absent_member returns its typed row: {conditional_root_item:#?}");
+    };
+    assert_eq!(conditional_root_finding.range.start_line, 5);
+    assert_eq!(conditional_root_finding.proof, "conditional");
+    assert_eq!(conditional_root_finding.also_fails_at.len(), 1);
+
+    let proven_root = run(Some("proven_root"), "any");
+    let [proven_root_item] = proven_root.results.as_slice() else {
+        panic!("the proven root collapses its repeat: {proven_root:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: proven_root_finding,
+    } = &proven_root_item.value
+    else {
+        panic!("absent_member returns its typed row: {proven_root_item:#?}");
+    };
+    assert_eq!(proven_root_finding.range.start_line, 5);
+    assert_eq!(proven_root_finding.proof, "proven");
+    assert_eq!(proven_root_finding.also_fails_at.len(), 1);
+
+    let conditional = run(None, "conditional");
+    assert!(conditional.results.is_empty(), "{conditional:#?}");
+
+    let proven = run(None, "proven");
+    let [proven_item] = proven.results.as_slice() else {
+        panic!("the proven first access appears once: {proven:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: proven_finding,
+    } = &proven_item.value
+    else {
+        panic!("absent_member returns its typed row: {proven_item:#?}");
+    };
+    assert_eq!(proven_finding.range.start_line, 5);
+    assert_eq!(proven_finding.proof, "proven");
+    assert_eq!(proven_finding.also_fails_at.len(), 1);
+
+    let any = run(None, "any");
+    let [any_item] = any.results.as_slice() else {
+        panic!("the any filter returns the collapsed pair once: {any:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding { value: any_finding } = &any_item.value else {
+        panic!("absent_member returns its typed row: {any_item:#?}");
+    };
+    assert_eq!(any_finding.id, proven_finding.id);
+    assert_eq!(any_finding.proof, "proven");
+    assert_eq!(any_finding.also_fails_at.len(), 1);
 }
 
 /// The query cost pin: one class-set solve per input procedure per query. Two
@@ -26129,4 +27022,139 @@ fn failure_handler_state_classifies_exact_java_catch_bodies() {
         .collect::<Vec<_>>();
     assert!(verdicts.contains(&"empty"), "{verdicts:?}");
     assert!(verdicts.contains(&"nonempty"), "{verdicts:?}");
+}
+
+#[test]
+fn result_subject_uses_preserves_one_return_through_local_copy() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "App.java",
+            r#"
+final class App {
+    static native App acquire();
+    void set() {}
+    void read() {}
+    static void run() {
+        App original = acquire();
+        App alias = original;
+        original.set();
+        alias.read();
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        r#"(result-subject-uses (call-results (call-shape (call :callee "acquire"))))"#,
+    )
+    .expect("normal-result subject query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows = result
+        .results
+        .iter()
+        .map(|item| serde_json::to_value(&item.value).expect("serialize public subject row"))
+        .collect::<Vec<_>>();
+    let proven = rows
+        .iter()
+        .filter(|row| row["proof"] == "proven")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        proven.len(),
+        2,
+        "both receiver occurrences share the normal result: {rows:#?}"
+    );
+    assert!(
+        proven
+            .iter()
+            .all(|row| row["result_type"] == "result_subject_use")
+    );
+    assert_eq!(proven[0]["origin"]["id"], proven[1]["origin"]["id"]);
+    assert_ne!(proven[0]["receiver_call_id"], proven[1]["receiver_call_id"]);
+    for row in proven {
+        assert_eq!(row["outcome"], "proven", "{row:#?}");
+        assert!(row["receiver_range"].is_object(), "{row:#?}");
+        let conversions = row["conversion_witnesses"]
+            .as_array()
+            .expect("typed assignment conversions survive public projection");
+        assert!(!conversions.is_empty(), "{row:#?}");
+        for conversion in conversions {
+            assert!(conversion["source_digest"].is_string());
+            assert!(conversion["source_type_id"].is_string());
+            assert!(conversion["target_type_id"].is_string());
+            assert!(conversion["assignment"].is_object());
+            assert!(conversion["target_binding"].is_object());
+            assert!(conversion["conversion"].is_string());
+        }
+        assert!(
+            !row["witness_event_ids"]
+                .as_array()
+                .expect("witness list")
+                .is_empty(),
+            "{row:#?}"
+        );
+    }
+}
+
+#[test]
+fn absent_member_repeat_remains_when_access_tiers_differ() {
+    let (_project, workspace) = type_flow_workspace_with_source(concat!(
+        "class C:\n    pass\n\n",
+        "def mixed_tier_root(flag, alternate):\n",
+        "    value = C()\n",
+        "    value.missing\n",
+        "    if flag:\n",
+        "        value = alternate\n",
+        "    value.missing\n",
+    ));
+    let run = |proof: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["python"],
+            "match": { "kind": "function", "name": "mixed_tier_root" },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "absent_member", "finding_proof": proof }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("absent-member query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let conditional = run("conditional");
+    let [conditional_item] = conditional.results.as_slice() else {
+        panic!("the conditional later access remains a row: {conditional:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: conditional_finding,
+    } = &conditional_item.value
+    else {
+        panic!("absent_member returns its typed row: {conditional_item:#?}");
+    };
+    assert_eq!(conditional_finding.range.start_line, 9);
+    assert_eq!(conditional_finding.proof, "conditional");
+
+    let proven = run("proven");
+    let [proven_item] = proven.results.as_slice() else {
+        panic!("the proven first access remains a row: {proven:#?}");
+    };
+    let CodeQueryResultValue::AbsentMemberFinding {
+        value: proven_finding,
+    } = &proven_item.value
+    else {
+        panic!("absent_member returns its typed row: {proven_item:#?}");
+    };
+    assert_eq!(proven_finding.range.start_line, 6);
+    assert_eq!(proven_finding.proof, "proven");
+
+    let any = run("any");
+    assert_eq!(any.results.len(), 2, "{any:#?}");
 }

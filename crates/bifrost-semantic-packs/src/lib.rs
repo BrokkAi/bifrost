@@ -50,6 +50,11 @@ impl<'a> EmbeddedSemanticPack<'a> {
         self.source_id
     }
 
+    /// Exact compiled manifest bytes, including every indexed shard digest.
+    pub fn manifest_bytes(&self) -> &'a [u8] {
+        self.manifest_bytes
+    }
+
     pub fn decode(
         &self,
         limits: &DecodeLimits,
@@ -186,7 +191,7 @@ const GO_STDLIB_OS_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-os-declarations/shards/go.stdlib.os.declarations.deflate"
 )];
 const GO_STDLIB_ERRORS_SHARDS: &[&[u8]] = &[include_bytes!(
-    "../embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.json"
+    "../embedded/go-stdlib-errors/shards/go.stdlib.errors.conditional-result-refinements.deflate"
 )];
 const GO_STDLIB_ERRORS_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-errors-declarations/shards/go.stdlib.errors.declarations.deflate"
@@ -805,7 +810,25 @@ mod tests {
             .payload()
             .procedure_summaries()
             .expect("the Go time shard carries procedure summaries");
-        assert_eq!(time.len(), 3);
+        assert_eq!(time.len(), 10);
+        let no_effect_ids = [
+            "time.now",
+            "time.since",
+            "time.until",
+            "time.new-ticker",
+            "time.new-timer",
+            "time.ticker.stop",
+            "time.ticker.reset",
+        ];
+        for id in no_effect_ids {
+            let summary = time
+                .iter()
+                .find(|summary| summary.id == id)
+                .unwrap_or_else(|| panic!("Go time pack lacks {id}: {time:#?}"));
+            assert!(summary.no_concurrency_effects, "{id}: {summary:#?}");
+            assert!(summary.concurrency_effects.is_empty(), "{id}: {summary:#?}");
+            assert!(!summary.ordinary_heap_unchanged, "{id}: {summary:#?}");
+        }
         assert!(time.iter().any(|summary| {
             summary.id == "time.after-func"
                 && matches!(
@@ -1825,6 +1848,16 @@ mod tests {
                 target: CompiledIndirectWriteTarget::Pointee,
             }]
         );
+        let errors_new = summaries
+            .iter()
+            .find(|summary| summary.id == "errors.new")
+            .unwrap_or_else(|| panic!("the Go errors pack must carry errors.New: {summaries:#?}"));
+        assert_eq!(errors_new.target.symbol, "errors.New(text string)");
+        assert!(!errors_new.target.has_receiver);
+        assert_eq!(errors_new.target.parameter_count, 1);
+        assert!(errors_new.no_concurrency_effects);
+        assert!(errors_new.concurrency_effects.is_empty());
+        assert!(!errors_new.ordinary_heap_unchanged);
 
         let net_url = decoded
             .iter()

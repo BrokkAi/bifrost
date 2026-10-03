@@ -7,7 +7,7 @@
   :name "Ignored file-deletion status"
   :message "the reviewed deletion status is discarded"
   :severity note
-  :description "The exact JDK 21 Files.deleteIfExists(Path) call returns a Boolean status: false means no file was deleted because it did not exist. An expression statement or for-loop initializer/update discards that status. Expression lambdas require a resolved functional return contract. I/O exceptions remain separate. This diagnostic requires exact selected-artifact and dispatch evidence; it does not claim that discarding the status is always a bug."
+  :description "The exact JDK 21 Files.deleteIfExists(Path) call returns a Boolean status: false means no file was deleted because it did not exist. An expression statement or for-loop initializer/update discards that status. An expression lambda discards the status only when its resolved functional method returns void; a value-returning target retains it. Missing or conflicting contracts remain incomplete, and a diagnostic does not prove the deferred body executes. I/O exceptions remain separate. This diagnostic requires exact selected-artifact and dispatch evidence; it does not claim that discarding the status is always a bug."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "java" "result-use" "status"]
   :analysis (analysis

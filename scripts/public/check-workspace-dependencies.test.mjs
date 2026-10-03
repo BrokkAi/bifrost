@@ -21,7 +21,6 @@ const names = [
   "brokk-bifrost-policy",
   "brokk-bifrost-runtime",
   "brokk-bifrost-mcp",
-  "brokk-bifrost-lsp",
   "brokk-bifrost-semantic-packs",
 ];
 
@@ -81,13 +80,6 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-runtime"),
       dependency("brokk-bifrost-rql"),
     ],
-    "brokk-bifrost-lsp": [
-      dependency("brokk-bifrost-analysis"),
-      dependency("brokk-bifrost-flow"),
-      dependency("brokk-bifrost-policy"),
-      dependency("brokk-bifrost-runtime"),
-      dependency("brokk-bifrost-rql"),
-    ],
     "brokk-bifrost-semantic-packs": [
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
@@ -112,6 +104,40 @@ test("accepts the intended one-way workspace graph", () => {
   assert.deepEqual(validateWorkspaceGraph(metadata()), []);
 });
 
+test("facade parser and identity dependencies are confined to development", () => {
+  const direct = ["brokk-bifrost-core", "brokk-bifrost-js-ts", "brokk-bifrost-jvm"];
+  for (const kind of ["dev", null, "build"]) {
+    const errors = validateWorkspaceGraph(metadata({
+      dependencies: {
+        "brokk-bifrost": direct.map((name) => ({ ...dependency(name), kind })),
+      },
+    }));
+    assert.deepEqual(errors, kind === "dev" ? [] : direct.map(
+      (name) => `brokk-bifrost must not depend on workspace package ${name}`,
+    ));
+  }
+});
+
+test("facade development exceptions still require exact workspace versions", () => {
+  assert.deepEqual(validateWorkspaceGraph(metadata({
+    dependencies: {
+      "brokk-bifrost": [{ name: "brokk-bifrost-core", req: "^0.8.12", kind: "dev" }],
+    },
+  })), ["brokk-bifrost dependency on brokk-bifrost-core must require exactly =0.8.12"]);
+});
+
+test("development edges do not bypass other workspace boundaries", () => {
+  assert.deepEqual(validateWorkspaceGraph(metadata({
+    dependencies: {
+      "brokk-bifrost-core": [{ ...dependency("brokk-bifrost-analysis"), kind: "dev" }],
+      "brokk-bifrost": [{ ...dependency("brokk-bifrost-go"), kind: "dev" }],
+    },
+  })), [
+    "brokk-bifrost must not depend on workspace package brokk-bifrost-go",
+    "brokk-bifrost-core must not depend on workspace package brokk-bifrost-analysis",
+  ]);
+});
+
 test("rejects a runtime dependency on a protocol host", () => {
   const errors = validateWorkspaceGraph(
     metadata({
@@ -121,13 +147,13 @@ test("rejects a runtime dependency on a protocol host", () => {
           dependency("brokk-bifrost-flow"),
           dependency("brokk-bifrost-policy"),
           dependency("brokk-bifrost-rql"),
-          dependency("brokk-bifrost-lsp"),
+          dependency("brokk-bifrost-mcp"),
         ],
       },
     }),
   );
   assert.deepEqual(errors, [
-    "brokk-bifrost-runtime must not depend on workspace package brokk-bifrost-lsp",
+    "brokk-bifrost-runtime must not depend on workspace package brokk-bifrost-mcp",
   ]);
 });
 
@@ -395,4 +421,26 @@ test("rejects a php crate reaching back up to analysis", () => {
     ),
     ["brokk-bifrost-php must not depend on workspace package brokk-bifrost-analysis"],
   );
+});
+
+// A registry package is outside workspace_members, so checking only the
+// workspace inventory cannot catch a transitive host dependency.
+test("rejects the retired upstream LSP in the resolved registry closure", () => {
+  const graph = metadata();
+  const retired = {
+    id: "registry+https://github.com/rust-lang/crates.io-index#brokk-bifrost-lsp@0.12.0",
+    name: "brokk-bifrost-lsp",
+    version: "0.12.0",
+    dependencies: [],
+  };
+  graph.packages.push(retired);
+  assert.deepEqual(validateWorkspaceGraph(graph), [
+    `engine dependency graph contains retired upstream host ${retired.id}`,
+  ]);
+  graph.packages[graph.packages.length - 1] = {
+    ...retired,
+    id: "registry+https://github.com/rust-lang/crates.io-index#lsp-types@0.97.0",
+    name: "lsp-types",
+  };
+  assert.deepEqual(validateWorkspaceGraph(graph), []);
 });

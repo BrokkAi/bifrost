@@ -12,18 +12,18 @@ use crate::imports::{
     resolve_js_ts_module_binding_candidates, resolve_js_ts_module_specifier,
 };
 use crate::providers::{JsTsSource, compute_direct_ancestors};
-use crate::syntax::compute_import_binder as compute_jsts_import_binder;
+use crate::source_facts::JsTsFileSourceFacts;
 use crate::syntax::parse_js_ts_tree;
-use crate::syntax::{
-    JsTsImportBinder, JsTsImportBindingResolution, inline_object_type, slice,
-    static_member_property,
-};
+use crate::syntax::{JsTsImportBinder, JsTsImportBindingResolution, slice, static_member_property};
 use crate::ts_owners::{
     jsts_identifier_candidates, jsts_indexed_callable_node,
-    ts_resolve_type_node_to_property_owner_outcome, ts_resolve_type_text_to_property_owners,
+    ts_resolve_source_type_to_property_owner_outcome,
+    ts_resolve_type_node_to_property_owner_outcome,
 };
 use crate::tsconfig::AliasResolver;
-use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::js_ts_facts::{
+    JsTsComponentPropsFact, JsTsExportKind, JsTsSourceTypeId, JsTsTypeShape,
+};
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -616,16 +616,85 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         imports: &JsTsImportBinder,
         aliases: &AliasResolver,
     ) -> Vec<CodeUnit> {
-        ts_resolve_type_text_to_property_owners(
+        ts_resolve_type_node_to_property_owner_outcome(
             self.host,
             self.support,
             file,
             source,
             imports,
             aliases,
-            ts_type_annotation_text(type_node, source).as_str(),
+            type_node,
             0,
+            ReceiverAnalysisBudget::default(),
         )
+        .values()
+        .map(|values| values.to_vec())
+        .unwrap_or_default()
+    }
+
+    fn source_type_property_owners(
+        &self,
+        type_id: JsTsSourceTypeId,
+        file: &ProjectFile,
+        facts: &JsTsFileSourceFacts,
+    ) -> Vec<CodeUnit> {
+        ts_resolve_source_type_to_property_owner_outcome(
+            self.host,
+            self.support,
+            file,
+            facts,
+            type_id,
+            0,
+            ReceiverAnalysisBudget::default(),
+        )
+        .values()
+        .map(|values| values.to_vec())
+        .unwrap_or_default()
+    }
+
+    fn canonical_props_source_owners(
+        &self,
+        props: &JsTsComponentPropsFact,
+        file: &ProjectFile,
+        facts: &JsTsFileSourceFacts,
+        aliases: &AliasResolver,
+        hops: usize,
+    ) -> Vec<CodeUnit> {
+        match props {
+            JsTsComponentPropsFact::Type(id) => self.source_type_property_owners(*id, file, facts),
+            JsTsComponentPropsFact::Named(name) => {
+                let imports = JsTsImportBinder::from_source_facts(
+                    &facts.facts,
+                    &facts.imports,
+                    &facts.source,
+                );
+                self.component_type_props_owners(name, file, "", &imports, aliases)
+            }
+            JsTsComponentPropsFact::Module(import) => {
+                if hops == 0 {
+                    return Vec::new();
+                }
+                let Some(path) = facts.imports[import.index()].path.as_ref() else {
+                    return Vec::new();
+                };
+                let [specifier] = path.segments.as_slice() else {
+                    return Vec::new();
+                };
+                resolve_js_ts_module_specifier(file, specifier, Language::TypeScript, Some(aliases))
+                    .iter()
+                    .flat_map(|module| {
+                        self.module_default_component_props_owners(module, aliases, hops - 1)
+                    })
+                    .collect()
+            }
+            JsTsComponentPropsFact::TypeMember {
+                owner_type,
+                members,
+            } => self.component_members_prop_owners(
+                self.source_type_property_owners(*owner_type, file, facts),
+                members,
+            ),
+        }
     }
 
     /// The props a component *type* declares: `type DevtoolsComponentType =
@@ -651,28 +720,22 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             name,
             false,
         ) {
-            let Ok(unit_source) = unit.source().read_to_string() else {
+            let Some(facts) = self.host.source_facts(unit.source()) else {
                 continue;
             };
-            let Some(tree) = parse_js_ts_tree(unit.source(), &unit_source, Language::TypeScript)
-            else {
-                continue;
-            };
-            let unit_imports = compute_jsts_import_binder(&unit_source, &tree);
-            for node in nodes_for_code_unit(self.host, &unit, tree.root_node()) {
-                let Some(argument) = node
-                    .child_by_field_name("value")
-                    .and_then(|value| function_component_wrapper_argument(value, &unit_source))
+            for declaration in facts.facts.declarations.iter().filter(|declaration| {
+                facts
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.contains(&unit))
+            }) {
+                let Some(argument) = declaration
+                    .alias_type
+                    .and_then(|id| source_component_wrapper_argument(&facts, id))
                 else {
                     continue;
                 };
-                owners.extend(self.type_node_property_owners(
-                    argument,
-                    unit.source(),
-                    &unit_source,
-                    &unit_imports,
-                    aliases,
-                ));
+                owners.extend(self.source_type_property_owners(argument, unit.source(), &facts));
             }
         }
         owners
@@ -686,20 +749,46 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         aliases: &AliasResolver,
         hops: usize,
     ) -> Vec<CodeUnit> {
-        let Ok(source) = file.read_to_string() else {
+        let Some(facts) = self.host.source_facts(file) else {
             return Vec::new();
         };
-        let Some(tree) = parse_js_ts_tree(file, &source, Language::TypeScript) else {
-            return Vec::new();
-        };
-        let imports = compute_jsts_import_binder(&source, &tree);
-        let Some(binding) = default_export_component_binding(tree.root_node(), &source) else {
-            return Vec::new();
-        };
-        jsx_binding_props_source(binding, &source)
-            .map(|props| {
-                self.jsx_props_source_owners(props, file, &source, &imports, aliases, hops)
+        let Some(export) =
+            facts.facts.exports.iter().find(|export| {
+                export.is_esm && matches!(export.kind, JsTsExportKind::Default { .. })
             })
+        else {
+            return Vec::new();
+        };
+        let JsTsExportKind::Default { local_name } = &export.kind else {
+            unreachable!()
+        };
+        let inline_declaration = facts.facts.declarations.iter().any(|declaration| {
+            facts.source.declaration(declaration.declaration).occurrence == export.occurrence
+        });
+        let mut declarations = facts.facts.declarations.iter().filter(|declaration| {
+            if inline_declaration {
+                return facts.source.declaration(declaration.declaration).occurrence
+                    == export.occurrence;
+            }
+            if let Some(name) = local_name {
+                facts
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.iter().any(|unit| unit.identifier() == name))
+            } else {
+                facts.source.declaration(declaration.declaration).occurrence == export.occurrence
+            }
+        });
+        let Some(declaration) = declarations.next() else {
+            return Vec::new();
+        };
+        if declarations.next().is_some() {
+            return Vec::new();
+        }
+        declaration
+            .component_props
+            .as_ref()
+            .map(|props| self.canonical_props_source_owners(props, file, &facts, aliases, hops))
             .unwrap_or_default()
     }
 
@@ -720,28 +809,36 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         imports: &JsTsImportBinder,
         aliases: &AliasResolver,
     ) -> Vec<CodeUnit> {
+        self.component_members_prop_owners(
+            self.type_node_property_owners(owner_type, file, source, imports, aliases),
+            members,
+        )
+    }
+
+    fn component_members_prop_owners(
+        &self,
+        roots: Vec<CodeUnit>,
+        members: &[String],
+    ) -> Vec<CodeUnit> {
         let mut owners = Vec::new();
-        for root in self.type_node_property_owners(owner_type, file, source, imports, aliases) {
-            let Ok(root_source) = root.source().read_to_string() else {
+        for root in roots {
+            let Some(facts) = self.host.source_facts(root.source()) else {
                 continue;
             };
-            let Some(tree) = parse_js_ts_tree(root.source(), &root_source, Language::TypeScript)
-            else {
-                continue;
-            };
-            let root_imports = compute_jsts_import_binder(&root_source, &tree);
-            for node in nodes_for_code_unit(self.host, &root, tree.root_node()) {
-                let Some(argument) = type_member_component_argument(node, members, &root_source)
+            for declaration in facts.facts.declarations.iter().filter(|declaration| {
+                facts
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.contains(&root))
+            }) {
+                let Some(argument) = declaration
+                    .alias_type
+                    .or(declaration.declared_type)
+                    .and_then(|id| source_type_member_component_argument(&facts, id, members))
                 else {
                     continue;
                 };
-                owners.extend(self.type_node_property_owners(
-                    argument,
-                    root.source(),
-                    &root_source,
-                    &root_imports,
-                    aliases,
-                ));
+                owners.extend(self.source_type_property_owners(argument, root.source(), &facts));
             }
         }
         owners
@@ -776,26 +873,26 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if let Some(cached) = self.jsx_props_owner_cache.borrow().get(&cache_key) {
             return cached.clone();
         }
-        let Ok(source) = component.source().read_to_string() else {
+        let Some(facts) = self.host.source_facts(component.source()) else {
             return Vec::new();
         };
-        let Some(tree) = parse_js_ts_tree(component.source(), &source, Language::TypeScript) else {
-            return Vec::new();
-        };
-        let imports = compute_jsts_import_binder(&source, &tree);
         let aliases = self.host.alias_resolver();
-        let mut owners = nodes_for_code_unit(self.host, component, tree.root_node())
-            .into_iter()
-            .filter_map(|node| {
-                enclosing_component_declaration(node, component.identifier(), &source)
+        let mut owners = facts
+            .facts
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                facts
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.contains(component))
             })
-            .filter_map(|declaration| jsx_binding_props_source(declaration, &source))
+            .filter_map(|declaration| declaration.component_props.as_ref())
             .flat_map(|props| {
-                self.jsx_props_source_owners(
+                self.canonical_props_source_owners(
                     props,
                     component.source(),
-                    &source,
-                    &imports,
+                    &facts,
                     aliases,
                     MAX_JSX_COMPONENT_HOPS,
                 )
@@ -1422,7 +1519,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             let Some(tree) = parse_js_ts_tree(function.source(), &source, self.language) else {
                 continue;
             };
-            let imports = compute_jsts_import_binder(&source, &tree);
+            let Some(facts) = self.host.source_facts(function.source()) else {
+                continue;
+            };
+            let imports = JsTsImportBinder::from_source_facts_with_lexical_bindings(
+                &facts.facts,
+                &facts.imports,
+                &facts.source,
+                tree.root_node(),
+                crate::syntax::JsTsLexicalBindingIndex::build(tree.root_node(), &source),
+            );
             let provider = JsTsReceiverFactProvider::new(
                 self.host,
                 self.support,
@@ -1632,16 +1738,44 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             };
         }
         if self.language == Language::TypeScript
-            && let Some(type_node) = function.child_by_field_name("return_type")
+            && let Some(facts) = self.host.source_facts(callee.source())
         {
-            let outcome = self.type_annotation_receiver_outcome(type_node, budget);
-            if !matches!(outcome, ReceiverAnalysisOutcome::Unknown) {
-                return outcome;
-            }
-            if inline_object_type(type_node).is_some() {
-                return ReceiverAnalysisOutcome::Precise(vec![ReceiverValue::InstanceType(
-                    callee.clone(),
-                )]);
+            for declaration in &facts.facts.declarations {
+                if !facts
+                    .declaration_units
+                    .get(&declaration.declaration)
+                    .is_some_and(|units| units.contains(callee))
+                {
+                    continue;
+                }
+                let Some(type_id) = declaration.return_type else {
+                    continue;
+                };
+                let outcome = ts_resolve_source_type_to_property_owner_outcome(
+                    self.host,
+                    self.support,
+                    callee.source(),
+                    &facts,
+                    type_id,
+                    0,
+                    budget,
+                );
+                let outcome = source_owner_receiver_outcome(outcome, budget);
+                if !matches!(outcome, ReceiverAnalysisOutcome::Unknown) {
+                    return outcome;
+                }
+                let mut inner = type_id;
+                while let JsTsTypeShape::Wrapped(child) = facts.facts.types[inner.index()].shape {
+                    inner = child;
+                }
+                if matches!(
+                    facts.facts.types[inner.index()].shape,
+                    JsTsTypeShape::Object(_)
+                ) {
+                    return ReceiverAnalysisOutcome::Precise(vec![ReceiverValue::InstanceType(
+                        callee.clone(),
+                    )]);
+                }
             }
         }
         let mut outcomes = Vec::new();
@@ -1873,7 +2007,7 @@ fn jsx_attribute_site(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
 /// annotation, a dynamic import specifier, the name of a component type, or a
 /// destructuring chain into a typed value. A binding that carries none of them
 /// proves no owner, and its attributes stay unresolved (#2041).
-enum JsxPropsSource<'tree> {
+pub(crate) enum JsxPropsSource<'tree> {
     /// The props type itself: a parameter's annotation, or the argument a
     /// component generic applies.
     Type(Node<'tree>),
@@ -1893,7 +2027,7 @@ enum JsxPropsSource<'tree> {
     },
 }
 
-fn jsx_binding_props_source<'tree>(
+pub(crate) fn jsx_binding_props_source<'tree>(
     binding: Node<'tree>,
     source: &str,
 ) -> Option<JsxPropsSource<'tree>> {
@@ -2070,81 +2204,99 @@ fn destructured_member_name(node: Node<'_>, source: &str) -> Option<String> {
 /// The chain is followed through the declaration's own property signatures and
 /// the inline object types nested in them; a member typed by a name declared
 /// elsewhere ends the walk.
-fn type_member_component_argument<'tree>(
-    declaration: Node<'tree>,
-    members: &[String],
-    source: &str,
-) -> Option<Node<'tree>> {
-    let mut container = type_member_container(declaration)?;
-    let mut remaining = members;
-    while let Some((member, rest)) = remaining.split_first() {
-        let annotation = property_signature_type(container, member, source)?;
-        if rest.is_empty() {
-            return function_component_wrapper_argument(annotation, source);
+fn source_component_wrapper_argument(
+    facts: &JsTsFileSourceFacts,
+    root: JsTsSourceTypeId,
+) -> Option<JsTsSourceTypeId> {
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        match &facts.facts.types[id.index()].shape {
+            JsTsTypeShape::Generic { base, arguments } => {
+                if let JsTsTypeShape::Named(path) = &facts.facts.types[base.index()].shape
+                    && path.last().is_some_and(|name| {
+                        matches!(
+                            name.as_str(),
+                            "FC" | "FunctionComponent"
+                                | "ComponentType"
+                                | "Component"
+                                | "ParentComponent"
+                                | "VoidComponent"
+                                | "FlowComponent"
+                        )
+                    })
+                {
+                    return arguments.first().copied();
+                }
+                pending.extend(arguments.iter().rev().copied());
+                pending.push(*base);
+            }
+            JsTsTypeShape::Wrapped(child)
+            | JsTsTypeShape::Query(child)
+            | JsTsTypeShape::Array(child) => pending.push(*child),
+            JsTsTypeShape::Union(children)
+            | JsTsTypeShape::Intersection(children)
+            | JsTsTypeShape::Tuple(children) => pending.extend(children.iter().rev().copied()),
+            JsTsTypeShape::Function { parameters, result } => {
+                pending.extend(result.iter().copied());
+                pending.extend(parameters.iter().rev().flatten().copied());
+            }
+            JsTsTypeShape::Object(members) => {
+                pending.extend(members.iter().rev().map(|(_, id)| *id))
+            }
+            _ => {}
         }
-        container = annotation
-            .named_child(0)
-            .filter(|node| node.kind() == "object_type")?;
-        remaining = rest;
     }
     None
 }
 
-fn type_member_container<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    match node.kind() {
-        "interface_declaration" => node.child_by_field_name("body"),
-        "type_alias_declaration" => node
-            .child_by_field_name("value")
-            .filter(|value| value.kind() == "object_type"),
-        "object_type" | "interface_body" => Some(node),
-        _ => None,
+fn source_owner_receiver_outcome(
+    outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<ReceiverValue> {
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(values) => ReceiverAnalysisOutcome::Precise(
+            values
+                .into_iter()
+                .take(budget.max_targets)
+                .map(ReceiverValue::InstanceType)
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Ambiguous(values) => ReceiverAnalysisOutcome::Ambiguous(
+            values
+                .into_iter()
+                .take(budget.max_targets)
+                .map(ReceiverValue::InstanceType)
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
     }
 }
 
-fn property_signature_type<'tree>(
-    container: Node<'tree>,
-    member: &str,
-    source: &str,
-) -> Option<Node<'tree>> {
-    let mut cursor = container.walk();
-    container
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "property_signature")
-        .find(|child| {
-            child
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text_matches(name, source, member))
-        })
-        .and_then(|property| property.child_by_field_name("type"))
-}
-
-/// The binding a module's `export default` renders.
-///
-/// `export default function Panel(props: P)` declares the component inline;
-/// `export default Panel` names one the module binds elsewhere.
-fn default_export_component_binding<'tree>(root: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    let mut cursor = root.walk();
-    let export = root
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "export_statement")
-        .find(|child| {
-            (0..child.child_count())
-                .filter_map(|index| child.child(index))
-                .any(|child| child.kind() == "default")
-        })?;
-    if let Some(declaration) = export.child_by_field_name("declaration") {
-        return Some(declaration);
+fn source_type_member_component_argument(
+    facts: &JsTsFileSourceFacts,
+    mut container: JsTsSourceTypeId,
+    members: &[String],
+) -> Option<JsTsSourceTypeId> {
+    for (index, member) in members.iter().enumerate() {
+        let JsTsTypeShape::Object(fields) = &facts.facts.types[container.index()].shape else {
+            return None;
+        };
+        let (_, annotation) = fields.iter().find(|(name, _)| name == member)?;
+        if index + 1 == members.len() {
+            return source_component_wrapper_argument(facts, *annotation);
+        }
+        container = match &facts.facts.types[annotation.index()].shape {
+            JsTsTypeShape::Wrapped(child) => *child,
+            _ => return None,
+        };
     }
-    let value = export.child_by_field_name("value")?;
-    if matches!(value.kind(), "function_expression" | "arrow_function") {
-        return Some(value);
-    }
-    let name = simple_identifier_text(value, source)?;
-    let bindings = visible_component_bindings(export, name, source);
-    let [binding] = bindings.as_slice() else {
-        return None;
-    };
-    Some(*binding)
+    None
 }
 
 /// The scope a site resolves names in, which is the program when nothing
@@ -2270,45 +2422,6 @@ fn destructured_pattern_entry<'tree>(
         }
     }
     None
-}
-
-fn enclosing_component_declaration<'tree>(
-    node: Node<'tree>,
-    component_name: &str,
-    source: &str,
-) -> Option<Node<'tree>> {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if component_declaration_has_name(candidate, component_name, source) {
-            return Some(candidate);
-        }
-        for index in (0..candidate.named_child_count()).rev() {
-            if let Some(child) = candidate.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if component_declaration_has_name(candidate, component_name, source) {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-fn component_declaration_has_name(node: Node<'_>, component_name: &str, source: &str) -> bool {
-    matches!(
-        node.kind(),
-        "function_declaration"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "variable_declarator"
-    ) && node
-        .child_by_field_name("name")
-        .is_some_and(|name| node_text_matches(name, source, component_name))
 }
 
 fn function_first_parameter_type(function: Node<'_>) -> Option<Node<'_>> {

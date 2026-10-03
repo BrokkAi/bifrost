@@ -41,12 +41,12 @@ use crate::analyzer::semantic::cfg_algorithms::{
     strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, CallBoundary, CallInvocationMode, CallSiteId, CallableTarget,
-    CallableTargetResolution, CandidateCoverage, EvidenceCompleteness, FreshObjectPublicationKind,
-    FreshObjectPublicationQuery, HeapOracle, IcfgProvider, IcfgProviderBehaviorIdentity,
-    IndexedLocationIdentity, LengthDelimitedDigest, MemoryLocationId, MemoryLocationKind,
-    ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointId, ProofStatus,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticExecutionBudget,
+    AbstractObject, AccessPathRoot, BindingOriginIndex, CallBoundary, CallInvocationMode,
+    CallSiteId, CallableTarget, CallableTargetResolution, CandidateCoverage, EvidenceCompleteness,
+    FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle, IcfgProvider,
+    IcfgProviderBehaviorIdentity, IndexedLocationIdentity, LengthDelimitedDigest, MemoryLocationId,
+    MemoryLocationKind, ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointId,
+    ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticExecutionBudget,
     SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot, SemanticOutcome,
     SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
     SynchronizationOperation, ValueFlowKind, ValueId,
@@ -70,7 +70,7 @@ use crate::dataflow::{
     SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
     SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 use super::{
     CompiledProtocol, CompleteProtocolSummaryRepository, ProtocolFactKey,
@@ -2969,6 +2969,8 @@ fn direct_concurrency_path_from(
     mut cursor: DirectPathCursor,
 ) -> DirectConcurrencyPath {
     let semantics = procedure.semantics();
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
+    let indirect_writes = indirect_binding_write_targets(semantics, &binding_origins);
     let mut selectors = Vec::new();
     let mut visited = crate::hash::HashSet::default();
     loop {
@@ -3013,6 +3015,9 @@ fn direct_concurrency_path_from(
                             }
                         });
                         cursor = DirectPathCursor::Value(*base);
+                    }
+                    MemoryLocationKind::Dereference { address } => {
+                        cursor = DirectPathCursor::Value(*address);
                     }
                     MemoryLocationKind::Static { member } => {
                         selectors.reverse();
@@ -3105,7 +3110,11 @@ fn direct_concurrency_path_from(
                                     // lexical cell's storage. Only an unchanged
                                     // binding can supply one stable value path.
                                     MemoryLocationKind::LexicalCell { binding }
-                                        if !direct_value_is_reassigned(semantics, binding) =>
+                                        if !direct_value_is_reassigned(
+                                            semantics,
+                                            binding,
+                                            &indirect_writes,
+                                        ) =>
                                     {
                                         DirectPathCursor::Value(binding)
                                     }
@@ -3157,25 +3166,62 @@ fn direct_summary_port(
 fn direct_value_is_reassigned(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     value: ValueId,
+    indirect_writes: &HashSet<ValueId>,
 ) -> bool {
-    semantics
-        .points()
-        .iter()
-        .flat_map(|point| &point.events)
-        .any(|event| match event.effect {
-            SemanticEffect::Assignment { target, .. } => target == value,
-            SemanticEffect::MemoryStore { location, .. } => semantics
+    indirect_writes.contains(&value)
+        || semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .any(|event| match event.effect {
+                SemanticEffect::Assignment { target, .. } => target == value,
+                SemanticEffect::MemoryStore { location, .. } => semantics
+                    .memory_location(location)
+                    .is_some_and(|location| match location.kind {
+                        MemoryLocationKind::LexicalCell { binding } => binding == value,
+                        MemoryLocationKind::Capture {
+                            binding: Some(binding),
+                            ..
+                        } => binding == value,
+                        _ => false,
+                    }),
+                _ => false,
+            })
+}
+
+fn indirect_binding_write_targets(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    origins: &BindingOriginIndex,
+) -> HashSet<ValueId> {
+    let mut written = HashSet::default();
+    let address_taken = origins.address_taken_bindings();
+    for point in semantics.points() {
+        for event in &point.events {
+            let SemanticEffect::MemoryStore { location, .. } = event.effect else {
+                continue;
+            };
+            let Some(MemoryLocationKind::Dereference { address }) = semantics
                 .memory_location(location)
-                .is_some_and(|location| match location.kind {
-                    MemoryLocationKind::LexicalCell { binding } => binding == value,
-                    MemoryLocationKind::Capture {
-                        binding: Some(binding),
-                        ..
-                    } => binding == value,
-                    _ => false,
-                }),
-            _ => false,
-        })
+                .map(|location| &location.kind)
+            else {
+                continue;
+            };
+            let targets = origins.addressed_binding_origins(*address);
+            if targets.is_complete() {
+                written.extend(targets.bindings().iter().copied());
+            } else {
+                written.extend(address_taken.iter().copied());
+            }
+        }
+    }
+    for binding in address_taken {
+        let relevant = crate::hash::HashSet::from_iter([binding]);
+        let aliases = crate::flow_state::address_alias_values(semantics, &relevant);
+        if !crate::flow_state::address_escape_points(semantics, &aliases, &[]).is_empty() {
+            written.insert(binding);
+        }
+    }
+    written
 }
 
 /// The exact boundary or literal source of one immutable scalar snapshot.
@@ -3183,6 +3229,7 @@ fn direct_value_is_reassigned(
 pub(crate) enum DirectScalarSource {
     Port(SummaryPort),
     UnsignedInteger(u128),
+    Boolean(bool),
     /// An exact structured string constant, spelled as its source text.
     ConstantString(Box<str>),
     IntegerOffset {
@@ -3201,11 +3248,13 @@ pub(crate) fn direct_scalar_source(
     mut value: ValueId,
 ) -> Option<DirectScalarSource> {
     let mut visited = crate::hash::HashSet::default();
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
+    let indirect_writes = indirect_binding_write_targets(semantics, &binding_origins);
     loop {
         if !visited.insert(value) {
             return None;
         }
-        let reassigned = direct_value_is_reassigned(semantics, value);
+        let reassigned = direct_value_is_reassigned(semantics, value, &indirect_writes);
         if reassigned {
             return None;
         }
@@ -3214,6 +3263,9 @@ pub(crate) fn direct_scalar_source(
         }
         if let SemanticValueKind::UnsignedInteger(integer) = semantics.value(value)?.kind {
             return Some(DirectScalarSource::UnsignedInteger(integer));
+        }
+        if let SemanticValueKind::Boolean(boolean) = semantics.value(value)?.kind {
+            return Some(DirectScalarSource::Boolean(boolean));
         }
         if let SemanticValueKind::ConstantString(text) = semantics.value(value)?.kind.clone() {
             return Some(DirectScalarSource::ConstantString(text));
@@ -3256,6 +3308,7 @@ pub(crate) fn direct_scalar_summary_port(
     match direct_scalar_source(semantics, value)? {
         DirectScalarSource::Port(port) => Some(port),
         DirectScalarSource::UnsignedInteger(_)
+        | DirectScalarSource::Boolean(_)
         | DirectScalarSource::ConstantString(_)
         | DirectScalarSource::IntegerOffset { .. } => None,
     }

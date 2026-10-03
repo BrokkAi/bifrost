@@ -17,6 +17,8 @@ mod external;
 mod imports;
 mod semantic;
 mod source_artifact;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 mod type_flow;
 
@@ -28,7 +30,6 @@ pub use external::{
     PhpDependencyPackAdapter,
 };
 
-use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
@@ -96,6 +97,10 @@ use clones::build_php_clone_candidate_data;
 pub struct PhpAnalyzer {
     inner: TreeSitterAnalyzer<PhpAdapter>,
     memo_budget: u64,
+    source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
+    >,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
@@ -119,6 +124,17 @@ pub struct PhpAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(PhpAnalyzer);
+
+impl brokk_bifrost_php::source_facts::PhpSourceFactProvider for PhpAnalyzer {
+    fn php_source_facts_while(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>> {
+        self.inner
+            .canonical_php_source_facts(file, &self.source_facts, keep_going)
+    }
+}
 
 impl PhpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
@@ -167,6 +183,14 @@ impl PhpAnalyzer {
         Self {
             inner,
             memo_budget,
+            source_facts: build_weighted_cache(
+                memo_budget / 8,
+                |_key, facts: &Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>| {
+                    u32::try_from(facts.estimated_retained_bytes())
+                        .unwrap_or(u32::MAX)
+                        .max(1)
+                },
+            ),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
@@ -180,17 +204,6 @@ impl PhpAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
-    }
-
-    pub(crate) fn prepared_syntax_limited_cancellable(
-        &self,
-        token: QueryToken<'_>,
-        file: &ProjectFile,
-        max_source_bytes: usize,
-        cancellation: Option<&crate::cancellation::CancellationToken>,
-    ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
-        self.inner
-            .prepared_syntax_limited_cancellable(token, file, max_source_bytes, cancellation)
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -781,6 +794,10 @@ impl LanguageSupport for PhpSupport {
         Language::Php
     }
 
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
     fn declaration_name_range(&self, node: tree_sitter::Node<'_>, _source: &str) -> Range {
         php_declaration_name_range(node)
     }
@@ -963,3 +980,6 @@ impl DeadCodeBulkProof for PhpDeadCodeBulk {
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }
+
+#[cfg(test)]
+mod source_fact_tests;

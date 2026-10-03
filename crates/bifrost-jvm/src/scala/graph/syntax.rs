@@ -1,11 +1,12 @@
-use crate::scala::scala_parenthesized_arity;
 use crate::scala::supertypes::scala_type_lookup_segments;
 use crate::scala::wildcard_imports::scala_package_prefixes_at;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, subtree_contains};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+#[cfg(test)]
+use tree_sitter::Parser;
 
 /// The builtin type a Scala literal node denotes.
 ///
@@ -23,8 +24,17 @@ pub fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
     }
 }
 
-type ScalaParameterFunctionTypePaths = Vec<Vec<Option<Vec<Option<Vec<String>>>>>>;
+pub use brokk_bifrost_core::analyzer::scala_facts::{
+    ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSourceAlternative,
+    ScalaDeclaredResult, ScalaGenericOwnerSourceFacts, ScalaParameterListKind,
+    ScalaTypeExpressionPath,
+};
+use brokk_bifrost_core::analyzer::scala_facts::{
+    ScalaDeclarationKind, ScalaDeclarationSourceFact, ScalaDeclarationVisibility,
+};
+use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceFactRows};
 
+/// A range-indexed consumer projection of canonical declaration properties.
 #[derive(Default)]
 pub struct ScalaSourceFacts {
     pub callable_alternatives_by_range: HashMap<(usize, usize), ScalaCallableSourceAlternative>,
@@ -37,38 +47,52 @@ pub struct ScalaSourceFacts {
     pub generic_owner_facts_by_range: HashMap<(usize, usize), ScalaGenericOwnerSourceFacts>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScalaTypeExpressionPath {
-    pub segments: Vec<String>,
-    pub arguments: Vec<ScalaTypeExpressionPath>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ScalaGenericOwnerSourceFacts {
-    pub type_parameters: Vec<String>,
-    pub supertypes: Vec<ScalaTypeExpressionPath>,
-}
-
-#[derive(Clone)]
-pub struct ScalaCallableSourceAlternative {
-    pub role: ScalaCallableRole,
-    pub shape: Vec<ScalaCallableParameterList>,
-    pub result: ScalaDeclaredResult,
-    pub parameter_defaults: Vec<Vec<bool>>,
-    pub parameter_function_arities: Vec<Vec<Option<usize>>>,
-    pub parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
-    pub parameter_type_expressions: Vec<Vec<Option<ScalaTypeExpressionPath>>>,
-    pub parameter_function_type_paths: ScalaParameterFunctionTypePaths,
-    pub extension_receiver_type_path: Option<Vec<String>>,
-    pub return_type_path: Option<Vec<String>>,
-    pub return_type_expression: Option<ScalaTypeExpressionPath>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScalaCallableRole {
-    Ordinary,
-    PrimaryConstructor,
-    SecondaryConstructor,
+impl ScalaSourceFacts {
+    pub fn from_canonical(
+        facts: &brokk_bifrost_core::analyzer::scala_facts::ScalaSourceFacts,
+        source: &SourceFactRows,
+    ) -> Self {
+        let mut projection = Self::default();
+        for fact in &facts.declarations {
+            let range = source
+                .occurrence(source.declaration(fact.declaration).occurrence)
+                .range;
+            let key = (range.start_byte, range.end_byte);
+            if let Some(callable) = &fact.callable {
+                projection
+                    .callable_alternatives_by_range
+                    .insert(key, callable.clone());
+            }
+            if let Some(path) = &fact.field_type_path {
+                projection
+                    .field_type_paths_by_range
+                    .insert(key, path.clone());
+            }
+            if let Some(path) = &fact.type_alias_path {
+                projection
+                    .type_alias_paths_by_range
+                    .insert(key, path.clone());
+            }
+            if fact.stable_owner {
+                projection.stable_owner_ranges.insert(key);
+            }
+            if fact.is_enum {
+                projection.enum_ranges.insert(key);
+            }
+            if fact.is_case_class {
+                projection.case_class_ranges.insert(key);
+            }
+            if fact.is_abstract_callable {
+                projection.abstract_callable_ranges.insert(key);
+            }
+            if let Some(owner) = &fact.generic_owner {
+                projection
+                    .generic_owner_facts_by_range
+                    .insert(key, owner.clone());
+            }
+        }
+        projection
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,12 +127,6 @@ impl ScalaFunctionParameterShape {
             parameter_types_authoritative: false,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScalaParameterListKind {
-    Explicit,
-    Contextual,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,263 +288,264 @@ pub enum ScalaCallShapeRelation {
     Partial { next_explicit_arity: CallableArity },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScalaCallableParameterList {
-    pub arity: CallableArity,
-    pub kind: ScalaParameterListKind,
-}
-
-impl ScalaCallableParameterList {
-    pub fn explicit(arity: CallableArity) -> Self {
-        Self {
-            arity,
-            kind: ScalaParameterListKind::Explicit,
-        }
-    }
-}
-
-/// How many application lists a callable's declared RESULT can consume once the
-/// site has filled every declared parameter list (#1853).
-///
-/// `def transform(flag: Boolean): Int => Int` is written `transform(true)(x)`:
-/// the second list applies the returned function, not the method. The
-/// declaration is the only structure that can decide such a site, so this is
-/// read from the return-type node beside the parameter lists.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ScalaDeclaredResult {
-    /// Application lists the declared result type supplies directly: `A => B`
-    /// supplies one, `A => B => C` two.
-    function_lists: usize,
-    /// Whether what remains after those lists can still be applied. An inferred
-    /// result is unknown, and a named result can alias a function type or carry
-    /// an `apply` member, so both stay open; a value type such as `Int` and an
-    /// absent declaration do not.
-    open: bool,
-}
-
-impl ScalaDeclaredResult {
-    /// No declaration structure was available (an arity-only fallback shape),
-    /// so nothing beyond the declared parameter lists is admitted. This is the
-    /// `Default`.
-    pub const UNDECLARED: Self = Self {
-        function_lists: 0,
-        open: false,
-    };
-
-    /// A declared result that could be a function value under some type.
-    pub const OPEN: Self = Self {
-        function_lists: 0,
-        open: true,
-    };
-
-    pub fn accepts_application_lists(self, lists: usize) -> bool {
-        self.open || lists <= self.function_lists
-    }
-}
-
-pub fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
+#[cfg(test)]
+fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     let mut parser = Parser::new();
     parser
         .set_language(&crate::scala::language::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(source, None)?;
-    Some(scala_source_facts_from_tree(&tree, source))
+    let file = brokk_bifrost_core::analyzer::ProjectFile::new(std::env::temp_dir(), "source.scala");
+    let parsed = crate::scala::declarations::parse_scala_file(&file, source, &tree);
+    let source = parsed.source_facts.as_ref()?;
+    Some(ScalaSourceFacts::from_canonical(
+        source.scala.as_ref()?,
+        &source.occurrences,
+    ))
 }
 
-pub fn scala_source_facts_from_tree(tree: &tree_sitter::Tree, source: &str) -> ScalaSourceFacts {
-    let mut facts = ScalaSourceFacts::default();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "val_definition" | "var_definition" | "val_declaration" | "var_declaration"
-            | "class_parameter" => {
-                if let Some(path) = node
-                    .child_by_field_name("type")
-                    .map(|type_node| scala_type_lookup_segments(type_node, source))
-                    .filter(|segments| !segments.is_empty())
-                {
-                    facts
-                        .field_type_paths_by_range
-                        .insert((node.start_byte(), node.end_byte()), path);
+pub(crate) fn scala_declaration_modifiers(
+    node: Node<'_>,
+) -> (ScalaDeclarationVisibility, bool, bool, bool) {
+    let mut visibility = ScalaDeclarationVisibility::Public;
+    let mut is_explicitly_abstract = false;
+    let mut is_sealed = false;
+    let mut is_final = false;
+    let mut modifiers = vec![node];
+    while let Some(current) = modifiers.pop() {
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            match child.kind() {
+                "modifiers" | "access_modifier" => modifiers.push(child),
+                "private" => visibility = ScalaDeclarationVisibility::NonApi,
+                "protected" if visibility != ScalaDeclarationVisibility::NonApi => {
+                    visibility = ScalaDeclarationVisibility::Protected;
                 }
+                "abstract" => is_explicitly_abstract = true,
+                "sealed" => is_sealed = true,
+                "final" => is_final = true,
+                _ => {}
             }
-            "type_definition" => {
-                if let Some(path) = node
-                    .child_by_field_name("type")
-                    .map(|type_node| scala_alias_underlying_type_path(type_node, source))
-                    .filter(|segments| !segments.is_empty())
-                {
-                    facts
-                        .type_alias_paths_by_range
-                        .insert((node.start_byte(), node.end_byte()), path);
-                }
-            }
-            "function_definition" | "function_declaration" => {
-                if node.kind() == "function_declaration" {
-                    facts
-                        .abstract_callable_ranges
-                        .insert((node.start_byte(), node.end_byte()));
-                }
-                let mut cursor = node.walk();
-                let parameter_lists = node
-                    .named_children(&mut cursor)
-                    .filter(|child| child.kind() == "parameters")
-                    .collect::<Vec<_>>();
-                let shape = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(callable_parameter_list)
-                    .collect();
-                let parameter_function_arities = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(parameter_function_arities)
-                    .collect();
-                let parameter_defaults = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(callable_parameter_defaults)
-                    .collect();
-                let parameter_type_paths = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_type_paths(parameters, source))
-                    .collect();
-                let parameter_type_expressions = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_type_expressions(parameters, source))
-                    .collect();
-                let parameter_function_type_paths = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_function_type_paths(parameters, source))
-                    .collect();
-                facts.callable_alternatives_by_range.insert(
-                    (node.start_byte(), node.end_byte()),
-                    ScalaCallableSourceAlternative {
-                        role: node
-                            .child_by_field_name("name")
-                            .filter(|name| node_text(*name, source).trim() == "this")
-                            .map_or(ScalaCallableRole::Ordinary, |_| {
-                                ScalaCallableRole::SecondaryConstructor
-                            }),
-                        shape,
-                        result: declared_result(node.child_by_field_name("return_type"), source),
-                        parameter_defaults,
-                        parameter_function_arities,
-                        parameter_type_paths,
-                        parameter_type_expressions,
-                        parameter_function_type_paths,
-                        extension_receiver_type_path: enclosing_extension_receiver_type_path(
-                            node, source,
-                        ),
-                        return_type_path: node
-                            .child_by_field_name("return_type")
-                            .map(|return_type| scala_type_lookup_segments(return_type, source))
-                            .filter(|segments| !segments.is_empty()),
-                        return_type_expression: node.child_by_field_name("return_type").and_then(
-                            |return_type| scala_type_expression_path(return_type, source),
-                        ),
-                    },
-                );
-                record_generic_owner_facts(node, source, &mut facts);
-            }
-            "class_definition" | "full_enum_case" => {
-                let mut cursor = node.walk();
-                let parameter_lists = node
-                    .named_children(&mut cursor)
-                    .filter(|child| child.kind() == "class_parameters")
-                    .collect::<Vec<_>>();
-                let mut lists = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(callable_parameter_list)
-                    .collect::<Vec<_>>();
-                let mut parameter_defaults = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(callable_parameter_defaults)
-                    .collect::<Vec<_>>();
-                let parameter_function_arities = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(parameter_function_arities)
-                    .collect::<Vec<_>>();
-                let parameter_type_paths = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_type_paths(parameters, source))
-                    .collect::<Vec<_>>();
-                let parameter_type_expressions = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_type_expressions(parameters, source))
-                    .collect::<Vec<_>>();
-                let parameter_function_type_paths = parameter_lists
-                    .iter()
-                    .copied()
-                    .map(|parameters| parameter_function_type_paths(parameters, source))
-                    .collect::<Vec<_>>();
-                if lists.is_empty() {
-                    lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
-                        0,
-                    )));
-                    parameter_defaults.push(Vec::new());
-                }
-                facts.callable_alternatives_by_range.insert(
-                    (node.start_byte(), node.end_byte()),
-                    ScalaCallableSourceAlternative {
-                        role: ScalaCallableRole::PrimaryConstructor,
-                        shape: lists,
-                        // A constructor's result is the class being defined,
-                        // and construction syntax consumes exactly the class's
-                        // parameter lists.
-                        result: ScalaDeclaredResult::UNDECLARED,
-                        parameter_defaults,
-                        parameter_function_arities,
-                        parameter_type_paths,
-                        parameter_type_expressions,
-                        parameter_function_type_paths,
-                        extension_receiver_type_path: None,
-                        return_type_path: None,
-                        return_type_expression: None,
-                    },
-                );
-                let is_case_class = if node.kind() == "full_enum_case" {
-                    true
-                } else {
-                    let mut children = node.walk();
-                    node.children(&mut children)
-                        .any(|child| child.kind() == "case")
-                };
-                if is_case_class {
-                    facts
-                        .case_class_ranges
-                        .insert((node.start_byte(), node.end_byte()));
-                }
-                record_generic_owner_facts(node, source, &mut facts);
-            }
-            "object_definition" | "enum_definition" => {
-                facts
-                    .stable_owner_ranges
-                    .insert((node.start_byte(), node.end_byte()));
-                if node.kind() == "enum_definition" {
-                    facts
-                        .enum_ranges
-                        .insert((node.start_byte(), node.end_byte()));
-                }
-                record_generic_owner_facts(node, source, &mut facts);
-            }
-            "trait_definition" => {
-                record_generic_owner_facts(node, source, &mut facts);
-            }
-            _ => {}
         }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
     }
-    facts
+    (visibility, is_explicitly_abstract, is_sealed, is_final)
+}
+
+pub(crate) fn scala_declaration_source_fact(
+    node: Node<'_>,
+    source: &str,
+    declaration: SourceDeclarationId,
+) -> ScalaDeclarationSourceFact {
+    let kind = match node.kind() {
+        "class_definition" => ScalaDeclarationKind::Class,
+        "trait_definition" => ScalaDeclarationKind::Trait,
+        "object_definition" => ScalaDeclarationKind::Object,
+        "enum_definition" => ScalaDeclarationKind::Enum,
+        "full_enum_case" | "simple_enum_case" => ScalaDeclarationKind::EnumCase,
+        "type_definition" => ScalaDeclarationKind::TypeAlias,
+        _ => ScalaDeclarationKind::Other,
+    };
+    let (visibility, is_explicitly_abstract, is_sealed, is_final) =
+        scala_declaration_modifiers(node);
+    let mut fact = ScalaDeclarationSourceFact {
+        declaration,
+        kind,
+        visibility,
+        is_explicitly_abstract,
+        is_sealed,
+        is_final,
+        callable: None,
+        field_type_path: None,
+        type_alias_path: None,
+        stable_owner: false,
+        is_enum: false,
+        is_case_class: false,
+        is_full_enum_case: node.kind() == "full_enum_case",
+        is_abstract_callable: false,
+        is_term_field: matches!(
+            node.kind(),
+            "val_definition"
+                | "var_definition"
+                | "val_declaration"
+                | "var_declaration"
+                | "class_parameter"
+                | "simple_enum_case"
+        ),
+        generic_owner: None,
+        lexical_prefixes: Vec::new(),
+        lexical_scopes: Vec::new(),
+    };
+    match node.kind() {
+        "val_definition" | "var_definition" | "val_declaration" | "var_declaration"
+        | "class_parameter" => {
+            if let Some(path) = node
+                .child_by_field_name("type")
+                .map(|type_node| scala_type_lookup_segments(type_node, source))
+                .filter(|segments| !segments.is_empty())
+            {
+                fact.field_type_path = Some(path);
+            }
+        }
+        "type_definition" => {
+            if let Some(path) = node
+                .child_by_field_name("type")
+                .map(|type_node| scala_alias_underlying_type_path(type_node, source))
+                .filter(|segments| !segments.is_empty())
+            {
+                fact.type_alias_path = Some(path);
+            }
+        }
+        "function_definition" | "function_declaration" => {
+            if node.kind() == "function_declaration" {
+                fact.is_abstract_callable = true;
+            }
+            let mut cursor = node.walk();
+            let parameter_lists = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "parameters")
+                .collect::<Vec<_>>();
+            let shape = parameter_lists
+                .iter()
+                .copied()
+                .map(callable_parameter_list)
+                .collect();
+            let parameter_function_arities = parameter_lists
+                .iter()
+                .copied()
+                .map(parameter_function_arities)
+                .collect();
+            let parameter_defaults = parameter_lists
+                .iter()
+                .copied()
+                .map(callable_parameter_defaults)
+                .collect();
+            let parameter_type_paths = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_type_paths(parameters, source))
+                .collect();
+            let parameter_type_expressions = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_type_expressions(parameters, source))
+                .collect();
+            let parameter_function_type_paths = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_function_type_paths(parameters, source))
+                .collect();
+            fact.callable = Some(ScalaCallableSourceAlternative {
+                role: node
+                    .child_by_field_name("name")
+                    .filter(|name| node_text(*name, source).trim() == "this")
+                    .map_or(ScalaCallableRole::Ordinary, |_| {
+                        ScalaCallableRole::SecondaryConstructor
+                    }),
+                shape,
+                result: declared_result(node.child_by_field_name("return_type"), source),
+                parameter_defaults,
+                parameter_function_arities,
+                parameter_type_paths,
+                parameter_type_expressions,
+                parameter_function_type_paths,
+                extension_receiver_type_path: enclosing_extension_receiver_type_path(node, source),
+                return_type_path: node
+                    .child_by_field_name("return_type")
+                    .map(|return_type| scala_type_lookup_segments(return_type, source))
+                    .filter(|segments| !segments.is_empty()),
+                return_type_is_singleton: node
+                    .child_by_field_name("return_type")
+                    .is_some_and(super::namespace::scala_type_reference_is_singleton),
+                return_type_expression: node
+                    .child_by_field_name("return_type")
+                    .and_then(|return_type| scala_type_expression_path(return_type, source)),
+            });
+            fact.generic_owner = Some(scala_generic_owner_facts(node, source));
+        }
+        "class_definition" | "full_enum_case" => {
+            let mut cursor = node.walk();
+            let parameter_lists = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "class_parameters")
+                .collect::<Vec<_>>();
+            let mut lists = parameter_lists
+                .iter()
+                .copied()
+                .map(callable_parameter_list)
+                .collect::<Vec<_>>();
+            let mut parameter_defaults = parameter_lists
+                .iter()
+                .copied()
+                .map(callable_parameter_defaults)
+                .collect::<Vec<_>>();
+            let parameter_function_arities = parameter_lists
+                .iter()
+                .copied()
+                .map(parameter_function_arities)
+                .collect::<Vec<_>>();
+            let parameter_type_paths = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_type_paths(parameters, source))
+                .collect::<Vec<_>>();
+            let parameter_type_expressions = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_type_expressions(parameters, source))
+                .collect::<Vec<_>>();
+            let parameter_function_type_paths = parameter_lists
+                .iter()
+                .copied()
+                .map(|parameters| parameter_function_type_paths(parameters, source))
+                .collect::<Vec<_>>();
+            if lists.is_empty() {
+                lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
+                    0,
+                )));
+                parameter_defaults.push(Vec::new());
+            }
+            fact.callable = Some(ScalaCallableSourceAlternative {
+                role: ScalaCallableRole::PrimaryConstructor,
+                shape: lists,
+                // A constructor's result is the class being defined,
+                // and construction syntax consumes exactly the class's
+                // parameter lists.
+                result: ScalaDeclaredResult::UNDECLARED,
+                parameter_defaults,
+                parameter_function_arities,
+                parameter_type_paths,
+                parameter_type_expressions,
+                parameter_function_type_paths,
+                extension_receiver_type_path: None,
+                return_type_path: None,
+                return_type_is_singleton: false,
+                return_type_expression: None,
+            });
+            let is_case_class = if node.kind() == "full_enum_case" {
+                true
+            } else {
+                let mut children = node.walk();
+                node.children(&mut children)
+                    .any(|child| child.kind() == "case")
+            };
+            if is_case_class {
+                fact.is_case_class = true;
+            }
+            fact.generic_owner = Some(scala_generic_owner_facts(node, source));
+        }
+        "object_definition" | "enum_definition" => {
+            fact.stable_owner = true;
+            if node.kind() == "enum_definition" {
+                fact.is_enum = true;
+            }
+            fact.generic_owner = Some(scala_generic_owner_facts(node, source));
+        }
+        "trait_definition" => {
+            fact.generic_owner = Some(scala_generic_owner_facts(node, source));
+        }
+        _ => {}
+    }
+    fact
 }
 
 fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<String> {
@@ -610,131 +629,107 @@ pub fn scala_declared_type_parameter_names(node: Node<'_>, source: &str) -> Vec<
         .collect()
 }
 
-fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSourceFacts) {
+fn scala_generic_owner_facts(node: Node<'_>, source: &str) -> ScalaGenericOwnerSourceFacts {
     let type_parameters = scala_declared_type_parameter_names(node, source);
     let supertypes = crate::scala::supertypes::scala_supertype_lookup_nodes(node)
         .into_iter()
         .filter_map(|(parent, _)| scala_type_expression_path(parent, source))
         .collect::<Vec<_>>();
-    facts.generic_owner_facts_by_range.insert(
-        (node.start_byte(), node.end_byte()),
-        ScalaGenericOwnerSourceFacts {
-            type_parameters,
-            supertypes,
-        },
-    );
+    ScalaGenericOwnerSourceFacts {
+        type_parameters,
+        supertypes,
+    }
 }
 
 fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeExpressionPath> {
-    if matches!(
-        node.kind(),
-        "repeated_parameter_type" | "by_name_type" | "lazy_parameter_type"
-    ) {
-        let mut cursor = node.walk();
-        return node
-            .named_children(&mut cursor)
-            .next()
-            .and_then(|element| scala_type_expression_path(element, source));
+    enum Work<'tree> {
+        Visit(Node<'tree>),
+        Assemble(Vec<String>, usize),
     }
-    if node.kind() == "function_type" {
-        let parameter_types = node.child_by_field_name("parameter_types")?;
-        let mut cursor = parameter_types.walk();
-        let mut arguments = parameter_types
-            .named_children(&mut cursor)
-            .map(|parameter| scala_type_expression_path(parameter, source))
-            .collect::<Option<Vec<_>>>()?;
-        arguments.push(scala_type_expression_path(
-            node.child_by_field_name("return_type")?,
-            source,
-        )?);
-        return Some(ScalaTypeExpressionPath {
-            segments: vec![format!("scala.Function{}", arguments.len() - 1)],
-            arguments,
-        });
-    }
-    if node.kind() == "tuple_type" {
-        let mut cursor = node.walk();
-        let arguments = node
-            .named_children(&mut cursor)
-            .map(|element| scala_type_expression_path(element, source))
-            .collect::<Option<Vec<_>>>()?;
-        return Some(ScalaTypeExpressionPath {
-            segments: vec![format!("scala.Tuple{}", arguments.len())],
-            arguments,
-        });
-    }
-    if node.kind() == "infix_type" {
-        let operator = node.child_by_field_name("operator")?;
-        let operator = node_text(operator, source).trim();
-        if operator.is_empty() {
-            return None;
-        }
-        return Some(ScalaTypeExpressionPath {
-            segments: vec![operator.to_string()],
-            arguments: vec![
-                scala_type_expression_path(node.child_by_field_name("left")?, source)?,
-                scala_type_expression_path(node.child_by_field_name("right")?, source)?,
-            ],
-        });
-    }
-    if matches!(node.kind(), "wildcard_type" | "wildcard") {
-        return Some(ScalaTypeExpressionPath {
-            segments: vec!["_".to_owned()],
-            arguments: Vec::new(),
-        });
-    }
-    if matches!(node.kind(), "generic_type" | "applied_constructor_type") {
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        let arguments = match children
-            .iter()
-            .copied()
-            .find(|child| child.kind() == "type_arguments")
-        {
-            Some(arguments) => {
-                let mut cursor = arguments.walk();
-                arguments
-                    .named_children(&mut cursor)
-                    .map(|argument| scala_type_expression_path(argument, source))
-                    .collect::<Option<Vec<_>>>()
+    let mut work = vec![Work::Visit(node)];
+    let mut values = Vec::<ScalaTypeExpressionPath>::new();
+    while let Some(next) = work.pop() {
+        let node = match next {
+            Work::Assemble(segments, count) => {
+                assert!(values.len() >= count);
+                let arguments = values.split_off(values.len() - count);
+                values.push(ScalaTypeExpressionPath {
+                    segments,
+                    arguments,
+                });
+                continue;
             }
-            None => Some(Vec::new()),
-        }?;
-        let constructor = children.into_iter().find(|child| {
-            !matches!(
-                child.kind(),
-                "type_arguments" | "arguments" | "annotation" | "structural_type"
-            )
-        })?;
-        let segments = scala_type_lookup_segments(constructor, source);
-        return (!segments.is_empty()).then_some(ScalaTypeExpressionPath {
-            segments,
-            arguments,
-        });
-    }
-    if matches!(node.kind(), "annotated_type") {
+            Work::Visit(node) => node,
+        };
         let mut cursor = node.walk();
-        return node
-            .named_children(&mut cursor)
-            .find(|child| child.kind() != "annotation")
-            .and_then(|child| scala_type_expression_path(child, source));
-    }
-    if !matches!(
-        node.kind(),
-        "identifier"
+        let (segments, arguments) = match node.kind() {
+            "repeated_parameter_type" | "by_name_type" | "lazy_parameter_type" => {
+                work.push(Work::Visit(node.named_children(&mut cursor).next()?));
+                continue;
+            }
+            "annotated_type" => {
+                work.push(Work::Visit(
+                    node.named_children(&mut cursor)
+                        .find(|child| child.kind() != "annotation")?,
+                ));
+                continue;
+            }
+            "function_type" => {
+                let parameters = node.child_by_field_name("parameter_types")?;
+                let mut arguments = parameters.named_children(&mut cursor).collect::<Vec<_>>();
+                let segments = vec![format!("scala.Function{}", arguments.len())];
+                arguments.push(node.child_by_field_name("return_type")?);
+                (segments, arguments)
+            }
+            "tuple_type" => {
+                let arguments = node.named_children(&mut cursor).collect::<Vec<_>>();
+                (vec![format!("scala.Tuple{}", arguments.len())], arguments)
+            }
+            "infix_type" => {
+                let operator = node_text(node.child_by_field_name("operator")?, source).trim();
+                if operator.is_empty() {
+                    return None;
+                }
+                (
+                    vec![operator.to_string()],
+                    vec![
+                        node.child_by_field_name("left")?,
+                        node.child_by_field_name("right")?,
+                    ],
+                )
+            }
+            "wildcard_type" | "wildcard" => (vec!["_".to_string()], Vec::new()),
+            "generic_type" | "applied_constructor_type" => {
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                let arguments = children
+                    .iter()
+                    .find(|child| child.kind() == "type_arguments")
+                    .map(|arguments| arguments.named_children(&mut cursor).collect())
+                    .unwrap_or_default();
+                let constructor = children.into_iter().find(|child| {
+                    !matches!(
+                        child.kind(),
+                        "type_arguments" | "arguments" | "annotation" | "structural_type"
+                    )
+                })?;
+                (scala_type_lookup_segments(constructor, source), arguments)
+            }
+            "identifier"
             | "operator_identifier"
             | "type_identifier"
             | "stable_type_identifier"
             | "projected_type"
-            | "singleton_type"
-    ) {
-        return None;
+            | "singleton_type" => (scala_type_lookup_segments(node, source), Vec::new()),
+            _ => return None,
+        };
+        if segments.is_empty() {
+            return None;
+        }
+        work.push(Work::Assemble(segments, arguments.len()));
+        work.extend(arguments.into_iter().rev().map(Work::Visit));
     }
-    let segments = scala_type_lookup_segments(node, source);
-    (!segments.is_empty()).then_some(ScalaTypeExpressionPath {
-        segments,
-        arguments: Vec::new(),
-    })
+    assert_eq!(values.len(), 1);
+    values.pop()
 }
 
 /// Return only the value binders introduced by a `val`/`var` definition.
@@ -1125,10 +1120,6 @@ fn declared_result(return_type: Option<Node<'_>>, source: &str) -> ScalaDeclared
         open: result.kind() != "type_identifier"
             || !NON_APPLICABLE_RESULT_TYPES.contains(&node_text(result, source).trim()),
     }
-}
-
-pub fn parenthesized_arity(source: &str) -> Option<usize> {
-    scala_parenthesized_arity(source)
 }
 
 pub fn scala_import_path(info: &ImportInfo) -> Option<String> {

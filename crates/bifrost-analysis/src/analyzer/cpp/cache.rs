@@ -11,6 +11,15 @@ pub(super) fn weight_macro_composed_field_vec_by_file(
     _key: &ProjectFile,
     value: &Arc<Vec<super::MacroComposedField>>,
 ) -> u32 {
+    let source_bytes = value.first().map_or(0, |first| {
+        assert!(
+            value
+                .iter()
+                .all(|field| Arc::ptr_eq(&first.source, &field.source)),
+            "macro-composed fields must share one canonical source arena"
+        );
+        first.source.estimated_retained_bytes()
+    });
     let size = value
         .iter()
         .fold(size_of::<Vec<super::MacroComposedField>>(), |acc, field| {
@@ -21,7 +30,8 @@ pub(super) fn weight_macro_composed_field_vec_by_file(
                 .saturating_add(field.unit.package_name().len())
                 .saturating_add(field.unit.signature().map_or(0, str::len))
                 .saturating_add(field.ranges.len().saturating_mul(size_of::<Range>()))
-        });
+        })
+        .saturating_add(source_bytes);
     size.min(u32::MAX as usize) as u32
 }
 

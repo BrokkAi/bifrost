@@ -1,4 +1,4 @@
-//! Exact Java statement reachability rows from production CFG entries.
+//! Exact statement reachability rows from production CFG entries.
 
 use super::results::{
     CodeQueryRange, CodeQueryResultRef, CodeQueryStatementReachability, DetailedCodeQueryKey,
@@ -6,8 +6,7 @@ use super::results::{
 use super::*;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    JavaStatementAssessment, JavaStatementCoordinates, JavaStatementVerdict,
-    java_statement_assessments,
+    StatementAssessment, StatementCoordinates, StatementVerdict, statement_assessments,
 };
 
 const STATEMENT_REACHABILITY_ID_DOMAIN: &[u8] = b"bifrost.code_query.statement_reachability.v1";
@@ -19,7 +18,7 @@ pub(super) struct StatementReachabilityValue {
     pub(super) row: CodeQueryStatementReachability,
 }
 
-fn public_range(coordinates: JavaStatementCoordinates) -> CodeQueryRange {
+fn public_range(coordinates: StatementCoordinates) -> CodeQueryRange {
     CodeQueryRange {
         start_line: coordinates.start_line,
         start_column: coordinates.start_column,
@@ -30,7 +29,7 @@ fn public_range(coordinates: JavaStatementCoordinates) -> CodeQueryRange {
 
 fn row(
     procedure: &semantic::SemanticProcedureValue,
-    assessment: JavaStatementAssessment,
+    assessment: StatementAssessment,
 ) -> PipelineExpansion {
     let procedure_id = procedure.wire_id();
     let mut digest = LengthDelimitedDigest::new(STATEMENT_REACHABILITY_ID_DOMAIN);
@@ -38,9 +37,9 @@ fn row(
     digest.push(&(assessment.range.start_byte as u64).to_le_bytes());
     digest.push(&(assessment.range.end_byte as u64).to_le_bytes());
     let (verdict, reason) = match assessment.verdict {
-        JavaStatementVerdict::Reachable => ("reachable", None),
-        JavaStatementVerdict::Unreachable => ("unreachable", None),
-        JavaStatementVerdict::Open(reason) => ("open", Some(reason.to_owned())),
+        StatementVerdict::Reachable => ("reachable", None),
+        StatementVerdict::Unreachable => ("unreachable", None),
+        StatementVerdict::Open(reason) => ("open", Some(reason.to_owned())),
     };
     pipeline_expansion(PipelineValue::StatementReachability(Box::new(
         StatementReachabilityValue {
@@ -50,7 +49,13 @@ fn row(
                 id: digest.finish().to_string(),
                 procedure_id,
                 path: rel_path_string(procedure.file()),
-                language: Language::Java.config_label(),
+                language: procedure
+                    .handle
+                    .artifact()
+                    .key()
+                    .language()
+                    .language()
+                    .config_label(),
                 range: public_range(assessment.coordinates),
                 statement_kind: assessment.kind,
                 verdict,
@@ -108,7 +113,7 @@ pub(super) fn statement_reachability_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
-    let assessments = java_statement_assessments(workspace, &procedure.handle, cancellation);
+    let assessments = statement_assessments(workspace, &procedure.handle, cancellation);
     if !assessments.complete {
         report_open(
             procedure,
@@ -119,7 +124,7 @@ pub(super) fn statement_reachability_expansions(
     }
     let mut rows = Vec::with_capacity(assessments.rows.len());
     for assessment in assessments.rows {
-        if let JavaStatementVerdict::Open(reason) = assessment.verdict {
+        if let StatementVerdict::Open(reason) = assessment.verdict {
             report_open(procedure, reason, diagnostics);
         }
         rows.push(row(procedure, assessment));

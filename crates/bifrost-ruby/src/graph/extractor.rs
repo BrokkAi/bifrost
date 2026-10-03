@@ -849,7 +849,9 @@ fn ruby_bare_new_outcome(
     semantic: &RubySemanticIndex<'_>,
     frame: &FactoryInferenceFrame,
 ) -> FactoryMethodOutcome {
-    let visible_files = semantic.visible_files_from(frame.method.source());
+    let Some(visible_files) = semantic.visible_files_from(frame.method.source()) else {
+        return FactoryMethodOutcome::Unknown;
+    };
     let receiver = ReceiverType {
         owner_fq_name: frame.invocation_owner_fq_name.clone(),
         mode: ReceiverMode::Class,
@@ -1000,7 +1002,9 @@ fn ruby_factory_new_receiver_outcome(
     match receiver.kind() {
         "self" => FactoryMethodOutcome::Owner(invocation_owner_fq_name.to_string()),
         "constant" | "scope_resolution" => {
-            let visible_files = semantic.visible_files_from(file);
+            let Some(visible_files) = semantic.visible_files_from(file) else {
+                return FactoryMethodOutcome::Unknown;
+            };
             semantic
                 .resolve_constant(file, &visible_files, &lexical_stack, receiver, source)
                 .filter(|unit| unit.is_class() || unit.is_module())
@@ -1044,7 +1048,9 @@ fn ruby_factory_chained_call_outcome(
     ) else {
         return FactoryMethodOutcome::Unknown;
     };
-    let visible_files = semantic.visible_files_from(file);
+    let Some(visible_files) = semantic.visible_files_from(file) else {
+        return FactoryMethodOutcome::Unknown;
+    };
     let class = ReceiverType {
         owner_fq_name: owner_fq_name.clone(),
         mode: ReceiverMode::Class,
@@ -1075,7 +1081,7 @@ fn ruby_factory_class_receiver_owner(
     match receiver.kind() {
         "self" => Some(invocation_owner_fq_name.to_string()),
         "constant" | "scope_resolution" => {
-            let visible_files = semantic.visible_files_from(file);
+            let visible_files = semantic.visible_files_from(file)?;
             semantic
                 .resolve_constant(file, &visible_files, lexical_stack, receiver, source)
                 .filter(|unit| unit.is_class() || unit.is_module())

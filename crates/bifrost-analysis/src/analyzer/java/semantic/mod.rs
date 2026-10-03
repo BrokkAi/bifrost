@@ -12,14 +12,19 @@ use crate::analyzer::semantic::cfg::{
     ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
+use crate::analyzer::semantic::structural_identity::{
+    StructuralNodeIndex, StructuralNodeIndexOutcome,
+};
 use crate::analyzer::semantic::*;
+use crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v25";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v27";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -27,13 +32,16 @@ struct JavaSemanticLowerer;
 
 impl ProgramSemanticsLowerer for JavaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
+        let mut digest =
+            LengthDelimitedDigest::new(b"bifrost.java-semantic.structural-facts-dependency.v1");
+        digest.push(&STRUCTURAL_FACTS_VERSION.to_le_bytes());
         SemanticAdapterIdentity {
             adapter: AdapterSemanticsVersion::hash_bytes("java", ADAPTER_VERSION)
                 .expect("adapter name is non-empty"),
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"java-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies: DependencyFingerprint::from_digest(digest.finish()),
         }
     }
 
@@ -48,7 +56,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (mut specs, initial_work, inventory_work) =
+        let (mut specs, mut initial_work, inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -114,6 +122,48 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
             })
             .collect::<HashMap<_, _>>();
 
+        let remaining = budget
+            .limits()
+            .nested_entries
+            .saturating_sub(inventory_work.nested_entries);
+        let structural_node_index = match StructuralNodeIndex::for_source(
+            &JAVA_STRUCTURAL_SPEC,
+            prepared,
+            remaining,
+            cancellation,
+        )? {
+            StructuralNodeIndexOutcome::Complete { index, work_items } => {
+                let work = SemanticWork {
+                    nested_entries: work_items,
+                    ..SemanticWork::default()
+                };
+                initial_work = sum_lowering_work(initial_work, work);
+                index
+            }
+            StructuralNodeIndexOutcome::Exceeded { minimum_work_items } => {
+                let work = sum_lowering_work(
+                    inventory_work,
+                    SemanticWork {
+                        nested_entries: minimum_work_items,
+                        ..SemanticWork::default()
+                    },
+                );
+                let exceeded = budget
+                    .check(work)
+                    .expect_err("structural minimum exceeds its remaining semantic budget");
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            StructuralNodeIndexOutcome::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: inventory_work,
+                });
+            }
+        };
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -124,6 +174,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                     prepared,
                     spec,
                     &procedure_targets,
+                    &structural_node_index,
                     staged_budget,
                     cancellation,
                 )
@@ -307,6 +358,7 @@ struct JavaSwitchArm<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
+    structural_node_index: &'targets StructuralNodeIndex,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<Box<str>, ValueId>,

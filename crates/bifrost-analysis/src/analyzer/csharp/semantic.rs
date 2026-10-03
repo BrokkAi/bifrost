@@ -11,16 +11,20 @@ use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
 };
-use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
+use crate::analyzer::semantic::service::{
+    PrimaryDeclarationSemanticsLowerer, ProgramSemanticsLowerer, SemanticAdapterIdentity,
+    lower_with_primary_declarations,
+};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::parsed_file::{CSharpSemanticDeclarationKind, ParsedFile};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v13";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v15";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -48,6 +52,10 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         csharp_capabilities()
     }
 
+    fn primary_declaration_lowerer(&self) -> Option<&dyn PrimaryDeclarationSemanticsLowerer> {
+        Some(self)
+    }
+
     fn lower(
         &self,
         file: &ProjectFile,
@@ -55,8 +63,39 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+        let source_work = SemanticWork {
+            source_bytes: prepared.source().len(),
+            ..SemanticWork::default()
+        };
+        let mut admitted = budget.clone();
+        if let Err(exceeded) = admitted.charge(source_work) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: source_work,
+            });
+        }
+        lower_with_primary_declarations(self, file, prepared, &admitted, cancellation, || {
+            brokk_bifrost_csharp::declarations::parse_csharp_file(
+                file,
+                prepared.source(),
+                prepared.tree(),
+            )
+        })
+    }
+}
+
+impl PrimaryDeclarationSemanticsLowerer for CSharpSemanticLowerer {
+    fn lower_with_primary_declarations(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        primary: &ParsedFile,
+        budget: &SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
         let (procedure_inventory, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
+            match enumerate_procedures(file, prepared, primary, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
                     initial_work,
@@ -870,6 +909,7 @@ struct ProcedureEnumerationFrame<'tree> {
 fn enumerate_procedures<'tree>(
     file: &ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
+    primary: &ParsedFile,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
@@ -878,9 +918,15 @@ fn enumerate_procedures<'tree>(
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "csharp-source", budget)?;
     let mut specs = Vec::new();
-    let mut static_callable_returns = StaticCallableReturnTypes::default();
+    let (static_callable_returns, member_declarations) =
+        primary_declaration_maps(primary, prepared)?;
+    if let Err(stop) = inventory.observe_additional_work(SemanticWork {
+        nested_entries: primary.csharp_semantic_declarations.len(),
+        ..SemanticWork::default()
+    }) {
+        return Ok(stop.into_outcome());
+    }
     let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
-    let mut member_declarations = MemberDeclarations::default();
     let mut type_declarations = TypeDeclarations::default();
     let mut type_aliases = HashSet::<Box<str>>::default();
     let mut type_members = HashMap::<usize, CSharpTypeMembers>::default();
@@ -928,12 +974,6 @@ fn enumerate_procedures<'tree>(
         if frame.node.kind() == "method_declaration" {
             callable_nodes.push(frame.node);
         }
-        record_static_callable_return_type(
-            &mut static_callable_returns,
-            frame.node,
-            prepared.source(),
-        );
-        record_member_declarations(&mut member_declarations, frame.node, prepared.source());
         record_type_declaration(
             &mut type_declarations,
             &mut type_members,
@@ -1267,123 +1307,86 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
         .or_else(|| enclosing_variable_name(source, node))
 }
 
-fn record_static_callable_return_type(
-    returns: &mut StaticCallableReturnTypes,
-    callable: Node<'_>,
-    source: &str,
-) {
-    if callable.kind() != "method_declaration" || !has_modifier(source, callable, "static") {
-        return;
-    }
-    let Some(owner_node) = enclosing_type_node(callable) else {
-        return;
-    };
-    if enclosing_type_node(owner_node).is_some() {
-        return;
-    }
-    let Some(owner) = declaration_container_name(source, owner_node) else {
-        return;
-    };
-    let Some(name) = callable_name(source, callable) else {
-        return;
-    };
-    let return_type = callable
-        .child_by_field_name("returns")
-        .or_else(|| callable.child_by_field_name("type"))
-        .and_then(|return_type| declared_type_spelling(return_type, source));
-    let key = TypeMemberKey {
-        namespace: enclosing_namespace_path(source, callable),
-        owner,
-        name,
-    };
-    match returns.entry(key) {
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            entry.insert(None);
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(return_type);
-        }
-    }
-}
-
-/// Index the fields and properties a type declares, so that an occurrence of
-/// one can name the *declaration's* anchor rather than its own (#2661).
-///
-/// Two reads of `this.value` in different procedures must agree that they name
-/// one location; anchoring each to its own occurrence would make them two.
-///
-/// A nested type is indexed like any other. The key carries only the innermost
-/// type name, so a nested `Inner` and a top-level `Inner` in the same namespace
-/// share one key -- but the duplicate collapse below already turns that into a
-/// decline, which is the honest answer and a strictly better one than refusing
-/// every nested type outright. Refusing them was how a `sealed class Holder`
-/// nested in a static host ended up with each occurrence of `h.Tainted`
-/// anchored to itself, so a store and a later load named two locations that
-/// only looked alike and no heap fact could ever connect them (#2661).
-fn record_member_declarations(members: &mut MemberDeclarations, node: Node<'_>, source: &str) {
-    let names = match node.kind() {
-        "field_declaration" | "event_field_declaration" => named_children(node)
-            .into_iter()
-            .filter(|child| child.kind() == "variable_declaration")
-            .flat_map(named_children)
-            .filter(|child| child.kind() == "variable_declarator")
-            .filter_map(|declarator| {
-                declarator
-                    .child_by_field_name("name")
-                    .or_else(|| first_runtime_named_child(declarator))
-            })
-            .collect::<Vec<_>>(),
-        "property_declaration" | "event_declaration" => {
-            node.child_by_field_name("name").into_iter().collect()
-        }
-        _ => return,
-    };
-    if names.is_empty() {
-        return;
-    }
-    let Some(owner_node) = enclosing_type_node(node) else {
-        return;
-    };
-    let Some(owner) = declaration_container_name(source, owner_node) else {
-        return;
-    };
-    // A `const` member is class-wide storage exactly as a `static` one is; C#
-    // simply implies the modifier rather than requiring it.
-    let is_static = has_modifier(source, node, "static") || has_modifier(source, node, "const");
-    // A field declares its type on the inner `variable_declaration`; a
-    // property declares it on the declaration itself.
-    let type_spelling = named_children(node)
-        .into_iter()
-        .find(|child| child.kind() == "variable_declaration")
-        .and_then(|declaration| declaration.child_by_field_name("type"))
-        .or_else(|| node.child_by_field_name("type"))
-        .and_then(|type_node| declared_type_spelling(type_node, source));
-    let namespace = enclosing_namespace_path(source, node);
-    for name_node in names {
-        let Some(name) = nonempty_node_text(source, name_node) else {
-            continue;
-        };
-        let Ok(anchor) = source_anchor(name_node, 0) else {
-            continue;
-        };
+/// Build executable maps from the primary source projection. Exact name
+/// anchors come from canonical occurrence identities; no declaration AST or
+/// rendered signature supplies these properties during executable lowering.
+fn primary_declaration_maps(
+    primary: &ParsedFile,
+    prepared: &PreparedSyntaxTree,
+) -> Result<(StaticCallableReturnTypes, MemberDeclarations), SemanticProviderError> {
+    let mut returns = StaticCallableReturnTypes::default();
+    let mut members = MemberDeclarations::default();
+    let facts = primary.source_facts.as_ref().expect("C# primary facts");
+    for declaration in &primary.csharp_semantic_declarations {
+        let source = facts.occurrences.declaration(declaration.declaration);
+        let name = source
+            .name
+            .expect("semantic declarations have source names");
+        let range = facts.occurrences.occurrence(name).range;
+        let name = &prepared.source()[range.start_byte..range.end_byte];
         let key = TypeMemberKey {
-            namespace: namespace.clone(),
-            owner: owner.clone(),
+            namespace: declaration
+                .namespace
+                .iter()
+                .map(|name| Box::<str>::from(name.as_str()))
+                .collect(),
+            owner: declaration.owner.clone().into_boxed_str(),
             name: Box::from(name),
         };
-        match members.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(MemberDeclaration {
-                    anchor,
-                    is_static,
-                    type_spelling: type_spelling.clone(),
-                }));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(None);
+        let type_spelling = declaration
+            .type_spelling
+            .clone()
+            .map(String::into_boxed_str);
+        match declaration.kind {
+            CSharpSemanticDeclarationKind::StaticMethodReturn => match returns.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(type_spelling);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            },
+            CSharpSemanticDeclarationKind::Member => {
+                let position =
+                    |byte: usize, line: usize| -> Result<SourcePosition, SemanticProviderError> {
+                        let row = line
+                            .checked_sub(1)
+                            .expect("source occurrences use one-based lines");
+                        let column = byte - prepared.line_starts()[row];
+                        Ok(SourcePosition::new(
+                            u32::try_from(byte).map_err(|_| {
+                                SemanticProviderError::invalid_identity("source byte exceeds u32")
+                            })?,
+                            u32::try_from(row).map_err(|_| {
+                                SemanticProviderError::invalid_identity("source row exceeds u32")
+                            })?,
+                            u32::try_from(column).map_err(|_| {
+                                SemanticProviderError::invalid_identity("source column exceeds u32")
+                            })?,
+                        ))
+                    };
+                let span = SourceSpan::new(
+                    position(range.start_byte, range.start_line)?,
+                    position(range.end_byte, range.end_line)?,
+                )
+                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
+                let member = MemberDeclaration {
+                    anchor: SourceAnchor::new(span, 0),
+                    is_static: declaration.is_static,
+                    type_spelling,
+                };
+                match members.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(member));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
             }
         }
     }
+    Ok((returns, members))
 }
 
 fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
@@ -1734,6 +1737,9 @@ struct LoweringContext<'tree, 'targets> {
     implicit_locals: Vec<ImplicitLocalBinding<'tree>>,
     receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
+    /// Whether this procedure is a lambda or local function, whose free
+    /// names can denote the enclosing procedure's locals.
+    nested: bool,
 }
 
 /// One structured heap location an access expression names, together with
@@ -1812,6 +1818,7 @@ fn lower_procedure<'tree, 'targets>(
         implicit_locals: Vec::new(),
         receiver: None,
         cleanups: Vec::new(),
+        nested: spec.lexical_parent.is_some(),
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
@@ -1876,7 +1883,9 @@ fn lower_procedure<'tree, 'targets>(
                 .find(|child| child.kind() == "constructor_initializer")
         })
         .flatten();
-    if spec.kind == ProcedureKind::Constructor && constructor_initializer.is_none() {
+    let implicit_base =
+        spec.kind == ProcedureKind::Constructor && constructor_initializer.is_none();
+    if implicit_base {
         context.add_gap(
             &mut builder,
             entry,
@@ -1884,14 +1893,6 @@ fn lower_procedure<'tree, 'targets>(
             SemanticCapability::Calls,
             SemanticGapKind::Unsupported,
             "implicit base-constructor invocation is not represented as a call site",
-        )?;
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            "implicit base-constructor invocation can complete exceptionally",
         )?;
     }
 
@@ -1953,6 +1954,17 @@ fn lower_procedure<'tree, 'targets>(
         });
     } else {
         context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
+    }
+    // The implicit `base()` runs before the body, outside every handler the
+    // body declares, so its exception leaves the constructor.
+    if implicit_base {
+        context.implicit_abort_route(
+            &mut builder,
+            spec.callable,
+            entry,
+            function_scope,
+            &mut pending,
+        )?;
     }
 
     drive_and_finish_procedure(
@@ -2231,7 +2243,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 "identifier" => {
                     let name = node_text(self.prepared.source(), current)?;
-                    break self.binding_resolved_type(name, current.start_byte())?;
+                    if self.implicit_member(current).is_none() {
+                        break self.binding_resolved_type(name, current.start_byte())?;
+                    }
+                    // A member named through the implicit `this`.
+                    members.push(name);
+                    break enclosing_type_node(current)
+                        .and_then(|owner| self.type_index.declared_at(owner.start_byte()))?;
                 }
                 "this" => {
                     break enclosing_type_node(current)
@@ -2590,7 +2608,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, None, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, None, stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -2776,9 +2797,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .child_by_field_name("type")
                 .and_then(|created| declared_type_spelling(created, source))
                 .is_some_and(|created| created.as_ref() == declared),
-            "identifier" => node_text(source, value)
-                .and_then(|name| self.binding_type_at(name, value.start_byte()))
-                .is_some_and(|bound| bound == declared),
+            "identifier" => match self.implicit_member(value) {
+                Some(member) => member.type_spelling.as_deref() == Some(declared),
+                None => node_text(source, value)
+                    .and_then(|name| self.binding_type_at(name, value.start_byte()))
+                    .is_some_and(|bound| bound == declared),
+            },
             "invocation_expression" => self
                 .static_invocation_return_type(value)
                 .is_some_and(|returned| returned == declared),
@@ -2893,8 +2917,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         match access.kind() {
             "member_access_expression" => self.member_location(builder, point, access),
             "element_access_expression" => self.element_location(builder, point, access),
+            "identifier" => {
+                let Some(declaration) = self.implicit_member(access) else {
+                    return Ok(None);
+                };
+                let base = self.receiver;
+                self.declared_member_location(builder, point, access, Some(declaration), base)
+            }
             _ => Ok(None),
         }
+    }
+
+    /// The field or property a simple name denotes through an implicit
+    /// `this` (or its type, for a static member): a name that no local or
+    /// parameter binds, declared by the innermost enclosing type in this file.
+    /// A lambda or local function can name an enclosing procedure's local, so
+    /// its free names stay unresolved.
+    fn implicit_member(&self, node: Node<'tree>) -> Option<MemberDeclaration> {
+        if self.nested || node.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), node)?;
+        if self.local_at(name, node.start_byte()).is_some() || self.parameters.contains_key(name) {
+            return None;
+        }
+        let owner = enclosing_type_node(node)
+            .and_then(|owner| declaration_container_name(self.prepared.source(), owner))?;
+        self.member_declaration_for(&owner, name, node)
     }
 
     fn member_location(
@@ -2915,6 +2964,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(None);
         };
         let declaration = self.access_member_declaration(base, &name, access);
+        // Without a base value this is not an instance access at all -- it is
+        // a member of a type this file could not resolve. Inventing a base
+        // object would invent an aliasing fact, so decline.
+        let base_value = if declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.is_static)
+        {
+            None
+        } else {
+            let Some(base_value) = self.access_base_value(builder, base)? else {
+                return Ok(None);
+            };
+            Some(base_value)
+        };
+        self.declared_member_location(builder, point, name_node, declaration, base_value)
+    }
+
+    /// The location of a member named at `name_node`, addressed through
+    /// `base_value` unless the declaration is static.
+    fn declared_member_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        name_node: Node<'tree>,
+        declaration: Option<MemberDeclaration>,
+        base_value: Option<ValueId>,
+    ) -> Result<Option<MemoryTarget>, CSharpLoweringError> {
         let member = self.member_locator(name_node, declaration.as_ref())?;
         // A `static` or `const` member is one class-wide slot, addressed by
         // nothing: it has no base object for a `Field` location to name.
@@ -2933,10 +3009,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 resolved: true,
             }));
         }
-        // Without a base value this is not an instance access at all -- it is
-        // a member of a type this file could not resolve. Inventing a base
-        // object would invent an aliasing fact, so decline.
-        let Some(base_value) = self.access_base_value(builder, base)? else {
+        let Some(base_value) = base_value else {
             return Ok(None);
         };
         let location = self.session.add_memory_location(
@@ -3124,6 +3197,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// declining every such assignment's result on principle (#2661).
     fn assignment_target_type(&self, target: Node<'tree>) -> Option<Box<str>> {
         match target.kind() {
+            "identifier" => self.implicit_member(target)?.type_spelling,
             "member_access_expression" => {
                 let base = target.child_by_field_name("expression")?;
                 let name = nonempty_node_text(
@@ -3469,7 +3543,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
 
         let mut continuation = terminal;
-        let evaluations = if left.kind() == "identifier" {
+        // A simple name that denotes a member writes `this.name`, exactly as
+        // a member access target does. An object initializer's names are
+        // handled as initializer members below.
+        let implicit_member = object_initializer_member_target(node).is_none()
+            && self.implicit_member(left).is_some();
+        let evaluations = if left.kind() == "identifier" && !implicit_member {
             let name = node_text(self.prepared.source(), left).ok_or_else(|| {
                 CSharpLoweringError::Invalid("assignment has invalid target range".into())
             })?;
@@ -4154,6 +4233,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let body = required_field(node, "body")?;
                 let condition_entry = self.point(builder, condition, Vec::new())?;
                 let body_entry = self.point(builder, body, Vec::new())?;
+                // Each iteration re-enters the condition.
+                self.session
+                    .record_loop_site(builder, node, condition_entry, body_entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -4192,6 +4274,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let body = required_field(node, "body")?;
                 let condition = required_field(node, "condition")?;
                 let condition_entry = self.point(builder, condition, Vec::new())?;
+                // A do body starts every iteration, so it is its own header.
+                self.session.record_loop_site(builder, node, entry, entry)?;
                 let loop_scope = builder.push_scope(
                     Some(scope),
                     ScopeBinding::Loop {
@@ -4314,6 +4398,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "record_struct_declaration" => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry, next),
         }
+    }
+
+    /// The terminal point of a member or element access: its abort route, the
+    /// accessor code it can run, and its load when the access is a read.
+    fn member_access_terminal(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        terminal: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        self.implicit_abort_route(builder, node, terminal, scope, stack)?;
+        // The lowered route answers where an abort goes, not what a
+        // property getter, an indexer, or a type initializer the
+        // access can enter does. That is an invocation question, so it
+        // is a `Calls` claim like the user-defined operator one, not an
+        // `ExceptionalControlFlow` claim: the solver reads a point
+        // claim of that capability as an unlowered abort route and
+        // reopens every caller's exceptional return (#3679).
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "property or element access can invoke accessor, indexer, or type-initializer user code whose value and effect semantics are not modeled",
+        )?;
+        // A read of a member or an element loads from a location
+        // (#2661). A write target and a method group are not reads at
+        // all: the target's own store already represents the write,
+        // and `obj.Method()` names a method group whose call site the
+        // invocation already publishes.
+        if !access_is_write_target(node) && !access_is_call_target(node) {
+            self.emit_memory_load(builder, terminal, node)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4599,6 +4720,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "variable_declaration" => {
                 self.local_declaration(builder, node, entry, next, scope, stack)
             }
+            "identifier" if self.implicit_member(node).is_some() => {
+                // A simple name that denotes a member accesses it through the
+                // implicit `this`, like `this.name`.
+                let terminal = self.point(builder, node, Vec::new())?;
+                self.member_access_terminal(builder, node, terminal, scope, stack)?;
+                self.edge(builder, entry, EdgeTarget::normal(terminal))?;
+                self.edge(builder, terminal, next)
+            }
             "member_access_expression"
             | "member_binding_expression"
             | "element_access_expression"
@@ -4608,30 +4737,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // a terminal preserves conservative downstream control flow
                 // without making the already-evaluated receiver incomplete.
                 let terminal = self.point(builder, node, Vec::new())?;
-                self.implicit_abort_route(builder, node, terminal, scope, stack)?;
-                // The lowered route answers where an abort goes, not what a
-                // property getter, an indexer, or a type initializer the
-                // access can enter does. That is an invocation question, so it
-                // is a `Calls` claim like the user-defined operator one, not an
-                // `ExceptionalControlFlow` claim: the solver reads a point
-                // claim of that capability as an unlowered abort route and
-                // reopens every caller's exceptional return (#3679).
-                self.add_gap(
-                    builder,
-                    terminal,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Calls,
-                    SemanticGapKind::Unknown,
-                    "property or element access can invoke accessor, indexer, or type-initializer user code whose value and effect semantics are not modeled",
-                )?;
-                // A read of a member or an element loads from a location
-                // (#2661). A write target and a method group are not reads at
-                // all: the target's own store already represents the write,
-                // and `obj.Method()` names a method group whose call site the
-                // invocation already publishes.
-                if !access_is_write_target(node) && !access_is_call_target(node) {
-                    self.emit_memory_load(builder, terminal, node)?;
-                }
+                self.member_access_terminal(builder, node, terminal, scope, stack)?;
                 self.edge(builder, terminal, next)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(
@@ -4787,6 +4893,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
+        // Updates run before the condition, which starts every iteration.
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let updates = updates
             .into_iter()
             .map(|update| {
@@ -6537,6 +6646,82 @@ fn is_statement_kind(kind: &str) -> bool {
         )
 }
 
+/// Procedure syntax roles for the C# lowering. Procedures are the callable
+/// declarations and expressions `callable_shape` lowers; `foreach` iterates
+/// and is not a conditional loop.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: csharp_statement_kind,
+        loop_site: |node| {
+            use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+            let kind = match node.kind() {
+                "while_statement" => LoopKind::While,
+                "for_statement" => LoopKind::For,
+                "do_statement" => LoopKind::Do,
+                _ => return None,
+            };
+            Some(LoopSyntax {
+                kind,
+                body: node.child_by_field_name("body"),
+                condition: node.child_by_field_name("condition"),
+            })
+        },
+        procedure_matches: |_, node| is_csharp_procedure_node(node),
+        nested_procedure: |node| {
+            is_csharp_procedure_node(node) || node.kind() == "declaration_list"
+        },
+    };
+
+fn is_csharp_procedure_node(node: Node<'_>) -> bool {
+    match node.kind() {
+        "method_declaration"
+        | "constructor_declaration"
+        | "local_function_statement"
+        | "lambda_expression"
+        | "anonymous_method_expression"
+        | "accessor_declaration"
+        | "operator_declaration"
+        | "conversion_operator_declaration"
+        | "destructor_declaration" => true,
+        "property_declaration" | "indexer_declaration" => node
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "arrow_expression_clause"),
+        _ => false,
+    }
+}
+
+/// Classify an executable C# statement. A local function is a nested
+/// procedure, not a statement of its parent; preprocessor regions are not
+/// statements.
+fn csharp_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    Some(match node.kind() {
+        "block" => "block",
+        "expression_statement" => "expression",
+        "local_declaration_statement" => "local_declaration",
+        "return_statement" => "return",
+        "throw_statement" => "throw",
+        "yield_statement" => "yield",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "goto_statement" => "goto",
+        "labeled_statement" => "labeled",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "do_statement" => "do",
+        "for_statement" => "for",
+        "foreach_statement" => "enhanced_for",
+        "switch_statement" => "switch",
+        "try_statement" => "try",
+        "using_statement" => "using",
+        "lock_statement" => "lock",
+        "fixed_statement" => "fixed",
+        "checked_statement" => "checked",
+        "unsafe_statement" => "unsafe",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
+}
+
 fn is_conditional_compilation_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -6691,7 +6876,7 @@ fn csharp_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> 
 ///
 /// An unqualified call (`Relay(value)`) names a member of the type that
 /// lexically encloses it, which is the same owner
-/// [`record_static_callable_return_type`] indexes; before #2661 only the
+/// [`primary_declaration_maps`] indexes; before #2661 only the
 /// explicitly qualified `Owner.Relay(value)` spelling produced a key, so a
 /// sibling static call resolved to nothing at all.
 fn static_invocation_key(invocation: Node<'_>, source: &str) -> Option<TypeMemberKey> {
@@ -6855,23 +7040,11 @@ fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
 /// `int[]` is not an identity-preserving initialization -- so the ranks are
 /// restored here. `var` names no declared type at all and yields `None`.
 fn declared_type_spelling(node: Node<'_>, source: &str) -> Option<Box<str>> {
-    if node.kind() == "implicit_type" {
-        return None;
-    }
-    let identity = super::csharp_type_node_identity(node, source);
-    if identity.is_empty() {
-        return None;
-    }
-    let mut ranks = String::new();
-    let mut current = node;
-    while current.kind() == "array_type" {
-        ranks.push_str("[]");
-        let Some(inner) = current.child_by_field_name("type") else {
-            break;
-        };
-        current = inner;
-    }
-    Some(format!("{identity}{ranks}").into_boxed_str())
+    brokk_bifrost_csharp::syntax::csharp_declared_type_spelling(
+        node,
+        &super::csharp_type_node_identity(node, source),
+    )
+    .map(String::into_boxed_str)
 }
 
 /// Whether an expression constructs its own value rather than naming one that
@@ -7258,6 +7431,41 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
+    }
+}
+
+#[cfg(test)]
+mod primary_handoff_tests {
+    use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+    use std::sync::Arc;
+
+    #[test]
+    fn standalone_csharp_lowering_admits_source_before_primary_construction() {
+        let source = "class C { static int Run() { return 1; } }";
+        let file = ProjectFile::new(std::env::temp_dir(), "Standalone.cs");
+        let tree = brokk_bifrost_csharp::preprocessor::parse_csharp(source).unwrap();
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            tree,
+            vec![0],
+            LanguageDialect::for_path(Language::CSharp, file.rel_path()),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let cancellation = CancellationToken::new();
+        let result = CSharpSemanticLowerer
+            .lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+            .unwrap();
+        assert!(matches!(result, SemanticOutcome::Complete { value, .. } if value.len() == 1));
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = source.len() - 1;
+        let limited = SemanticBudget::new(limits).unwrap();
+        let result = CSharpSemanticLowerer
+            .lower(&file, &prepared, &limited, &cancellation)
+            .unwrap();
+        assert!(matches!(result, SemanticOutcome::ExceededBudget { .. }));
     }
 }
 

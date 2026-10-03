@@ -53,11 +53,11 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer::{
     InjectionContext, SanitizerCompleteness, SanitizerEntry, SanitizerPort, SanitizerRejection,
     gate_sanitizer,
 };
-use super::{FOUNDRY_BIFROST_REQUIREMENT, FOUNDRY_PRODUCER_VERSION};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -600,6 +600,7 @@ fn build_summary(
             SanitizerCompleteness::Complete => Completeness::Complete,
         },
         ordinary_heap_unchanged: false,
+        no_concurrency_effects: false,
         covers_overrides: false,
         normal_continuation_absent: false,
         normal_result_count: None,
@@ -744,7 +745,8 @@ impl PackIdentity {
         completeness: Completeness,
     ) -> AuthoredSemanticModelPack {
         AuthoredSemanticModelPack {
-            schema_version: 2,
+            schema_version:
+                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
             pack_id: self.pack_id.clone(),
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {
@@ -754,7 +756,7 @@ impl PackIdentity {
             language: "java".to_owned(),
             ecosystem: self.ecosystem.clone(),
             compatibility: Compatibility {
-                bifrost: FOUNDRY_BIFROST_REQUIREMENT.to_owned(),
+                bifrost: None,
                 toolchains: self.toolchains.clone(),
             },
             provenance: Provenance {

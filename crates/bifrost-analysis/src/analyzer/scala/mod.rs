@@ -7,6 +7,9 @@ pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
 mod semantic_adaptation;
+mod source_facts;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 
 use crate::analyzer::Range;
@@ -752,6 +755,10 @@ pub struct ScalaAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    source_facts: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
+    >,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     file_dependency_index: Arc<OnceLock<imports::ScalaFileDependencyIndex>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
@@ -888,6 +895,17 @@ impl ScalaAnalyzer {
         self.inner.is_type_alias(code_unit)
     }
 
+    pub(crate) fn canonical_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>> {
+        if file_language(file) != Language::Scala {
+            return None;
+        }
+        self.inner
+            .canonical_scala_source_facts(file, &self.source_facts)
+    }
+
     pub(crate) fn import_lexical_context_for_unit(
         &self,
         unit: &CodeUnit,
@@ -896,19 +914,31 @@ impl ScalaAnalyzer {
         Vec<crate::analyzer::StructuredImportScope>,
         usize,
     )> {
-        let reference_byte = self
-            .ranges(unit)
-            .into_iter()
-            .map(|range| range.start_byte)
-            .min()?;
-        let scope = AnalyzerQueryScope::new(self);
-        let prepared = self.inner.prepared_syntax(scope.token(), unit.source())?;
-        let root = prepared.tree().root_node();
-        Some((
-            scala_package_prefixes_at(root, prepared.source(), reference_byte),
-            scala_lexical_scope_path_at(root, reference_byte),
-            reference_byte,
-        ))
+        let bundle = self.canonical_source_facts(unit.source())?;
+        let fact = bundle.for_unit(unit).min_by_key(|fact| {
+            bundle
+                .source
+                .occurrence(bundle.source.declaration(fact.declaration).occurrence)
+                .range
+                .start_byte
+        })?;
+        let scopes = fact
+            .lexical_scopes
+            .iter()
+            .map(|scope| {
+                let range = bundle.source.occurrence(*scope).range;
+                crate::analyzer::StructuredImportScope {
+                    start_byte: range.start_byte,
+                    end_byte: range.end_byte,
+                }
+            })
+            .collect();
+        let start = bundle
+            .source
+            .occurrence(bundle.source.declaration(fact.declaration).occurrence)
+            .range
+            .start_byte;
+        Some((fact.lexical_prefixes.clone(), scopes, start))
     }
 
     pub(crate) fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
@@ -923,52 +953,21 @@ impl ScalaAnalyzer {
     }
 
     pub(crate) fn is_full_enum_case_declaration(&self, code_unit: &CodeUnit) -> bool {
-        if !code_unit.is_class() {
-            return false;
-        }
-        let Some(range) = self.ranges(code_unit).into_iter().next() else {
-            return false;
-        };
-        let scope = AnalyzerQueryScope::new(self);
-        let Some(prepared) = self
-            .inner
-            .prepared_syntax(scope.token(), code_unit.source())
-        else {
-            return false;
-        };
-        prepared
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(range.start_byte, range.end_byte)
-            .is_some_and(|node| node.kind() == "full_enum_case")
+        code_unit.is_class()
+            && self
+                .canonical_source_facts(code_unit.source())
+                .is_some_and(|bundle| {
+                    bundle
+                        .for_unit(code_unit)
+                        .any(|fact| fact.is_full_enum_case)
+                })
     }
 
     pub(crate) fn is_case_class_declaration(&self, code_unit: &CodeUnit) -> bool {
-        if !code_unit.is_class() {
-            return false;
-        }
-        let Some(range) = self.ranges(code_unit).into_iter().next() else {
-            return false;
-        };
-        let scope = AnalyzerQueryScope::new(self);
-        let Some(prepared) = self
-            .inner
-            .prepared_syntax(scope.token(), code_unit.source())
-        else {
-            return false;
-        };
-        let Some(node) = prepared
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(range.start_byte, range.end_byte)
-        else {
-            return false;
-        };
-        node.kind() == "full_enum_case"
-            || node.kind() == "class_definition"
-                && (0..node.child_count())
-                    .filter_map(|index| node.child(index))
-                    .any(|child| child.kind() == "case")
+        code_unit.is_class()
+            && self
+                .canonical_source_facts(code_unit.source())
+                .is_some_and(|bundle| bundle.for_unit(code_unit).any(|fact| fact.is_case_class))
     }
 
     pub(crate) fn forward_owner_facts(
@@ -1051,6 +1050,12 @@ impl ScalaAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            source_facts: build_weighted_cache(
+                memo_budget / 8,
+                |_, facts: &Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>| {
+                    u32::try_from(facts.estimated_retained_bytes()).unwrap_or(u32::MAX)
+                },
+            ),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             file_dependency_index: Arc::new(OnceLock::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
@@ -1533,6 +1538,11 @@ impl ScalaAnalyzer {
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.inner.bulk_hydration_count_for_test()
     }
+
+    #[cfg(test)]
+    pub(crate) fn clear_retained_file_states_for_test(&mut self) {
+        self.inner.clear_retained_file_states_for_test();
+    }
 }
 
 /// A tier that stopped Scala's ladder because an import could bind the name and
@@ -1572,6 +1582,13 @@ fn qualify_scala_name(package_name: &str, name: &str) -> String {
 }
 
 impl ScalaSource for ScalaAnalyzer {
+    fn canonical_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>> {
+        ScalaAnalyzer::canonical_source_facts(self, file)
+    }
+
     /// Scala's type-name ladder, read-only (#1619).
     ///
     /// Every tier peeks: `self.external_index.get()` rather than
@@ -2336,6 +2353,10 @@ static SCALA_USAGE_STRATEGY: ScalaUsageGraphStrategy = ScalaUsageGraphStrategy::
 pub(crate) struct ScalaSupport;
 
 impl LanguageSupport for ScalaSupport {
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        crate::analyzer::jvm::is_jvm_configuration_input_path(path)
+    }
+
     fn language(&self) -> Language {
         Language::Scala
     }
@@ -2532,6 +2553,60 @@ mod overlay_usage_tests {
     use super::*;
     use crate::analyzer::usages::{UsageFinder, scala_graph::build_scala_usage_edges};
     use crate::analyzer::{OverlayProject, TestProject};
+
+    #[test]
+    fn canonical_declaration_properties_follow_overlay_content_without_mutating_disk_snapshot() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file("Types.scala", "package app\ncase class Shape(value: Int)\nobject Api { def build(value: Int): Shape = Shape(value) }\n")
+            .build();
+        let file = fixture.file("Types.scala");
+        let disk = ScalaAnalyzer::new(fixture.project_dyn());
+        let shape = disk
+            .get_definitions("app.Shape")
+            .into_iter()
+            .next()
+            .expect("disk shape");
+        assert!(disk.is_case_class_declaration(&shape));
+        let before = disk
+            .canonical_source_facts(&file)
+            .expect("disk canonical publication");
+        assert!(Arc::ptr_eq(
+            &before,
+            &disk
+                .canonical_source_facts(&file)
+                .expect("memoized disk publication")
+        ));
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(file.abs_path(), "package app\nclass Shape(value: Int)\nobject Api { def build(value: Int)(label: String): Shape = new Shape(value) }\n".to_string()));
+        let snapshot = disk.clone_with_project(overlay);
+        let overlay_shape = snapshot
+            .get_definitions("app.Shape")
+            .into_iter()
+            .next()
+            .expect("overlay shape");
+        assert!(!snapshot.is_case_class_declaration(&overlay_shape));
+        let after = snapshot
+            .canonical_source_facts(&file)
+            .expect("overlay canonical publication");
+        let build = snapshot
+            .get_definitions("app.Api$.build")
+            .into_iter()
+            .next()
+            .expect("overlay build");
+        assert!(
+            after
+                .for_unit(&build)
+                .filter_map(|fact| fact.callable.as_ref())
+                .any(|callable| callable.shape.len() == 2)
+        );
+        assert!(disk.is_case_class_declaration(&shape));
+        assert_eq!(
+            before.facts,
+            disk.canonical_source_facts(&file)
+                .expect("unchanged disk publication")
+                .facts
+        );
+    }
 
     #[test]
     fn cloned_overlay_rebuilds_scala_source_facts_for_targeted_and_inverted_ranges() {

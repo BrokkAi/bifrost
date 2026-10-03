@@ -834,6 +834,10 @@ pub(super) fn literal_matches_type(
     matches!(
         (literal, scalar_type),
         (RowLiteral::Integer(_), CodeQueryRowScalarType::Integer)
+            | (
+                RowLiteral::StringList(_),
+                CodeQueryRowScalarType::StringList
+            )
             | (RowLiteral::Boolean(_), CodeQueryRowScalarType::Boolean)
             | (
                 RowLiteral::ConstrainedEnum(_),
@@ -851,6 +855,7 @@ pub(super) fn literal_matches_type(
 pub(super) fn row_literal_kind(literal: &RowLiteral) -> &'static str {
     match literal {
         RowLiteral::String(_) => "string",
+        RowLiteral::StringList(_) => "string_list",
         RowLiteral::Integer(_) => "integer",
         RowLiteral::Boolean(_) => "boolean",
         RowLiteral::ConstrainedEnum(_) => "constrained-enum",

@@ -1,3 +1,4 @@
+use crate::scala::structural::{SCALA_KIND_TABLE, SCALA_STRUCTURAL_SPEC};
 use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
@@ -6,8 +7,16 @@ use brokk_bifrost_core::analyzer::model::{
     ParameterMetadata, ProjectFile, Range, SignatureMetadata, StructuredTypeIdentity,
     StructuredTypeName,
 };
+use brokk_bifrost_core::analyzer::parsed_file::{ParsedSourceFacts, SourceDeclarationMetadataLink};
+use brokk_bifrost_core::analyzer::scala_facts::ScalaDeclarationVisibility;
+use brokk_bifrost_core::analyzer::source_facts::{
+    PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceProvenance,
+};
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{node_range, subtree_contains};
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
@@ -63,16 +72,13 @@ fn scala_type_name_segment(raw_name: &str, is_object: bool) -> SegmentId {
     }
 }
 
+use crate::scala::graph::syntax::ScalaPackageContextIndex;
 use crate::scala::graph::syntax::scala_declared_type_parameter_names;
-use crate::scala::imports::{
-    scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
-    scala_lexical_scope_path,
-};
+use crate::scala::imports::{scala_export_info_from_node, scala_lexical_scope_path};
 use crate::scala::supertypes::{
     extract_scala_instance_supertypes, extract_scala_supertypes,
     scala_full_enum_case_owner_supertype,
 };
-use crate::scala::wildcard_imports::scala_package_prefixes_at;
 
 pub fn parse_scala_file(
     file: &ProjectFile,
@@ -80,29 +86,133 @@ pub fn parse_scala_file(
     tree: &Tree,
 ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
     let mut parsed = brokk_bifrost_core::analyzer::parsed_file::ParsedFile::new(String::new());
+    let mut collector = PrimarySourceFactCollector::new(source);
     let mut visitor = ScalaVisitor {
         file,
         source,
         parsed: &mut parsed,
+        collector: &mut collector,
+        scala_facts: Default::default(),
+        captured_declarations: Default::default(),
+        package_contexts: ScalaPackageContextIndex::new(tree.root_node(), source),
     };
-    visitor.visit_compilation_unit(tree.root_node(), "");
-    visitor.visit_anonymous_classes(tree.root_node());
-    collect_scala_imports(tree.root_node(), source, &mut parsed);
-    collect_scala_same_package_identifiers(tree.root_node(), source, &mut parsed.type_identifiers);
-    parsed
-}
-
-/// The `type_identifiers` fact family persisted for one Scala blob: every leaf
-/// name the file spells, which is what Scala's implicit same-package tier can
-/// bind. Both the ordinary walk and the file-graph walk record it, so a file
-/// parsed by either produces the same same-package edges.
-fn collect_scala_same_package_identifiers(
-    root: Node<'_>,
-    source: &str,
-    identifiers: &mut brokk_bifrost_core::hash::HashSet<String>,
-) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let root = tree.root_node();
+    let grammar = crate::scala::language::LANGUAGE.into();
+    let kinds = CompiledKinds::compile(&grammar, SCALA_KIND_TABLE);
+    let context = SCALA_STRUCTURAL_SPEC.call_site_context(root, source);
+    let mut structural = StructuralFactCollector::new(
+        &SCALA_STRUCTURAL_SPEC,
+        source,
+        &context,
+        brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node()),
+        usize::MAX,
+        None,
+    );
+    let mut pending = HashMap::<usize, Vec<ScalaWork<'_>>>::default();
+    schedule_scala_work(
+        vec![ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
+            children: scala_compilation_children(root),
+            index: 0,
+            package_name: String::new(),
+            package_prefixes: Vec::new(),
+            recovery_owners: Vec::new(),
+            unmatched_end_names: None,
+        })],
+        &mut pending,
+    );
+    let mut imports = Vec::new();
+    let mut stack = vec![(root, None)];
+    while let Some((node, enclosing)) = stack.pop() {
+        if let Some(work) = pending.remove(&node.id()) {
+            let mut scheduled = Vec::new();
+            for work in work {
+                match work {
+                    ScalaWork::CompilationUnit(work) => {
+                        visitor.process_compilation_unit(work, &mut scheduled)
+                    }
+                    ScalaWork::TemplateBody {
+                        children,
+                        index,
+                        package_name,
+                        package_prefixes,
+                        parent,
+                    } => visitor.process_template_body(
+                        children,
+                        index,
+                        &package_name,
+                        &package_prefixes,
+                        &parent,
+                        &mut scheduled,
+                    ),
+                }
+            }
+            schedule_scala_work(scheduled, &mut pending);
+        }
+        if matches!(
+            node.kind(),
+            "class_definition"
+                | "full_enum_case"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "function_definition"
+                | "function_declaration"
+                | "val_definition"
+                | "var_definition"
+                | "val_declaration"
+                | "var_declaration"
+                | "class_parameter"
+                | "type_definition"
+        ) {
+            let name = if matches!(
+                node.kind(),
+                "class_definition"
+                    | "full_enum_case"
+                    | "object_definition"
+                    | "trait_definition"
+                    | "enum_definition"
+            ) {
+                scala_type_declaration_name_node(node)
+            } else {
+                node.child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("pattern"))
+            };
+            visitor.capture(node, name);
+        }
+        if node.kind() == "instance_expression" && scala_anonymous_template_body(node).is_some() {
+            visitor.visit_anonymous_class(node);
+        }
+        let mut parent = enclosing;
+        if node.is_named()
+            && let Some(kind) = kinds.kind_of(&node)
+            && SCALA_STRUCTURAL_SPEC.should_extract(node, kind)
+        {
+            let kind = SCALA_STRUCTURAL_SPEC.refine_kind(
+                node,
+                kind,
+                enclosing.map(|id| structural.normalized_kind(id)),
+                source,
+                &context,
+            );
+            let id = structural
+                .enter(node, kind, enclosing, visitor.collector)
+                .expect("complete Scala structural collection");
+            let mut sink = structural.role_sink(visitor.collector);
+            SCALA_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+            structural
+                .accept_roles(id, sink.into_parts())
+                .expect("complete Scala structural roles");
+            parent = Some(id);
+        }
+        if node.kind() == "import_declaration" {
+            let prefixes = visitor.package_contexts.prefixes_at(node.start_byte());
+            imports.extend(crate::scala::imports::scala_source_imports_from_node(
+                node,
+                source,
+                prefixes,
+                visitor.collector,
+            ));
+        }
         if node.named_child_count() == 0
             && matches!(
                 node.kind(),
@@ -113,15 +223,76 @@ fn collect_scala_same_package_identifiers(
                     | "stable_type_identifier"
             )
         {
-            let text = scala_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
+            let name = scala_node_text(node, source).trim();
+            if !name.is_empty() {
+                visitor.parsed.type_identifiers.insert(name.to_string());
             }
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                stack.push((child, parent));
             }
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "Scala declaration work must be reached by the primary walk"
+    );
+    let scala_facts = std::mem::take(&mut visitor.scala_facts);
+    let occurrences = collector.finish();
+    parsed.imports = imports
+        .iter()
+        .map(|import| import.import_info(&occurrences))
+        .collect();
+    let generic_imports = (0..imports.len())
+        .map(|index| {
+            brokk_bifrost_core::analyzer::source_facts::SourceImportId::try_from_index(index)
+                .expect("Scala import id")
+        })
+        .collect();
+    parsed.source_facts = Some(ParsedSourceFacts {
+        cpp: None,
+        go: None,
+        java: None,
+        scala: Some(scala_facts),
+        js_ts: None,
+        php: None,
+        ruby: None,
+        python: None,
+        source_bytes: source.len(),
+        occurrences,
+        structural: structural
+            .finish()
+            .expect("complete Scala structural collection"),
+        native_site_occurrences: Vec::new(),
+        native_declaration_sources: Vec::new(),
+        declaration_visibilities: None,
+        rust_declaration_properties: Vec::new(),
+        rust_modules: None,
+        rust_types: Vec::new(),
+        rust_items: Default::default(),
+        imports,
+        generic_imports,
+        rust_import_contexts: Vec::new(),
+    });
+    parsed
+}
+
+fn schedule_scala_work<'tree>(
+    work: Vec<ScalaWork<'tree>>,
+    pending: &mut HashMap<usize, Vec<ScalaWork<'tree>>>,
+) {
+    for work in work {
+        let next = match &work {
+            ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
+                children, index, ..
+            }) => children.get(*index),
+            ScalaWork::TemplateBody {
+                children, index, ..
+            } => children.get(*index),
+        };
+        if let Some(next) = next {
+            pending.entry(next.id()).or_default().push(work);
         }
     }
 }
@@ -138,49 +309,30 @@ fn scala_compilation_children(node: Node<'_>) -> Vec<Node<'_>> {
     children
 }
 
-fn collect_scala_imports(
-    root: Node<'_>,
-    source: &str,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "import_declaration" {
-            let raw = scala_node_text(node, source).trim().to_string();
-            if !raw.is_empty() {
-                let package_prefixes = scala_package_prefixes_at(root, source, node.start_byte());
-                parsed
-                    .imports
-                    .extend(scala_import_infos_from_node_with_prefixes(
-                        node,
-                        source,
-                        &package_prefixes,
-                    ));
-            }
-        }
-
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
+struct ScalaVisitor<'a, 'source> {
+    file: &'a ProjectFile,
+    source: &'source str,
+    parsed: &'a mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    collector: &'a mut PrimarySourceFactCollector<'source>,
+    scala_facts: brokk_bifrost_core::analyzer::scala_facts::ScalaSourceFacts,
+    captured_declarations: brokk_bifrost_core::hash::HashSet<SourceDeclarationId>,
+    package_contexts: ScalaPackageContextIndex,
 }
 
-struct ScalaVisitor<'a> {
-    file: &'a ProjectFile,
-    source: &'a str,
-    parsed: &'a mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+struct ScalaCompilationUnitWork<'tree> {
+    children: Vec<Node<'tree>>,
+    index: usize,
+    package_name: String,
+    package_prefixes: Vec<String>,
+    recovery_owners: Vec<ScalaRecoveryOwner>,
+    unmatched_end_names: Option<HashMap<String, usize>>,
 }
 
 enum ScalaWork<'tree> {
-    CompilationUnit {
-        children: Vec<Node<'tree>>,
-        index: usize,
-        package_name: String,
-        package_prefixes: Vec<String>,
-        recovery_owners: Vec<ScalaRecoveryOwner>,
-    },
+    CompilationUnit(ScalaCompilationUnitWork<'tree>),
     TemplateBody {
         children: Vec<Node<'tree>>,
+        index: usize,
         package_name: String,
         package_prefixes: Vec<String>,
         parent: CodeUnit,
@@ -194,7 +346,20 @@ struct ScalaRecoveryOwner {
     indentation: usize,
 }
 
-impl<'a> ScalaVisitor<'a> {
+impl ScalaVisitor<'_, '_> {
+    fn declare(
+        &mut self,
+        unit: &CodeUnit,
+        node: Node<'_>,
+        name: Option<Node<'_>>,
+    ) -> SourceDeclarationId {
+        let declaration = self.capture(node, name);
+        self.parsed
+            .source_declaration_units
+            .push((declaration, unit.clone()));
+        declaration
+    }
+
     /// The [`CodeUnit`] of one Scala type-namespace declaration.
     ///
     /// Classes, traits, objects, and `type` aliases share one identity rule so
@@ -232,69 +397,62 @@ impl<'a> ScalaVisitor<'a> {
         )
     }
 
-    fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
-        self.run_work_stack(vec![ScalaWork::CompilationUnit {
-            children: scala_compilation_children(node),
-            index: 0,
-            package_name: package_name.to_string(),
-            package_prefixes: Vec::new(),
-            recovery_owners: Vec::new(),
-        }]);
+    fn capture(&mut self, node: Node<'_>, name: Option<Node<'_>>) -> SourceDeclarationId {
+        let occurrence = self.collector.intern_node(node);
+        let name = name.map(|name| self.collector.intern_node(name));
+        let declaration = self.collector.declare(occurrence, name);
+        if self.captured_declarations.insert(declaration) {
+            let mut fact = crate::scala::graph::syntax::scala_declaration_source_fact(
+                node,
+                self.source,
+                declaration,
+            );
+            self.capture_declaration_context(node, &mut fact);
+            self.scala_facts.declarations.push(fact);
+        }
+        declaration
     }
 
-    fn run_work_stack<'tree>(&mut self, mut stack: Vec<ScalaWork<'tree>>) {
-        while let Some(work) = stack.pop() {
-            match work {
-                ScalaWork::CompilationUnit {
-                    children,
-                    index,
-                    package_name,
-                    package_prefixes,
-                    recovery_owners,
-                } => self.process_compilation_unit(
-                    children,
-                    index,
-                    package_name,
-                    package_prefixes,
-                    recovery_owners,
-                    &mut stack,
-                ),
-                ScalaWork::TemplateBody {
-                    children,
-                    package_name,
-                    package_prefixes,
-                    parent,
-                } => self.process_template_body(
-                    children,
-                    &package_name,
-                    &package_prefixes,
-                    &parent,
-                    &mut stack,
-                ),
+    fn capture_declaration_context(
+        &mut self,
+        node: Node<'_>,
+        fact: &mut brokk_bifrost_core::analyzer::scala_facts::ScalaDeclarationSourceFact,
+    ) {
+        fact.lexical_prefixes = self
+            .package_contexts
+            .prefixes_at(node.start_byte())
+            .to_vec();
+        // A declaration lookup occurs at its opening token, inside its own
+        // lexical region, just as the previous point-syntax lookup observed.
+        let mut current = Some(node);
+        while let Some(parent) = current {
+            if crate::scala::imports::is_scala_lexical_scope(parent.kind()) {
+                fact.lexical_scopes.push(self.collector.intern_node(parent));
             }
+            current = parent.parent();
         }
+        fact.lexical_scopes.reverse();
     }
 
-    fn visit_anonymous_classes(&mut self, root: Node<'_>) {
-        let mut instances = Vec::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "instance_expression" && scala_anonymous_template_body(node).is_some()
-            {
-                instances.push(node);
-            }
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            stack.extend(children.into_iter().rev());
-        }
-        instances.sort_unstable_by_key(|node| (node.start_byte(), usize::MAX - node.end_byte()));
-
-        for instance in instances {
-            self.visit_anonymous_class(instance, root);
-        }
+    fn metadata(
+        &mut self,
+        declaration: SourceDeclarationId,
+        unit: CodeUnit,
+        metadata: SignatureMetadata,
+    ) {
+        let metadata_ordinal = self
+            .parsed
+            .add_signature_with_metadata(unit.clone(), metadata);
+        self.parsed
+            .source_declaration_metadata
+            .push(SourceDeclarationMetadataLink {
+                declaration,
+                unit,
+                metadata_ordinal,
+            });
     }
 
-    fn visit_anonymous_class(&mut self, instance: Node<'_>, root: Node<'_>) {
+    fn visit_anonymous_class(&mut self, instance: Node<'_>) {
         let parent = self
             .parsed
             .declarations()
@@ -341,14 +499,15 @@ impl<'a> ScalaVisitor<'a> {
             true,
             fq,
         );
+        self.declare(&anonymous, instance, None);
         self.parsed
             .add_code_unit(anonymous.clone(), instance, self.source, parent, None);
 
-        let package_prefixes = scala_package_prefixes_at(root, self.source, instance.start_byte());
+        let package_prefixes = self.package_contexts.prefixes_at(instance.start_byte());
         let lexical_scopes = scala_lexical_scope_path(instance);
         let mut supertypes = extract_scala_instance_supertypes(instance, self.source);
         for fact in &mut supertypes {
-            fact.lookup_path.set_package_prefixes(&package_prefixes);
+            fact.lookup_path.set_package_prefixes(package_prefixes);
             fact.lookup_path.set_lexical_scopes(&lexical_scopes);
         }
         if !supertypes.is_empty() {
@@ -411,22 +570,33 @@ impl<'a> ScalaVisitor<'a> {
 
     fn process_compilation_unit<'tree>(
         &mut self,
-        children: Vec<Node<'tree>>,
-        mut index: usize,
-        mut current_package: String,
-        mut package_prefixes: Vec<String>,
-        mut recovery_owners: Vec<ScalaRecoveryOwner>,
+        work: ScalaCompilationUnitWork<'tree>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        let mut unmatched_end_names = HashMap::<String, usize>::default();
-        for candidate in &children[index..] {
-            if candidate.kind() == "_end_ident" {
-                *unmatched_end_names
-                    .entry(scala_node_text(*candidate, self.source).trim().to_string())
-                    .or_default() += 1;
+        let ScalaCompilationUnitWork {
+            children,
+            mut index,
+            package_name: mut current_package,
+            mut package_prefixes,
+            mut recovery_owners,
+            unmatched_end_names,
+        } = work;
+        let mut unmatched_end_names = unmatched_end_names.unwrap_or_else(|| {
+            let mut unmatched_end_names = HashMap::<String, usize>::default();
+            for candidate in &children[index..] {
+                if candidate.kind() == "_end_ident" {
+                    *unmatched_end_names
+                        .entry(scala_node_text(*candidate, self.source).trim().to_string())
+                        .or_default() += 1;
+                }
             }
-        }
-        while index < children.len() {
+            unmatched_end_names
+        });
+        assert!(
+            index < children.len(),
+            "scheduled Scala declaration child exists"
+        );
+        'declaration: {
             let child = children[index];
             index += 1;
             if child.kind() == "_end_ident" {
@@ -441,7 +611,7 @@ impl<'a> ScalaVisitor<'a> {
                 {
                     recovery_owners.truncate(position);
                 }
-                continue;
+                break 'declaration;
             }
             if child.is_named() {
                 let indentation = child.start_position().column;
@@ -499,27 +669,29 @@ impl<'a> ScalaVisitor<'a> {
                             } else {
                                 (outer_package, outer_prefixes)
                             };
-                        stack.push(ScalaWork::CompilationUnit {
+                        stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
                             children,
                             index,
                             package_name: continuation_package,
                             package_prefixes: continuation_prefixes,
                             recovery_owners: recovery_owners.clone(),
-                        });
-                        stack.push(ScalaWork::CompilationUnit {
+                            unmatched_end_names: Some(unmatched_end_names),
+                        }));
+                        stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
                             children: scala_compilation_children(body),
                             index: 0,
                             package_name: current_package.clone(),
                             package_prefixes: package_prefixes.clone(),
                             recovery_owners: Vec::new(),
-                        });
+                            unmatched_end_names: None,
+                        }));
                         return;
                     }
                 }
                 "package_object" => {
                     let package = scala_package_name(child, self.source);
                     if package.is_empty() {
-                        continue;
+                        break 'declaration;
                     }
                     let package_name = if current_package.is_empty() {
                         package
@@ -533,20 +705,22 @@ impl<'a> ScalaVisitor<'a> {
                         self.parsed.content_qualifier = package_name.clone();
                     }
                     if let Some(body) = child.child_by_field_name("body") {
-                        stack.push(ScalaWork::CompilationUnit {
+                        stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
                             children,
                             index,
                             package_name: current_package,
                             package_prefixes,
                             recovery_owners,
-                        });
-                        stack.push(ScalaWork::CompilationUnit {
+                            unmatched_end_names: Some(unmatched_end_names),
+                        }));
+                        stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
                             children: scala_compilation_children(body),
                             index: 0,
                             package_name,
                             package_prefixes: nested_package_prefixes,
                             recovery_owners: Vec::new(),
-                        });
+                            unmatched_end_names: None,
+                        }));
                         return;
                     }
                 }
@@ -631,6 +805,14 @@ impl<'a> ScalaVisitor<'a> {
                 _ => {}
             }
         }
+        stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
+            children,
+            index,
+            package_name: current_package,
+            package_prefixes,
+            recovery_owners,
+            unmatched_end_names: Some(unmatched_end_names),
+        }));
     }
 
     fn visit_recovered_type_header(
@@ -655,6 +837,24 @@ impl<'a> ScalaVisitor<'a> {
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
         }
+        let occurrence = self.collector.intern_subspan_bytes(
+            node.start_byte(),
+            colon.end_byte(),
+            SourceOccurrenceProvenance::ExplicitSubspan,
+        );
+        let name = self.collector.intern_node(name_node);
+        let declaration = self.collector.declare(occurrence, Some(name));
+        self.parsed
+            .source_declaration_units
+            .push((declaration, code_unit.clone()));
+        let mut fact = crate::scala::graph::syntax::scala_declaration_source_fact(
+            node,
+            self.source,
+            declaration,
+        );
+        self.capture_declaration_context(node, &mut fact);
+        self.scala_facts.declarations.push(fact);
+        self.captured_declarations.insert(declaration);
         // The recovered header runs from the node the recovery claimed to the
         // colon that closes it, so each end comes from `node_range`: it is
         // the one reader of a tree-sitter position in this walk, and it is
@@ -708,12 +908,14 @@ impl<'a> ScalaVisitor<'a> {
             return Some(code_unit);
         }
 
+        let declaration = self.declare(&code_unit, node, Some(name_node));
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
         // A type declaration's own parameter list is what canonical identity
         // reads as generic arity, so a class that writes none records a zero
         // rather than leaving the arity unread (#1651).
-        self.parsed.add_signature_with_metadata(
+        self.metadata(
+            declaration,
             code_unit.clone(),
             SignatureMetadata::new(scala_type_signature(node, self.source), Vec::new())
                 .with_recorded_type_parameters(scala_declared_type_parameter_names(
@@ -775,6 +977,7 @@ impl<'a> ScalaVisitor<'a> {
                     .with_pushed(scala_segment(raw_name, SegmentKind::Member)),
             )
             .with_synthetic(true);
+            let declaration = self.declare(&constructor, node, Some(name_node));
             self.parsed.add_code_unit(
                 constructor.clone(),
                 node,
@@ -783,7 +986,8 @@ impl<'a> ScalaVisitor<'a> {
                 None,
             );
             let signature = scala_primary_constructor_signature(node, self.source);
-            self.parsed.add_signature_with_metadata(
+            self.metadata(
+                declaration,
                 constructor,
                 scala_class_signature_metadata(signature, node, self.source)
                     // The synthetic primary constructor is a constructor, and
@@ -815,17 +1019,19 @@ impl<'a> ScalaVisitor<'a> {
                 .flatten()
                 .unwrap_or_default();
             if !promoted.is_empty() {
-                stack.push(ScalaWork::CompilationUnit {
+                stack.push(ScalaWork::CompilationUnit(ScalaCompilationUnitWork {
                     children: promoted,
                     index: 0,
                     package_name: package_name.to_string(),
                     package_prefixes: package_prefixes.to_vec(),
                     recovery_owners: Vec::new(),
-                });
+                    unmatched_end_names: None,
+                }));
             }
             if !children.is_empty() {
                 stack.push(ScalaWork::TemplateBody {
                     children,
+                    index: 0,
                     package_name: package_name.to_string(),
                     package_prefixes: package_prefixes.to_vec(),
                     parent: code_unit.clone(),
@@ -869,6 +1075,7 @@ impl<'a> ScalaVisitor<'a> {
                         .clone()
                         .with_pushed(scala_segment(name, SegmentKind::Member)),
                 );
+                self.declare(&code_unit, parameter, Some(name_node));
                 self.parsed.add_code_unit(
                     code_unit.clone(),
                     parameter,
@@ -887,12 +1094,20 @@ impl<'a> ScalaVisitor<'a> {
     fn process_template_body<'tree>(
         &mut self,
         children: Vec<Node<'tree>>,
+        index: usize,
         package_name: &str,
         package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        for child in children {
+        if let Some(child) = children.get(index).copied() {
+            stack.push(ScalaWork::TemplateBody {
+                children,
+                index: index + 1,
+                package_name: package_name.to_string(),
+                package_prefixes: package_prefixes.to_vec(),
+                parent: parent.clone(),
+            });
             match child.kind() {
                 "function_definition" | "function_declaration" | "given_definition" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
@@ -943,6 +1158,7 @@ impl<'a> ScalaVisitor<'a> {
                     let mut cursor = child.walk();
                     stack.push(ScalaWork::TemplateBody {
                         children: child.named_children(&mut cursor).collect(),
+                        index: 0,
                         package_name: package_name.to_string(),
                         package_prefixes: package_prefixes.to_vec(),
                         parent: parent.clone(),
@@ -1013,38 +1229,37 @@ impl<'a> ScalaVisitor<'a> {
         parent: Option<&CodeUnit>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "function_definition" | "function_declaration" => self.visit_extension_function(
-                    child,
-                    receiver_parameters,
-                    package_name,
-                    parent.cloned(),
-                ),
-                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
-                    self.visit_field_declaration(child, package_name, parent.cloned())
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "function_definition" | "function_declaration" => self
+                        .visit_extension_function(
+                            child,
+                            receiver_parameters,
+                            package_name,
+                            parent.cloned(),
+                        ),
+                    "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
+                        self.visit_field_declaration(child, package_name, parent.cloned())
+                    }
+                    "type_definition" => {
+                        self.visit_type_alias(child, package_name, parent.cloned())
+                    }
+                    "class_definition" | "object_definition" | "trait_definition"
+                    | "enum_definition" => {
+                        self.visit_type_declaration(
+                            child,
+                            package_name,
+                            package_prefixes,
+                            parent.cloned(),
+                            stack,
+                        );
+                    }
+                    "template_body" | "block" | "indented_block" => pending.push(child),
+                    _ => {}
                 }
-                "type_definition" => self.visit_type_alias(child, package_name, parent.cloned()),
-                "class_definition" | "object_definition" | "trait_definition"
-                | "enum_definition" => {
-                    self.visit_type_declaration(
-                        child,
-                        package_name,
-                        package_prefixes,
-                        parent.cloned(),
-                        stack,
-                    );
-                }
-                "template_body" | "block" | "indented_block" => self.visit_extension_block(
-                    child,
-                    receiver_parameters,
-                    package_name,
-                    package_prefixes,
-                    parent,
-                    stack,
-                ),
-                _ => {}
             }
         }
     }
@@ -1133,6 +1348,7 @@ impl<'a> ScalaVisitor<'a> {
         );
         let dispatch_extensibility =
             scala_callable_dispatch_extensibility(parent.as_ref(), raw_name);
+        let declaration = self.declare(&code_unit, node, Some(name_node));
         // Scala has no `static` keyword: a member of an `object` is the
         // singleton's, and the declaration walk already marks an object by
         // giving its code unit a `$`-suffixed short name, which is the same
@@ -1162,7 +1378,7 @@ impl<'a> ScalaVisitor<'a> {
                         scala_structured_type_identity(receiver_type, self.source, node)
                     },
                 ));
-        self.parsed.add_signature_with_metadata(code_unit, metadata);
+        self.metadata(declaration, code_unit, metadata);
     }
 
     fn visit_field_declaration(
@@ -1182,7 +1398,7 @@ impl<'a> ScalaVisitor<'a> {
                 .collect()
         };
 
-        for name in names {
+        for (name, name_node) in names {
             let short_name = if let Some(parent) = &parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
@@ -1197,6 +1413,7 @@ impl<'a> ScalaVisitor<'a> {
                 short_name,
                 fq,
             );
+            self.declare(&code_unit, node, Some(name_node));
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
             self.parsed
@@ -1215,9 +1432,11 @@ impl<'a> ScalaVisitor<'a> {
 
         let code_unit =
             self.scala_type_declaration_unit(name, package_name, parent.as_ref(), false);
+        let declaration = self.declare(&code_unit, node, Some(name_node));
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
-        self.parsed.add_signature_with_metadata(
+        self.metadata(
+            declaration,
             code_unit.clone(),
             SignatureMetadata::new(
                 scala_node_text(node, self.source).trim().to_string(),
@@ -1247,6 +1466,7 @@ impl<'a> ScalaVisitor<'a> {
                 .clone()
                 .with_pushed(scala_segment(name, SegmentKind::Member)),
         );
+        self.declare(&code_unit, node, Some(name_node));
         self.parsed.add_code_unit(
             code_unit.clone(),
             node,
@@ -1827,7 +2047,7 @@ fn scala_parameter_type_spellings(parameter_nodes: &[Node<'_>], source: &str) ->
 /// member is visible; they never widen it, so both collapse onto the
 /// unqualified form for the purposes every consumer of this field has.
 fn scala_declared_visibility(node: Node<'_>) -> DeclaredVisibility {
-    match scala_declaration_visibility(node) {
+    match crate::scala::graph::syntax::scala_declaration_modifiers(node).0 {
         ScalaDeclarationVisibility::NonApi => DeclaredVisibility::Private,
         ScalaDeclarationVisibility::Protected => DeclaredVisibility::Protected,
         ScalaDeclarationVisibility::Public => DeclaredVisibility::Public,
@@ -1982,41 +2202,10 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ScalaDeclarationVisibility {
-    Public,
-    Protected,
-    NonApi,
-}
-
-pub fn scala_declaration_visibility(node: Node<'_>) -> ScalaDeclarationVisibility {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if candidate.kind() == "access_modifier" {
-            let mut cursor = candidate.walk();
-            for child in candidate.children(&mut cursor) {
-                match child.kind() {
-                    "private" => return ScalaDeclarationVisibility::NonApi,
-                    "protected" => return ScalaDeclarationVisibility::Protected,
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(
-            candidate
-                .named_children(&mut cursor)
-                .filter(|child| matches!(child.kind(), "modifiers" | "access_modifier")),
-        );
-    }
-    ScalaDeclarationVisibility::Public
-}
-
-fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
+fn scala_pattern_names<'tree>(node: Node<'tree>, source: &str) -> Vec<(String, Node<'tree>)> {
     match node.kind() {
         "identifier" | "operator_identifier" => {
-            vec![scala_node_text(node, source).trim().to_string()]
+            vec![(scala_node_text(node, source).trim().to_string(), node)]
         }
         "identifiers" => {
             let mut names = Vec::new();
@@ -2025,7 +2214,7 @@ fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
                 if matches!(child.kind(), "identifier" | "operator_identifier") {
                     let text = scala_node_text(child, source).trim();
                     if !text.is_empty() {
-                        names.push(text.to_string());
+                        names.push((text.to_string(), child));
                     }
                 }
             }
@@ -2037,7 +2226,7 @@ fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
             if text.is_empty() {
                 Vec::new()
             } else {
-                vec![text.to_string()]
+                vec![(text.to_string(), node)]
             }
         }
     }
@@ -2235,6 +2424,102 @@ class Consumer {
             "top-level extension methods must be declared: {:?}",
             parsed.declarations()
         );
+    }
+    #[test]
+    fn canonical_walk_shares_declaration_roles_and_captures_source_only_locals() {
+        let source = "package demo\nimport lib.{Widget as Renamed, Tools}\ncase class Box(value: Int) { def run(x: Int): Box = { val local: Box = this; helper(x); local } }\nobject Registry { def instance: Registry.type = this }\n";
+        let parsed = parse(source);
+        let canonical = parsed.source_facts.as_ref().expect("Scala canonical facts");
+        let scala = canonical
+            .scala
+            .as_ref()
+            .expect("Scala declaration properties");
+        assert!(scala.valid_links(&canonical.occurrences));
+        assert!(
+            scala
+                .declarations
+                .iter()
+                .filter_map(|fact| fact.callable.as_ref())
+                .any(|callable| callable.return_type_is_singleton
+                    && callable
+                        .return_type_expression
+                        .as_ref()
+                        .is_some_and(|expression| { expression.segments == ["Registry"] }))
+        );
+        for (declaration, unit) in &parsed.source_declaration_units {
+            let declaration = canonical.occurrences.declaration(*declaration);
+            if unit.is_function() && !unit.is_synthetic() {
+                let structural = canonical
+                    .structural
+                    .nodes()
+                    .iter()
+                    .find(|node| node.occurrence == declaration.occurrence)
+                    .expect("declared function shares its structural occurrence");
+                assert_eq!(structural.name, declaration.name);
+            }
+        }
+        assert!(canonical.structural.nodes().iter().any(|node| node.kind
+            == brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call));
+        assert!(scala.declarations.iter().any(|fact| {
+            let declaration = canonical.occurrences.declaration(fact.declaration);
+            declaration.name.is_some_and(|name| {
+                let range = canonical.occurrences.occurrence(name).range;
+                &source[range.start_byte..range.end_byte] == "local"
+            }) && !parsed
+                .source_declaration_units
+                .iter()
+                .any(|(id, _)| *id == fact.declaration)
+        }));
+        assert_eq!(parsed.imports.len(), 2);
+        for (id, import) in canonical.generic_imports.iter().zip(&parsed.imports) {
+            assert_eq!(
+                *import,
+                canonical.imports[id.index()].import_info(&canonical.occurrences)
+            );
+        }
+        let alias = canonical.imports[0]
+            .alias_occurrence
+            .expect("renamed token");
+        let range = canonical.occurrences.occurrence(alias).range;
+        assert_eq!(&source[range.start_byte..range.end_byte], "Renamed");
+        assert!(
+            canonical
+                .structural
+                .nodes()
+                .iter()
+                .any(|node| node.occurrence == alias)
+        );
+    }
+
+    #[test]
+    fn canonical_walk_preserves_anonymous_member_owners_and_enum_constructors() {
+        let parsed = parse(
+            "enum Shape { case Circle(radius: Int) }\nclass Factory { def make = new Runnable { def run(): Unit = () } }\n",
+        );
+        let canonical = parsed.source_facts.as_ref().expect("Scala canonical facts");
+        let scala = canonical
+            .scala
+            .as_ref()
+            .expect("Scala declaration properties");
+        assert!(scala.valid_links(&canonical.occurrences));
+        assert!(
+            scala
+                .declarations
+                .iter()
+                .any(|fact| fact.is_full_enum_case && fact.is_case_class)
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.short_name().contains("anon$") && unit.is_function())
+        );
+        assert!(parsed.declarations().iter().all(|unit| {
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(|(_, linked)| linked == unit)
+        }));
     }
 }
 

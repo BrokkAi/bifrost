@@ -327,7 +327,7 @@ fn production_request(dependency: &ResolvedDependency) -> ProductionRequest {
         pack_id: "bifrost.external.go".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: dependency
                 .evidence
                 .toolchain
@@ -945,6 +945,7 @@ fn module_type_drafts(
                         visibility: Visibility::Package,
                         is_abstract: false,
                         is_sealed: false,
+                        callable_surface_complete: false,
                         has_explicit_type_terms: false,
                         type_parameters: Vec::new(),
                         type_parameter_constraints: Vec::new(),
@@ -1203,6 +1204,7 @@ fn collect_type_draft(
             },
             is_abstract: type_kind == TypeKind::Interface,
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: type_kind == TypeKind::Interface
                 && interface_has_explicit_type_terms(type_node),
             type_parameters,
@@ -1599,6 +1601,7 @@ fn push_member(
         .unwrap_or_default();
     members.push(MemberDraft {
         fact: MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id,
             owner: owner_id.to_owned(),
@@ -2654,7 +2657,7 @@ var privateValue int
             language: "go".to_owned(),
             ecosystem: "go-module".to_owned(),
             compatibility: Compatibility {
-                bifrost: "*".to_owned(),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             provenance: Provenance {

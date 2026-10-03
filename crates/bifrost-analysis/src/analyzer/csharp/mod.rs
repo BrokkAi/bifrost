@@ -35,9 +35,9 @@ pub(crate) use brokk_bifrost_csharp::{graph_support, hierarchy};
 // (the re-export hub in `analyzer/mod.rs`, the definition and type routes, the
 // usage graph, and this crate's own C# modules).
 pub(crate) use brokk_bifrost_csharp::syntax::{
-    csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
-    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_source_identifier, csharp_type_node_identity,
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
+    csharp_member_name, csharp_normalize_full_name, csharp_source_identifier,
+    csharp_type_node_identity,
 };
 pub use brokk_bifrost_csharp::syntax::{csharp_source_name_segment, strip_csharp_generic_arity};
 
@@ -1463,6 +1463,10 @@ pub(crate) struct CSharpSupport;
 impl LanguageSupport for CSharpSupport {
     fn language(&self) -> Language {
         Language::CSharp
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn referencing_candidate_files(

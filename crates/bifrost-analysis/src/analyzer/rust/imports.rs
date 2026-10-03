@@ -98,7 +98,17 @@ impl ImportAnalysisProvider for RustAnalyzer {
         files: &[ProjectFile],
         cancellation: &crate::cancellation::CancellationToken,
     ) -> Option<crate::analyzer::AdditionalFileDependencies> {
-        let routes = self.cargo_routes_while(&|| !cancellation.is_cancelled())?;
+        let routes = match self.cargo_routes_while(&|| !cancellation.is_cancelled()) {
+            Ok(routes) => routes,
+            Err(super::RustCargoRouteError::Cancelled) => return None,
+            Err(super::RustCargoRouteError::Unavailable) => {
+                // The route reader records the publication error on the query.
+                // Preserve incompleteness here so no caller caches an empty graph.
+                return Some(crate::analyzer::AdditionalFileDependencies::incomplete(
+                    crate::hash::HashMap::default(),
+                ));
+            }
+        };
         let selected: HashSet<_> = files.iter().cloned().collect();
         let mut dependencies: crate::hash::HashMap<ProjectFile, HashSet<ProjectFile>> =
             crate::hash::HashMap::default();
@@ -157,9 +167,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
                     .unwrap_or_else(|| self.inner.import_info_of(token, file));
                 imports
                     .iter()
-                    .filter_map(|import| {
-                        resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
-                    })
+                    .filter_map(|import| resolve_rust_import_fq_name(file, &package, import))
                     .collect::<Vec<_>>()
                     .into_iter()
             })

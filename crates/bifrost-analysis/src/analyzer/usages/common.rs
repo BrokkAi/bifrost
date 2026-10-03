@@ -2,9 +2,7 @@
 // reclassification need nothing but a node, a string, or the hit set, so they
 // moved to `brokk-bifrost-core` and are re-exported here at the paths their
 // callers already use. What stays needs an `IAnalyzer` or a `Language`.
-pub(super) use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, same_node, usage_hit,
-};
+pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
 pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
     classify_recursive_hit, external_usage_hit_count, namespace_prefixes,
 };

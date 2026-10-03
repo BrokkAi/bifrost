@@ -1,6 +1,5 @@
 //! Go structural spec for `query_code`.
 
-use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child,
@@ -17,13 +16,15 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    BindingActivation, BindingKind, EnvironmentAxis, HoistingClass, LexicalEnvironmentSupport,
+    ScopeFormation, default_scope_formation,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, node_range};
+use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -59,6 +60,15 @@ const GO_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("return_statement", NormalizedKind::Return),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::Loop),
+    // Explicit and implicit blocks: a braced block, each case clause, and a
+    // switch, whose initializer is scoped to the whole switch.
+    ("block", NormalizedKind::Block),
+    ("expression_case", NormalizedKind::Block),
+    ("type_case", NormalizedKind::Block),
+    ("communication_case", NormalizedKind::Block),
+    ("default_case", NormalizedKind::Block),
+    ("expression_switch_statement", NormalizedKind::Block),
+    ("type_switch_statement", NormalizedKind::Block),
 ];
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -211,8 +221,126 @@ fn attach_value_field_targets<'tree>(
         .and_then(|target| attach_role_targets(sink, role, target))
 }
 
-static GO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
-    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+static GO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::Binder);
+
+/// Go derives its scope tree from the callable, loop, `if`, switch, case and
+/// block facts in [`GO_KIND_TABLE`], and every binder it classifies states an
+/// interval through [`go_binding_activation`]. Import binders and the package
+/// clause are not derived.
+static GO_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport = LexicalEnvironmentSupport::NONE
+    .supported(EnvironmentAxis::Scopes)
+    .supported(EnvironmentAxis::BindingIntervals);
+
+/// Whether `node` has a direct `:=` token child, which is what makes a range
+/// or receive clause declare its left-hand names rather than assign them.
+fn declares_with_walrus(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == ":=")
+}
+
+/// Whether an identifier is a Go binder: a parameter, receiver or result
+/// name; a `:=` name; a function-local `var` or `const` name; a `:=` range or
+/// receive name; or a type switch alias. A package-level `var` or `const`
+/// names a package member, not a lexical binding.
+fn go_is_binder(node: Node<'_>, parents: &ParentIndex<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = parents.parent(node) else {
+        return false;
+    };
+    let field = field_name_in_parent(parent, node);
+    match parent.kind() {
+        "parameter_declaration" | "variadic_parameter_declaration" => field == Some("name"),
+        "var_spec" | "const_spec" => {
+            field == Some("name")
+                && std::iter::successors(parents.parent(parent), |node| parents.parent(*node))
+                    .any(|ancestor| ancestor.kind() == "block")
+        }
+        "expression_list" => {
+            let Some(owner) = parents.parent(parent) else {
+                return false;
+            };
+            let side = field_name_in_parent(owner, parent);
+            match owner.kind() {
+                "short_var_declaration" => side == Some("left"),
+                "range_clause" | "receive_statement" => {
+                    side == Some("left") && declares_with_walrus(owner)
+                }
+                "type_switch_statement" => side == Some("alias"),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The binding one Go binder token introduces, and the interval it is in
+/// effect over.
+///
+/// A parameter, receiver or named result is in effect over its whole
+/// function. A `:=`, `var` or `const` name is in effect from the end of its
+/// statement or spec to the end of its block, so `x := x` reads an outer `x`.
+/// A `:=` range variable is in effect over the loop body, a select case's
+/// received names over that case, and a type switch alias over the switch.
+///
+/// A multi-name `:=` may redeclare a name the same block already declares;
+/// Go then assigns the existing variable. Each declaration still gets its
+/// own row here, and in valid Go two rows with one name in one block are
+/// therefore one variable.
+fn go_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let binding = |kind, hoisting, activation| {
+        Some(BindingActivation {
+            kind,
+            hoisting,
+            activation,
+        })
+    };
+    let after = |node: Node<'_>| Range {
+        start_byte: node.end_byte(),
+        end_byte: scope.end_byte,
+        start_line: node.end_position().row + 1,
+        end_line: scope.end_line,
+    };
+    let parent = binder.parent()?;
+    match parent.kind() {
+        "parameter_declaration" | "variadic_parameter_declaration" => {
+            binding(BindingKind::Parameter, HoistingClass::ScopeWide, scope)
+        }
+        "var_spec" | "const_spec" => binding(
+            BindingKind::Local,
+            HoistingClass::SourceOrder,
+            after(parent),
+        ),
+        "expression_list" => {
+            let owner = parent.parent()?;
+            match owner.kind() {
+                "short_var_declaration" => {
+                    binding(BindingKind::Local, HoistingClass::SourceOrder, after(owner))
+                }
+                "range_clause" => binding(
+                    BindingKind::LoopVariable,
+                    HoistingClass::DeclaredHead,
+                    node_range(owner.parent()?.child_by_field_name("body")?),
+                ),
+                "receive_statement" => binding(
+                    BindingKind::Local,
+                    HoistingClass::DeclaredHead,
+                    node_range(owner.parent()?),
+                ),
+                "type_switch_statement" => binding(
+                    BindingKind::PatternBinder,
+                    HoistingClass::DeclaredHead,
+                    node_range(owner),
+                ),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Classify the selector member token in a Go `selector_expression`.
 ///
@@ -240,8 +368,11 @@ fn go_occurrence_role<'tree>(
     }
 
     let parent = parents.parent(node)?;
-    (parent.kind() == "selector_expression" && field_name_in_parent(parent, node) == Some("field"))
-        .then_some(OccurrenceRole::MemberPosition)
+    if parent.kind() == "selector_expression" && field_name_in_parent(parent, node) == Some("field")
+    {
+        return Some(OccurrenceRole::MemberPosition);
+    }
+    go_is_binder(node, parents).then_some(OccurrenceRole::Binder)
 }
 
 impl StructuralSpec for GoStructuralSpec {
@@ -284,7 +415,21 @@ impl StructuralSpec for GoStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &NO_LEXICAL_ENVIRONMENT_SUPPORT
+        &GO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    /// An `if` statement is an implicit block: a name its initializer
+    /// declares is in effect in every branch and nowhere after.
+    fn scope_formation(&self, kind: NormalizedKind) -> ScopeFormation {
+        if kind == NormalizedKind::If {
+            ScopeFormation::BindingScope
+        } else {
+            default_scope_formation(kind)
+        }
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        go_binding_activation(binder, scope)
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
@@ -459,10 +604,10 @@ mod structural_spec_tests {
                     && field_name_in_parent(parent, identifier) == Some("field")
             });
             if !is_selector_member {
-                assert_eq!(
+                assert_ne!(
                     go_occurrence_role(identifier, &parents),
-                    None,
-                    "non-selector identifier at {} must not be classified",
+                    Some(OccurrenceRole::MemberPosition),
+                    "non-selector identifier at {} must not be a member position",
                     identifier.start_byte()
                 );
             }
@@ -478,7 +623,10 @@ mod structural_spec_tests {
                 .occurrence_role_support()
                 .iter()
                 .filter(|(_, support)| support.is_supported())
-                .all(|(role, _)| role == OccurrenceRole::MemberPosition)
+                .all(|(role, _)| matches!(
+                    role,
+                    OccurrenceRole::MemberPosition | OccurrenceRole::Binder
+                ))
         );
     }
 }

@@ -45,6 +45,8 @@ pub mod model;
 pub mod parse;
 pub mod providers;
 pub mod queries;
+pub mod scope_source;
+pub mod source_facts;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;
@@ -53,3 +55,6 @@ pub mod tsconfig;
 pub mod type_text;
 pub mod typescript;
 pub mod workspace_packages;
+
+mod primary;
+mod type_source;

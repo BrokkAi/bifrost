@@ -1,4 +1,4 @@
-//! Exact Java catch-handler body state over prepared syntax.
+//! Exact native failure-handler body state over prepared syntax.
 
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{
@@ -8,8 +8,11 @@ use super::results::{
 use super::*;
 use crate::analyzer::semantic::{ContentIdentity, StableDigest};
 use brokk_bifrost_analysis::analyzer::structural::failure_handlers::{
-    HandlerBodyState, java_catch_body_shape,
+    HandlerBodyShape, HandlerBodyState, cpp_catch_body_shape, csharp_catch_body_shape,
+    java_catch_body_shape, js_ts_catch_body_shape, kotlin_catch_body_shape, php_catch_body_shape,
+    python_except_body_shape, ruby_rescue_body_shape,
 };
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 
 const MAX_HANDLER_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -118,16 +121,26 @@ pub(super) fn failure_handler_state_expansions(
     if seed.facts.node(seed.fact_match.node).kind != NormalizedKind::Catch {
         return Vec::new();
     }
-    if seed.language != Language::Java {
-        return expansion(
-            cache,
-            seed,
-            None,
-            "unknown",
-            Some("unsupported_language"),
-            diagnostics,
-        );
-    }
+    let classify: fn(&PreparedSyntaxTree, Range) -> HandlerBodyShape = match seed.language {
+        Language::Java => java_catch_body_shape,
+        Language::JavaScript | Language::TypeScript => js_ts_catch_body_shape,
+        Language::Python => python_except_body_shape,
+        Language::CSharp => csharp_catch_body_shape,
+        Language::Php => php_catch_body_shape,
+        Language::Cpp => cpp_catch_body_shape,
+        Language::Kotlin => kotlin_catch_body_shape,
+        Language::Ruby => ruby_rescue_body_shape,
+        _ => {
+            return expansion(
+                cache,
+                seed,
+                None,
+                "unknown",
+                Some("unsupported_language"),
+                diagnostics,
+            );
+        }
+    };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return expansion(cache, seed, None, "unknown", Some("cancelled"), diagnostics);
     }
@@ -187,7 +200,7 @@ pub(super) fn failure_handler_state_expansions(
         }
     };
     let catch = seed.facts.node(seed.fact_match.node).range;
-    let shape = java_catch_body_shape(&syntax, catch);
+    let shape = classify(&syntax, catch);
     match shape.state {
         HandlerBodyState::Open(gap) => expansion(
             cache,

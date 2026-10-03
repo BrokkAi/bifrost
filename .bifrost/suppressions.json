@@ -339,7 +339,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "50ead0cb6685c696835e1f5c172b998ee2dda31a6adfaecaec9d7430ccbfacdb",
+      "finding_id": "0b1b6d76826ce9c5f001489518c32ad17b1d8be309d45839093b85194663c52c",
       "path": "crates/bifrost-analysis/src/analyzer/usages/workspace_graph_cache.rs",
       "identity_stability": "strong",
       "status": "accepted",

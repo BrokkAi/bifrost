@@ -22,6 +22,8 @@ use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
 use crate::providers::JsTsSource;
+use crate::source_facts::JsTsFileSourceFacts;
+#[cfg(test)]
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::{
     JsTsImportBinder, nested_type_identifier_parts, parse_js_ts_tree, slice,
@@ -30,9 +32,12 @@ use crate::syntax::{
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
-    ts_clean_type_text, ts_type_annotation_text,
+    ts_clean_type_text,
 };
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
+use brokk_bifrost_core::analyzer::js_ts_facts::{
+    JsTsDeclarationFact, JsTsSourceTypeId, JsTsTypeShape,
+};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -316,37 +321,46 @@ fn ts_receiver_owners_from_parameters(
             .child_by_field_name("name")
             .is_some_and(|name| node_text_matches(name, source, receiver))
         {
-            owners.extend(ts_resolve_type_text_to_property_owners(
-                host,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                ts_type_annotation_text(type_node, source).as_str(),
-                0,
-            ));
+            owners.extend(
+                ts_resolve_type_node_to_property_owner_outcome(
+                    host,
+                    support,
+                    file,
+                    source,
+                    imports,
+                    aliases,
+                    type_node,
+                    0,
+                    ReceiverAnalysisBudget::default(),
+                )
+                .values()
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
             continue;
         }
         if parameter
             .child_by_field_name("pattern")
             .is_some_and(|pattern| ts_object_pattern_binds(pattern, source, receiver))
         {
-            let container_owners = ts_resolve_type_text_to_property_owners(
+            let container_owners = ts_resolve_type_node_to_property_owner_outcome(
                 host,
                 support,
                 file,
                 source,
                 imports,
                 aliases,
-                ts_type_annotation_text(type_node, source).as_str(),
+                type_node,
                 0,
-            );
+                ReceiverAnalysisBudget::default(),
+            )
+            .values()
+            .map(|values| values.to_vec())
+            .unwrap_or_default();
             let fields = jsts_member_candidates(host, support, container_owners, receiver, true);
             for field in fields {
-                owners.extend(ts_field_signature_type_owners(
-                    host, support, file, source, imports, aliases, &field, 0,
-                ));
+                owners.extend(ts_field_signature_type_owners(host, support, &field, 0));
             }
         }
     }
@@ -447,126 +461,46 @@ fn ts_callback_parameter_owners_from_callee(
     if depth > 8 {
         return Vec::new();
     }
-    let Ok(source) = callee.source().read_to_string() else {
+    let Some(facts) = host.source_facts(callee.source()) else {
         return Vec::new();
     };
-    let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    // The analyzer's shared resolver, so this route reuses its warm config and
-    // workspace-package memos instead of building cold ones per call.
-    let aliases = host.alias_resolver().as_ref();
     let mut owners = Vec::new();
-    for node in ts_nodes_for_code_unit(host, callee, tree.root_node()) {
-        let Some(callback_type) = ts_function_parameter_type_text(node, &source, argument_index)
+    for declaration in source_declarations_for_unit(&facts, callee) {
+        let Some(Some(mut callback_type)) = declaration
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get(argument_index))
+            .copied()
         else {
             continue;
         };
-        let Some(parameter_type) =
-            ts_callback_parameter_type_text(&callback_type, callback_parameter_index)
+        while let JsTsTypeShape::Wrapped(child) = &facts.facts.types[callback_type.index()].shape {
+            callback_type = *child;
+        }
+        let JsTsTypeShape::Function { parameters, .. } =
+            &facts.facts.types[callback_type.index()].shape
         else {
             continue;
         };
-        owners.extend(ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            callee.source(),
-            &source,
-            &imports,
-            aliases,
-            &parameter_type,
-            depth + 1,
-        ));
+        let Some(Some(parameter_type)) = parameters.get(callback_parameter_index).copied() else {
+            continue;
+        };
+        owners.extend(
+            ts_resolve_source_type_to_property_owner_outcome(
+                host,
+                support,
+                callee.source(),
+                &facts,
+                parameter_type,
+                depth + 1,
+                ReceiverAnalysisBudget::default(),
+            )
+            .values()
+            .map(|values| values.to_vec())
+            .unwrap_or_default(),
+        );
     }
     owners
-}
-
-fn ts_function_parameter_type_text(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| {
-            matches!(
-                parameter.kind(),
-                "required_parameter" | "optional_parameter"
-            )
-        })
-        .nth(parameter_index)
-        .and_then(|parameter| parameter.child_by_field_name("type"))
-        .map(|type_node| ts_type_annotation_text(type_node, source))
-}
-
-fn ts_callback_parameter_type_text(callback_type: &str, parameter_index: usize) -> Option<String> {
-    let callback_type = callback_type.trim();
-    let open = callback_type.find('(')?;
-    let close = ts_matching_close_delimiter(callback_type, open, '(', ')')?;
-    let parameters = callback_type.get(open + 1..close)?;
-    let parameter = ts_split_top_level_commas(parameters)
-        .into_iter()
-        .nth(parameter_index)?;
-    let (_, type_text) = parameter.split_once(':')?;
-    Some(ts_clean_type_text(type_text))
-}
-
-fn ts_matching_close_delimiter(
-    text: &str,
-    open_byte: usize,
-    open_char: char,
-    close_char: char,
-) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, ch) in text
-        .char_indices()
-        .skip_while(|(index, _)| *index < open_byte)
-    {
-        if ch == open_char {
-            depth += 1;
-        } else if ch == close_char {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-fn ts_split_top_level_commas(text: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut paren_depth = 0usize;
-    let mut angle_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    for (index, ch) in text.char_indices() {
-        match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ',' if paren_depth == 0
-                && angle_depth == 0
-                && brace_depth == 0
-                && bracket_depth == 0 =>
-            {
-                parts.push(text[start..index].trim());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(text[start..].trim());
-    parts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,28 +765,21 @@ fn ts_expression_property_owners(
             .unwrap_or_default(),
         "as_expression" | "satisfies_expression" | "type_assertion" => {
             ts_type_wrapper_type(expression)
-                .filter(|type_node| {
-                    matches!(
-                        type_node.kind(),
-                        "type_identifier"
-                            | "generic_type"
-                            | "object_type"
-                            | "predefined_type"
-                            | "union_type"
-                            | "intersection_type"
-                    )
-                })
                 .map(|type_node| {
-                    ts_resolve_type_text_to_property_owners(
+                    ts_resolve_type_node_to_property_owner_outcome(
                         host,
                         support,
                         file,
                         source,
                         imports,
                         aliases,
-                        ts_type_annotation_text(type_node, source).as_str(),
+                        type_node,
                         depth + 1,
+                        ReceiverAnalysisBudget::default(),
                     )
+                    .values()
+                    .map(|values| values.to_vec())
+                    .unwrap_or_default()
                 })
                 .unwrap_or_else(|| {
                     ts_type_wrapper_operand(expression)
@@ -1308,11 +1235,35 @@ pub fn ts_named_type_candidates(
     segments.push(current);
     segments.reverse();
 
-    let Some(root) = segments.first() else {
+    let segments = segments
+        .into_iter()
+        .map(|node| slice(node, source).trim().to_string())
+        .collect::<Vec<_>>();
+    ts_named_type_path_candidates(
+        host,
+        support,
+        file,
+        imports,
+        aliases,
+        &segments,
+        value_position,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_named_type_path_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    segments: &[String],
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let Some(root_name) = segments.first() else {
         return Vec::new();
     };
-    let root_name = slice(*root, source).trim();
-    let mut remaining = segments.into_iter().skip(1);
+    let mut remaining = segments.iter().skip(1);
     let has_qualified_tail = remaining.len() != 0;
     let mut candidates = if let Some(binding) = imports.binding(root_name).filter(|binding| {
         matches!(
@@ -1323,7 +1274,7 @@ pub fn ts_named_type_candidates(
         let Some(segment) = remaining.next() else {
             return Vec::new();
         };
-        let member = slice(segment, source).trim();
+        let member = segment.as_str();
         resolve_js_ts_module_binding_candidates(
             host,
             support,
@@ -1345,7 +1296,7 @@ pub fn ts_named_type_candidates(
             host,
             support,
             file,
-            source,
+            "",
             imports,
             aliases,
             root_name,
@@ -1353,13 +1304,102 @@ pub fn ts_named_type_candidates(
         )
     };
     for segment in remaining {
-        let member = slice(segment, source).trim();
+        let member = segment.as_str();
         if member.is_empty() {
             return Vec::new();
         }
         candidates = jsts_member_candidates(host, support, candidates, member, value_position);
     }
     candidates
+}
+
+fn source_declarations_for_unit<'a>(
+    facts: &'a JsTsFileSourceFacts,
+    unit: &'a CodeUnit,
+) -> impl Iterator<Item = &'a JsTsDeclarationFact> {
+    facts.facts.declarations.iter().filter(|fact| {
+        facts
+            .declaration_units
+            .get(&fact.declaration)
+            .is_some_and(|units| units.contains(unit))
+    })
+}
+
+/// Resolve already captured declaration type syntax without reparsing a
+/// foreign file or synthesizing a type-alias source fragment.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ts_resolve_source_type_to_property_owner_outcome(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    facts: &JsTsFileSourceFacts,
+    type_id: JsTsSourceTypeId,
+    depth: usize,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    let imports = JsTsImportBinder::from_source_facts(&facts.facts, &facts.imports, &facts.source);
+    let aliases = host.alias_resolver().as_ref();
+    let mut pending = vec![(type_id, depth, false)];
+    let mut outcomes = Vec::new();
+    while let Some((id, depth, value_position)) = pending.pop() {
+        if depth > 8 {
+            outcomes.push(ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "type_resolution_depth",
+            });
+            continue;
+        }
+        match &facts.facts.types[id.index()].shape {
+            JsTsTypeShape::Wrapped(child) => pending.push((*child, depth + 1, value_position)),
+            JsTsTypeShape::Query(child) => pending.push((*child, depth + 1, true)),
+            JsTsTypeShape::Union(children) | JsTsTypeShape::Intersection(children) => {
+                if children.is_empty() {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                }
+                pending.extend(
+                    children
+                        .iter()
+                        .rev()
+                        .map(|id| (*id, depth + 1, value_position)),
+                );
+            }
+            JsTsTypeShape::Generic { base, arguments } => {
+                let unwrap = match &facts.facts.types[base.index()].shape {
+                    JsTsTypeShape::Named(path) => path.last().is_some_and(|terminal| {
+                        (path.len() == 1 && matches!(terminal.as_str(), "Promise" | "ReturnType"))
+                            || (path.len() > 1 && matches!(terminal.as_str(), "infer" | "Infer"))
+                    }),
+                    _ => false,
+                };
+                if unwrap {
+                    if let Some(argument) = arguments.first() {
+                        pending.push((*argument, depth + 1, value_position));
+                    } else {
+                        outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                    }
+                } else {
+                    pending.push((*base, depth, value_position));
+                }
+            }
+            JsTsTypeShape::Named(path) => {
+                let candidates = ts_named_type_path_candidates(
+                    host,
+                    support,
+                    file,
+                    &imports,
+                    aliases,
+                    path,
+                    value_position,
+                );
+                let owners = ts_expand_property_owners(host, support, candidates, depth + 1);
+                outcomes.push(ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+                    owners, budget,
+                ));
+            }
+            JsTsTypeShape::NoReceiver => {}
+            _ => outcomes.push(ReceiverAnalysisOutcome::Unknown),
+        }
+    }
+    ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
 }
 
 fn known_non_receiver_type(node: Node<'_>, source: &str) -> bool {
@@ -1391,12 +1431,26 @@ fn ts_expand_property_owners(
             // The aliased type comes from the declaration's AST `value` field;
             // the signature string cannot be split at `=` without hitting a
             // type-parameter default (#2227).
-            let expanded = host
-                .type_alias_value_text(&candidate)
-                .map(|rhs| {
-                    ts_resolve_type_from_unit_context(host, support, &candidate, &rhs, depth + 1)
+            let Some(facts) = host.source_facts(candidate.source()) else {
+                continue;
+            };
+            let expanded = source_declarations_for_unit(&facts, &candidate)
+                .filter_map(|declaration| declaration.alias_type)
+                .flat_map(|type_id| {
+                    ts_resolve_source_type_to_property_owner_outcome(
+                        host,
+                        support,
+                        candidate.source(),
+                        &facts,
+                        type_id,
+                        depth + 1,
+                        ReceiverAnalysisBudget::default(),
+                    )
+                    .values()
+                    .map(|values| values.to_vec())
+                    .unwrap_or_default()
                 })
-                .unwrap_or_default();
+                .collect::<Vec<_>>();
             if expanded.is_empty() {
                 owners.push(candidate);
             } else {
@@ -1551,35 +1605,6 @@ pub(crate) fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>>
     }
 }
 
-fn ts_resolve_type_from_unit_context(
-    host: &dyn JsTsSource,
-    support: &dyn BoundedDefinitionLookup,
-    unit: &CodeUnit,
-    type_text: &str,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    let Ok(source) = unit.source().read_to_string() else {
-        return Vec::new();
-    };
-    let Some(tree) = parse_js_ts_tree(unit.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    // The analyzer's shared resolver, so this route reuses its warm config and
-    // workspace-package memos instead of building cold ones per call.
-    let aliases = host.alias_resolver().as_ref();
-    ts_resolve_type_text_to_property_owners(
-        host,
-        support,
-        unit.source(),
-        &source,
-        &imports,
-        aliases,
-        type_text,
-        depth + 1,
-    )
-}
-
 /// Entry point for a caller outside the recursive cluster, which starts a fresh
 /// receiver resolution. A caller already inside the cluster must use
 /// [`ts_function_return_property_owners_with_resolution`] and pass its live
@@ -1609,30 +1634,39 @@ fn ts_function_return_property_owners_with_resolution(
     if depth > 8 {
         return Vec::new();
     }
-    let Ok(source) = function.source().read_to_string() else {
+    let Some(facts) = host.source_facts(function.source()) else {
         return Vec::new();
     };
-    let Some(tree) = parse_js_ts_tree(function.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    // The analyzer's shared resolver, so this route reuses its warm config and
-    // workspace-package memos instead of building cold ones per call.
-    let aliases = host.alias_resolver().as_ref();
-    let mut owners = Vec::new();
-    for node in ts_nodes_for_code_unit(host, function, tree.root_node()) {
-        if let Some(type_text) = ts_function_return_type_text(node, &source) {
-            owners.extend(ts_resolve_type_text_to_property_owners(
+    let mut owners = source_declarations_for_unit(&facts, function)
+        .filter_map(|declaration| declaration.return_type)
+        .flat_map(|type_id| {
+            ts_resolve_source_type_to_property_owner_outcome(
                 host,
                 support,
                 function.source(),
-                &source,
-                &imports,
-                aliases,
-                &type_text,
+                &facts,
+                type_id,
                 depth + 1,
-            ));
-        }
+                ReceiverAnalysisBudget::default(),
+            )
+            .values()
+            .map(|values| values.to_vec())
+            .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut owners);
+    owners.dedup();
+    let Ok(source) = function.source().read_to_string() else {
+        return owners;
+    };
+    let Some(tree) = parse_js_ts_tree(function.source(), &source, Language::TypeScript) else {
+        return owners;
+    };
+    let imports = JsTsImportBinder::from_source_facts(&facts.facts, &facts.imports, &facts.source);
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
+    for node in ts_nodes_for_code_unit(host, function, tree.root_node()) {
         ts_collect_return_property_owners(
             host,
             support,
@@ -1651,13 +1685,6 @@ fn ts_function_return_property_owners_with_resolution(
     sort_units(&mut owners);
     owners.dedup();
     owners
-}
-
-fn ts_function_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
-    function
-        .child_by_field_name("return_type")
-        .map(|type_node| ts_type_annotation_text(type_node, source))
-        .filter(|text| !text.is_empty())
 }
 
 pub fn ts_nodes_for_code_unit<'tree>(
@@ -1742,34 +1769,32 @@ fn ts_collect_return_property_owners(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn ts_field_signature_type_owners(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
     field: &CodeUnit,
     depth: usize,
 ) -> Vec<CodeUnit> {
-    let mut owners = Vec::new();
-    // The declared type comes from the property signature's AST `type`
-    // annotation; the signature string cannot be split on `,` without cutting
-    // a multi-argument generic like `Map<string, number>` in half (#2227).
-    if let Some(type_text) = host.member_type_annotation_text(field) {
-        owners.extend(ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            &type_text,
-            depth + 1,
-        ));
-    }
-    owners
+    let Some(facts) = host.source_facts(field.source()) else {
+        return Vec::new();
+    };
+    source_declarations_for_unit(&facts, field)
+        .filter_map(|declaration| declaration.member_type)
+        .flat_map(|type_id| {
+            ts_resolve_source_type_to_property_owner_outcome(
+                host,
+                support,
+                field.source(),
+                &facts,
+                type_id,
+                depth + 1,
+                ReceiverAnalysisBudget::default(),
+            )
+            .values()
+            .map(|values| values.to_vec())
+            .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn ts_object_pattern_binds(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
@@ -1870,6 +1895,9 @@ export function caller(items: string[]): Wrapped<string> | string {
         file: ProjectFile,
         source: String,
         declarations: Vec<(CodeUnit, Range)>,
+        source_facts: Arc<JsTsFileSourceFacts>,
+        source_facts_available: bool,
+        source_inventory_complete: bool,
     }
 
     impl FakeJsTsSource {
@@ -1910,12 +1938,34 @@ export function caller(items: string[]): Wrapped<string> | string {
                 stack.extend(children);
             }
 
+            let parsed = crate::typescript::parse_typescript_file(&file, source, &tree);
+            declarations.extend(
+                parsed
+                    .ranges
+                    .iter()
+                    .filter(|(unit, _)| !unit.is_function())
+                    .flat_map(|(unit, ranges)| ranges.iter().map(|range| (unit.clone(), *range))),
+            );
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in parsed.source_declaration_units {
+                declaration_units.entry(declaration).or_default().push(unit);
+            }
+            let publication = parsed.source_facts.expect("primary source publication");
+            let source_facts = Arc::new(JsTsFileSourceFacts {
+                source: publication.occurrences,
+                imports: publication.imports,
+                facts: publication.js_ts.expect("JS/TS source family"),
+                declaration_units,
+            });
             Self {
                 project,
                 aliases,
                 file,
                 source: source.to_string(),
                 declarations,
+                source_facts,
+                source_facts_available: true,
+                source_inventory_complete: true,
             }
         }
     }
@@ -1930,7 +1980,11 @@ export function caller(items: string[]): Wrapped<string> | string {
         }
 
         fn analyzed_files(&self) -> Vec<ProjectFile> {
-            vec![self.file.clone()]
+            if self.source_facts_available {
+                vec![self.file.clone()]
+            } else {
+                Vec::new()
+            }
         }
 
         fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -2011,6 +2065,20 @@ export function caller(items: string[]): Wrapped<string> | string {
     }
 
     impl JsTsSource for FakeJsTsSource {
+        fn source_file_inventory(
+            &self,
+        ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
+            let files = vec![self.file.clone()];
+            if self.source_inventory_complete {
+                brokk_bifrost_core::analyzer::query_batch::QueryBatch::complete(files, 1)
+            } else {
+                brokk_bifrost_core::analyzer::query_batch::QueryBatch::incomplete(files, 1)
+            }
+        }
+
+        fn source_facts(&self, file: &ProjectFile) -> Option<Arc<JsTsFileSourceFacts>> {
+            (self.source_facts_available && file == &self.file).then(|| self.source_facts.clone())
+        }
         fn alias_resolver(&self) -> &Arc<AliasResolver> {
             &self.aliases
         }
@@ -2038,8 +2106,9 @@ export function caller(items: string[]): Wrapped<string> | string {
             Vec::new()
         }
 
-        fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
-            false
+        fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+            source_declarations_for_unit(&self.source_facts, code_unit)
+                .any(|declaration| declaration.alias_type.is_some())
         }
 
         fn raw_signatures(&self, _code_unit: &CodeUnit) -> Vec<String> {
@@ -2081,7 +2150,7 @@ export function caller(items: string[]): Wrapped<string> | string {
             }
             self.declarations
                 .iter()
-                .filter(|(unit, _)| unit.short_name() == ident)
+                .filter(|(unit, _)| unit.identifier() == ident)
                 .map(|(unit, _)| unit.clone())
                 .collect()
         }
@@ -2105,6 +2174,95 @@ export function caller(items: string[]): Wrapped<string> | string {
         fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn usage_graph_requires_every_source_publication() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut host = FakeJsTsSource::new(root.path(), "");
+        for parallel in [false, true] {
+            assert!(
+                crate::graph::resolver::build_jsts_usage_index(
+                    &host,
+                    host.aliases.as_ref(),
+                    Language::TypeScript,
+                    parallel
+                )
+                .is_some()
+            );
+        }
+        host.source_facts_available = false;
+        assert!(host.analyzed_files().is_empty());
+        for parallel in [false, true] {
+            assert!(
+                crate::graph::resolver::build_jsts_usage_index(
+                    &host,
+                    host.aliases.as_ref(),
+                    Language::TypeScript,
+                    parallel
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn usage_graph_rejects_incomplete_source_inventory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut host = FakeJsTsSource::new(root.path(), "");
+        host.source_inventory_complete = false;
+        for parallel in [false, true] {
+            assert!(
+                crate::graph::resolver::build_jsts_usage_index(
+                    &host,
+                    host.aliases.as_ref(),
+                    Language::TypeScript,
+                    parallel
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_types_resolve_after_source_file_is_removed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = FakeJsTsSource::new(
+            root.path(),
+            "interface Props { title: string } type Alias<T = string> = Props; function run(cb: (props: Alias) => void): Props { throw 0; }",
+        );
+        let run = host
+            .declarations
+            .iter()
+            .find(|(unit, _)| unit.identifier() == "run")
+            .expect("run")
+            .0
+            .clone();
+        let props = host
+            .declarations
+            .iter()
+            .find(|(unit, _)| unit.identifier() == "Props")
+            .expect("Props")
+            .0
+            .clone();
+        std::fs::remove_file(host.file.abs_path()).expect("remove declaring source");
+        assert_eq!(
+            ts_callback_parameter_owners_from_callee(&host, &host, &run, 0, 0, 0),
+            vec![props.clone()]
+        );
+        let declaration = source_declarations_for_unit(&host.source_facts, &run)
+            .next()
+            .expect("source declaration");
+        let outcome = ts_resolve_source_type_to_property_owner_outcome(
+            &host,
+            &host,
+            &host.file,
+            &host.source_facts,
+            declaration.return_type.expect("return type"),
+            0,
+            ReceiverAnalysisBudget::default(),
+        );
+        assert_eq!(outcome.values(), Some([props].as_slice()));
     }
 
     /// Before #2744, the receiver-owner cluster reset both of its bounded

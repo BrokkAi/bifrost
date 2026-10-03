@@ -25,7 +25,7 @@ use super::resolver::{
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
-    JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
+    JsTsImportBinder, JsTsLexicalBindingIndex, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice,
 };
@@ -74,7 +74,26 @@ pub fn scan_file(
 
     // Per-file resolution context: which bare names resolve to which
     // exported name, and which locals are namespace imports.
-    let binder = compute_import_binder(source, input.tree);
+    let Some(facts) = host.source_facts(file) else {
+        return PerFileEdges::default();
+    };
+    let declarations = declarations_index.declarations(file);
+    let (same_file, browser_globals, lexical_bindings) = file_declaration_names(
+        declarations_index,
+        language,
+        &declarations,
+        input.root(),
+        source,
+    );
+    let binder = JsTsImportBinder::from_source_facts_with_lexical_bindings(
+        &facts.facts,
+        &facts.imports,
+        &facts.source,
+        input.root(),
+        lexical_bindings
+            .clone()
+            .unwrap_or_else(|| JsTsLexicalBindingIndex::build(input.root(), source)),
+    );
     let mut named_imports: HashMap<String, String> = HashMap::default();
     let mut namespace_locals: HashSet<String> = HashSet::default();
     for (local, binding) in binder.all_bindings() {
@@ -95,14 +114,6 @@ pub fn scan_file(
             ImportKind::Default => {}
         }
     }
-    let declarations = declarations_index.declarations(file);
-    let (same_file, browser_globals, lexical_bindings) = file_declaration_names(
-        declarations_index,
-        language,
-        &declarations,
-        input.root(),
-        source,
-    );
 
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = TsScan {
@@ -205,6 +216,18 @@ pub fn scan_scoped_file(
     if flow_dialect_blocks_extraction(file, input.root(), input.source) {
         return PerFileEdges::default();
     }
+    let receiver_binder = index
+        .binders_by_file
+        .get(file)
+        .cloned()
+        .unwrap_or_default()
+        .with_lexical_bindings(
+            input.root(),
+            file_prep
+                .lexical_bindings
+                .clone()
+                .unwrap_or_else(|| JsTsLexicalBindingIndex::build(input.root(), input.source)),
+        );
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = ScopedTsScan {
             source: input.source,
@@ -215,7 +238,7 @@ pub fn scan_scoped_file(
                 file,
                 input.source,
                 input.root(),
-                compute_import_binder(input.source, input.tree),
+                receiver_binder,
             ),
             index,
             declarations: &prep.declarations,

@@ -2775,6 +2775,33 @@ impl Project for RevisionImageProject {
                 }),
         }
     }
+
+    fn read_source_snapshot(
+        &self,
+        file: &ProjectFile,
+    ) -> std::io::Result<crate::analyzer::ProjectSourceSnapshot> {
+        match self.revision_bytes(file) {
+            Some(bytes) => bytes.and_then(crate::analyzer::ProjectSourceSnapshot::disk_bytes),
+            None => self.files.read_source_snapshot(file),
+        }
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<crate::analyzer::ProjectSourceSnapshot>> {
+        match self.revision_bytes(file) {
+            Some(bytes) => {
+                let bytes = bytes?;
+                if bytes.len() > max_bytes {
+                    return Ok(None);
+                }
+                crate::analyzer::ProjectSourceSnapshot::disk_bytes(bytes).map(Some)
+            }
+            None => self.files.read_source_snapshot_limited(file, max_bytes),
+        }
+    }
 }
 
 impl RevisionImageProject {
@@ -3396,7 +3423,7 @@ fn export_file_dependency_tree(
 /// The bytes come from the object database on demand, but the PATH has to be
 /// on disk: module resolution in several languages answers "does this module
 /// exist" by probing the filesystem for candidate files -- Rust's `mod foo;`
-/// tries `foo.rs` and `foo/mod.rs` (`rust_external_module_children` in
+/// tries `foo.rs` and `foo/mod.rs` (`module_child_edges` in
 /// `brokk_bifrost_rust::cargo_routes`), and a JavaScript or TypeScript
 /// specifier tries each extension and `index.<ext>`
 /// (`brokk_bifrost_js_ts::imports`). Both take absence as proof that the module
@@ -4791,6 +4818,10 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
+#[cfg(test)]
+#[path = "diff_analysis/native_rust_tests.rs"]
+mod native_rust_tests;
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
@@ -5792,6 +5823,59 @@ mod tests {
              dependency_symbols, got {:?}",
             result.dependency_symbols
         );
+    }
+
+    #[test]
+    fn rust_diff_analysis_uses_complete_selected_rooted_edge_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { right() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        // Direct Rust shadow tests cover the selected comparison paths; this
+        // concurrent diff test covers the public rooted edge result.
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+            &CancellationToken::new(),
+        )
+        .expect("Rust analyze_diff");
+
+        let caller = result
+            .patch_symbols
+            .edited
+            .iter()
+            .find(|pair| pair.after.name == "caller")
+            .expect("edited Rust caller");
+        assert_eq!(caller.added_calls.len(), 1, "edited caller: {caller:#?}");
+        assert_eq!(caller.removed_calls.len(), 1, "edited caller: {caller:#?}");
+        assert_eq!(caller.added_calls[0].weight, 1);
+        assert_eq!(caller.removed_calls[0].weight, 1);
+        assert!(caller.added_calls[0].to.ends_with(".right"));
+        assert!(caller.removed_calls[0].to.ends_with(".left"));
     }
 
     /// Same shape again, for Python: `from pkgb.b import make_thing` has no

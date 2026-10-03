@@ -1,17 +1,32 @@
-use crate::imports::parse_ruby_require_call;
-use crate::mixins::{encode_mixin_relation, encode_superclass_relation, raw_mixin_specs_for_type};
+use crate::imports::parse_ruby_load_syntax;
+use crate::local_bindings::PrimaryLocalBindings;
+use crate::mixins::{encode_mixin_relation, encode_superclass_relation, mixin_specs_for_call};
+use crate::structural::{RUBY_STRUCTURAL_SPEC, is_nested_scope_root, is_value_read_position};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CodeUnitType, DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata,
 };
-use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::parsed_file::{
+    ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
+};
+use brokk_bifrost_core::analyzer::ruby_facts::{RubyLoadFact, RubySourceFacts};
+use brokk_bifrost_core::analyzer::rust_facts::RustItemSourceFacts;
+use brokk_bifrost_core::analyzer::source_facts::{
+    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId,
+};
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
+use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, WalkControl, node_range, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -70,6 +85,18 @@ pub struct RubyVisitor<'a> {
     pub file: &'a ProjectFile,
     pub source: &'a str,
     pub parsed: &'a mut ParsedFile,
+    pub source_facts: PrimarySourceFactCollector<'a>,
+    pub imports: Vec<SourceImportFact>,
+    pub import_by_node: HashMap<usize, SourceImportId>,
+    pub generic_imports: Vec<SourceImportId>,
+    pub ruby: RubySourceFacts,
+    pub field_contexts: HashMap<usize, usize>,
+    pub field_owners: Vec<RubyFieldContext>,
+    pub current_module: Option<usize>,
+    pub module_functions: HashMap<usize, RubyModuleFunctions>,
+    pub pending_dispatch: Vec<RubyPendingDispatch>,
+    pub mixin_roots: HashMap<usize, usize>,
+    pub mixin_containers: Vec<RubyMixinContainer>,
 }
 
 /// A pending traversal step: visit `node` as a statement within the enclosing
@@ -80,6 +107,34 @@ struct RubyWork<'tree> {
     node: Node<'tree>,
     segments: Vec<String>,
     parent: Option<CodeUnit>,
+}
+
+#[derive(Default)]
+pub struct RubyMixinContainer {
+    owner: Option<(CodeUnit, Vec<(String, String)>)>,
+    relations: Vec<(String, String)>,
+    children: Vec<usize>,
+}
+
+#[derive(Default)]
+pub struct RubyModuleFunctions {
+    bare_start: Option<usize>,
+    names: HashSet<String>,
+}
+
+pub struct RubyPendingDispatch {
+    unit: CodeUnit,
+    module: Option<usize>,
+    name: String,
+    start: usize,
+    mode: RubyMethodDispatchMode,
+}
+
+#[derive(Clone)]
+pub struct RubyFieldContext {
+    segments: Vec<String>,
+    parent: Option<CodeUnit>,
+    scope: RubyFieldScope,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,12 +164,339 @@ fn push_named_children<'tree>(
 }
 
 impl RubyVisitor<'_> {
-    pub fn visit_program(&mut self, root: Node<'_>) {
-        let mut stack = Vec::new();
-        push_named_children(root, &[], None, &mut stack);
-        while let Some(work) = stack.pop() {
-            self.visit_statement(work.node, &work.segments, work.parent.as_ref(), &mut stack);
+    pub fn visit_program(mut self, root: Node<'_>) {
+        self.ruby.has_parse_errors = root.has_error();
+        let spec = &RUBY_STRUCTURAL_SPEC;
+        let kinds = CompiledKinds::compile(&tree_sitter_ruby::LANGUAGE.into(), spec.kind_table());
+        let context = CallSiteContext::default();
+        let mut bindings = PrimaryLocalBindings::default();
+        let root_bindings = bindings.enter_scope(self.source, root, None);
+        let mut structural = StructuralFactCollector::new(
+            spec,
+            self.source,
+            &context,
+            ParentIndex::new(root),
+            usize::MAX,
+            None,
+        );
+        let mut pending = Vec::new();
+        push_named_children(root, &[], None, &mut pending);
+        let mut statements: HashMap<usize, RubyWork<'_>> = pending
+            .drain(..)
+            .map(|work| (work.node.id(), work))
+            .collect();
+        let mut lexical_scopes = vec![Vec::<String>::new()];
+        let mut walk = vec![(
+            root,
+            None,
+            None::<usize>,
+            root_bindings,
+            0usize,
+            None::<usize>,
+            None::<usize>,
+        )];
+        while let Some((
+            node,
+            parent,
+            mut fields,
+            inherited_bindings,
+            mut lexical_scope,
+            mut module,
+            mut mixin,
+        )) = walk.pop()
+        {
+            if matches!(node.kind(), "class" | "module")
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let mut segments = lexical_scopes[lexical_scope].clone();
+                segments.extend(extract_name_segments(name, self.source));
+                lexical_scope = lexical_scopes.len();
+                lexical_scopes.push(segments);
+            }
+            if let Some(root) = self.mixin_roots.remove(&node.id()) {
+                mixin = Some(root);
+            } else if let Some(container) = mixin {
+                if node.kind() == "call" {
+                    self.mixin_containers[container].relations.extend(
+                        mixin_specs_for_call(node, self.source)
+                            .into_iter()
+                            .map(|spec| {
+                                let encoded = encode_mixin_relation(&spec);
+                                (spec.raw_target, encoded)
+                            }),
+                    );
+                    mixin = None;
+                } else if is_descendable_container(node.kind()) {
+                    let child = self.mixin_containers.len();
+                    self.mixin_containers.push(RubyMixinContainer::default());
+                    self.mixin_containers[container].children.push(child);
+                    mixin = Some(child);
+                } else {
+                    mixin = None;
+                }
+            }
+            self.current_module = module;
+            match node.kind() {
+                "module" => {
+                    module = Some(node.id());
+                }
+                "class" | "method" | "singleton_method" => {
+                    module = None;
+                }
+                _ => {}
+            }
+            if let Some(owner) = module {
+                let names = if node.kind() == "call"
+                    && node.child_by_field_name("method").is_some_and(|method| {
+                        ruby_node_text(method, self.source).trim() == "module_function"
+                    }) {
+                    Some(module_function_names(node, self.source).collect::<Vec<_>>())
+                } else if node.kind() == "identifier"
+                    && ruby_node_text(node, self.source).trim() == "module_function"
+                {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
+                if let Some(names) = names {
+                    let facts = self.module_functions.entry(owner).or_default();
+                    if names.is_empty() {
+                        facts.bare_start = Some(
+                            facts
+                                .bare_start
+                                .map_or(node.start_byte(), |start| start.min(node.start_byte())),
+                        );
+                    } else {
+                        facts.names.extend(names);
+                    }
+                    module = None;
+                }
+            }
+            let load_syntax = parse_ruby_load_syntax(node, self.source);
+            self.ruby.has_parse_errors |= node.is_error() || node.is_missing();
+            if let Some(boundary) = crate::diagnostics::runtime_boundary_for_node(
+                node,
+                self.source,
+                load_syntax.as_ref(),
+            ) {
+                // Preserve the old right-to-left preorder boundary selection:
+                // later sibling extents win, and an ancestor precedes its children.
+                let range = node_range(node);
+                if self.ruby.runtime_boundary.is_none_or(|(occurrence, _)| {
+                    let previous = self.source_facts.occurrence(occurrence).range;
+                    (range.end_byte, std::cmp::Reverse(range.start_byte))
+                        > (previous.end_byte, std::cmp::Reverse(previous.start_byte))
+                }) {
+                    self.ruby.runtime_boundary =
+                        Some((self.source_facts.intern_node(node), boundary));
+                }
+            }
+            if let Some(syntax) = load_syntax {
+                let import = SourceImportId::try_from_index(self.imports.len())
+                    .expect("Ruby import ids fit u32");
+                let declaration = self.source_facts.intern_node(node);
+                let target = self.source_facts.intern_node(syntax.target);
+                self.imports.push(SourceImportFact::from_import(
+                    syntax.import,
+                    declaration,
+                    Some(target),
+                    None,
+                    Vec::new(),
+                ));
+                self.import_by_node.insert(node.id(), import);
+                self.ruby.loads.push(RubyLoadFact {
+                    import,
+                    kind: syntax.kind,
+                    has_receiver: syntax.has_receiver,
+                    autoload_constant: syntax.constant.map(|constant| {
+                        let mut name = lexical_scopes[lexical_scope].clone();
+                        name.push(constant);
+                        name
+                    }),
+                });
+            }
+            let binding_scope = if node != root && is_nested_scope_root(node) {
+                bindings.enter_scope(self.source, node, Some(inherited_bindings))
+            } else {
+                inherited_bindings
+            };
+            bindings.observe(self.source, binding_scope, node);
+            if matches!(node.kind(), "identifier" | "constant") {
+                let text = ruby_node_text(node, self.source).trim();
+                if !text.is_empty() {
+                    self.parsed.type_identifiers.insert(text.to_owned());
+                }
+            }
+            let mut structural_parent = parent;
+            if let Some(raw_kind) = kinds.kind_of(&node)
+                && spec.should_extract(node, raw_kind)
+            {
+                let kind = if node.kind() == "identifier"
+                    && is_value_read_position(node)
+                    && !bindings.is_active(
+                        binding_scope,
+                        ruby_node_text(node, self.source),
+                        node.start_byte(),
+                    ) {
+                    NormalizedKind::Call
+                } else {
+                    spec.refine_kind(
+                        node,
+                        raw_kind,
+                        parent.map(|id| structural.normalized_kind(id)),
+                        self.source,
+                        &context,
+                    )
+                };
+                let fact = structural
+                    .enter(node, kind, parent, &mut self.source_facts)
+                    .expect("Ruby structural collection is unbounded");
+                let mut sink = structural.role_sink(&mut self.source_facts);
+                spec.extract(node, kind, &mut sink);
+                structural
+                    .accept_roles(fact, sink.into_parts())
+                    .expect("Ruby structural roles are unbounded");
+                structural_parent = Some(fact);
+            }
+            if matches!(
+                node.kind(),
+                "class" | "module" | "method" | "singleton_method" | "singleton_class"
+            ) {
+                fields = None;
+            }
+            let field_assignment =
+                matches!(node.kind(), "assignment" | "operator_assignment") && fields.is_some();
+            if let Some(index) = fields.filter(|_| field_assignment) {
+                let context = self.field_owners[index].clone();
+                self.visit_assignment(
+                    node,
+                    &context.segments,
+                    context.parent.as_ref(),
+                    Some(context.scope),
+                );
+            }
+            if let Some(work) = statements.remove(&node.id()) {
+                if !field_assignment {
+                    self.visit_statement(node, &work.segments, work.parent.as_ref(), &mut pending);
+                }
+                statements.extend(pending.drain(..).map(|work| (work.node.id(), work)));
+            }
+            if let Some(context) = self.field_contexts.remove(&node.id()) {
+                fields = Some(context);
+            }
+            // A field assignment is one declaration; its expression children
+            // do not introduce additional field declarations in this projection.
+            if matches!(node.kind(), "assignment" | "operator_assignment") {
+                fields = None;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    walk.push((
+                        child,
+                        structural_parent,
+                        fields,
+                        binding_scope,
+                        lexical_scope,
+                        module,
+                        mixin,
+                    ));
+                }
+            }
         }
+        assert!(
+            statements.is_empty(),
+            "Ruby statement admission must follow primary nodes"
+        );
+        for root in 0..self.mixin_containers.len() {
+            let Some((owner, mut relations)) = self.mixin_containers[root].owner.take() else {
+                continue;
+            };
+            if !self.parsed.contains_declaration(&owner) {
+                continue;
+            }
+            let mut pending = vec![root];
+            while let Some(container) = pending.pop() {
+                relations.append(&mut self.mixin_containers[container].relations);
+                pending.extend(self.mixin_containers[container].children.iter().copied());
+            }
+            if relations.is_empty() {
+                self.parsed.raw_supertypes.remove(&owner);
+                self.parsed.supertype_lookup_paths.remove(&owner);
+            } else {
+                self.parsed.set_raw_supertypes(
+                    owner.clone(),
+                    relations.iter().map(|(raw, _)| raw.clone()).collect(),
+                );
+                self.parsed.set_supertype_lookup_paths(
+                    owner,
+                    relations.into_iter().map(|(_, encoded)| encoded).collect(),
+                );
+            }
+        }
+        for pending in self.pending_dispatch {
+            if !self.parsed.contains_declaration(&pending.unit) {
+                continue;
+            }
+            let mode = if pending
+                .module
+                .and_then(|module| self.module_functions.get(&module))
+                .is_some_and(|facts| {
+                    facts.names.contains(&pending.name)
+                        || facts.bare_start.is_some_and(|start| start < pending.start)
+                }) {
+                RubyMethodDispatchMode::ModuleFunction
+            } else {
+                pending.mode
+            };
+            self.parsed
+                .set_ruby_method_dispatch_mode(pending.unit, mode);
+        }
+        let occurrences = self.source_facts.finish();
+        self.parsed.imports = self
+            .generic_imports
+            .iter()
+            .map(|id| self.imports[id.index()].import_info(&occurrences))
+            .collect();
+        self.parsed.source_facts = Some(ParsedSourceFacts {
+            cpp: None,
+            go: None,
+            java: None,
+            js_ts: None,
+            ruby: Some(self.ruby),
+            php: None,
+            scala: None,
+            python: None,
+            source_bytes: self.source.len(),
+            occurrences,
+            structural: structural
+                .finish()
+                .expect("Ruby structural collection must finish"),
+            native_site_occurrences: Vec::new(),
+            native_declaration_sources: Vec::new(),
+            declaration_visibilities: None,
+            rust_declaration_properties: Vec::new(),
+            rust_modules: None,
+            rust_types: Vec::new(),
+            rust_items: RustItemSourceFacts::default(),
+            generic_imports: self.generic_imports,
+            imports: self.imports,
+            rust_import_contexts: Vec::new(),
+        });
+    }
+
+    fn record_declaration(
+        &mut self,
+        node: Node<'_>,
+        name: Option<Node<'_>>,
+        unit: CodeUnit,
+    ) -> SourceDeclarationId {
+        let occurrence = self.source_facts.intern_node(node);
+        let name = name.map(|name| self.source_facts.intern_node(name));
+        let declaration = self.source_facts.declare(occurrence, name);
+        self.parsed
+            .source_declaration_units
+            .push((declaration, unit));
+        declaration
     }
 
     fn visit_statement<'tree>(
@@ -179,45 +561,33 @@ impl RubyVisitor<'_> {
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+        self.record_declaration(node, Some(name_node), code_unit.clone());
         self.parsed
             .add_signature(code_unit.clone(), first_line(node, self.source));
 
-        let mut owner_relations = extract_ruby_supertypes(node, self.source)
+        let owner_relations = extract_ruby_supertypes(node, self.source)
             .into_iter()
             .map(|target| {
                 let encoded = encode_superclass_relation(&target);
                 (target, encoded)
             })
-            .collect::<Vec<_>>();
-        owner_relations.extend(raw_mixin_specs_for_type(node, self.source).into_iter().map(
-            |spec| {
-                let encoded = encode_mixin_relation(&spec);
-                (spec.raw_target, encoded)
-            },
-        ));
-        if !owner_relations.is_empty() {
-            self.parsed.set_raw_supertypes(
-                code_unit.clone(),
-                owner_relations
-                    .iter()
-                    .map(|(target, _)| target.clone())
-                    .collect(),
-            );
-            self.parsed.set_supertype_lookup_paths(
-                code_unit.clone(),
-                owner_relations
-                    .into_iter()
-                    .map(|(_, encoded)| encoded)
-                    .collect(),
-            );
+            .collect();
+        let root = self.mixin_containers.len();
+        self.mixin_containers.push(RubyMixinContainer {
+            owner: Some((code_unit.clone(), owner_relations)),
+            ..Default::default()
+        });
+        if let Some(body) = node.child_by_field_name("body") {
+            self.mixin_roots.insert(body.id(), root);
         }
 
-        self.visit_scope_field_assignments(
-            node,
-            &new_segments,
-            Some(&code_unit),
-            RubyFieldScope::SingletonClass,
-        );
+        self.field_contexts
+            .insert(node.id(), self.field_owners.len());
+        self.field_owners.push(RubyFieldContext {
+            segments: new_segments.clone(),
+            parent: Some(code_unit.clone()),
+            scope: RubyFieldScope::SingletonClass,
+        });
         if let Some(body) = node.child_by_field_name("body") {
             push_named_children(body, &new_segments, Some(&code_unit), stack);
         }
@@ -246,18 +616,37 @@ impl RubyVisitor<'_> {
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
-        self.parsed.set_ruby_method_dispatch_mode(
+        let declaration = self.record_declaration(node, Some(name_node), code_unit.clone());
+        self.pending_dispatch.push(RubyPendingDispatch {
+            unit: code_unit.clone(),
+            module: (node.kind() == "method")
+                .then_some(self.current_module)
+                .flatten(),
+            name: name.to_owned(),
+            start: node.start_byte(),
+            mode: ruby_method_dispatch_mode(node),
+        });
+        let metadata_ordinal = self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            ruby_method_dispatch_mode(node, self.source),
-        );
-        self.parsed.add_signature_with_metadata(
-            code_unit,
             ruby_signature_metadata(first_line(node, self.source), node, self.source),
         );
+        self.parsed
+            .source_declaration_metadata
+            .push(SourceDeclarationMetadataLink {
+                declaration,
+                unit: code_unit,
+                metadata_ordinal,
+            });
         // Method bodies are otherwise leaves for declaration purposes, but Ruby
         // instance/class variables are declarations even when first assigned in
         // methods.
-        self.visit_scope_field_assignments(node, segments, parent, ruby_method_field_scope(node));
+        self.field_contexts
+            .insert(node.id(), self.field_owners.len());
+        self.field_owners.push(RubyFieldContext {
+            segments: segments.to_vec(),
+            parent: parent.cloned(),
+            scope: ruby_method_field_scope(node),
+        });
     }
 
     fn visit_assignment(
@@ -293,39 +682,11 @@ impl RubyVisitor<'_> {
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+        self.record_declaration(node, Some(left), code_unit.clone());
         self.parsed.add_signature(
             code_unit,
             ruby_node_text(node, self.source).trim().to_string(),
         );
-    }
-
-    fn visit_scope_field_assignments(
-        &mut self,
-        node: Node<'_>,
-        segments: &[String],
-        parent: Option<&CodeUnit>,
-        field_scope: RubyFieldScope,
-    ) {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if current != node
-                && matches!(
-                    current.kind(),
-                    "class" | "module" | "method" | "singleton_method" | "singleton_class"
-                )
-            {
-                continue;
-            }
-            if matches!(current.kind(), "assignment" | "operator_assignment") {
-                self.visit_assignment(current, segments, parent, Some(field_scope));
-                continue;
-            }
-            for index in (0..current.named_child_count()).rev() {
-                if let Some(child) = current.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
     }
 
     fn visit_variable_field_assignment(
@@ -357,6 +718,7 @@ impl RubyVisitor<'_> {
         }
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+        self.record_declaration(node, Some(left), code_unit.clone());
         self.parsed.add_signature(
             code_unit,
             ruby_node_text(node, self.source).trim().to_string(),
@@ -370,8 +732,8 @@ impl RubyVisitor<'_> {
         let method_name = ruby_node_text(method, self.source).trim();
         match method_name {
             "require" | "require_relative" | "load" | "autoload" => {
-                if let Some(info) = parse_ruby_require_call(node, self.source) {
-                    self.parsed.imports.push(info);
+                if let Some(import) = self.import_by_node.get(&node.id()) {
+                    self.generic_imports.push(*import);
                 }
             }
             "attr_accessor" | "attr_reader" | "attr_writer" => {
@@ -424,6 +786,7 @@ impl RubyVisitor<'_> {
                 Some(parent.clone()),
                 None,
             );
+            self.record_declaration(node, Some(arg), code_unit.clone());
             self.parsed
                 .record_materialization(MaterializationRecord::GeneratedDeclaration {
                     site: node_range(node),
@@ -525,6 +888,7 @@ impl RubyVisitor<'_> {
             Some(parent.clone()),
             None,
         );
+        self.record_declaration(range_node, Some(range_node), code_unit.clone());
         self.parsed
             .record_materialization(MaterializationRecord::GeneratedDeclaration {
                 site: node_range(signature_node),
@@ -532,10 +896,13 @@ impl RubyVisitor<'_> {
                 kind: generation,
                 unit: code_unit.clone(),
             });
-        self.parsed.set_ruby_method_dispatch_mode(
-            code_unit.clone(),
-            ruby_method_dispatch_mode(signature_node, self.source),
-        );
+        self.pending_dispatch.push(RubyPendingDispatch {
+            unit: code_unit.clone(),
+            module: None,
+            name: name.to_owned(),
+            start: signature_node.start_byte(),
+            mode: ruby_method_dispatch_mode(signature_node),
+        });
         self.parsed.add_signature(
             code_unit,
             ruby_node_text(signature_node, self.source)
@@ -647,10 +1014,8 @@ fn ruby_method_field_scope(node: Node<'_>) -> RubyFieldScope {
     }
 }
 
-fn ruby_method_dispatch_mode(node: Node<'_>, source: &str) -> RubyMethodDispatchMode {
-    if module_function_applies_to_method(node, source) {
-        RubyMethodDispatchMode::ModuleFunction
-    } else if method_is_singleton_context(node) {
+fn ruby_method_dispatch_mode(node: Node<'_>) -> RubyMethodDispatchMode {
+    if method_is_singleton_context(node) {
         RubyMethodDispatchMode::Singleton
     } else {
         RubyMethodDispatchMode::Instance
@@ -672,74 +1037,6 @@ fn method_is_singleton_context(node: Node<'_>) -> bool {
         parent = current.parent();
     }
     false
-}
-
-fn module_function_applies_to_method(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "method" {
-        return false;
-    }
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return false;
-    };
-    let method_name = ruby_node_text(name_node, source).trim();
-    let Some(module) = enclosing_module_for_module_function(node) else {
-        return false;
-    };
-    let Some(body) = module.child_by_field_name("body") else {
-        return false;
-    };
-
-    let mut bare_module_function_active = false;
-    let mut stack = vec![body];
-    while let Some(current) = stack.pop() {
-        if current != body
-            && matches!(
-                current.kind(),
-                "class" | "module" | "method" | "singleton_method"
-            )
-        {
-            continue;
-        }
-        if current.kind() == "identifier"
-            && current.start_byte() < node.start_byte()
-            && ruby_node_text(current, source).trim() == "module_function"
-        {
-            bare_module_function_active = true;
-            continue;
-        }
-        if current.kind() == "call"
-            && let Some(method) = current.child_by_field_name("method")
-            && ruby_node_text(method, source).trim() == "module_function"
-        {
-            let mut names = module_function_names(current, source);
-            if names.next().is_none() {
-                if current.start_byte() < node.start_byte() {
-                    bare_module_function_active = true;
-                }
-            } else if module_function_names(current, source).any(|name| name == method_name) {
-                return true;
-            }
-            continue;
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    bare_module_function_active
-}
-
-fn enclosing_module_for_module_function(node: Node<'_>) -> Option<Node<'_>> {
-    let mut parent = node.parent();
-    while let Some(current) = parent {
-        match current.kind() {
-            "module" => return Some(current),
-            "class" => return None,
-            _ => parent = current.parent(),
-        }
-    }
-    None
 }
 
 fn module_function_names<'a>(node: Node<'_>, source: &'a str) -> impl Iterator<Item = String> + 'a {
@@ -809,33 +1106,29 @@ pub fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 pub fn extract_name_path(name_node: Node<'_>, source: &str) -> RubyNamePath {
-    match name_node.kind() {
-        "scope_resolution" => {
-            let mut path = name_node
-                .child_by_field_name("scope")
-                .map(|scope| extract_name_path(scope, source))
-                .unwrap_or_else(|| RubyNamePath {
-                    segments: Vec::new(),
-                    absolute: true,
-                });
-            if let Some(name) = name_node.child_by_field_name("name") {
-                path.segments.extend(extract_name_segments(name, source));
+    let mut path = RubyNamePath {
+        segments: Vec::new(),
+        absolute: false,
+    };
+    let mut stack = vec![name_node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "scope_resolution" {
+            if let Some(name) = node.child_by_field_name("name") {
+                stack.push(name);
             }
-            path
-        }
-        _ => {
-            let text = ruby_node_text(name_node, source).trim();
-            let segments = if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![text.to_string()]
-            };
-            RubyNamePath {
-                segments,
-                absolute: false,
+            if let Some(scope) = node.child_by_field_name("scope") {
+                stack.push(scope);
+            } else if path.segments.is_empty() {
+                path.absolute = true;
+            }
+        } else {
+            let text = ruby_node_text(node, source).trim();
+            if !text.is_empty() {
+                path.segments.push(text.to_owned());
             }
         }
     }
+    path
 }
 
 /// Renders a `constant`/`scope_resolution` reference node into the internal
@@ -981,7 +1274,6 @@ pub fn is_descendable_container(kind: &str) -> bool {
             | "end_block"
     )
 }
-
 pub fn collect_ruby_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         if matches!(node.kind(), "identifier" | "constant") {

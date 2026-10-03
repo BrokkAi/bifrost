@@ -1,22 +1,36 @@
 use crate::bindings::python_direct_scope_bindings_bounded;
-use crate::imports::python_import_infos_from_node;
+use crate::imports::{python_import_infos_from_node, python_import_syntaxes_from_node};
 use crate::syntax::{
-    PythonOverloadDecoratorBindings, expression_name_node, python_plain_string_literal,
+    PythonOverloadDecoratorBindings, PythonOverloadDecoratorName, expression_name_node,
+    python_plain_string_literal,
 };
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
-    StructuredImportPathKind,
+    StructuredImportPathKind, StructuredTypeIdentity,
 };
-use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::parsed_file::{
+    ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink, SourceImportFact,
+};
+use brokk_bifrost_core::analyzer::python_facts::{PythonCallableReturnFact, PythonSourceFacts};
+use brokk_bifrost_core::analyzer::rust_facts::RustItemSourceFacts;
+use brokk_bifrost_core::analyzer::source_facts::{
+    PrimarySourceFactCollector, SourceDeclarationId, SourceImportId,
+};
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Tree};
+
+use crate::source_properties::{python_annotation_references, python_return_type_identity};
+use crate::structural::PYTHON_STRUCTURAL_SPEC;
 
 /// Intern one qualified-name segment in the process-global interner.
 fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -741,65 +755,291 @@ enum ScopeKind {
     Function,
 }
 
-pub struct PythonVisitor<'a> {
-    pub file: &'a ProjectFile,
-    pub source: &'a str,
-    pub package_name: &'a str,
-    module_fq: &'a FqName,
-    pub parsed: &'a mut ParsedFile,
+pub struct PythonVisitor<'source, 'parsed, 'structural>
+where
+    'source: 'structural,
+{
+    pub file: &'parsed ProjectFile,
+    pub source: &'source str,
+    pub package_name: &'parsed str,
+    module_fq: &'parsed FqName,
+    pub parsed: &'parsed mut ParsedFile,
     pub module: Option<CodeUnit>,
-    pub overload_decorators: &'a PythonOverloadDecoratorBindings,
+    overload_decorators: PythonOverloadDecoratorBindings,
+    source_facts: PrimarySourceFactCollector<'source>,
+    structural: StructuralFactCollector<'structural, 'structural>,
+    structural_kinds: &'structural CompiledKinds,
+    call_site_context: &'structural CallSiteContext,
+    structural_parents: Vec<Option<u32>>,
+    source_imports: Vec<SourceImportFact>,
+    generic_imports: Vec<SourceImportId>,
+    source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
+    python_source_facts: PythonSourceFacts,
+    python_callable_return_by_node: HashMap<usize, usize>,
+    overload_metadata: Vec<(CodeUnit, usize, Vec<PythonOverloadDecoratorName>)>,
 }
 
-struct PythonContainer<'tree> {
+struct PythonFrame<'tree> {
     node: Node<'tree>,
     scope: Vec<Scope>,
     module_control_depth: usize,
+    declaration: bool,
+    wrapper: Option<Node<'tree>>,
+    lexical_scopes: Vec<Node<'tree>>,
 }
 
 enum PythonWork<'tree> {
-    Container(PythonContainer<'tree>),
-    Statement {
-        node: Node<'tree>,
-        scope: Vec<Scope>,
-        module_control_depth: usize,
-    },
+    Enter(PythonFrame<'tree>),
+    Exit,
 }
 
-impl<'a> PythonVisitor<'a> {
+struct DeclarationChildren<'tree> {
+    body: Option<(Node<'tree>, Vec<Scope>)>,
+    container_scope: Option<Vec<Scope>>,
+    container_depth: usize,
+}
+
+impl<'source, 'parsed, 'structural> PythonVisitor<'source, 'parsed, 'structural>
+where
+    'source: 'structural,
+{
     pub fn visit_container(
         &mut self,
         node: Node<'_>,
         scope: &[Scope],
         module_control_depth: usize,
     ) {
-        let mut stack = vec![PythonWork::Container(PythonContainer {
+        let mut stack = vec![PythonWork::Enter(PythonFrame {
             node,
             scope: scope.to_vec(),
             module_control_depth,
+            declaration: true,
+            wrapper: None,
+            lexical_scopes: Vec::new(),
         })];
         while let Some(work) = stack.pop() {
-            match work {
-                PythonWork::Container(container) => {
-                    let mut cursor = container.node.walk();
-                    let children = container
-                        .node
-                        .named_children(&mut cursor)
-                        .collect::<Vec<_>>();
-                    for child in children.into_iter().rev() {
-                        stack.push(PythonWork::Statement {
-                            node: child,
-                            scope: container.scope.clone(),
-                            module_control_depth: container.module_control_depth,
-                        });
-                    }
+            let PythonWork::Enter(frame) = work else {
+                self.structural_parents
+                    .pop()
+                    .expect("Python structural parent stack must balance");
+                continue;
+            };
+            let structural_parent = self.structural_parents.last().copied().flatten();
+            let structural_id = self.admit_structural(frame.node, structural_parent);
+            self.structural_parents
+                .push(structural_id.or(structural_parent));
+
+            if frame.node.kind() == "identifier" {
+                let text = py_node_text(frame.node, self.source).trim();
+                if !text.is_empty() {
+                    self.parsed.type_identifiers.insert(text.to_string());
                 }
-                PythonWork::Statement {
-                    node,
-                    scope,
-                    module_control_depth,
-                } => self.visit_statement(node, &scope, module_control_depth, &mut stack),
             }
+
+            if frame.node.kind() == "function_definition" {
+                self.capture_function_return_fact(frame.node, frame.wrapper);
+            }
+
+            if matches!(
+                frame.node.kind(),
+                "import_statement" | "import_from_statement"
+            ) {
+                self.visit_import_statement(frame.node, &frame.lexical_scopes);
+            }
+
+            let declaration_children = if frame.declaration {
+                self.visit_statement(
+                    frame.node,
+                    &frame.scope,
+                    frame.module_control_depth,
+                    frame.wrapper,
+                )
+            } else {
+                DeclarationChildren {
+                    body: None,
+                    container_scope: None,
+                    container_depth: frame.module_control_depth,
+                }
+            };
+
+            let mut children = Vec::new();
+            let mut cursor = frame.node.walk();
+            for child in frame.node.named_children(&mut cursor) {
+                let mut child_scope = frame.scope.clone();
+                let mut declaration = false;
+                let mut wrapper = None;
+                let mut child_depth = frame.module_control_depth;
+
+                if let Some((body, scope)) = &declaration_children.body
+                    && child.id() == body.id()
+                {
+                    declaration = true;
+                    child_scope = scope.clone();
+                } else if let Some(scope) = &declaration_children.container_scope {
+                    declaration = true;
+                    child_scope = scope.clone();
+                    child_depth = declaration_children.container_depth;
+                } else if frame.declaration
+                    && frame.node.kind() == "decorated_definition"
+                    && matches!(child.kind(), "class_definition" | "function_definition")
+                {
+                    // The wrapper owns the source range, while its concrete
+                    // definition owns the declaration semantics.
+                    declaration = true;
+                    wrapper = Some(frame.node);
+                }
+
+                let mut lexical_scopes = frame.lexical_scopes.clone();
+                if matches!(
+                    frame.node.kind(),
+                    "class_definition" | "function_definition" | "lambda"
+                ) {
+                    lexical_scopes.push(frame.node);
+                }
+                children.push(PythonFrame {
+                    node: child,
+                    scope: child_scope,
+                    module_control_depth: child_depth,
+                    declaration,
+                    wrapper,
+                    lexical_scopes,
+                });
+            }
+
+            stack.push(PythonWork::Exit);
+            stack.extend(children.into_iter().rev().map(PythonWork::Enter));
+        }
+    }
+
+    fn admit_structural(&mut self, node: Node<'_>, parent: Option<u32>) -> Option<u32> {
+        if !node.is_named() {
+            return parent;
+        }
+        let Some(raw_kind) = self.structural_kinds.kind_of(&node) else {
+            return parent;
+        };
+        if !PYTHON_STRUCTURAL_SPEC.should_extract(node, raw_kind) {
+            return parent;
+        }
+        let kind = PYTHON_STRUCTURAL_SPEC.refine_kind(
+            node,
+            raw_kind,
+            parent.map(|id| self.structural.normalized_kind(id)),
+            self.source,
+            self.call_site_context,
+        );
+        let fact_id = self
+            .structural
+            .enter(node, kind, parent, &mut self.source_facts)
+            .expect("Python structural fact collection must remain unbounded");
+        let mut sink = self.structural.role_sink(&mut self.source_facts);
+        PYTHON_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+        self.structural
+            .accept_roles(fact_id, sink.into_parts())
+            .expect("Python structural role collection must remain unbounded");
+        Some(fact_id)
+    }
+
+    fn replace_source_declaration(
+        &mut self,
+        declaration_node: Node<'_>,
+        name_node: Option<Node<'_>>,
+        unit: CodeUnit,
+        metadata_ordinal: Option<usize>,
+    ) -> SourceDeclarationId {
+        self.source_declaration_units
+            .retain(|(_, existing)| existing != &unit);
+        self.parsed
+            .source_declaration_metadata
+            .retain(|link| link.unit != unit);
+        self.record_source_declaration(declaration_node, name_node, unit, metadata_ordinal)
+    }
+
+    fn record_source_declaration(
+        &mut self,
+        declaration_node: Node<'_>,
+        name_node: Option<Node<'_>>,
+        unit: CodeUnit,
+        metadata_ordinal: Option<usize>,
+    ) -> SourceDeclarationId {
+        let occurrence = self.source_facts.intern_node(declaration_node);
+        let name = name_node.map(|node| self.source_facts.intern_node(node));
+        let declaration = self.source_facts.declare(occurrence, name);
+        self.source_declaration_units
+            .push((declaration, unit.clone()));
+        if let Some(metadata_ordinal) = metadata_ordinal {
+            self.parsed
+                .source_declaration_metadata
+                .push(SourceDeclarationMetadataLink {
+                    declaration,
+                    unit,
+                    metadata_ordinal,
+                });
+        }
+        declaration
+    }
+
+    fn capture_function_return_fact<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        wrapper: Option<Node<'tree>>,
+    ) {
+        let declaration_node = wrapper
+            .or_else(|| {
+                node.parent()
+                    .filter(|parent| parent.kind() == "decorated_definition")
+            })
+            .unwrap_or(node);
+        let occurrence = self.source_facts.intern_node(declaration_node);
+        let name = node
+            .child_by_field_name("name")
+            .map(|name| self.source_facts.intern_node(name));
+        let declaration = self.source_facts.declare(occurrence, name);
+        let return_annotation = node
+            .child_by_field_name("return_type")
+            .map(|annotation| self.source_facts.intern_node(annotation));
+        let annotation_references = node
+            .child_by_field_name("return_type")
+            .map(|annotation| {
+                python_annotation_references(annotation, self.source, &mut self.source_facts)
+            })
+            .unwrap_or_default();
+        let runtime_type = node
+            .child_by_field_name("return_type")
+            .and_then(|annotation| python_return_type_identity(annotation, self.source));
+        let fact_index = self.python_source_facts.callable_returns.len();
+        self.python_source_facts
+            .callable_returns
+            .push(PythonCallableReturnFact {
+                declaration,
+                return_annotation,
+                annotation_references,
+                runtime_type,
+            });
+        assert!(
+            self.python_callable_return_by_node
+                .insert(node.id(), fact_index)
+                .is_none(),
+            "each Python function definition must have one callable return fact"
+        );
+    }
+
+    fn link_source_declaration(
+        &mut self,
+        declaration: SourceDeclarationId,
+        unit: CodeUnit,
+        metadata_ordinal: Option<usize>,
+    ) {
+        self.source_declaration_units
+            .push((declaration, unit.clone()));
+        if let Some(metadata_ordinal) = metadata_ordinal {
+            self.parsed
+                .source_declaration_metadata
+                .push(SourceDeclarationMetadataLink {
+                    declaration,
+                    unit,
+                    metadata_ordinal,
+                });
         }
     }
 
@@ -808,27 +1048,30 @@ impl<'a> PythonVisitor<'a> {
         node: Node<'tree>,
         scope: &[Scope],
         module_control_depth: usize,
-        stack: &mut Vec<PythonWork<'tree>>,
-    ) {
+        wrapper: Option<Node<'tree>>,
+    ) -> DeclarationChildren<'tree> {
         match node.kind() {
-            "decorated_definition" => {
-                if let Some(definition) = node.child_by_field_name("definition") {
-                    self.visit_definition(
-                        definition,
-                        Some(node),
-                        scope,
-                        module_control_depth,
-                        stack,
-                    );
-                }
-            }
+            "decorated_definition" => DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            },
             "class_definition" | "function_definition" => {
-                self.visit_definition(node, None, scope, module_control_depth, stack)
+                self.visit_definition(node, wrapper, scope, module_control_depth)
             }
             "expression_statement" => {
-                self.visit_expression_statement(node, scope, module_control_depth)
+                self.visit_expression_statement(node, scope, module_control_depth);
+                DeclarationChildren {
+                    body: None,
+                    container_scope: None,
+                    container_depth: module_control_depth,
+                }
             }
-            "import_statement" | "import_from_statement" => self.visit_import_statement(node),
+            "import_statement" | "import_from_statement" => DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            },
             "if_statement" | "try_statement" | "with_statement" | "for_statement"
             | "while_statement" => {
                 let next_depth = if scope.is_empty() {
@@ -836,25 +1079,29 @@ impl<'a> PythonVisitor<'a> {
                 } else {
                     module_control_depth
                 };
-                stack.push(PythonWork::Container(PythonContainer {
-                    node,
-                    scope: scope.to_vec(),
-                    module_control_depth: next_depth,
-                }));
+                DeclarationChildren {
+                    body: None,
+                    container_scope: Some(scope.to_vec()),
+                    container_depth: next_depth,
+                }
             }
             "elif_clause" | "else_clause" | "except_clause" | "finally_clause" => {
-                stack.push(PythonWork::Container(PythonContainer {
-                    node,
-                    scope: scope.to_vec(),
-                    module_control_depth,
-                }));
+                DeclarationChildren {
+                    body: None,
+                    container_scope: Some(scope.to_vec()),
+                    container_depth: module_control_depth,
+                }
             }
-            "block" | "module" => stack.push(PythonWork::Container(PythonContainer {
-                node,
-                scope: scope.to_vec(),
-                module_control_depth,
-            })),
-            _ => {}
+            "block" | "module" => DeclarationChildren {
+                body: None,
+                container_scope: Some(scope.to_vec()),
+                container_depth: module_control_depth,
+            },
+            _ => DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            },
         }
     }
 
@@ -864,24 +1111,25 @@ impl<'a> PythonVisitor<'a> {
         wrapper: Option<Node<'tree>>,
         scope: &[Scope],
         module_control_depth: usize,
-        stack: &mut Vec<PythonWork<'tree>>,
-    ) {
+    ) -> DeclarationChildren<'tree> {
         match definition.kind() {
             "class_definition" => self.visit_class_definition(
                 definition,
                 wrapper.unwrap_or(definition),
                 scope,
                 module_control_depth,
-                stack,
             ),
             "function_definition" => self.visit_function_definition(
                 definition,
                 wrapper.unwrap_or(definition),
                 scope,
                 module_control_depth,
-                stack,
             ),
-            _ => {}
+            _ => DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            },
         }
     }
 
@@ -891,14 +1139,21 @@ impl<'a> PythonVisitor<'a> {
         range_node: Node<'tree>,
         scope: &[Scope],
         module_control_depth: usize,
-        stack: &mut Vec<PythonWork<'tree>>,
-    ) {
+    ) -> DeclarationChildren<'tree> {
         let Some(name_node) = node.child_by_field_name("name") else {
-            return;
+            return DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            };
         };
         let name = py_node_text(name_node, self.source).trim();
         if name.is_empty() {
-            return;
+            return DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            };
         }
 
         let capture = !scope.is_empty() || module_control_depth <= 1;
@@ -950,6 +1205,7 @@ impl<'a> PythonVisitor<'a> {
                 code_unit.clone(),
                 extract_python_supertypes(node, self.source),
             );
+            self.replace_source_declaration(range_node, Some(name_node), code_unit.clone(), None);
         }
 
         let mut next_scope = scope.to_vec();
@@ -962,12 +1218,12 @@ impl<'a> PythonVisitor<'a> {
                 method_receiver: None,
             });
         }
-        if let Some(body) = node.child_by_field_name("body") {
-            stack.push(PythonWork::Container(PythonContainer {
-                node: body,
-                scope: next_scope,
-                module_control_depth,
-            }));
+        DeclarationChildren {
+            body: node
+                .child_by_field_name("body")
+                .map(|body| (body, next_scope)),
+            container_scope: None,
+            container_depth: module_control_depth,
         }
     }
 
@@ -977,14 +1233,21 @@ impl<'a> PythonVisitor<'a> {
         range_node: Node<'tree>,
         scope: &[Scope],
         module_control_depth: usize,
-        stack: &mut Vec<PythonWork<'tree>>,
-    ) {
+    ) -> DeclarationChildren<'tree> {
         let Some(name_node) = node.child_by_field_name("name") else {
-            return;
+            return DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            };
         };
         let name = py_node_text(name_node, self.source).trim();
         if name.is_empty() {
-            return;
+            return DeclarationChildren {
+                body: None,
+                container_scope: None,
+                container_depth: module_control_depth,
+            };
         }
 
         // Only the shapes a reviewed summary can name are declarations: a
@@ -1049,12 +1312,43 @@ impl<'a> PythonVisitor<'a> {
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
             let signature = python_function_signature(range_node, self.source);
-            self.parsed.add_signature_with_metadata(
+            let fact_index = *self
+                .python_callable_return_by_node
+                .get(&node.id())
+                .expect("function return fact must precede declaration admission");
+            let return_fact = &self.python_source_facts.callable_returns[fact_index];
+            let return_declaration = return_fact.declaration;
+            let return_type_identity = return_fact.runtime_type.clone();
+            let return_type_text = return_fact.return_annotation.map(|annotation| {
+                let range = self.source_facts.occurrence(annotation).range;
+                self.source[range.start_byte..range.end_byte].to_string()
+            });
+            let metadata_ordinal = self.parsed.add_signature_with_metadata(
                 code_unit.clone(),
-                python_signature_metadata(signature, node, self.source).with_declaration_only(
-                    self.overload_decorators
-                        .decorates_as_overload(node, self.source),
+                python_signature_metadata(
+                    signature,
+                    node,
+                    self.source,
+                    return_type_text.as_deref(),
+                    return_type_identity,
                 ),
+            );
+            self.overload_metadata
+                .retain(|(existing, _, _)| existing != &code_unit);
+            self.overload_metadata.push((
+                code_unit.clone(),
+                metadata_ordinal,
+                PythonOverloadDecoratorBindings::overload_decorator_names(node, self.source),
+            ));
+            self.source_declaration_units
+                .retain(|(_, existing)| existing != &code_unit);
+            self.parsed
+                .source_declaration_metadata
+                .retain(|link| link.unit != code_unit);
+            self.link_source_declaration(
+                return_declaration,
+                code_unit.clone(),
+                Some(metadata_ordinal),
             );
             if let Some(module) = &self.module
                 && scope.is_empty()
@@ -1080,14 +1374,13 @@ impl<'a> PythonVisitor<'a> {
                     .then(|| python_instance_method_receiver_name(node, self.source))
                     .flatten(),
             });
-            if let Some(body) = node.child_by_field_name("body") {
-                stack.push(PythonWork::Container(PythonContainer {
-                    node: body,
-                    scope: next_scope,
-                    module_control_depth,
-                }));
-            }
-            return;
+            return DeclarationChildren {
+                body: node
+                    .child_by_field_name("body")
+                    .map(|body| (body, next_scope)),
+                container_scope: None,
+                container_depth: module_control_depth,
+            };
         }
 
         let mut next_scope = scope.to_vec();
@@ -1098,12 +1391,12 @@ impl<'a> PythonVisitor<'a> {
             code_unit: None,
             method_receiver: None,
         });
-        if let Some(body) = node.child_by_field_name("body") {
-            stack.push(PythonWork::Container(PythonContainer {
-                node: body,
-                scope: next_scope,
-                module_control_depth,
-            }));
+        DeclarationChildren {
+            body: node
+                .child_by_field_name("body")
+                .map(|body| (body, next_scope)),
+            container_scope: None,
+            container_depth: module_control_depth,
         }
     }
 
@@ -1128,9 +1421,12 @@ impl<'a> PythonVisitor<'a> {
         }
         let names = targets
             .iter()
-            .flat_map(|left| collect_assigned_names(*left, self.source))
-            .collect::<Vec<_>>();
-        for name in names {
+            .flat_map(|left| collect_assigned_name_nodes(*left, self.source));
+        for name_node in names {
+            let name = py_node_text(name_node, self.source).trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
             let (short_name, fq) = if let Some(parent) = scope.last() {
                 if parent.kind != ScopeKind::Class {
                     continue;
@@ -1176,6 +1472,14 @@ impl<'a> PythonVisitor<'a> {
                 code_unit.clone(),
                 py_node_text(node, self.source).trim().to_string(),
             );
+            if scope
+                .last()
+                .is_some_and(|parent| parent.kind == ScopeKind::Class)
+            {
+                self.record_source_declaration(node, Some(name_node), code_unit.clone(), None);
+            } else {
+                self.replace_source_declaration(node, Some(name_node), code_unit.clone(), None);
+            }
             if let Some(module) = &self.module
                 && scope.is_empty()
             {
@@ -1228,18 +1532,109 @@ impl<'a> PythonVisitor<'a> {
                     Some(parent_cu.clone()),
                     Some(parent_cu.clone()),
                 );
+                self.record_source_declaration(node, Some(node), code_unit.clone(), None);
             }
             self.parsed.add_signature(
                 code_unit.clone(),
-                py_node_text(left, self.source).trim().to_string(),
+                py_node_text(node, self.source).trim().to_string(),
             );
         }
     }
 
-    fn visit_import_statement(&mut self, node: Node<'_>) {
-        for info in python_import_infos_from_node(node, self.source) {
-            self.parsed.imports.push(info);
+    fn visit_import_statement(&mut self, node: Node<'_>, lexical_scopes: &[Node<'_>]) {
+        for syntax in python_import_syntaxes_from_node(node, self.source) {
+            if lexical_scopes.is_empty() {
+                self.overload_decorators.collect_import(&syntax.info);
+            }
+            let declaration = self.source_facts.intern_node(syntax.declaration);
+            let target = syntax
+                .target
+                .map(|node| self.source_facts.intern_node(node));
+            let alias_occurrence = syntax.alias.map(|node| self.source_facts.intern_node(node));
+            let lexical_scopes = lexical_scopes
+                .iter()
+                .map(|node| self.source_facts.intern_node(*node))
+                .collect();
+            let source_import = SourceImportFact::from_import(
+                syntax.info,
+                declaration,
+                target,
+                alias_occurrence,
+                lexical_scopes,
+            );
+            let id = SourceImportId::try_from_index(self.source_imports.len())
+                .expect("Python source import ids must fit in a u32");
+            self.source_imports.push(source_import);
+            self.generic_imports.push(id);
         }
+    }
+
+    fn finish(self) {
+        let PythonVisitor {
+            parsed,
+            source,
+            source_facts,
+            structural,
+            structural_parents,
+            source_imports,
+            generic_imports,
+            source_declaration_units,
+            python_source_facts,
+            python_callable_return_by_node: _,
+            overload_decorators,
+            overload_metadata,
+            ..
+        } = self;
+        assert_eq!(structural_parents, vec![None]);
+        let structural = structural
+            .finish()
+            .expect("Python structural fact collection must finish");
+        let occurrences = source_facts.finish();
+        assert!(
+            python_source_facts.valid_links(&occurrences),
+            "Python callable return facts must link to exact source identities"
+        );
+        for (unit, metadata_ordinal, decorators) in overload_metadata {
+            let declaration_only = decorators
+                .iter()
+                .any(|name| overload_decorators.matches_overload_binding(name));
+            if declaration_only
+                && let Some(metadata) = parsed
+                    .signature_metadata
+                    .get_mut(&unit)
+                    .and_then(|entries| entries.get_mut(metadata_ordinal))
+            {
+                *metadata = metadata.clone().with_declaration_only(true);
+            }
+        }
+        parsed.imports = generic_imports
+            .iter()
+            .map(|id| source_imports[id.index()].import_info(&occurrences))
+            .collect();
+        parsed.source_declaration_units = source_declaration_units;
+        parsed.source_facts = Some(ParsedSourceFacts {
+            cpp: None,
+            go: None,
+            java: None,
+            js_ts: None,
+            php: None,
+            scala: None,
+            ruby: None,
+            source_bytes: source.len(),
+            occurrences,
+            structural,
+            python: Some(python_source_facts),
+            native_site_occurrences: Vec::new(),
+            native_declaration_sources: Vec::new(),
+            declaration_visibilities: None,
+            rust_declaration_properties: Vec::new(),
+            rust_modules: None,
+            rust_types: Vec::new(),
+            rust_items: RustItemSourceFacts::default(),
+            imports: source_imports,
+            generic_imports,
+            rust_import_contexts: Vec::new(),
+        });
     }
 }
 
@@ -1253,14 +1648,17 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
     let mut parsed = ParsedFile::new(module_name.clone());
     let root = tree.root_node();
 
-    collect_python_identifiers(root, source, &mut parsed.type_identifiers);
-
     let module_code_unit = module_code_unit_from_fq(file, &module_components, module_fq.clone());
     if let Some(module) = module_code_unit.clone() {
         parsed.add_code_unit(module, root, source, None, None);
     }
 
-    let overload_decorators = PythonOverloadDecoratorBindings::collect(root, source);
+    let overload_decorators = PythonOverloadDecoratorBindings::default();
+    let structural_kinds = CompiledKinds::compile(
+        &tree_sitter_python::LANGUAGE.into(),
+        PYTHON_STRUCTURAL_SPEC.kind_table(),
+    );
+    let call_site_context = PYTHON_STRUCTURAL_SPEC.call_site_context(root, source);
     let mut visitor = PythonVisitor {
         file,
         source,
@@ -1268,9 +1666,28 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         module_fq: &module_fq,
         parsed: &mut parsed,
         module: module_code_unit,
-        overload_decorators: &overload_decorators,
+        overload_decorators,
+        source_facts: PrimarySourceFactCollector::new(source),
+        structural: StructuralFactCollector::new(
+            &PYTHON_STRUCTURAL_SPEC,
+            source,
+            &call_site_context,
+            ParentIndex::new(root),
+            usize::MAX,
+            None,
+        ),
+        structural_kinds: &structural_kinds,
+        call_site_context: &call_site_context,
+        structural_parents: vec![None],
+        source_imports: Vec::new(),
+        generic_imports: Vec::new(),
+        source_declaration_units: Vec::new(),
+        python_source_facts: PythonSourceFacts::default(),
+        python_callable_return_by_node: HashMap::default(),
+        overload_metadata: Vec::new(),
     };
     visitor.visit_container(root, &[], 0);
+    visitor.finish();
 
     parsed
 }
@@ -1326,48 +1743,52 @@ fn python_function_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
-    let with_modifiers = |metadata: SignatureMetadata| {
-        metadata.with_callable_modifiers(
+fn python_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+    return_type_text: Option<&str>,
+    return_type_identity: Option<StructuredTypeIdentity>,
+) -> SignatureMetadata {
+    let Some(parameters_node) = node
+        .child_by_field_name("parameters")
+        .filter(|parameters| parameters.start_position().row == parameters.end_position().row)
+    else {
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_return_type_text(return_type_text)
+            .with_return_type_identity(return_type_identity)
+            .with_dispatch_extensibility(DispatchExtensibility::Open)
+            .with_callable_modifiers(
+                python_callable_is_static(node, source),
+                false,
+                DeclaredVisibility::Unknown,
+            );
+    };
+    // The display header is the last line after any decorators. Parameter
+    // labels use offsets from their exact AST nodes, so repeated spellings in
+    // annotations/defaults cannot masquerade as another parameter's identity.
+    // The existing one-line display omits multiline continuations; omitted
+    // labels remain unavailable rather than pointing into unrelated text.
+    let header_start = signature.rfind('\n').map_or(0, |offset| offset + 1);
+    let parameters = python_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = py_node_text(label_node, source);
+            let start_byte = header_start + label_node.start_byte() - node.start_byte();
+            let end_byte = start_byte + label.len();
+            (signature.get(start_byte..end_byte) == Some(label))
+                .then(|| ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+        .with_return_type_text(return_type_text)
+        .with_return_type_identity(return_type_identity)
+        .with_dispatch_extensibility(DispatchExtensibility::Open)
+        .with_callable_modifiers(
             python_callable_is_static(node, source),
             false,
             DeclaredVisibility::Unknown,
         )
-    };
-    let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return with_modifiers(
-            SignatureMetadata::new(signature, Vec::new())
-                .with_dispatch_extensibility(DispatchExtensibility::Open),
-        );
-    };
-    let parameter_text = py_node_text(parameters_node, source).trim();
-    let Some(parameters_start) = signature.find(parameter_text) else {
-        return with_modifiers(
-            SignatureMetadata::new(signature, Vec::new())
-                .with_dispatch_extensibility(DispatchExtensibility::Open),
-        );
-    };
-    let parameters_end = parameters_start + parameter_text.len();
-    let mut search_start = parameters_start;
-    let parameters = python_parameter_label_nodes(parameters_node)
-        .into_iter()
-        .filter_map(|label_node| {
-            let label = py_node_text(label_node, source).trim();
-            if label.is_empty() || search_start > parameters_end {
-                return None;
-            }
-            let haystack = signature.get(search_start..parameters_end)?;
-            let relative_start = haystack.find(label)?;
-            let start_byte = search_start + relative_start;
-            let end_byte = start_byte + label.len();
-            search_start = end_byte;
-            Some(ParameterMetadata::new(label, start_byte, end_byte))
-        })
-        .collect();
-    with_modifiers(
-        SignatureMetadata::new(signature, parameters)
-            .with_dispatch_extensibility(DispatchExtensibility::Open),
-    )
 }
 
 /// Whether this Python callable binds no instance receiver, read from its own
@@ -1577,10 +1998,6 @@ fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 
 /// The node whose text names a base class: the value a subscripted base
 /// applies its type arguments to, or the base expression itself.
-///
-/// Base spellings recorded by [`extract_python_supertypes`] are looked up
-/// again against the class's own syntax, so both sides must reduce a base the
-/// same way or a generic base stops matching the spelling it produced.
 pub fn python_base_origin_node<'tree>(base: Node<'tree>) -> Node<'tree> {
     if base.kind() != "subscript" {
         return base;
@@ -1595,7 +2012,7 @@ pub fn python_base_origin_node<'tree>(base: Node<'tree>) -> Node<'tree> {
     }
 }
 
-fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
+fn collect_assigned_name_nodes<'tree>(node: Node<'tree>, _source: &str) -> Vec<Node<'tree>> {
     let mut names = Vec::new();
     walk_named_tree_preorder(node, true, |node| {
         match node.kind() {
@@ -1604,10 +2021,7 @@ fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
             // the member as a name, so do not descend into it.
             "attribute" | "subscript" => WalkControl::SkipChildren,
             "identifier" => {
-                let text = py_node_text(node, source).trim();
-                if !text.is_empty() {
-                    names.push(text.to_string());
-                }
+                names.push(node);
                 WalkControl::Continue
             }
             _ => WalkControl::Continue,
@@ -1740,6 +2154,360 @@ pub fn parse_python_tree(source: &str) -> Option<Tree> {
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .expect("failed to load python parser");
     parser.parse(source, None)
+}
+
+#[cfg(test)]
+mod primary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::python_facts::PythonAnnotationReferenceName;
+
+    fn parse(source: &str) -> ParsedFile {
+        let file = ProjectFile::new(std::env::temp_dir(), "m4.py");
+        let tree = parse_python_tree(source).expect("Python fixture tree");
+        parse_python_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn replacing_a_class_withdraws_descendant_metadata_links() {
+        let parsed = parse(
+            "class Replaced:\n    def obsolete(self): pass\n    class Nested:\n        def stale(self): pass\n\nclass Kept:\n    def stable(self): pass\n\nclass Replaced:\n    def current(self): pass\n",
+        );
+        let mut names = parsed
+            .source_declaration_metadata
+            .iter()
+            .map(|link| {
+                assert!(
+                    parsed.signature_metadata[&link.unit]
+                        .get(link.metadata_ordinal)
+                        .is_some(),
+                    "the link must name retained callable metadata: {link:?}"
+                );
+                link.unit.short_name().to_string()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["Kept.stable", "Replaced.current"]);
+    }
+
+    #[test]
+    fn canonical_declarations_share_structural_name_identity_and_exact_ranges() {
+        let source = "@decorate\nclass Item:\n    value = 1\n    value = 2\n    def write(self):\n        self.member = 1\n        self.member = 2\n\nfirst, second = 1, 2\n";
+        let parsed = parse(source);
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("canonical Python facts");
+        for (id, unit) in &parsed.source_declaration_units {
+            let declaration = facts.occurrences.declaration(*id);
+            let range = facts.occurrences.occurrence(declaration.occurrence).range;
+            assert!(parsed.ranges[unit].contains(&range), "{unit:?}: {range:?}");
+            let name = declaration.name.expect("source declaration name");
+            assert!(
+                facts
+                    .structural
+                    .nodes()
+                    .iter()
+                    .any(|node| node.occurrence == name),
+                "shared name identity for {unit:?}"
+            );
+        }
+        let fields = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| unit.short_name() == "Item.value")
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert_ne!(fields[0].0, fields[1].0);
+        assert_eq!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .filter(|(_, unit)| unit.short_name() == "Item.member")
+                .count(),
+            1
+        );
+        let class = parsed
+            .source_declaration_units
+            .iter()
+            .find(|(_, unit)| unit.short_name() == "Item")
+            .expect("decorated class");
+        let range = facts
+            .occurrences
+            .occurrence(facts.occurrences.declaration(class.0).occurrence)
+            .range;
+        assert_eq!(range.start_byte, 0);
+        assert_eq!(&source[range.start_byte..range.start_byte + 9], "@decorate");
+    }
+
+    #[test]
+    fn imports_keep_scope_order_and_late_overload_capture_without_local_pollution() {
+        let source = "@overload\ndef public(value: int):\n    pass\nfrom typing import overload\n\ndef outer():\n    from typing import overload as local_only\n@local_only\ndef ordinary(value: int):\n    pass\nmatch 1:\n    case 1:\n        from .models import Item as Imported\n";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().expect("canonical imports");
+        assert_eq!(facts.imports.len(), 3);
+        assert!(
+            facts.imports[0]
+                .path
+                .as_ref()
+                .unwrap()
+                .lexical_scopes
+                .is_empty()
+        );
+        assert_eq!(
+            facts.imports[1].path.as_ref().unwrap().lexical_scopes.len(),
+            1
+        );
+        assert!(
+            facts.imports[2]
+                .path
+                .as_ref()
+                .unwrap()
+                .lexical_scopes
+                .is_empty()
+        );
+        for (id, import) in facts.generic_imports.iter().zip(&parsed.imports) {
+            assert_eq!(
+                &facts.imports[id.index()].import_info(&facts.occurrences),
+                import
+            );
+        }
+        let metadata = |name: &str| {
+            parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.short_name() == name)
+                .unwrap()
+                .1
+        };
+        assert!(metadata("public")[0].is_declaration_only());
+        assert!(!metadata("ordinary")[0].is_declaration_only());
+    }
+
+    #[test]
+    fn aliased_import_leaves_keep_the_statement_and_exact_binder_tokens() {
+        let source = "from pkg import alpha as beta, beta as alpha\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.imports.len(), 2);
+        for (import, name) in parsed.imports.iter().zip(["beta", "alpha"]) {
+            assert_eq!(import.path.as_ref().unwrap().declaration_start_byte, 0);
+            let span = import.binder_span.as_ref().expect("exact alias binder");
+            assert_eq!(&source[span.start_byte..span.end_byte], name);
+        }
+    }
+
+    #[test]
+    fn parameter_offsets_use_ast_tokens_instead_of_annotation_spelling() {
+        let source = "@decorate(\"(first, second)\")\ndef call(first: Literal[\"second\"], second: int):\n    pass\n";
+        let parsed = parse(source);
+        let metadata = parsed
+            .signature_metadata
+            .values()
+            .flatten()
+            .find(|metadata| metadata.parameters().len() == 2)
+            .expect("parameter metadata");
+        let second = &metadata.parameters()[1];
+        assert_eq!(
+            &metadata.label()[second.start_byte()..second.end_byte()],
+            "second"
+        );
+        assert_eq!(
+            second.start_byte(),
+            metadata.label().rfind("second:").unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_and_recovered_python_publish_canonical_structural_facts() {
+        for source in [
+            "",
+            "class Broken(:\n    pass\ndef valid(value):\n    return value\n",
+        ] {
+            let parsed = parse(source);
+            let facts = parsed.source_facts.expect("complete producer publication");
+            assert_eq!(facts.source_bytes, source.len());
+            assert!(facts.python.is_some());
+            assert_eq!(parsed.resolution_facts, Default::default());
+            assert!(
+                facts
+                    .occurrences
+                    .occurrences()
+                    .iter()
+                    .all(|occurrence| occurrence.range.end_byte <= source.len())
+            );
+        }
+    }
+
+    #[test]
+    fn unmounted_annotated_functions_keep_source_declarations_and_return_facts() {
+        let source = "if outer:\n    if inner:\n        def hidden(value: int) -> Hidden:\n            pass\n\ndef visible() -> Visible:\n    pass\n";
+        let parsed = parse(source);
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("canonical Python facts");
+        let python = facts.python.as_ref().expect("Python source facts");
+        assert_eq!(python.callable_returns.len(), 2);
+
+        let fact_named = |name: &str| {
+            python
+                .callable_returns
+                .iter()
+                .find(|fact| {
+                    let declaration = facts.occurrences.declaration(fact.declaration);
+                    let Some(name_occurrence) = declaration.name else {
+                        return false;
+                    };
+                    let range = facts.occurrences.occurrence(name_occurrence).range;
+                    &source[range.start_byte..range.end_byte] == name
+                })
+                .expect("callable return fact")
+        };
+        let hidden = fact_named("hidden");
+        let hidden_declaration = facts.occurrences.declaration(hidden.declaration);
+        let hidden_range = facts
+            .occurrences
+            .occurrence(hidden_declaration.occurrence)
+            .range;
+        assert_eq!(
+            &source[hidden_range.start_byte..hidden_range.start_byte + 3],
+            "def"
+        );
+        let hidden_annotation = hidden.return_annotation.expect("hidden annotation");
+        let hidden_annotation_range = facts.occurrences.occurrence(hidden_annotation).range;
+        assert_eq!(
+            &source[hidden_annotation_range.start_byte..hidden_annotation_range.end_byte],
+            "Hidden"
+        );
+        assert!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .all(|(_, unit)| unit.short_name() != "hidden")
+        );
+
+        let visible = fact_named("visible");
+        assert!(visible.return_annotation.is_some());
+        assert!(visible.runtime_type.is_some());
+        assert!(
+            parsed
+                .source_declaration_units
+                .iter()
+                .any(|(_, unit)| unit.short_name() == "visible")
+        );
+        let visible_metadata = parsed
+            .signature_metadata
+            .iter()
+            .find(|(unit, _)| unit.short_name() == "visible")
+            .and_then(|(_, metadata)| metadata.first())
+            .expect("visible signature metadata");
+        assert_eq!(visible_metadata.return_type_text(), Some("Visible"));
+        assert_eq!(
+            visible_metadata.return_type_identity(),
+            visible.runtime_type.as_ref()
+        );
+    }
+
+    #[test]
+    fn return_fact_preserves_unsupported_annotation_without_runtime_identity() {
+        let source = "def unsupported() -> Left | Right:\n    pass\n\ndef plain():\n    pass\n";
+        let parsed = parse(source);
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("canonical Python facts");
+        let python = facts.python.as_ref().expect("Python source facts");
+        let by_name = |name: &str| {
+            python
+                .callable_returns
+                .iter()
+                .find(|fact| {
+                    let declaration = facts.occurrences.declaration(fact.declaration);
+                    let Some(name_occurrence) = declaration.name else {
+                        return false;
+                    };
+                    let range = facts.occurrences.occurrence(name_occurrence).range;
+                    &source[range.start_byte..range.end_byte] == name
+                })
+                .expect("callable return fact")
+        };
+        let unsupported = by_name("unsupported");
+        assert!(unsupported.return_annotation.is_some());
+        assert!(unsupported.runtime_type.is_none());
+        let plain = by_name("plain");
+        assert!(plain.return_annotation.is_none());
+        assert!(plain.runtime_type.is_none());
+    }
+
+    #[test]
+    fn return_annotation_references_preserve_runtime_owners() {
+        let source = "def generic() -> list[User]:\n    pass\n\ndef nested() -> list[pkg.User]:\n    pass\n\ndef direct() -> pkg.User:\n    pass\n\ndef quoted() -> \"pkg.User\":\n    pass\n\ndef unsupported() -> Left | Right:\n    pass\n";
+        let parsed = parse(source);
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .expect("canonical Python facts");
+        let python = facts.python.as_ref().expect("Python source facts");
+        let fact_named = |name: &str| {
+            python
+                .callable_returns
+                .iter()
+                .find(|fact| {
+                    let declaration = facts.occurrences.declaration(fact.declaration);
+                    let Some(name_occurrence) = declaration.name else {
+                        return false;
+                    };
+                    let range = facts.occurrences.occurrence(name_occurrence).range;
+                    &source[range.start_byte..range.end_byte] == name
+                })
+                .expect("callable return fact")
+        };
+        let generic = fact_named("generic");
+        assert_eq!(
+            generic
+                .annotation_references
+                .iter()
+                .map(|reference| &reference.name)
+                .collect::<Vec<_>>(),
+            vec![&PythonAnnotationReferenceName::Lexical("list".to_string())]
+        );
+
+        // Generic arguments describe elements, not the returned runtime owner.
+        let nested = fact_named("nested");
+        assert_eq!(nested.annotation_references.len(), 1);
+        assert!(matches!(
+            &nested.annotation_references[0].name,
+            PythonAnnotationReferenceName::Lexical(name) if name == "list"
+        ));
+
+        let direct = fact_named("direct");
+        assert_eq!(direct.annotation_references.len(), 3);
+        assert_eq!(direct.annotation_references[0].subtree_end, 3);
+        assert_eq!(direct.annotation_references[0].lookup_depth, 1);
+        assert!(matches!(
+            &direct.annotation_references[0].name,
+            PythonAnnotationReferenceName::Qualified(path)
+                if path == &vec!["pkg".to_string(), "User".to_string()]
+        ));
+
+        let quoted = fact_named("quoted");
+        assert_eq!(quoted.annotation_references.len(), 1);
+        assert!(matches!(
+            &quoted.annotation_references[0].name,
+            PythonAnnotationReferenceName::Lexical(name) if name == "pkg.User"
+        ));
+        assert_eq!(quoted.annotation_references[0].lookup_depth, 2);
+
+        let unsupported = fact_named("unsupported");
+        assert!(
+            unsupported
+                .annotation_references
+                .iter()
+                .all(|reference| !matches!(
+                    &reference.name,
+                    PythonAnnotationReferenceName::Qualified(_)
+                ))
+        );
+    }
 }
 
 /// Every target a possibly chained assignment binds.

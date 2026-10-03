@@ -643,10 +643,16 @@ pub struct ParentIndex<'tree> {
 impl<'tree> ParentIndex<'tree> {
     /// Record the parent of every node beneath `root`.
     pub fn new(root: Node<'tree>) -> Self {
+        Self::new_with_visit(root, |_| {})
+    }
+
+    /// Build the parent index while visiting each node once in AST preorder.
+    pub fn new_with_visit(root: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) -> Self {
         let mut parents = crate::hash::HashMap::default();
         let mut cursor = root.walk();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            visit(node);
             // Visible children, named and anonymous alike: that is the relation
             // `ts_node_parent` walks, so an index built from anything narrower
             // would answer a different question for an anonymous node.
@@ -656,6 +662,7 @@ impl<'tree> ParentIndex<'tree> {
             for child in &stack[before..] {
                 parents.insert(child.id(), node);
             }
+            stack[before..].reverse();
         }
         Self {
             parents,
@@ -680,6 +687,29 @@ impl<'tree> ParentIndex<'tree> {
         }
     }
 
+    /// Record an edge supplied by a coordinated primary traversal. Record
+    /// visible named and anonymous children before visiting them, so ancestry
+    /// consumers need no independent whole-tree indexing pass.
+    pub fn record_parent(&mut self, child: Node<'tree>, parent: Node<'tree>) {
+        if let Some(previous) = self.parents.insert(child.id(), parent) {
+            assert_eq!(previous.id(), parent.id(), "a parser node has one parent");
+        }
+    }
+
+    /// Record `node` as the parent of each of its visible children.
+    ///
+    /// A traversal that already reaches every node calls this as it enters one
+    /// and pays no second whole-tree pass. Visible children, named and
+    /// anonymous alike: that is the relation `ts_node_parent` walks, so an
+    /// index built from anything narrower would answer a different question
+    /// for an anonymous node.
+    pub fn record_children(&mut self, node: Node<'tree>) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.record_parent(child, node);
+        }
+    }
+
     /// The parent of `node`, or `None` for the root.
     ///
     /// A node the index does not hold -- the indexed root, a node of another
@@ -693,6 +723,12 @@ impl<'tree> ParentIndex<'tree> {
             Some(parent) => Some(*parent),
             None => node.parent(),
         }
+    }
+
+    /// Whether this index contains a descendant of its indexed root.
+    /// The root itself is deliberately excluded; callers compare its identity separately.
+    pub fn contains(&self, node: Node<'_>) -> bool {
+        self.parents.contains_key(&node.id())
     }
 
     /// Every ancestor of `node`, innermost first, ending at the root.

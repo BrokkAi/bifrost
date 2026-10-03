@@ -54,6 +54,10 @@ const packed = new Set(files.map((file) => file.path));
 const requiredFiles = [
   "bin/bifrost-launcher.mjs",
   "bin/bifrost-launcher.d.mts",
+  "bin/open-packs.mjs",
+  "bin/open-packs.d.mts",
+  "bin/pack-release.schema.json",
+  "bin/pack-release.v1.schema.json",
   "bifrost-release.json",
   ".codex-plugin/plugin.json",
   ".mcp.json",

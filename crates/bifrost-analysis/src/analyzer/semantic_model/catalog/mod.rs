@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -19,8 +19,8 @@ use super::validate::is_canonical_relative_path;
 use super::{
     ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
     CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
-    SEMANTIC_MODEL_SCHEMA_VERSION, decode_manifest, decode_validated_shard_for_manifest,
-    validate_manifest_inventory,
+    SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, decode_manifest,
+    decode_validated_shard_for_manifest, validate_manifest_inventory,
 };
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::store::{
@@ -100,7 +100,16 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// overload for the ignored-status rule (#3649).
 /// 33: Java functional-interface inputs retain sealed declarations and do not
 /// classify static interface methods as abstract (#3702).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 33;
+/// 34: concurrent producers added scoped callable inventories (#3702) and
+/// reviewed Statement.executeQuery(String) compatibility/formal facts (#3699).
+/// 35: the functional-target branch resolves implicit java.lang declarations.
+/// 36: merged producer output includes both branches; neither earlier cache
+/// epoch represents the combined declaration semantics.
+/// 37: Java producers retain explicit final-method evidence independently of virtuality defaults.
+/// 38: Python class hierarchy extraction no longer treats `metaclass=` as an instance base.
+/// 39: TypeScript default exports retain aliases; unsupported exports make packs partial.
+/// 40: combined native schema8 and TypeScript producer changes invalidate both earlier outputs.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 40;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -140,11 +149,21 @@ pub fn open_default_semantic_pack_catalog(
     let directory_name = catalog_root
         .file_name()
         .expect("the default semantic-pack catalog has a directory name");
-    SemanticPackCatalog::open(
+    let mut catalog = SemanticPackCatalog::open(
         &cache_dir.join(directory_name),
         CatalogOpenMode::ReadWrite,
         options,
-    )
+    )?;
+    // The local catalog owns workspace sources and activation state. Only
+    // exact generated productions may cross into the host cache.
+    if std::env::var_os(SEMANTIC_PACK_CACHE_ROOT_ENV).is_none_or(|value| value.is_empty()) {
+        catalog.shared_generated_root = crate::gitblob::machine_cache_dir().map(|root| {
+            root.join(format!(
+                "generated-semantic-packs.v{CATALOG_SCHEMA_VERSION}"
+            ))
+        });
+    }
+    Ok(catalog)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +499,11 @@ impl AcquisitionReceiptRequest {
                 hasher.field(
                     "bifrost_version",
                     query.bifrost_version.to_string().as_bytes(),
+                );
+                hasher.sequence(
+                    "supported_semantic_model_schema_versions",
+                    SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
+                    |hasher, version| hasher.field("version", &version.to_be_bytes()),
                 );
             }
         }
@@ -960,11 +984,18 @@ pub struct SemanticPackCatalog {
     validated_python_profile_packs: Mutex<HashSet<String>>,
     manifest_decodes: AtomicU64,
     manifest_inventory_validations: AtomicU64,
+    shard_validations: AtomicU64,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
     sql_statements: AtomicU64,
     object_reads: AtomicU64,
     mutation_generation: AtomicU64,
+    shared_generated_root: Option<PathBuf>,
+    // The opened host catalog at `shared_generated_root`. A read-write open
+    // reconciles every stored object, and each dependency lookup that missed
+    // locally used to pay it: 433 opens and about 4 s per warm start of an npm
+    // workspace (#3748). A failed open is not kept, so the next use retries.
+    shared_generated: OnceLock<Box<SemanticPackCatalog>>,
     _ephemeral_root: Option<TempDir>,
 }
 
@@ -989,6 +1020,54 @@ struct DecodedManifestMemo {
 /// costs one decode per distinct manifest, never one per row. The bound keeps a
 /// catalog that serves many packs from retaining unbounded decoded state.
 const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
+
+// Increment when artifact semantic validation or normalization changes. A
+// certificate proves those checks for exact bytes under exact decode limits;
+// it never replaces the stored/content digest checks on each load.
+const SHARD_VALIDATION_VERSION: u32 = 3;
+
+fn decode_limits_digest(limits: &DecodeLimits) -> String {
+    let mut hasher = CanonicalHasher::new(b"bifrost.semantic-pack.decode-limits.v1");
+    for (name, value) in [
+        ("manifest_bytes", limits.max_manifest_bytes as u64),
+        ("stored_shard_bytes", limits.max_stored_shard_bytes as u64),
+        ("raw_shard_bytes", limits.max_raw_shard_bytes as u64),
+        ("total_raw_bytes", limits.max_total_raw_bytes),
+        ("shards", limits.max_shards as u64),
+        ("records_per_shard", limits.max_records_per_shard as u64),
+        ("total_records", limits.max_total_records),
+        ("text_bytes", limits.max_text_bytes as u64),
+        ("depth", limits.max_depth as u64),
+    ] {
+        hasher.field(name, &value.to_be_bytes());
+    }
+    lower_hex_string(&hasher.finish())
+}
+
+const SHARED_PRODUCTION_PRESENT_SQL: &str = "SELECT EXISTS(
+    SELECT 1 FROM catalog_verified_generated_productions WHERE production_digest = ?1)";
+
+const CERTIFIED_SHARD_SQL: &str = "SELECT EXISTS(
+    SELECT 1 FROM catalog_shard_validations
+    WHERE manifest_digest = ?1 AND shard_id = ?2
+      AND validation_version = ?3 AND limits_sha256 = ?4)";
+
+fn record_shard_validation(
+    connection: &Connection,
+    manifest: &str,
+    shard: &str,
+    limits: &str,
+) -> Result<(), CatalogError> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO catalog_shard_validations
+         (manifest_digest, shard_id, validation_version, limits_sha256)
+         VALUES (?1, ?2, ?3, ?4)",
+            params![manifest, shard, SHARD_VALIDATION_VERSION, limits],
+        )
+        .map_err(|error| CatalogError::sqlite("record shard validation", error))?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticPackCatalogCacheIdentity {
@@ -1147,11 +1226,14 @@ impl SemanticPackCatalog {
             validated_python_profile_packs: Mutex::new(HashSet::new()),
             manifest_decodes: AtomicU64::new(0),
             manifest_inventory_validations: AtomicU64::new(0),
+            shard_validations: AtomicU64::new(0),
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
             sql_statements: AtomicU64::new(0),
             object_reads: AtomicU64::new(0),
             mutation_generation: AtomicU64::new(0),
+            shared_generated_root: None,
+            shared_generated: OnceLock::new(),
             _ephemeral_root: None,
         })
     }
@@ -1170,12 +1252,166 @@ impl SemanticPackCatalog {
         &self.root
     }
 
+    fn shared_generated_catalog(&self) -> Option<&Self> {
+        let root = self.shared_generated_root.as_ref()?;
+        if let Some(catalog) = self.shared_generated.get() {
+            return Some(catalog);
+        }
+        match Self::open(root, CatalogOpenMode::ReadWrite, self.options.clone()) {
+            // A concurrent first use may have stored its own open; keep that one.
+            Ok(catalog) => Some(self.shared_generated.get_or_init(|| Box::new(catalog))),
+            Err(error) => {
+                eprintln!(
+                    "shared generated cache {root:?} is unavailable; using the workspace catalog: {error}"
+                );
+                None
+            }
+        }
+    }
+
+    // Publication is optional: a verified local production remains usable if
+    // the additional host copy cannot be written. Retry on the next local hit.
+    fn retain_shared_generated(&self, production: &GeneratedProduction) {
+        let Some(shared) = self.shared_generated_catalog() else {
+            return;
+        };
+        let retained = (|| -> Result<(), CatalogError> {
+            if shared.has_verified_generated_production(&production.key)? {
+                let connection = shared
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
+                connection
+                    .execute(
+                        "UPDATE catalog_packs SET last_used_at = ?2
+                     WHERE manifest_digest = ?1 AND COALESCE(last_used_at, 0) < ?2 - 60",
+                        params![
+                            production.manifest_digest,
+                            crate::cache_db::now_unix_seconds()
+                        ],
+                    )
+                    .map_err(|error| CatalogError::sqlite("touch shared production", error))?;
+            } else {
+                shared.copy_generated_from(self, production)?;
+                // Only publication pays for bounded cleanup. Active imports
+                // hold leases; recent host hits refresh the age above.
+                shared.garbage_collect(&CatalogGcOptions::default())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = retained {
+            eprintln!(
+                "could not retain shared generated production {}; the workspace copy remains available and publication will be retried: {error}",
+                production.key.production_digest()
+            );
+        }
+    }
+
+    fn has_verified_generated_production(
+        &self,
+        key: &GeneratedProductionKey,
+    ) -> Result<bool, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        connection
+            .query_row(
+                SHARED_PRODUCTION_PRESENT_SQL,
+                [key.production_digest()],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check shared production publication", error))
+    }
+
+    // One exact production is the transfer unit. Installed/workspace sources,
+    // activation history, pins and configuration never cross this boundary.
+    fn copy_generated_from(
+        &self,
+        source: &Self,
+        production: &GeneratedProduction,
+    ) -> Result<(), CatalogError> {
+        let _scope = crate::profiling::scope("semantic_pack.copy_generated");
+        let lease = source.lease(
+            &production.manifest_digest,
+            "generated-transfer",
+            Duration::from_secs(300),
+        )?;
+        let manifest = source.stored_manifest(&production.manifest_digest)?;
+        validate_generated_pack_identity(&production.key, &manifest)?;
+        let manifest_bytes = {
+            let connection = source
+                .connection
+                .lock()
+                .expect("semantic-pack catalog connection mutex poisoned");
+            stored_manifest_bytes_on(&connection, &production.manifest_digest)?
+                .ok_or(CatalogError::Unavailable)?
+        };
+        let mut shards = Vec::with_capacity(manifest.shards.len());
+        for descriptor in &manifest.shards {
+            let relative = storage::relative_object_path(&descriptor.stored_sha256);
+            let bytes = storage::read(
+                source.root(),
+                &relative.to_string_lossy(),
+                &descriptor.stored_sha256,
+                descriptor.stored_size,
+            )?;
+            shards.push(super::CompiledShardArtifact {
+                descriptor: descriptor.clone(),
+                bytes,
+            });
+        }
+        let pack = CompiledSemanticModelPack {
+            manifest: (*manifest).clone(),
+            manifest_bytes,
+            shards,
+        };
+        let extraction = source.extraction_accounting(&production.manifest_digest)?;
+        if let Some(extraction) = &extraction {
+            validate_extraction_accounting(extraction)?;
+        }
+        self.install_with(
+            &pack,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::Generated,
+                source_id: production.key.source_id(),
+            },
+            |transaction, manifest, now| {
+                insert_generated_production(transaction, &production.key, manifest, now)?;
+                if let Some(extraction) = &extraction {
+                    insert_extraction_accounting(
+                        transaction,
+                        &manifest.content_sha256,
+                        extraction,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        source
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned")
+            .execute(
+                "UPDATE catalog_packs SET last_used_at = ?2 WHERE manifest_digest = ?1",
+                params![
+                    production.manifest_digest,
+                    crate::cache_db::now_unix_seconds()
+                ],
+            )
+            .map_err(|error| CatalogError::sqlite("touch imported production", error))?;
+        lease.release()?;
+        Ok(())
+    }
+
     pub(crate) fn generated_production_lock(
         &self,
         key: &GeneratedProductionKey,
     ) -> Result<GeneratedProductionLock, CatalogError> {
         self.require_writable()?;
-        let file = storage::open_generated_production_lock(&self.root, key.production_digest())?;
+        let shared = self.shared_generated_catalog();
+        let lock_root = shared.map_or(self.root(), Self::root);
+        let file = storage::open_generated_production_lock(lock_root, key.production_digest())?;
         Ok(GeneratedProductionLock { file })
     }
 
@@ -1192,6 +1428,11 @@ impl SemanticPackCatalog {
     ///
     /// A cached generated-pack lookup must not read shard objects (#2875).
     /// Tests pin that with the difference between two snapshots.
+    /// Full semantic shard validations on cache reads, excluding hydration.
+    pub fn shard_validation_count(&self) -> u64 {
+        self.shard_validations.load(Ordering::Relaxed)
+    }
+
     pub fn object_read_count(&self) -> u64 {
         self.object_reads.load(Ordering::Relaxed)
     }
@@ -1247,6 +1488,7 @@ impl SemanticPackCatalog {
         bytes: &[u8],
     ) -> Result<CompiledShard, CatalogError> {
         self.validated_manifest_inventory(manifest)?;
+        self.shard_validations.fetch_add(1, Ordering::Relaxed);
         decode_validated_shard_for_manifest(
             manifest,
             descriptor,
@@ -1672,6 +1914,11 @@ impl SemanticPackCatalog {
                 now,
             )
         })?;
+        self.retain_shared_generated(&GeneratedProduction {
+            key: key.clone(),
+            manifest_digest: install.manifest_digest.clone(),
+            completeness: pack.manifest.completeness,
+        });
         Ok(GeneratedInstallOutcome {
             production: GeneratedProduction {
                 key: key.clone(),
@@ -1863,6 +2110,11 @@ impl SemanticPackCatalog {
         let install = self.install_with(pack, &source, |transaction, manifest, now| {
             insert_generated_production(transaction, key, manifest, now)
         })?;
+        self.retain_shared_generated(&GeneratedProduction {
+            key: key.clone(),
+            manifest_digest: install.manifest_digest.clone(),
+            completeness: pack.manifest.completeness,
+        });
         Ok(GeneratedInstallOutcome {
             production: GeneratedProduction {
                 key: key.clone(),
@@ -1931,6 +2183,16 @@ impl SemanticPackCatalog {
                 key.production_digest()
             )));
         }
+        drop(connection);
+        if let Some(shared) = self.shared_generated_catalog() {
+            // Failure of the optional host mapping does not invalidate the
+            // local identity just committed. A later local hit retries it.
+            if let Err(error) = shared.install_generated_source_identity(source_identity, key) {
+                eprintln!(
+                    "could not mirror generated source identity to the host cache; retaining the workspace identity: {error}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1978,7 +2240,17 @@ impl SemanticPackCatalog {
             .map_err(|error| CatalogError::sqlite("lookup generated source identity", error))?;
         drop(connection);
         let Some((production_digest, input_digest)) = row else {
-            return Ok(None);
+            let Some(shared) = self.shared_generated_catalog() else {
+                return Ok(None);
+            };
+            let Some(production) =
+                shared.generated_production_by_source_identity(source_identity, producer)?
+            else {
+                return Ok(None);
+            };
+            self.copy_generated_from(shared, &production)?;
+            self.install_generated_source_identity(source_identity, &production.key)?;
+            return Ok(Some(production));
         };
         let key = GeneratedProductionKey::new(
             input_digest,
@@ -2015,16 +2287,10 @@ impl SemanticPackCatalog {
             .expect("semantic-pack catalog connection mutex poisoned");
         let row = connection
             .query_row(
-                "SELECT gp.input_digest, gp.producer_name, gp.producer_version,
-                        gp.schema_version, gp.manifest_digest, p.manifest_bytes
-                 FROM catalog_generated_productions AS gp
-                 JOIN catalog_packs AS p
-                   ON p.manifest_digest = gp.manifest_digest
-                 JOIN catalog_sources AS source
-                   ON source.manifest_digest = gp.manifest_digest
-                  AND source.source_kind = 'generated'
-                  AND source.source_id = 'production:' || gp.production_digest
-                 WHERE gp.production_digest = ?1 AND p.state = 'verified'",
+                "SELECT input_digest, producer_name, producer_version,
+                        schema_version, manifest_digest, manifest_bytes
+                 FROM catalog_verified_generated_productions
+                 WHERE production_digest = ?1",
                 [&key.production_digest],
                 |row| {
                     Ok((
@@ -2049,7 +2315,14 @@ impl SemanticPackCatalog {
             manifest_bytes,
         )) = row
         else {
-            return Ok(None);
+            let Some(shared) = self.shared_generated_catalog() else {
+                return Ok(None);
+            };
+            let Some(production) = shared.generated_production(key)? else {
+                return Ok(None);
+            };
+            self.copy_generated_from(shared, &production)?;
+            return Ok(Some(production));
         };
         let validated = (|| -> Result<GeneratedProduction, CatalogError> {
             let stored_key = GeneratedProductionKey::new(
@@ -2073,7 +2346,10 @@ impl SemanticPackCatalog {
             })
         })();
         match validated {
-            Ok(production) => Ok(Some(production)),
+            Ok(production) => {
+                self.retain_shared_generated(&production);
+                Ok(Some(production))
+            }
             Err(error) => {
                 self.rejected_manifests
                     .lock()
@@ -2235,7 +2511,7 @@ impl SemanticPackCatalog {
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(9)?,
                         row.get::<_, Vec<u8>>(10)?,
                         row.get::<_, String>(11)?,
                         row.get::<_, String>(12)?,
@@ -2271,7 +2547,8 @@ impl SemanticPackCatalog {
             || producer_version != validated.manifest.producer.version
             || language != validated.manifest.language
             || ecosystem != validated.manifest.ecosystem
-            || bifrost_compatibility != validated.manifest.compatibility.bifrost
+            || bifrost_compatibility.as_deref()
+                != validated.manifest.compatibility.bifrost.as_deref()
             || stored_provenance_json != provenance_json
             || license != validated.manifest.license
             || completeness != completeness_name(&validated.manifest.completeness)
@@ -2603,6 +2880,12 @@ impl SemanticPackCatalog {
                 &validated.manifest.content_sha256,
                 ordinal,
                 descriptor,
+            )?;
+            record_shard_validation(
+                &transaction,
+                &validated.manifest.content_sha256,
+                &descriptor.shard_id,
+                &decode_limits_digest(&self.options.decode_limits),
             )?;
             insert_selectors(
                 &transaction,
@@ -3924,7 +4207,41 @@ impl SemanticPackCatalog {
             &candidate.descriptor.stored_sha256,
             row.1,
         )?;
-        let shard = self.decode_stored_shard(&manifest, &candidate.descriptor, &bytes)?;
+        self.validated_manifest_inventory(&manifest)?;
+        let limits_digest = decode_limits_digest(&self.options.decode_limits);
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        let certified: bool = connection
+            .query_row(
+                CERTIFIED_SHARD_SQL,
+                params![
+                    manifest.content_sha256,
+                    candidate.shard_id,
+                    SHARD_VALIDATION_VERSION,
+                    limits_digest
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("lookup shard validation", error))?;
+        let shard = if certified {
+            super::artifact::hydrate_certified_shard(
+                &manifest,
+                &candidate.descriptor,
+                &bytes,
+                &self.options.decode_limits,
+            )
+            .map_err(|error| CatalogError::Artifact(error.to_string()))?
+        } else {
+            let shard = self.decode_stored_shard(&manifest, &candidate.descriptor, &bytes)?;
+            if self.mode == CatalogOpenMode::ReadWrite {
+                record_shard_validation(
+                    &connection,
+                    &manifest.content_sha256,
+                    &candidate.shard_id,
+                    &limits_digest,
+                )?;
+            }
+            shard
+        };
         if self.mode == CatalogOpenMode::ReadWrite {
             connection
                 .execute(
@@ -4257,6 +4574,11 @@ fn durable_selector_rows_on(
     query: &SemanticPackSelectorQuery,
     max_rows: usize,
 ) -> Result<Vec<DurableSelectorRow>, CatalogError> {
+    let supported_schema_versions = SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let selector_source = if query.package.is_some() {
         "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
          WHERE package_name IS NULL
@@ -4301,6 +4623,7 @@ fn durable_selector_rows_on(
           AND generated.manifest_digest = source.manifest_digest
           AND source.source_id = 'production:' || generated.production_digest
          WHERE p.state = 'verified'
+           AND p.schema_version IN ({supported_schema_versions})
            AND (generated.production_digest IS NULL OR generated.generated_cache_version = ?10)
            AND p.language = ?1
            AND p.ecosystem = ?2
@@ -4867,7 +5190,7 @@ fn insert_manifest(
                 &manifest.producer.version,
                 &manifest.language,
                 &manifest.ecosystem,
-                &manifest.compatibility.bifrost,
+                manifest.compatibility.bifrost.as_deref(),
                 serde_json::to_vec(&manifest.provenance)
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?,
                 &manifest.license,
@@ -5207,9 +5530,11 @@ fn manifest_compatible(
     manifest: &CompiledPackManifest,
     query: &SemanticPackSelectorQuery,
 ) -> Result<bool, CatalogError> {
-    let requirement = VersionReq::parse(&manifest.compatibility.bifrost)
-        .map_err(|error| CatalogError::Integrity(error.to_string()))?;
-    if !requirement.matches(&query.bifrost_version) {
+    if !manifest
+        .compatibility
+        .matches_engine(manifest.schema_version, &query.bifrost_version)
+        .map_err(|error| CatalogError::Integrity(error.to_string()))?
+    {
         return Ok(false);
     }
     let Some(toolchain) = &query.toolchain else {
@@ -5315,9 +5640,11 @@ fn version_near_miss(
     selectors: &[ActivationSelector],
     query: &SemanticPackSelectorQuery,
 ) -> Result<Option<SemanticPackVersionNearMiss>, CatalogError> {
-    let bifrost = VersionReq::parse(&manifest.compatibility.bifrost)
-        .map_err(|error| CatalogError::Integrity(error.to_string()))?;
-    if !bifrost.matches(&query.bifrost_version) {
+    if !manifest
+        .compatibility
+        .matches_engine(manifest.schema_version, &query.bifrost_version)
+        .map_err(|error| CatalogError::Integrity(error.to_string()))?
+    {
         return Ok(None);
     }
     if let Some(toolchain) = &query.toolchain {
@@ -5817,6 +6144,8 @@ mod generated_production_cache_version_tests {
         catalog.connection.lock().unwrap().execute_batch(
             "CREATE UNIQUE INDEX catalog_generated_productions_identity ON catalog_generated_productions(input_digest, producer_name, producer_version, schema_version);
              ALTER TABLE catalog_generated_productions DROP COLUMN generated_cache_version;
+             DROP VIEW catalog_verified_generated_productions;
+             DROP TABLE catalog_shard_validations;
              PRAGMA user_version = 8;"
         ).unwrap();
         drop(catalog);
@@ -6149,5 +6478,446 @@ mod stored_manifest_memo_tests {
             1,
             "loading every shard must not revalidate the manifest inventory"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_compatibility_catalog_tests {
+    use super::{
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, DurablePackSource,
+        DurablePackSourceKind, SemanticPackCatalog, SemanticPackSelectorQuery,
+    };
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    use semver::Version;
+
+    fn compiled_pack(
+        schema_version: u32,
+    ) -> crate::analyzer::semantic_model::CompiledSemanticModelPack {
+        let compatibility = if schema_version == 8 {
+            serde_json::json!({
+                "toolchains": [{"name": "jdk", "requirement": ">=21.0.0, <22.0.0"}]
+            })
+        } else {
+            serde_json::json!({
+                "bifrost": ">=0.8.0, <1.0.0",
+                "toolchains": [{"name": "jdk", "requirement": ">=21.0.0, <22.0.0"}]
+            })
+        };
+        let source = serde_json::json!({
+            "schema_version": schema_version,
+            "pack_id": format!("fixture.schema-{schema_version}"),
+            "version": "1.0.0",
+            "producer": {"name": "fixture-producer", "version": "1.0.0"},
+            "language": "java",
+            "ecosystem": "jvm",
+            "compatibility": compatibility,
+            "provenance": {"source": "catalog-compatibility-test"},
+            "license": "Apache-2.0",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "declarations",
+                "activation": [{"package": {"name": "fixture", "version": "=1.0.0"}}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": "fixture.type",
+                    "name": "fixture.Type",
+                    "type_kind": "class",
+                    "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "fixture.jar", "symbol": "fixture/Type.class"}
+                }], "members": [], "relations": []}
+            }]
+        });
+        compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn query(engine_version: &str, toolchain_version: &str) -> SemanticPackSelectorQuery {
+        SemanticPackSelectorQuery {
+            language: "java".to_owned(),
+            ecosystem: "jvm".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "fixture".to_owned(),
+                version: Some(Version::parse("1.0.0").unwrap()),
+            }),
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse(toolchain_version).unwrap()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+            bifrost_version: Version::parse(engine_version).unwrap(),
+        }
+    }
+
+    #[test]
+    fn schema_eight_ignores_engine_version_while_legacy_range_still_filters() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let catalog = SemanticPackCatalog::open(
+            &root_path,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let legacy = compiled_pack(7);
+        let native = compiled_pack(8);
+        let source = |source_id: &str| DurablePackSource {
+            kind: DurablePackSourceKind::Installed,
+            source_id: source_id.to_owned(),
+        };
+        catalog.install(&legacy, &source("legacy")).unwrap();
+        catalog.install(&native, &source("native")).unwrap();
+        let repeated = catalog.install(&native, &source("native")).unwrap();
+        assert!(
+            !repeated.inserted_manifest,
+            "exact verified native install is reusable"
+        );
+
+        let candidates = catalog.candidates(&query("9.0.0", "21.0.2")).unwrap();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(
+            candidates[0].manifest_digest(),
+            native.manifest.content_sha256.as_str()
+        );
+        assert!(
+            catalog
+                .version_near_misses(&query("9.0.0", "21.0.2"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let engine_supported = catalog.candidates(&query("0.12.0", "21.0.2")).unwrap();
+        assert_eq!(engine_supported.len(), 2, "{engine_supported:?}");
+        let bad_toolchain_query = query("9.0.0", "17.0.10");
+        assert!(catalog.candidates(&bad_toolchain_query).unwrap().is_empty());
+        let near_misses = catalog.version_near_misses(&bad_toolchain_query).unwrap();
+        assert_eq!(near_misses.len(), 1, "{near_misses:?}");
+        assert_eq!(
+            near_misses[0].manifest_digest,
+            native.manifest.content_sha256
+        );
+        assert_eq!(near_misses[0].coordinate, "toolchain jdk");
+
+        let persisted_shapes: Vec<(u32, Option<String>)> = {
+            let connection = catalog.connection.lock().unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT schema_version, bifrost_compatibility FROM catalog_packs
+                     ORDER BY schema_version",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            persisted_shapes,
+            [(7, Some(">=0.8.0, <1.0.0".to_owned())), (8, None)]
+        );
+        drop(catalog);
+
+        let reopened = SemanticPackCatalog::open(
+            &root_path,
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let reopened_candidates = reopened.candidates(&query("9.0.0", "21.0.2")).unwrap();
+        assert_eq!(reopened_candidates.len(), 1, "{reopened_candidates:?}");
+        assert_eq!(
+            reopened_candidates[0].manifest_digest(),
+            native.manifest.content_sha256.as_str()
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_sharing_tests {
+    use super::*;
+
+    fn generated_fixture(version: &str) -> (CompiledSemanticModelPack, GeneratedProductionKey) {
+        let source = serde_json::json!({
+            "schema_version": SEMANTIC_MODEL_SCHEMA_VERSION,
+            "pack_id": "cache.fixture", "version": version,
+            "producer": {"name": "cache-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "maven",
+            "compatibility": {"toolchains": []},
+            "provenance": {"source": "cache-test"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{
+                "id": "types", "activation": [{"package": {"name": "cache:fixture"}}],
+                "payload": {"kind": "declaration_facts", "types": [{
+                    "id": "type.example", "name": "cache.Example",
+                    "type_kind": "class", "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "cache/Example.class", "symbol": "cache.Example"}
+                }]}
+            }]
+        });
+        let pack = super::super::compile_source(
+            super::super::SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &super::super::CompilerOptions::default(),
+        )
+        .unwrap();
+        let key = GeneratedProductionKey::new(
+            pack.manifest.content_sha256.clone(),
+            &pack.manifest.producer.name,
+            &pack.manifest.producer.version,
+            pack.manifest.schema_version,
+        )
+        .unwrap();
+        (pack, key)
+    }
+
+    #[test]
+    fn unavailable_host_preserves_local_install_identity_and_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let unavailable = root.path().join("not-a-directory");
+        std::fs::write(&unavailable, b"occupied").unwrap();
+        let mut local = SemanticPackCatalog::open(
+            &root.path().join("local"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        local.shared_generated_root = Some(unavailable);
+        let (pack, key) = generated_fixture("1.2.0");
+        local.install_generated(&key, &pack).unwrap();
+        let identity = "b".repeat(64);
+        local
+            .install_generated_source_identity(&identity, &key)
+            .unwrap();
+        assert_eq!(
+            local
+                .generated_production_by_source_identity(&identity, &pack.manifest.producer)
+                .unwrap()
+                .unwrap()
+                .key,
+            key
+        );
+        assert!(
+            local
+                .generated_production_lock(&key)
+                .unwrap()
+                .try_acquire()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn host_cleanup_keeps_recent_hits_and_local_copy_repairs_eviction() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_root = root.path().join("host");
+        let mut local = SemanticPackCatalog::open(
+            &root.path().join("local"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        local.shared_generated_root = Some(shared_root.clone());
+        let (old, old_key) = generated_fixture("1.2.0");
+        local.install_generated(&old_key, &old).unwrap();
+        let shared = SemanticPackCatalog::open(
+            &shared_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let age_old = || {
+            shared
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE catalog_packs SET last_used_at = 0 WHERE manifest_digest = ?1",
+                    [&old.manifest.content_sha256],
+                )
+                .unwrap();
+        };
+        age_old();
+        assert!(local.generated_production(&old_key).unwrap().is_some());
+        let (new, new_key) = generated_fixture("1.3.0");
+        local.install_generated(&new_key, &new).unwrap();
+        assert!(shared.has_verified_generated_production(&old_key).unwrap());
+        age_old();
+        let (newest, newest_key) = generated_fixture("1.4.0");
+        local.install_generated(&newest_key, &newest).unwrap();
+        assert!(!shared.has_verified_generated_production(&old_key).unwrap());
+        assert!(local.generated_production(&old_key).unwrap().is_some());
+        assert!(shared.has_verified_generated_production(&old_key).unwrap());
+        shared
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM catalog_sources WHERE source_id = ?1",
+                [old_key.source_id()],
+            )
+            .unwrap();
+        assert!(!shared.has_verified_generated_production(&old_key).unwrap());
+        assert!(local.generated_production(&old_key).unwrap().is_some());
+        assert!(shared.has_verified_generated_production(&old_key).unwrap());
+    }
+
+    #[test]
+    fn host_reuse_copies_only_exact_generated_production_and_keeps_activation_local() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_root = root.path().join("host");
+        let mut first = SemanticPackCatalog::open(
+            &root.path().join("first"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        first.shared_generated_root = Some(shared_root.clone());
+        let (pack, key) = generated_fixture("1.2.0");
+        first
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::WorkspaceProduced,
+                    source_id: "first-only".to_owned(),
+                },
+            )
+            .unwrap();
+        first.install_generated(&key, &pack).unwrap();
+        let identity = "b".repeat(64);
+        first
+            .install_generated_source_identity(&identity, &key)
+            .unwrap();
+        let first_lock = first.generated_production_lock(&key).unwrap();
+        assert!(first_lock.try_acquire().unwrap());
+        let mut second = SemanticPackCatalog::open(
+            &root.path().join("second"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        second.shared_generated_root = Some(shared_root);
+        let second_lock = second.generated_production_lock(&key).unwrap();
+        assert!(!second_lock.try_acquire().unwrap());
+        drop(first_lock);
+        assert!(second_lock.try_acquire().unwrap());
+        drop(second_lock);
+        drop(first);
+        let production = second
+            .generated_production_by_source_identity(&identity, &pack.manifest.producer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(production.key, key);
+        assert_eq!(production.manifest_digest, pack.manifest.content_sha256);
+        let connection = second.connection.lock().unwrap();
+        let sources: Vec<(String, String)> = connection
+            .prepare("SELECT source_kind, source_id FROM catalog_sources")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sources, vec![("generated".to_owned(), key.source_id())]);
+        drop(connection);
+        let missing = GeneratedProductionKey::new(
+            "c".repeat(64),
+            &pack.manifest.producer.name,
+            &pack.manifest.producer.version,
+            pack.manifest.schema_version,
+        )
+        .unwrap();
+        assert!(second.generated_production(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn certificate_lookup_uses_its_primary_key_with_and_without_statistics() {
+        for state in crate::cache_gc::PlannerStatisticsState::BOTH {
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let (pack, key) = generated_fixture("1.2.0");
+            catalog
+                .install(
+                    &pack,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::Installed,
+                        source_id: "fixture".to_owned(),
+                    },
+                )
+                .unwrap();
+            catalog.install_generated(&key, &pack).unwrap();
+            let connection = catalog.connection.lock().unwrap();
+            let limits = decode_limits_digest(&catalog.options.decode_limits);
+            for version in (1..)
+                .filter(|version| *version != SHARD_VALIDATION_VERSION)
+                .take(256)
+            {
+                connection
+                    .execute(
+                        "INSERT INTO catalog_shard_validations VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            pack.manifest.content_sha256,
+                            pack.manifest.shards[0].shard_id,
+                            version,
+                            limits
+                        ],
+                    )
+                    .unwrap();
+            }
+            state.install(&connection);
+            let publication_plan = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {SHARED_PRODUCTION_PRESENT_SQL}"
+                ))
+                .unwrap()
+                .query_map([key.production_digest()], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                publication_plan
+                    .iter()
+                    .any(|line| line.contains("SEARCH gp")),
+                "{state}: {publication_plan:?}"
+            );
+            assert!(
+                publication_plan
+                    .iter()
+                    .any(|line| line.contains("SEARCH p USING")),
+                "{state}: {publication_plan:?}"
+            );
+            assert!(
+                !publication_plan.iter().any(|line| line.contains("SCAN gp")
+                    || line.contains("SCAN p ")
+                    || line.contains("AUTOMATIC")),
+                "{state}: {publication_plan:?}"
+            );
+            let details = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {CERTIFIED_SHARD_SQL}"))
+                .unwrap()
+                .query_map(
+                    params![
+                        pack.manifest.content_sha256,
+                        pack.manifest.shards[0].shard_id,
+                        SHARD_VALIDATION_VERSION,
+                        limits
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(details.iter().any(|line| line.contains("SEARCH catalog_shard_validations USING PRIMARY KEY")), "{state}: {details:?}");
+            assert!(
+                !details
+                    .iter()
+                    .any(|line| line.contains("SCAN catalog_shard_validations")),
+                "{state}: {details:?}"
+            );
+        }
     }
 }

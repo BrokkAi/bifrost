@@ -5,9 +5,9 @@ use crate::graph::hits::{
 };
 use crate::graph::receiver_analysis::JsTsReceiverFactProvider;
 use crate::graph::resolver::{
-    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name, target_language,
-    unbound_browser_global_property,
+    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
 };
+use crate::graph::source::declaration_ids_for_unit;
 use crate::imports::{require_call_module_specifier, resolve_js_ts_imported_member_chain};
 use crate::parse::{flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file};
 use crate::providers::{JsTsSource, with_usage_definitions};
@@ -16,12 +16,13 @@ use crate::syntax::{
     JsTsLexicalBindingScope, declarator_module_value_specifier, direct_pattern_binding,
     direct_property_definitions, is_declaration_identifier, is_lexically_nested_type_declaration,
     is_named_function_expression_declaration, is_object_in_member_expression,
-    is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
-    object_pattern_entries, pattern_binder_identifiers, slice, static_member_property,
-    static_member_receiver, typescript_enclosing_enum_initializer,
+    is_property_key_in_member, nested_type_identifier_parts, object_pattern_entries,
+    pattern_binder_identifiers, slice, static_member_property, static_member_receiver,
+    typescript_enclosing_enum_initializer,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -83,14 +84,14 @@ pub fn scan_files_for_seeds(
         .is_none()
         .then(|| browser_global_shape.map(|(object, _)| object))
         .flatten()
-        .filter(|_| target_is_unbound_browser_global_property(analyzer, target, language));
+        .filter(|_| target_is_unbound_browser_global_property(host, target));
     let lookup_only_local_property = language == Language::JavaScript
         && target_owner.is_none()
         && target_member.is_some()
         && exported_local_property_root.is_none()
         && (!analyzer.declarations(target.source()).contains(target)
             || (target.is_function()
-                && function_target_has_non_program_local_receiver(analyzer, target, language)));
+                && function_target_has_non_program_local_receiver(host, target)));
     // Any ownerless JavaScript member with an exact same-file property
     // definition can use the lexical local-property route. Some generated
     // namespace assignments are also exposed on the declaration surface, so
@@ -105,22 +106,19 @@ pub fn scan_files_for_seeds(
     // global model the forward lookup already owns. Read the admissible receiver
     // chains once, out of the declaring file's own parse (#1777).
     let global_property_receivers = if lookup_only_local_property {
-        let member = target_member
-            .as_deref()
-            .expect("a definition-lookup-only property target has a member name");
-        collect_global_property_receivers(analyzer, target, member, language)
+        collect_global_property_receivers(host, target)
     } else {
         Vec::new()
     };
     let target_property_receivers = target_member
         .as_deref()
-        .map(|member| collect_target_property_receivers(analyzer, target, member, language))
+        .map(|_| collect_target_property_receivers(host, target))
         .unwrap_or_default();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
-    let script_global_bare_target =
-        target_member.is_none() && unique_script_global_binding(analyzer, target, &target_short);
+    let script_global_bare_target = target_member.is_none()
+        && unique_script_global_binding(host, analyzer, target, &target_short);
 
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
@@ -166,7 +164,7 @@ pub fn scan_files_for_seeds(
         }
         let tree_ref = &tree;
 
-        let imports = index.binders_by_file.get(file).cloned().unwrap_or_default();
+        let cached_imports = index.binders_by_file.get(file).cloned().unwrap_or_default();
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut local_unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
@@ -199,7 +197,14 @@ pub fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
-        let file_is_script = !js_program_is_external_module(root, source_str);
+        // The cached binder is built from canonical source facts so it can be
+        // reused by graph construction, but exact position-sensitive proof
+        // also needs the lexical scopes from this parsed candidate tree.
+        let lexical_index = JsTsLexicalBindingIndex::build(root, source_str);
+        let imports = cached_imports.with_lexical_bindings(root, lexical_index.clone());
+        let file_is_script = host
+            .source_facts(file)
+            .is_some_and(|facts| !facts.facts.file_is_external_module);
         // The global-property model needs this file's bindings too: a reading file
         // that binds the receiver root reads its own object, exactly as it does in
         // the declaring file.
@@ -208,7 +213,7 @@ pub fn scan_files_for_seeds(
             || !global_property_receivers.is_empty()
             || !target_property_receivers.is_empty()
             || script_global_bare_target)
-            .then(|| JsTsLexicalBindingIndex::build(root, source_str));
+            .then_some(lexical_index);
         // Local-property definitions read the declaring file's byte ranges, so
         // they stay confined to it. The validated browser-global identity is
         // workspace-wide and retains each reading file's lexical shadow index.
@@ -321,43 +326,21 @@ pub fn scan_files_for_seeds(
 }
 
 fn function_target_has_non_program_local_receiver(
-    analyzer: &dyn CodeUnitIndex,
+    host: &dyn JsTsSource,
     target: &CodeUnit,
-    language: Language,
 ) -> bool {
-    let Some(member) = member_name(target) else {
+    let Some(facts) = host.source_facts(target.source()) else {
         return false;
     };
-    let Ok(source) = target.source().read_to_string() else {
-        return false;
-    };
-    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
-    else {
-        return false;
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&parser_language).is_err() {
-        return false;
-    }
-    let Some(tree) = parser.parse(&source, None) else {
-        return false;
-    };
-    let root = tree.root_node();
-    let bindings = JsTsLexicalBindingIndex::build(root, &source);
-    direct_property_definitions(root, &source, &analyzer.ranges(target), &member)
-        .into_iter()
-        .any(|definition| {
-            let receiver = slice(definition.receiver.root, &source);
-            bindings.is_bound_at(receiver, definition.receiver.root.start_byte())
-                && !bindings.is_program_binding_at(
-                    receiver,
-                    definition.receiver.root.start_byte(),
-                    root,
-                )
-        })
+    let declarations = declaration_ids_for_unit(&facts, target);
+    facts.facts.property_receivers.iter().any(|property| {
+        declarations.contains(&property.declaration)
+            && matches!(property.binding, JsTsReceiverBinding::Local)
+    })
 }
 
 fn unique_script_global_binding(
+    host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     target: &CodeUnit,
     name: &str,
@@ -365,39 +348,25 @@ fn unique_script_global_binding(
     let target_fqn = target.fq_name();
     let mut candidates = analyzer
         .definitions(&target_fqn)
-        .filter(|candidate| code_unit_is_script_global_binding(analyzer, candidate, name));
+        .filter(|candidate| code_unit_is_script_global_binding(host, candidate, name));
     candidates.next().as_ref() == Some(target) && candidates.next().is_none()
 }
 
 fn code_unit_is_script_global_binding(
-    analyzer: &dyn CodeUnitIndex,
+    host: &dyn JsTsSource,
     candidate: &CodeUnit,
     name: &str,
 ) -> bool {
-    let language = target_language(candidate);
-    let Ok(source) = candidate.source().read_to_string() else {
+    let Some(facts) = host.source_facts(candidate.source()) else {
         return false;
     };
-    let Some(parser_language) = js_ts_tree_sitter_language_for_file(candidate.source(), language)
-    else {
-        return false;
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&parser_language).is_err() {
+    if facts.facts.file_is_external_module {
         return false;
     }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return false;
-    };
-    let root = tree.root_node();
-    if js_program_is_external_module(root, source.as_str()) {
-        return false;
-    }
-    let bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
-    analyzer
-        .ranges(candidate)
-        .iter()
-        .any(|range| bindings.is_program_binding_at(name, range.start_byte, root))
+    let declarations = declaration_ids_for_unit(&facts, candidate);
+    facts.facts.declaration_bindings.iter().any(|binding| {
+        declarations.contains(&binding.declaration) && binding.name == name && binding.is_program
+    })
 }
 
 pub struct ScanCtx<'a> {
@@ -508,42 +477,23 @@ struct GlobalPropertyReceiver {
 }
 
 fn collect_target_property_receivers(
-    analyzer: &dyn CodeUnitIndex,
+    host: &dyn JsTsSource,
     target: &CodeUnit,
-    target_member: &str,
-    language: Language,
 ) -> Vec<GlobalPropertyReceiver> {
-    let Ok(source) = target.source().read_to_string() else {
+    let Some(facts) = host.source_facts(target.source()) else {
         return Vec::new();
     };
-    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
-    else {
-        return Vec::new();
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&parser_language).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return Vec::new();
-    };
-    let mut receivers = direct_property_definitions(
-        tree.root_node(),
-        source.as_str(),
-        &analyzer.ranges(target),
-        target_member,
-    )
-    .into_iter()
-    .map(|definition| GlobalPropertyReceiver {
-        root: slice(definition.receiver.root, source.as_str()).to_string(),
-        members: definition
-            .receiver
-            .members
-            .iter()
-            .map(|member| slice(*member, source.as_str()).to_string())
-            .collect(),
-    })
-    .collect::<Vec<_>>();
+    let declarations = declaration_ids_for_unit(&facts, target);
+    let mut receivers = facts
+        .facts
+        .property_receivers
+        .iter()
+        .filter(|property| declarations.contains(&property.declaration))
+        .map(|property| GlobalPropertyReceiver {
+            root: property.receiver_root.clone(),
+            members: property.members.clone(),
+        })
+        .collect::<Vec<_>>();
     receivers
         .sort_by(|left, right| (&left.root, &left.members).cmp(&(&right.root, &right.members)));
     receivers.dedup();
@@ -559,75 +509,40 @@ fn collect_target_property_receivers(
 /// root must be one of that script's program-scope bindings -- that is, a
 /// property of the one shared global object.
 fn collect_global_property_receivers(
-    analyzer: &dyn CodeUnitIndex,
+    host: &dyn JsTsSource,
     target: &CodeUnit,
-    target_member: &str,
-    language: Language,
 ) -> Vec<GlobalPropertyReceiver> {
-    let Ok(source) = target.source().read_to_string() else {
+    let Some(facts) = host.source_facts(target.source()) else {
         return Vec::new();
     };
-    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
-    else {
-        return Vec::new();
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&parser_language).is_err() {
+    if facts.facts.file_is_external_module {
         return Vec::new();
     }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return Vec::new();
-    };
-    let root = tree.root_node();
-    if js_program_is_external_module(root, source.as_str()) {
-        return Vec::new();
-    }
-    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
-    let target_ranges = analyzer.ranges(target);
-    direct_property_definitions(root, source.as_str(), &target_ranges, target_member)
-        .into_iter()
-        .filter(|definition| {
-            lexical_bindings.is_program_binding_at(
-                slice(definition.receiver.root, source.as_str()),
-                definition.receiver.root.start_byte(),
-                root,
-            )
+    let declarations = declaration_ids_for_unit(&facts, target);
+    facts
+        .facts
+        .property_receivers
+        .iter()
+        .filter(|property| {
+            declarations.contains(&property.declaration)
+                && matches!(property.binding, JsTsReceiverBinding::Program)
         })
-        .map(|definition| GlobalPropertyReceiver {
-            root: slice(definition.receiver.root, source.as_str()).to_string(),
-            members: definition
-                .receiver
-                .members
-                .iter()
-                .map(|member| slice(*member, source.as_str()).to_string())
-                .collect(),
+        .map(|property| GlobalPropertyReceiver {
+            root: property.receiver_root.clone(),
+            members: property.members.clone(),
         })
         .collect()
 }
 
-fn target_is_unbound_browser_global_property(
-    analyzer: &dyn CodeUnitIndex,
-    target: &CodeUnit,
-    language: Language,
-) -> bool {
-    let Ok(source) = target.source().read_to_string() else {
+fn target_is_unbound_browser_global_property(host: &dyn JsTsSource, target: &CodeUnit) -> bool {
+    let Some(facts) = host.source_facts(target.source()) else {
         return false;
     };
-    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
-    else {
-        return false;
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&parser_language).is_err() {
-        return false;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return false;
-    };
-    let root = tree.root_node();
-    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
-    unbound_browser_global_property(analyzer, target, root, source.as_str(), &lexical_bindings)
-        .is_some()
+    let declarations = declaration_ids_for_unit(&facts, target);
+    facts.facts.property_receivers.iter().any(|property| {
+        declarations.contains(&property.declaration)
+            && matches!(property.binding, JsTsReceiverBinding::Unbound)
+    })
 }
 
 fn collect_local_property_definitions(
@@ -3453,23 +3368,27 @@ pub fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
         let Some(child) = root.named_child(index_id) else {
             continue;
         };
-        if child.kind() == "export_statement" {
-            visit_export_statement(child, source, &mut index);
-        } else if child.kind() == "expression_statement" {
-            visit_commonjs_export_statement(child, source, &mut index);
-            visit_module_object_member_export_statement(
-                child,
-                source,
-                &module_object_exports,
-                &mut index,
-            );
-        }
+        collect_export_statement(child, source, &module_object_exports, &mut index);
     }
 
     index
 }
 
-fn collect_module_object_exports(root: Node<'_>, source: &str) -> HashSet<String> {
+pub(crate) fn collect_export_statement(
+    node: Node<'_>,
+    source: &str,
+    module_object_exports: &HashSet<String>,
+    index: &mut ExportIndex,
+) {
+    if node.kind() == "export_statement" {
+        visit_export_statement(node, source, index);
+    } else if node.kind() == "expression_statement" {
+        visit_commonjs_export_statement(node, source, index);
+        visit_module_object_member_export_statement(node, source, module_object_exports, index);
+    }
+}
+
+pub(crate) fn collect_module_object_exports(root: Node<'_>, source: &str) -> HashSet<String> {
     let mut exports = HashSet::default();
     for index_id in 0..root.named_child_count() {
         let Some(child) = root.named_child(index_id) else {

@@ -467,7 +467,8 @@ fn record_reference(
                     .visibility
                     .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
                     && let Some(constructor) = constructors.iter().find(|constructor| {
-                        cpp_callable_arity(&ctx.analyzer, constructor).accepts(call_arity)
+                        cpp_callable_arity(&ctx.analyzer, constructor)
+                            .is_none_or(|known| known.accepts(call_arity))
                     })
                 {
                     ctx.record(constructor.fq_name(), node);
@@ -643,7 +644,7 @@ fn record_recovered_relational_template_member_call(
         return;
     };
     let mut candidates = callables.into_iter().filter(|candidate| {
-        cpp_callable_arity(&ctx.analyzer, candidate).accepts(call.arity)
+        cpp_callable_arity(&ctx.analyzer, candidate).is_none_or(|known| known.accepts(call.arity))
             && ctx
                 .visibility
                 .callable_is_template_declaration(&ctx.analyzer, candidate)
@@ -1128,7 +1129,8 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                         {
                             VisibleMemberResolution::Callable(callables) => {
                                 if let Some(callable) = callables.iter().find(|callable| {
-                                    cpp_callable_arity(&ctx.analyzer, callable).accepts(call_arity)
+                                    cpp_callable_arity(&ctx.analyzer, callable)
+                                        .is_none_or(|known| known.accepts(call_arity))
                                 }) {
                                     ctx.record(callable.fq_name(), field);
                                 }
@@ -1180,7 +1182,8 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                         {
                             VisibleMemberResolution::Callable(callables) => {
                                 if let Some(callable) = callables.iter().find(|callable| {
-                                    cpp_callable_arity(&ctx.analyzer, callable).accepts(call_arity)
+                                    cpp_callable_arity(&ctx.analyzer, callable)
+                                        .is_none_or(|known| known.accepts(call_arity))
                                 }) {
                                     ctx.record(callable.fq_name(), function);
                                 }
@@ -1236,7 +1239,8 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                         .visibility
                         .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
                         && let Some(constructor) = constructors.iter().find(|constructor| {
-                            cpp_callable_arity(&ctx.analyzer, constructor).accepts(call_arity)
+                            cpp_callable_arity(&ctx.analyzer, constructor)
+                                .is_none_or(|known| known.accepts(call_arity))
                         })
                     {
                         ctx.record(constructor.fq_name(), terminal);

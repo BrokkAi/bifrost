@@ -55,7 +55,6 @@ For host-local changes, run the independently owned package contract first:
 
 ```bash
 cargo test -p brokk-bifrost-mcp
-cargo test -p brokk-bifrost-lsp --all-features
 ```
 
 Changes in `brokk-bifrost-core`, `brokk-bifrost-analysis`,
@@ -106,11 +105,13 @@ citation live in [`docs/src/content/docs/cite-bifrost.md`](docs/src/content/docs
 
 ## Release Process
 
-The Rust crate, the `bifrost` binary, the Python wheel, and the agent/editor
+The Rust crates, the `bifrost` binary, the Python wheel, and the engine's agent
 plugin release metadata are versioned **together** and cut from a **single tag**.
+The standalone language server and VS Code extension in
+[bifrost-lsp](https://github.com/BrokkAi/bifrost-lsp) have independent versions.
 `Cargo.toml`'s `[workspace.package]` version is the committed source of truth for the release version:
 `pyproject.toml` inherits it via maturin's `dynamic = ["version"]`, and
-`scripts/public/release-version.mjs sync` copies it into citation, semantic-pack,
+`scripts/public/release-version.mjs sync` copies it into citation, retained semantic-pack,
 plugin, and editor metadata that require literal versions. The script does not
 infer `CITATION.cff`'s `date-released`; setting the actual release date remains
 an explicit release-preparation step.
@@ -122,64 +123,34 @@ were not part of the release candidate. An RC branch freezes a certified commit
 while still allowing narrowly scoped release fixes and repeatable validation
 against one immutable source line.
 
-The protected `release-ready` branch records the newest `master` commit that
-has passed all promotion evidence at that exact SHA. The periodic and manually
-dispatchable `promote-release-ready.yml` reconciler reviews each candidate by
-its immutable SHA, not the moving branch tip. It advances the ref only when
-CI, Hourly CI, Release analyzer validation, and complete full-performance
-qualification all report terminal success;
-Release analyzer validation includes policy analysis and performance evidence
-whose artifact digest is verified. Promotion is a fast-forward only, records
-the evidence used, and never resets the performance baseline. If evidence is
-missing, pending, failed, or skipped, the branch stays where it is. Full benchmark evidence must belong to the exact
-candidate, including all
-standard benchmark jobs. A green ancestor or manual diagnostic subset cannot
-qualify a newer commit. Nightly evidence, when present, must also pass.
+Create an ordinary versioned RC branch from a deliberately selected master
+commit. Prepare its version and changelog, then qualify its immutable head.
+Every repair produces a new candidate SHA and requires fresh evidence. There
+is no permanent release-ready branch, campaign registry, or promotion controller.
 
-The daily Benchmark schedule supplies full evidence automatically. For an
-on-demand master or RC candidate, dispatch `full-performance.yml` at that exact
-branch head. This dedicated workflow has no subset or non-strict options and
-runs the same full benchmark jobs without tracing or notifications. Full
-reports carry source, manifest, baseline, binary and comparison digests; the
-qualifier verifies the GitHub artifact digest and those bindings. Older runs
-without this provenance cannot qualify. Arbitrary manual
-Benchmark diagnostics cannot qualify. If either trusted full-performance
-workflow has a run for the candidate, its latest attempt must pass; a second
-workflow cannot hide an existing failure. Rerun the failed workflow to replace
-its evidence after an infrastructure failure, or repair source at a new SHA.
+Qualification requires terminal CI, executed Hourly CI, policy analysis, and
+quick and full performance evidence for the exact source. Missing, failed,
+pending, or skipped required evidence blocks the handoff. The latest eligible
+attempt wins; another green workflow cannot hide a known failure. Performance
+reports retain the historical baseline, complete scenario population, and
+verified artifact and input digests. Manual diagnostic subsets do not qualify.
+Dispatch `full-performance.yml` for the frozen RC to obtain complete evidence.
 
-The 30-minute reconciler does not promise 30-minute qualification throughput:
-all evidence must meet on one source SHA. Projection checks full performance
-and digest-verified quick performance before building and immediately before
-publishing, using tooling from the workflow revision. A later failure revokes
-publication permission even for an already-promoted commit. Keep the protected
-ref in place and repair master; never roll it back. RC handoffs retain their
-manual quick-performance qualification path and require the dedicated full
-workflow too. Manual projection and workflow recovery cannot skip these gates.
+Public projection is manual. Dispatch `prepare-open-core-projection.yml` from
+master with the explicit versioned RC branch in `source_ref` and the independently
+observed public head. The workflow pins the source SHA, uses qualification tools
+from its immutable workflow revision, and rechecks evidence immediately before
+pushing. Classification, public builds, readiness, tags, and publication remain
+separate gates. A branch name is never proof of qualification.
 
-`release-ready` is operated by the reconciler, not edited by people. GitHub
-branch rules must reject deletion and non-fast-forward updates with no bypass
-actors. A new `release-ready` branch may be created only at a commit the same
-reconciler has qualified. Development fixes still land on `master`, which lets
-ordinary review and repair continue independently of promotion.
-
-A registered stabilization campaign can freeze a selected master ancestor
-while master development continues. Its registry is read from trusted master,
-not candidate code. The registered branch and immutable candidate SHA must
-agree. Each forward-only repair revision needs its own complete CI, executed
-Hourly matrix, policy, quick and full performance, classification and applicable
-auxiliary evidence. Newer failed or pending attempts remain blockers across
-both master and RC origins. Registration never erases a measured failure.
-
-The existing promotion workflow serializes campaign registration, candidate
-updates and promotion. While a campaign is active it cannot silently select
-another master source. The gate contract pins workflow/action/tooling inputs,
-coverage configuration, corpus pins, historical baseline and thresholds.
-An unexpected branch, registry or protected-ref change holds promotion.
-Promotion additionally requires the tested RC head to be integrated into master
-with its identity intact. Closing or explicitly withdrawing a campaign restores
-normal master discovery; every later source still requires exact qualification.
-RC creation and promotion do not authorize public projection, tagging or publication.
+For the 0.12.0 release only, the owner accepted the measured cold workspace-build
+tradeoff following native resolution. Quick and full benchmark artifacts retain
+their raw regressions, historical baselines, thresholds, and complete scenario
+population. An executed, source-bound exception record may qualify only the
+reviewed cold cases; a warm, new, missing, failed, or inconclusive scenario still
+blocks. The exception is tracked by #3716 and the cold SQLite follow-up #3737.
+It does not skip CI, Hourly, classification, projection, public readiness,
+or publication checks.
 
 Rust third-party license HTML is generated rather than committed. Release
 workflows generate it automatically. To inspect or package it locally, install
@@ -270,7 +241,7 @@ To cut a release:
    Confirm that each crate exists on crates.io and has the required trusted
    publisher. Bootstrap any new crate before release preparation. Do not use
    the version release to create a crate for the first time.
-2. Resolve the current `release-ready` head to its exact SHA and create a
+2. Select the intended master commit by its exact SHA and create a
    dedicated RC branch from that commit, for example `dave/v0.8.22-rc`. Push
    the branch so the candidate and any subsequent stabilization fixes are
    preserved remotely.
@@ -325,11 +296,14 @@ To cut a release:
    rm -rf "$plugin_smoke_root"
    policy_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-policy-pretag.XXXXXX")"
    trap 'rm -rf -- "$policy_smoke_root"' EXIT
-   bash scripts/public/build-pinned-python-semantic-packs.sh \
-     "$policy_smoke_root/bundle" \
-     "$policy_smoke_root/work" \
-     "$policy_smoke_root/cache"
-   BIFROST_SEMANTIC_PACK_CACHE_ROOT="$policy_smoke_root/cache" \
+   node scripts/public/prepare-open-packs.mjs \
+     --binary "$(pwd)/target/release/bifrost" \
+     --cache-dir "$policy_smoke_root/cache" \
+     --receipt-path "$policy_smoke_root/open-pack-receipt.json" \
+     --env-path "$policy_smoke_root/open-pack-env.json"
+   BIFROST_SEMANTIC_PACK_CACHE_ROOT="$(jq -r '.BIFROST_SEMANTIC_PACK_CACHE_ROOT' "$policy_smoke_root/open-pack-env.json")" \
+   BIFROST_OPEN_SEMANTIC_PACK_BUNDLE="$(jq -r '.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE' "$policy_smoke_root/open-pack-env.json")" \
+   BIFROST_OPEN_POLICY_PACK_ROOT="$(jq -r '.BIFROST_OPEN_POLICY_PACK_ROOT' "$policy_smoke_root/open-pack-env.json")" \
      target/release/bifrost \
      --root . \
      --format sarif \
@@ -349,21 +323,18 @@ To cut a release:
 
    The policy command is a release-artifact smoke test. Existing findings do
    not fail it. An unreliable scan still exits with status 2 and blocks the
-   release. Its pinned Python semantic-pack setup matches policy CI and Release
+   release. Its verified Bifrost-packs selection and exact receipt match Release
    Readiness, so the absent-member policy has the declaration surface it needs
    to distinguish a clean result from incomplete capability coverage. Do not
    tag the RC commit only because its ordinary branch CI is green. Confirm that
    each release-only promotion gate has an equivalent pre-tag check, and run it
-   on the frozen RC commit.
-7. Integrate the release version and stabilization history from the RC branch
-   into `master`, preserving the original RC commits. A registered stabilization
-   campaign requires the exact tested RC head to be an ancestor of master;
-   a squash or cherry-pick alone does not satisfy that check. Resolve integration
-   conflicts deliberately on master without importing unrelated changes into
-   the RC. A necessary candidate repair advances the RC and requires new exact
-   qualification. The designated reconciler then fast-forwards `release-ready`
-   directly to that fully qualified RC SHA, without creating an untested merge
-   commit on `release-ready`.
+   on the frozen RC commit. Missing eligible, integrity-verified pack releases block
+   this preparation; do not generate a substitute bundle or accept incomplete
+   coverage as a clean scan.
+7. Keep the qualified RC head frozen during the public release handoff.
+   Integrate release metadata and stabilization fixes back into `master`,
+   resolving conflicts there without importing unrelated changes into the RC.
+   Any repair to the candidate requires fresh qualification of its new SHA.
 8. After the RC branch is frozen and validated, project it to public `master`,
    qualify that public commit, and tag **the qualified public commit in
    `BrokkAi/bifrost`**. The tag does not go on the private RC commit and does
@@ -389,6 +360,23 @@ commit once, then builds and validates CLI archives, crate contents, wheels/sdis
 and agent-plugin packages before opening the promotion gate. The GitHub Release,
 crates.io, PyPI, and agent-plugin release assets only run after that common
 evidence is green.
+
+Open semantic packs and policy rules are maintained and released in
+[`BrokkAi/bifrost-packs`](https://github.com/BrokkAi/bifrost-packs). Submit open
+content and generation-recipe changes there. Its `packs/vX.Y.Z` and
+`rules/vX.Y.Z` streams have independent versions and machine-readable engine,
+schema, capability, and qualification requirements. Engine releases no longer
+generate, assemble, or publish native semantic-pack content. They retain the
+semantic-pack installer and authoring tooling needed by pack producers.
+Engine CI may still generate focused fixtures to test analyzer behavior; that
+does not publish a pack release.
+
+During v0.13.0 preparation, plugin acquisition must select compatible pack
+metadata and verify artifact hashes before exposing a cache to the server.
+A pending pack release or a matching version label does not establish runtime
+qualification. Offline reuse must retain the exact selected source commit,
+manifest, and artifact hashes. Existing embedded content remains until the
+engine content migration is completed separately.
 
 After the **Release** workflow succeeds, `publish-npm.yml` packages each native
 archive as a platform package. It publishes the platform packages first. It
@@ -481,7 +469,6 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 6 |
 | `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 7 |
 | `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 8 |
-| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 8 |
 | `brokk-bifrost` | `Cargo.toml` | 9 |
 
 Before each release, compare this table with the root workspace members and
@@ -554,18 +541,12 @@ release summary records completed and pending publication targets.
 
 Use one explicit handoff from source projection to release publication:
 
-0. Cut a release branch in the private repository at the exact certified
-   `release-ready` SHA, and treat that branch as the release line for every
-   later step. A qualification takes about an hour and private `master` takes
-   a commit every
-   few minutes, so a correction based on the qualified source is routinely not
-   a fast-forward of `master` by the time it can be made. The release branch is
-   the ref that holds still for the length of a release. Merge it back into
-   `master` after the tag exists. A remote branch named `vX.Y.Z-rc` or
-   `*/vX.Y.Z-rc` also locks the scheduled projection of private `release-ready`
-   while its version is newer than the latest stable public tag, so scheduled
-   publication cannot move public `master` during this handoff.
-   Delete an abandoned RC branch to release its lock.
+0. Cut an ordinary versioned RC branch in the private repository from the
+   deliberately selected master commit. Prepare release metadata and qualify
+   the exact RC head before proceeding. Keep that branch as the release line
+   throughout the handoff while master development continues. Merge release
+   fixes and metadata back into master after the tag exists. Public projection
+   has no schedule and runs only when explicitly dispatched for an RC.
 1. Project the release branch's commit to public `master`, then wait for
    public CI to validate that projection.
 2. Dispatch `Release readiness` from the public repository with the exact

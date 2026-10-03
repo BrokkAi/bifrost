@@ -364,7 +364,7 @@ fn sync_directory(_path: &Path) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn relative_object_path(digest: &str) -> PathBuf {
+pub(super) fn relative_object_path(digest: &str) -> PathBuf {
     Path::new("objects")
         .join("sha256")
         .join(&digest[..2])

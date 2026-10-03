@@ -13,6 +13,8 @@ bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyCl
 
 `--args` is inline JSON matching the selected tool's MCP argument object. Omit it for tools that accept an empty object, such as `get_active_workspace`.
 
+A dispatched tool call always prints one JSON object on standard output. A call that succeeds prints `{"structuredContent": ..., "isError": false}`. A call that fails prints `{"error": "<message>", "isError": true}`, repeats the message on standard error, and exits with a non-zero status. This also covers a failure that arises inside the analysis, including one on an analysis worker thread. Invalid command-line arguments are reported on standard error before any tool is dispatched, so they print nothing on standard output.
+
 ## Immutable Git Snapshot Diffs
 
 The diff tools can compare exact Git commits or tree objects. For snapshot trees
@@ -84,7 +86,7 @@ result and says so instead of erroring.
 
 `bifrost scan --list-builtin-policies` prints the shipped catalog as JSON
 without running anything (the same document as `--list-policies`). A scan
-accepts `--format`, `--fail-on`, `--evaluation-date`, `--output`, `--verbose`,
+accepts `--format`, `--fail-on`, `--evaluation-date`, `--no-incremental`, `--output`, `--verbose`,
 and `--color` with the meanings documented below, shares the policy exit
 contract (0 clean, 1 gated findings, 2 unreliable), and reads the default
 suppression, scope, and baseline documents beneath the scanned root. For
@@ -154,11 +156,13 @@ registries. A workspace semantic-pack policy uses the shared
 dependency packs for languages present in the workspace, a configured document
 selects its named ecosystems, and an empty `ecosystems` array explicitly
 disables that route. A configured catalog is workspace-relative; without one,
-activation is ephemeral. The catalog and activation contract do not download
+catalog persistence follows the analyzer and host cache overrides. The catalog
+and activation contract do not download
 packs or dependencies, and compatibility and `review_required` gates remain
-authoritative. The released `brokk-bifrost` facade separately opts into fetching
-the immutable matching public release bundle only for an exact generated
-production miss; set `BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path.
+authoritative. Host plugins acquire compatible open content from
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs) through the host's
+verified persistent cache. Engine release bundles no longer supply semantic
+content; analysis can still generate missing exact productions locally.
 A catalog-backed
 policy requires a library embedding which explicitly populated
 `TaintCatalogRegistry`. A policy that uses only
@@ -271,9 +275,12 @@ and what every part of that evaluation read, so a later run against the same
 base skips the base export and build, and recomputes only the parts of the
 working tree whose inputs changed. Findings, identities, diagnostics,
 completion tiers, and the exit status do not depend on what the cache holds.
+An ordinary full scan also publishes complete policy units to this same cache.
+A later PR scan can verify and reuse those units; units from incomplete or
+widened work do not become reusable complete evidence.
 
-`--no-incremental` turns that reuse off for one run: every policy is evaluated
-in full on both revisions, and nothing is looked up or stored. Reuse is on by
+`--no-incremental` turns policy-unit caching off for one run: every policy is evaluated
+in full on both revisions, and no policy units are looked up or stored. Reuse is on by
 default and produces the same report, so use this switch only to compare a
 run against the full dual evaluation when you are diagnosing a difference.
 The report's `incremental` section then reports every policy as evaluated in

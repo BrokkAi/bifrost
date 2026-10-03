@@ -4,9 +4,7 @@ use super::java_artifact::{
 };
 use crate::CancellationToken;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
-use crate::analyzer::scala::declarations::{
-    ScalaDeclarationVisibility, parse_scala_file, scala_declaration_visibility,
-};
+use crate::analyzer::scala::declarations::parse_scala_file;
 use crate::analyzer::scala::{language, scala_normalize_full_name};
 use crate::analyzer::semantic_model::csmi::{
     CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowEntryComponent, CsmiCollectionFlowInvocation,
@@ -32,13 +30,15 @@ use crate::analyzer::semantic_model::{
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::HashMap;
-use brokk_bifrost_jvm::scala::ambient_use::{scala_declaration_ambient_use, scala_has_modifier};
+use brokk_bifrost_core::analyzer::scala_facts::{
+    ScalaDeclarationKind, ScalaDeclarationSourceFact, ScalaDeclarationVisibility,
+};
+use brokk_bifrost_jvm::scala::ambient_use::scala_declaration_ambient_use;
 use brokk_bifrost_jvm::scala::graph::syntax::{
-    ScalaCallableRole, ScalaCallableSourceAlternative, ScalaSourceFacts, ScalaTypeExpressionPath,
-    scala_source_facts_from_tree,
+    ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
 };
 use std::io::{Cursor, Read};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -276,12 +276,6 @@ impl ScalaSourceJarPackProducer {
     }
 }
 
-struct ParsedScalaEntry {
-    tree: Tree,
-    parsed: ParsedFile,
-    source_facts: ScalaSourceFacts,
-}
-
 fn parse_source_entry(
     entry_name: &str,
     source: &str,
@@ -309,12 +303,12 @@ fn parse_source_entry(
     }
     let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
     let parsed = parse_scala_file(&synthetic_file, source, &tree);
-    let source_facts = scala_source_facts_from_tree(&tree, source);
-    Some(ParsedScalaEntry {
-        tree,
-        parsed,
-        source_facts,
-    })
+    Some(ParsedScalaEntry { parsed, tree })
+}
+
+struct ParsedScalaEntry {
+    parsed: ParsedFile,
+    tree: tree_sitter::Tree,
 }
 
 struct ScalaEntryFacts {
@@ -335,8 +329,27 @@ fn scala_entry_facts(
 ) -> ScalaEntryFacts {
     let tree = &entry.tree;
     let parsed = &entry.parsed;
-    let source_facts = &entry.source_facts;
     let parent_by_child = parent_index(parsed);
+    let canonical = parsed
+        .source_facts
+        .as_ref()
+        .expect("Scala primary source facts");
+    let facts = canonical
+        .scala
+        .as_ref()
+        .expect("Scala declaration properties");
+    let facts_by_declaration = facts
+        .declarations
+        .iter()
+        .map(|fact| (fact.declaration, fact))
+        .collect::<HashMap<_, _>>();
+    let mut source_facts = HashMap::default();
+    for (source, unit) in &parsed.source_declaration_units {
+        let fact = facts_by_declaration
+            .get(source)
+            .expect("Scala declaration bridge has source facts");
+        source_facts.entry(unit).or_insert(*fact);
+    }
     let mut declarations = parsed.declarations().iter().collect::<Vec<_>>();
     declarations.sort_unstable_by_key(|unit| unit.fq_name());
     let mut types = Vec::new();
@@ -350,21 +363,36 @@ fn scala_entry_facts(
         .copied()
         .filter(|declaration| declaration.is_class() || parsed.type_aliases.contains(*declaration))
     {
-        let Some(visibility) = effective_visibility(tree, parsed, declaration, &parent_by_child)
+        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
         else {
             continue;
         };
-        let Some(node) = declaration_node(tree, parsed, declaration) else {
+        let Some(range) = parsed
+            .ranges
+            .get(declaration)
+            .and_then(|ranges| ranges.first())
+        else {
             continue;
         };
+        let Some(node) = tree
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            continue;
+        };
+        let declaration_source = source_facts
+            .get(&declaration)
+            .expect("Scala artifact declaration has primary source facts");
         let name = scala_normalize_full_name(&declaration.fq_name());
-        let type_kind = scala_type_kind(node, parsed.type_aliases.contains(declaration));
+        let type_kind = scala_type_kind(
+            declaration_source.kind,
+            parsed.type_aliases.contains(declaration),
+        );
         let type_id = type_declaration_id(TypeIdentity {
             ecosystem: "jvm",
             name: &name,
         });
-        let range_key = (node.start_byte(), node.end_byte());
-        let generic_facts = source_facts.generic_owner_facts_by_range.get(&range_key);
+        let generic_facts = declaration_source.generic_owner.as_ref();
         let type_parameters = generic_facts
             .map(|facts| facts.type_parameters.clone())
             .unwrap_or_default();
@@ -393,8 +421,9 @@ fn scala_entry_facts(
             name,
             type_kind,
             visibility,
-            is_abstract: type_kind == TypeKind::Trait || scala_has_modifier(node, "abstract"),
-            is_sealed: scala_has_modifier(node, "sealed"),
+            is_abstract: type_kind == TypeKind::Trait || declaration_source.is_explicitly_abstract,
+            is_sealed: declaration_source.is_sealed,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters,
             type_parameter_constraints: Vec::new(),
@@ -438,25 +467,37 @@ fn scala_entry_facts(
         let Some(owner_id) = type_ids.get(owner) else {
             continue;
         };
-        let Some(visibility) = effective_visibility(tree, parsed, declaration, &parent_by_child)
+        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
         else {
             continue;
         };
         if !take_record(remaining_records, record_limit_hit) {
             break;
         }
-        let Some(node) = declaration_node(tree, parsed, declaration) else {
+        let Some(range) = parsed
+            .ranges
+            .get(declaration)
+            .and_then(|ranges| ranges.first())
+        else {
             continue;
         };
-        let range_key = (node.start_byte(), node.end_byte());
-        let callable = source_facts.callable_alternatives_by_range.get(&range_key);
+        let Some(node) = tree
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            continue;
+        };
+        let declaration_source = source_facts
+            .get(&declaration)
+            .expect("Scala artifact declaration has primary source facts");
+        let callable = declaration_source.callable.as_ref();
         let member_kind = scala_member_kind(declaration, callable);
         let signature = callable.and_then(|callable| {
             scala_signature(
                 callable,
                 node,
                 source,
-                source_facts.generic_owner_facts_by_range.get(&range_key),
+                declaration_source.generic_owner.as_ref(),
                 type_parameters_by_declaration
                     .get(owner)
                     .map(Vec::as_slice)
@@ -524,6 +565,7 @@ fn scala_entry_facts(
             && !is_static
             && matches!(member_kind, MemberKind::Method);
         members.push(MemberFact {
+            non_overridable: None,
             ambient_use: scala_declaration_ambient_use(node),
             id,
             owner: owner_id.clone(),
@@ -531,10 +573,10 @@ fn scala_entry_facts(
             member_kind,
             visibility,
             is_static,
-            is_abstract: source_facts.abstract_callable_ranges.contains(&range_key),
+            is_abstract: declaration_source.is_abstract_callable,
             is_virtual: member_kind == MemberKind::Method
                 && !is_static
-                && !scala_has_modifier(node, "final"),
+                && !declaration_source.is_final,
             implicit_operation: None,
             explicit_operation: None,
             callable_family_complete: false,
@@ -569,6 +611,7 @@ fn scala_entry_facts(
 /// no contextual role of its own.
 fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
     MemberFact {
+        non_overridable: None,
         ambient_use: Some(AmbientUseRole::NotAmbient),
         id: member_declaration_id(MemberIdentity {
             owner_id: &owner.id,
@@ -953,32 +996,18 @@ fn parent_index(parsed: &ParsedFile) -> HashMap<CodeUnit, CodeUnit> {
     parents
 }
 
-fn declaration_node<'tree>(
-    tree: &'tree Tree,
-    parsed: &ParsedFile,
-    declaration: &CodeUnit,
-) -> Option<Node<'tree>> {
-    let range = parsed.declaration_ranges(declaration).first()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
-    while node.start_byte() != range.start_byte || node.end_byte() != range.end_byte {
-        node = node.parent()?;
-    }
-    Some(node)
-}
-
 fn effective_visibility(
-    tree: &Tree,
-    parsed: &ParsedFile,
+    source_facts: &HashMap<&CodeUnit, &ScalaDeclarationSourceFact>,
     declaration: &CodeUnit,
     parents: &HashMap<CodeUnit, CodeUnit>,
 ) -> Option<Visibility> {
     let mut visibility = Visibility::Public;
     let mut current = Some(declaration);
     while let Some(candidate) = current {
-        let node = declaration_node(tree, parsed, candidate)?;
-        match scala_declaration_visibility(node) {
+        let fact = source_facts
+            .get(&candidate)
+            .expect("Scala artifact owner has primary source facts");
+        match fact.visibility {
             ScalaDeclarationVisibility::Public => {}
             ScalaDeclarationVisibility::Protected => visibility = Visibility::Protected,
             ScalaDeclarationVisibility::NonApi => return None,
@@ -988,14 +1017,14 @@ fn effective_visibility(
     Some(visibility)
 }
 
-fn scala_type_kind(node: Node<'_>, type_alias: bool) -> TypeKind {
+fn scala_type_kind(kind: ScalaDeclarationKind, type_alias: bool) -> TypeKind {
     if type_alias {
         return TypeKind::TypeAlias;
     }
-    match node.kind() {
-        "trait_definition" => TypeKind::Trait,
-        "object_definition" => TypeKind::Module,
-        "enum_definition" | "full_enum_case" => TypeKind::Enum,
+    match kind {
+        ScalaDeclarationKind::Trait => TypeKind::Trait,
+        ScalaDeclarationKind::Object => TypeKind::Module,
+        ScalaDeclarationKind::Enum | ScalaDeclarationKind::EnumCase => TypeKind::Enum,
         _ => TypeKind::Class,
     }
 }
@@ -1293,6 +1322,7 @@ object Child {
 
 trait Annotated[@specialized -A]
 case class Data(value: Int)
+sealed abstract class Family { final def stable(value: Int): Int = value }
 
 object Syntax {
   extension (value: Child)
@@ -1312,7 +1342,7 @@ object Syntax {
             pack_version: version.to_owned(),
             ecosystem: "maven".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
                     name: "scala".to_owned(),
                     requirement: format!("={version}"),
@@ -1414,6 +1444,14 @@ object Syntax {
                 .any(|fact| fact.name == "visible" && fact.visibility == Visibility::Public)
         );
         assert!(!members.iter().any(|fact| fact.name == "hidden"));
+        assert!(types.iter().any(|fact| {
+            fact.name == "scala.sample.Family" && fact.is_abstract && fact.is_sealed
+        }));
+        assert!(
+            members
+                .iter()
+                .any(|fact| { fact.name == "stable" && !fact.is_virtual })
+        );
         assert!(
             members
                 .iter()
@@ -1745,15 +1783,20 @@ trait Map[K, V] {
         let mut parser = Parser::new();
         parser.set_language(&language::LANGUAGE.into()).unwrap();
         let tree = parser.parse(source, None).unwrap();
-        let mut visibility = HashSet::default();
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            if matches!(node.kind(), "function_definition" | "function_declaration") {
-                visibility.insert(scala_declaration_visibility(node));
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
+        let file = ProjectFile::new(std::env::temp_dir(), "Visibility.scala");
+        let parsed = parse_scala_file(&file, source, &tree);
+        let visibility = parsed
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .scala
+            .as_ref()
+            .unwrap()
+            .declarations
+            .iter()
+            .filter(|fact| fact.callable.is_some())
+            .map(|fact| fact.visibility)
+            .collect::<HashSet<_>>();
         assert!(visibility.contains(&ScalaDeclarationVisibility::Public));
         assert!(visibility.contains(&ScalaDeclarationVisibility::Protected));
         assert!(visibility.contains(&ScalaDeclarationVisibility::NonApi));

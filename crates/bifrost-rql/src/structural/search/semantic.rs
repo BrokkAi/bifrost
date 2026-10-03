@@ -1,7 +1,9 @@
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
-use super::concurrency::{ConcurrentAccessConflictValue, WorkspaceConcurrencyProvider};
+use super::concurrency::{
+    ConcurrentAccessConflictValue, WorkspaceConcurrencyProvider, WorkspaceConcurrencyQueryCache,
+};
 use super::taint::{SemanticTaintFindingValue, TaintQueryState};
 use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
@@ -142,6 +144,7 @@ pub(super) struct SemanticCallResultValue {
     pub(super) value: ValueId,
     pub(super) site_id: String,
     pub(super) site_ast_id: String,
+    source_mapping_exact: bool,
     file: ProjectFile,
     source: SemanticSourceSnapshot,
     quality: SemanticQueryQuality,
@@ -239,6 +242,38 @@ struct PreparedSourceDispatchCache<'a> {
     retained_bytes: usize,
 }
 
+/// Attribute the first refusal of a query's shared semantic budget seen by a
+/// concurrency root: the root (unless the budget refused a charge before the
+/// root began), the internal dimension, the code that asked for the charge,
+/// and the charge itself.
+fn concurrency_budget_exhaustion(
+    root: &SemanticProcedureValue,
+    refused_before_root: bool,
+    refusal: Option<crate::analyzer::semantic::SemanticBudgetRefusal>,
+) -> CodeQueryExhaustedRoot {
+    CodeQueryExhaustedRoot {
+        path: crate::path_utils::rel_path_string(root.file()),
+        procedure: (!refused_before_root).then(|| super::type_flow::procedure_name(&root.handle)),
+        lane: refusal.map_or_else(
+            || "semantic/unrecorded".to_string(),
+            |refusal| format!("semantic/{}", refusal.exceeded.dimension().label()),
+        ),
+        // `file!()` uses the host separator; render the site the same on every OS.
+        stage: refusal.map(|refusal| {
+            format!(
+                "{}:{}",
+                refusal.site.file().replace('\\', "/"),
+                refusal.site.line()
+            )
+        }),
+        charge: refusal.map(|refusal| CodeQueryExhaustedCharge {
+            attempted: refusal.exceeded.attempted(),
+            limit: refusal.exceeded.limit(),
+        }),
+        feedback_iteration: None,
+    }
+}
+
 pub(super) struct SemanticQueryContext<'a> {
     workspace: &'a WorkspaceAnalyzer,
     cancellation: Option<&'a CancellationToken>,
@@ -252,6 +287,9 @@ pub(super) struct SemanticQueryContext<'a> {
     /// The activation snapshot shared by every semantic row family in this
     /// query, including each ICFG provider created on a cache miss.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    /// Complete race answers shared by every root while this query's semantic
+    /// budget is active. The store is dropped with this query context.
+    concurrency_query_cache: WorkspaceConcurrencyQueryCache,
     semantic_summaries: Arc<brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository>,
     budget: SemanticBudget,
     cache: HashMap<ProjectFile, CachedSemanticMaterialization>,
@@ -274,6 +312,10 @@ pub(super) struct SemanticQueryContext<'a> {
     source_call_indexes: HashMap<ProjectFile, Option<SemanticSourceCallIndex>>,
     prepared_source_dispatch: Option<PreparedSourceDispatchCache<'a>>,
     budget_exhausted: bool,
+    /// Where the first concurrency root found the shared budget exhausted.
+    /// Later roots name it, so their gaps are not read as caused by the
+    /// phase that happened to ask next.
+    concurrency_budget_exhaustion: Option<CodeQueryExhaustedRoot>,
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
@@ -457,6 +499,7 @@ impl<'a> SemanticQueryContext<'a> {
             workspace_generation,
             analysis_context,
             active_semantic_model_snapshot,
+            concurrency_query_cache: WorkspaceConcurrencyQueryCache::default(),
             semantic_summaries: semantic_summaries.unwrap_or_else(|| {
                 Arc::new(brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new())
             }),
@@ -481,6 +524,7 @@ impl<'a> SemanticQueryContext<'a> {
             source_call_indexes: HashMap::default(),
             prepared_source_dispatch: None,
             budget_exhausted: false,
+            concurrency_budget_exhaustion: None,
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
             taint: TaintQueryState::default(),
@@ -1020,9 +1064,10 @@ impl<'a> SemanticQueryContext<'a> {
             return Vec::new();
         }
 
+        let unique_source_call = candidates.len() == 1;
         candidates
             .into_iter()
-            .flat_map(|(_, candidate)| {
+            .flat_map(|(inexact, candidate)| {
                 let call = candidate
                     .procedure
                     .semantics()
@@ -1036,6 +1081,16 @@ impl<'a> SemanticQueryContext<'a> {
                         value,
                         site_id: site_id.to_owned(),
                         site_ast_id: site_ast_id.to_owned(),
+                        source_mapping_exact: !inexact
+                            && unique_source_call
+                            && candidate
+                                .procedure
+                                .semantics()
+                                .source_mapping(call.source)
+                                .is_some_and(|mapping| {
+                                    mapping.kind
+                                        == crate::analyzer::semantic::SourceMappingKind::Exact
+                                }),
                         file: file.clone(),
                         source: source.clone(),
                         quality: quality.clone(),
@@ -1472,6 +1527,41 @@ impl<'a> SemanticQueryContext<'a> {
         Some(procedures.remove(0).handle)
     }
 
+    pub(super) fn java_expression_lambda_result_use(
+        &mut self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        range: crate::analyzer::Range,
+    ) -> Option<crate::analyzer::JavaCallResultUse> {
+        const OPERATION: &str = "Java expression-lambda result use";
+        if !self.charge_consumer_traversal(file, 0, OPERATION) {
+            return None;
+        }
+        let available = self
+            .limits
+            .max_traversal_steps
+            .saturating_sub(self.traversal_steps);
+        let mut remaining = available;
+        let result = crate::analyzer::usages::get_definition::java_expression_lambda_result_use(
+            analyzer,
+            self.active_semantic_model_snapshot.as_deref(),
+            file,
+            source,
+            range,
+            &mut remaining,
+            self.cancellation.unwrap_or(&self.uncancelled),
+        );
+        let spent = if result.is_none() && remaining == 0 {
+            available.saturating_add(1)
+        } else {
+            available - remaining
+        };
+        self.charge_consumer_traversal(file, spent, OPERATION)
+            .then_some(result)
+            .flatten()
+    }
+
     /// Charge a bounded consumer walk over rows in an already retained
     /// artifact. Materialization pays for the rows themselves; this ledger is
     /// the independent per-query bound on how many of them consumers inspect.
@@ -1666,16 +1756,18 @@ impl<'a> SemanticQueryContext<'a> {
         if let Some(collector) = &artifact_collector {
             request = request.with_artifact_collector(collector);
         }
+        let refused_before_root = request.budget.first_refusal().is_some();
         let icfg = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
         );
         let summary_reads =
             brokk_bifrost_flow::dataflow::SummaryReadRecorder::new(self.workspace.analyzer());
-        let projection_concurrency = WorkspaceConcurrencyProvider::new(
+        let projection_concurrency = WorkspaceConcurrencyProvider::new_with_query_cache(
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
             None,
+            &self.concurrency_query_cache,
         );
         let summaries = match brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
             std::slice::from_ref(&procedure.handle),
@@ -1708,53 +1800,133 @@ impl<'a> SemanticQueryContext<'a> {
                 Some(summaries)
             }
             Err(error) => {
+                use brokk_bifrost_flow::typestate::ProductionSummaryProjectionError as Error;
+                let budget_error = matches!(
+                    error,
+                    Error::CallTransferBudgetExceeded { .. }
+                        | Error::PublicationBudgetExceeded { .. }
+                        | Error::RetainedClosureBudgetExceeded(_)
+                );
+                let (message, exhausted_roots) = match &self.concurrency_budget_exhaustion {
+                    Some(first) if budget_error => (
+                        format!(
+                            "concurrency summary projection was incomplete because the query's \
+                             shared semantic budget was already exhausted at {}: {error}",
+                            first.render()
+                        ),
+                        Vec::new(),
+                    ),
+                    None if budget_error => {
+                        let entry = concurrency_budget_exhaustion(
+                            procedure,
+                            refused_before_root,
+                            request.budget.first_refusal(),
+                        );
+                        self.concurrency_budget_exhaustion = Some(entry.clone());
+                        (
+                            format!(
+                                "concurrency summary projection exhausted the query's shared \
+                                 semantic budget: {error}: {}",
+                                entry.render()
+                            ),
+                            vec![entry],
+                        )
+                    }
+                    _ => (
+                        format!("concurrency summary projection was incomplete: {error}"),
+                        Vec::new(),
+                    ),
+                };
                 self.diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
                     language: "workspace",
-                    message: format!("concurrency summary projection was incomplete: {error}"),
-                    exhausted_roots: Vec::new(),
+                    message,
+                    exhausted_roots,
                 });
                 None
             }
         };
-        let provider = WorkspaceConcurrencyProvider::new(
+        let provider = WorkspaceConcurrencyProvider::new_with_query_cache(
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
             summaries,
+            &self.concurrency_query_cache,
         );
-        match brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        match brokk_bifrost_flow::concurrency::concurrent_access_conflicts_with_query_cache(
             &provider,
             &procedure.handle,
             &mut request,
+            self.concurrency_query_cache.flow_cache(),
         ) {
             Ok(report) => {
                 if !report.reasons.is_empty() {
-                    let code = if report.reasons.contains(
+                    let exhausted = report.reasons.contains(
                         &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::BudgetExhausted,
-                    ) {
+                    );
+                    let code = if exhausted {
                         CodeQueryDiagnosticCode::SemanticBudgetExhausted
                     } else {
                         CodeQueryDiagnosticCode::SemanticAnalysisPartial
                     };
+                    let (message, exhausted_roots) =
+                        match (exhausted, &self.concurrency_budget_exhaustion) {
+                            (true, Some(first)) => (
+                                format!(
+                                    "concurrent access analysis retained incomplete task slices \
+                                     because the query's shared semantic budget was already \
+                                     exhausted at {}: {:?}",
+                                    first.render(),
+                                    report.reasons
+                                ),
+                                Vec::new(),
+                            ),
+                            (true, None) => {
+                                let entry = concurrency_budget_exhaustion(
+                                    procedure,
+                                    refused_before_root,
+                                    request.budget.first_refusal(),
+                                );
+                                self.concurrency_budget_exhaustion = Some(entry.clone());
+                                (
+                                    format!(
+                                        "concurrent access analysis exhausted the query's shared \
+                                         semantic budget and retained incomplete task slices: \
+                                         {:?}: {}",
+                                        report.reasons,
+                                        entry.render()
+                                    ),
+                                    vec![entry],
+                                )
+                            }
+                            (false, _) => (
+                                format!(
+                                    "concurrent access analysis retained incomplete task slices: \
+                                     {:?}",
+                                    report.reasons
+                                ),
+                                Vec::new(),
+                            ),
+                        };
                     self.diagnostics.push(CodeQueryDiagnostic {
                         code,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
                         language: "go",
-                        message: format!(
-                            "concurrent access analysis retained incomplete task slices: {:?}",
-                            report.reasons
-                        ),
-                        exhausted_roots: Vec::new(),
+                        message,
+                        exhausted_roots,
                     });
                 }
                 report
                     .conflicts
                     .into_iter()
                     .map(|conflict| {
-                        super::concurrency::project_conflict(self.workspace, procedure, conflict)
+                        super::concurrency::project_conflict(
+                            self.workspace,
+                            &procedure.handle,
+                            conflict,
+                        )
                     })
                     .collect()
             }
@@ -3076,6 +3248,17 @@ impl SemanticControlEdgeValue {
 }
 
 impl SemanticCallResultValue {
+    pub(super) const fn source_mapping_exact(&self) -> bool {
+        self.source_mapping_exact
+    }
+
+    pub(super) fn public_range_for_source_range(
+        &self,
+        range: crate::analyzer::Range,
+    ) -> CodeQueryRange {
+        public_range_for_offsets(range.start_byte, range.end_byte, &self.source)
+    }
+
     pub(super) fn public(&self) -> CodeQueryCallResult {
         let procedure = self.handle.procedure();
         let call = procedure
@@ -3281,16 +3464,18 @@ fn procedure_evidence(handle: &ProcedureHandle) -> &Evidence {
 
 fn public_range(mapping: &SourceMapping, source: &SemanticSourceSnapshot) -> CodeQueryRange {
     let span = mapping.locator.anchor().span();
-    let (start_line, start_column) = line_column_for_offset(
-        &source.source,
-        &source.line_starts,
-        span.start_byte() as usize,
-    );
-    let (end_line, end_column) = line_column_for_offset(
-        &source.source,
-        &source.line_starts,
-        span.end_byte() as usize,
-    );
+    public_range_for_offsets(span.start_byte() as usize, span.end_byte() as usize, source)
+}
+
+fn public_range_for_offsets(
+    start_offset: usize,
+    end_offset: usize,
+    source: &SemanticSourceSnapshot,
+) -> CodeQueryRange {
+    let (start_line, start_column) =
+        line_column_for_offset(&source.source, &source.line_starts, start_offset);
+    let (end_line, end_column) =
+        line_column_for_offset(&source.source, &source.line_starts, end_offset);
     CodeQueryRange {
         start_line,
         start_column,

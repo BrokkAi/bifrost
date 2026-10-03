@@ -206,6 +206,17 @@ pub(super) fn enumerate_procedures<'tree>(
             procedure_context = Some((identity.id, identity.declaration_path));
         }
 
+        // Module evaluation may suspend without an `async` declaration token.
+        // Use the inventory's executable owner so awaits in nested callables
+        // do not change the enclosing module's contract. This shares the
+        // existing traversal budget and cancellation checks.
+        if node.kind() == "await_expression"
+            && let Some(owner) = lexical_parent
+            && specs[owner.index()].callable.kind() == "program"
+        {
+            specs[owner.index()].properties.is_async = true;
+        }
+
         if matches!(node.kind(), "with_statement" | "call_expression") {
             let possible_direct_eval = node.kind() == "call_expression"
                 && node.child_by_field_name("function").is_some_and(|callee| {

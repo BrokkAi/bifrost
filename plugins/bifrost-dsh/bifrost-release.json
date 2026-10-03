@@ -1,6 +1,6 @@
 {
-  "binaryVersion": "0.12.0",
-  "minimumBinaryVersion": "0.12.0",
+  "binaryVersion": "0.13.0",
+  "minimumBinaryVersion": "0.13.0",
   "allowPrerelease": false,
   "archiveSha256": {
     "aarch64-pc-windows-msvc": "29aa9d8606943d07a7b399b7ef1a324a72ed5a3388a6fbbd072bcfcc619dd84a",

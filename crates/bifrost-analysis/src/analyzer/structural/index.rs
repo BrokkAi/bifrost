@@ -170,6 +170,7 @@ pub struct SnapshotStructuralIndex {
     kind_name_postings: KindNamePostings,
     role_postings: HashMap<RolePostingKey, Box<[FactAddress]>>,
     source_trigram_filters: Box<[u64]>,
+    fact_nodes: u64,
     retained_bytes: u64,
 }
 
@@ -185,6 +186,10 @@ impl SnapshotStructuralIndex {
 
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     /// Returns false only when at least one required anchor group has every
@@ -211,7 +216,7 @@ impl SnapshotStructuralIndex {
     pub fn select(
         &self,
         requirements: &StructuralAccessRequirements,
-        scoped_files: &[ProjectFile],
+        scoped_files: Option<&[ProjectFile]>,
         source_verification_required: bool,
         cache_ready_before_lookup: bool,
         cancellation: &CancellationToken,
@@ -219,27 +224,38 @@ impl SnapshotStructuralIndex {
         if requirements.terms().is_empty() {
             return Ok(None);
         }
-        let mut scoped_ids = Vec::with_capacity(scoped_files.len());
-        let mut scoped_fact_nodes = 0u64;
-        for (index, file) in scoped_files.iter().enumerate() {
-            if index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
-                return Err("structural index selection cancelled");
-            }
-            let Some(id) = self.file_ids.get(file).copied() else {
-                return Err("snapshot index does not contain a scoped provider file");
+        let (scoped_ids, scoped_file_count, scoped_fact_nodes, full_provider_scope) =
+            if let Some(scoped_files) = scoped_files {
+                let mut scoped_ids = Vec::with_capacity(scoped_files.len());
+                let mut scoped_fact_nodes = 0u64;
+                for (index, file) in scoped_files.iter().enumerate() {
+                    if index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
+                        return Err("structural index selection cancelled");
+                    }
+                    let Some(id) = self.file_ids.get(file).copied() else {
+                        return Err("snapshot index does not contain a scoped provider file");
+                    };
+                    scoped_ids.push(id);
+                    scoped_fact_nodes = scoped_fact_nodes
+                        .saturating_add(u64::from(self.files[id as usize].fact_nodes));
+                }
+                scoped_ids.sort_unstable();
+                scoped_ids.dedup();
+                let full_provider_scope = scoped_ids.len() == self.files.len()
+                    && scoped_ids
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .all(|(index, file)| usize::try_from(file).ok() == Some(index));
+                (
+                    scoped_ids,
+                    scoped_files.len(),
+                    scoped_fact_nodes,
+                    full_provider_scope,
+                )
+            } else {
+                (Vec::new(), self.files.len(), self.fact_nodes, true)
             };
-            scoped_ids.push(id);
-            scoped_fact_nodes =
-                scoped_fact_nodes.saturating_add(u64::from(self.files[id as usize].fact_nodes));
-        }
-        scoped_ids.sort_unstable();
-        scoped_ids.dedup();
-        let full_provider_scope = scoped_ids.len() == self.files.len()
-            && scoped_ids
-                .iter()
-                .copied()
-                .enumerate()
-                .all(|(index, file)| usize::try_from(file).ok() == Some(index));
 
         let mut terms =
             self.selection_terms(requirements, &scoped_ids, full_provider_scope, cancellation)?;
@@ -286,7 +302,7 @@ impl SnapshotStructuralIndex {
         let estimate = StructuralAccessPathEstimate {
             kind: StructuralAccessPathKind::Posting,
             provider_files: self.files.len() as u64,
-            scoped_files: scoped_files.len() as u64,
+            scoped_files: scoped_file_count as u64,
             scoped_fact_nodes,
             candidate_files: by_file.len() as u64,
             candidate_facts: selected.len() as u64,
@@ -614,6 +630,10 @@ pub struct StructuralCandidateSet {
 impl StructuralCandidateSet {
     pub fn facts_for(&self, file: &ProjectFile) -> &[u32] {
         self.by_file.get(file).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.by_file.keys()
     }
 }
 
@@ -1579,6 +1599,7 @@ fn build_index(
         kind_name_postings,
         role_postings,
         source_trigram_filters: source_trigram_filters.into_boxed_slice(),
+        fact_nodes: metrics.fact_nodes,
         retained_bytes: 0,
     };
     let Some(retained_bytes) = retained_bytes(&index, cancellation) else {
@@ -1966,7 +1987,7 @@ mod tests {
         let selected = index
             .select(
                 &requirements,
-                &provider.files,
+                Some(&provider.files),
                 false,
                 false,
                 &CancellationToken::default(),
@@ -1993,7 +2014,7 @@ mod tests {
         let selected = index
             .select(
                 &requirements,
-                &provider.files,
+                Some(&provider.files),
                 false,
                 false,
                 &CancellationToken::default(),
@@ -2522,7 +2543,13 @@ mod tests {
 
         assert_eq!(
             index
-                .select(&requirements, &provider.files, false, true, &cancellation,)
+                .select(
+                    &requirements,
+                    Some(&provider.files),
+                    false,
+                    true,
+                    &cancellation,
+                )
                 .expect_err("selection must observe cancellation"),
             "structural index selection cancelled"
         );

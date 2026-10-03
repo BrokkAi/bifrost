@@ -366,12 +366,15 @@ impl Default for CSharpExternalDeclarationIndex {
 
 impl CSharpExternalDeclarationIndex {
     pub fn build_for_project(config: &CSharpAnalyzerConfig, project: &dyn Project) -> Self {
-        let discovery = resolve_csharp_semantic_pack_dependencies(
-            config,
-            project,
-            &DependencyPackLimits::default(),
-            None,
-        );
+        let discovery = {
+            let _timing = crate::profiling::scope("csharp_external_index.discovery");
+            resolve_csharp_semantic_pack_dependencies(
+                config,
+                project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        };
         let mut paths: Vec<_> = discovery
             .dependencies
             .iter()
@@ -380,6 +383,7 @@ impl CSharpExternalDeclarationIndex {
             .collect();
         paths.sort();
         paths.dedup();
+        let _timing = crate::profiling::scope("csharp_external_index.build_from_artifacts");
         let mut index = Self::default();
         index.complete &= discovery.complete;
         index.has_dependency_inputs = discovery.profile.metadata_inputs_considered > 0;
@@ -515,7 +519,7 @@ impl CSharpExternalDeclarationIndex {
                 pack_version: env!("CARGO_PKG_VERSION").to_owned(),
                 ecosystem: "nuget".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 activation: vec![ActivationSelector {
@@ -1250,6 +1254,7 @@ impl CSharpAssemblyPackProducer {
                 visibility: semantic_visibility(ty.visibility),
                 is_abstract: ty.is_abstract,
                 is_sealed: ty.is_sealed,
+                callable_surface_complete: false,
                 has_explicit_type_terms: false,
                 type_parameters: ty.type_parameters.clone(),
                 type_parameter_constraints: Vec::new(),
@@ -1341,6 +1346,7 @@ impl CSharpAssemblyPackProducer {
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
+                    non_overridable: None,
                     ambient_use: None,
                     id,
                     owner: type_id.clone(),
@@ -1678,7 +1684,7 @@ fn csharp_dependency_production_request(
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
-            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         activation: vec![ActivationSelector {

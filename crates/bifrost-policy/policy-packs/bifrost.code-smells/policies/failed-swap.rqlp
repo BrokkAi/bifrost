@@ -18,7 +18,7 @@
                         (verdict eq failed_swap)
                         (proof eq exact)
                         (coverage eq exhaustive))
-          (language java javascript typescript python
+          (language java javascript typescript python csharp kotlin go rust
             (assignment-relations :relation [failed-swap]
               (procedure-of
                 (callable)))))))

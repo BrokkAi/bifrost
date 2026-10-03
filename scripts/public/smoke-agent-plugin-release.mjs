@@ -10,6 +10,8 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-contract.mjs";
+import { required } from "./cli-argument-helpers.mjs";
+import { roundTrip, waitForSpawn, writeMessage } from "./mcp-smoke-transport.mjs";
 
 const execFileAsync = promisify(execFile);
 const codexHandshake = JSON.parse(
@@ -97,13 +99,6 @@ function parseArgs(args) {
     options[key.slice(2).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())] = value;
   }
   return options;
-}
-
-function required(value, name) {
-  if (!value) {
-    throw new Error(`Missing required --${name}`);
-  }
-  return value;
 }
 
 async function requiredDirectory(value, name) {
@@ -629,57 +624,6 @@ function waitForMethod(child, reader, method) {
     };
     reader.on("line", onLine);
     child.on("error", onError);
-  });
-}
-
-function waitForSpawn(child) {
-  return new Promise((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  });
-}
-
-function writeMessage(child, message) {
-  child.stdin.write(`${JSON.stringify(message)}\n`);
-}
-
-function roundTrip(child, reader, message) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for MCP response to ${message.method}`));
-    }, 90_000);
-    const onLine = (line) => {
-      let response;
-      try {
-        response = JSON.parse(line);
-      } catch (error) {
-        cleanup();
-        reject(new Error(`MCP emitted non-JSON stdout: ${error.message}`));
-        return;
-      }
-      if (response.id !== message.id) {
-        return;
-      }
-      cleanup();
-      if (response.error) {
-        reject(new Error(`MCP ${message.method} failed: ${JSON.stringify(response.error)}`));
-        return;
-      }
-      resolve(response);
-    };
-    const onError = (error) => {
-      cleanup();
-      reject(error);
-    };
-    const cleanup = () => {
-      clearTimeout(timeout);
-      reader.off("line", onLine);
-      child.off("error", onError);
-    };
-    reader.on("line", onLine);
-    child.on("error", onError);
-    writeMessage(child, message);
   });
 }
 

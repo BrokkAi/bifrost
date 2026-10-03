@@ -551,7 +551,13 @@ impl ScalaQueryTargetCatalog {
             });
             match spec.kind {
                 java_resolver::TargetKind::Method | java_resolver::TargetKind::Constructor => {
-                    let arity = java_callable_arity(java, target);
+                    // Java TargetSpec admits callable targets only after the
+                    // canonical arity has been read. An absent value here is
+                    // therefore an unavailable manually-constructed spec,
+                    // not a candidate to reject from a normal query.
+                    let Some(arity) = java_callable_arity(java, target) else {
+                        continue;
+                    };
                     if is_static {
                         static_callable_arities.insert(arity);
                     } else {

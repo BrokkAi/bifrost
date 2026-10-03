@@ -22,7 +22,7 @@
 //! from two different snapshots.
 
 use super::edges::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
-use super::facts::Span;
+use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::lexical_environment::environment_for_file;
 use super::occurrence_rows::{
@@ -32,16 +32,20 @@ use super::occurrence_rows::{
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::resolution::EnvironmentAxis;
 use crate::analyzer::canonical_hash::CanonicalHasher;
+use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::usages::{
     FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
     UsageHitSurface, UsageProof, UsageQueryCompletion,
 };
-use crate::analyzer::{CodeUnit, DeclarationId, FqName, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{
+    CodeUnit, DeclarationId, FqName, IAnalyzer, ProjectFile, Range, TypeHierarchyProvider,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// The file a scan unit reads: a bare file scans whole, a file with demanded
 /// lines scans only those lines' reference rows. Declared for
@@ -131,6 +135,11 @@ fn reference_hits_from_fuzzy_result(
             hits_by_overload,
             unproven_by_overload,
             ..
+        }
+        | FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
         } => (
             hits_by_overload
                 .into_iter()
@@ -190,6 +199,375 @@ fn reference_hits_from_fuzzy_result(
     }
 }
 
+#[derive(Clone, Copy)]
+struct IndexedSpan<T> {
+    span: Span,
+    value: T,
+}
+
+struct ContainingSpanNode<T> {
+    center: usize,
+    spanning: Box<[IndexedSpan<T>]>,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+impl<T> ContainingSpanNode<T> {
+    fn placeholder() -> Self {
+        Self {
+            center: 0,
+            spanning: Box::new([]),
+            left: None,
+            right: None,
+        }
+    }
+}
+
+/// Immutable interval index for finding facts whose spans contain one queried
+/// source range.
+///
+/// Every node stores the intervals crossing its center. A containment lookup
+/// inspects those intervals and follows at most one child, because an interval
+/// wholly on the other side of the center cannot contain the query. This keeps
+/// lookup proportional to tree depth plus the actual containing intervals,
+/// without allocating a traversal stack or scanning the file arena.
+struct ContainingSpanIndex<T> {
+    nodes: Box<[ContainingSpanNode<T>]>,
+}
+
+impl<T: Copy> ContainingSpanIndex<T> {
+    fn new(entries: impl IntoIterator<Item = (Span, T)>) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(span, value)| {
+                assert!(
+                    span.start_byte <= span.end_byte,
+                    "indexed structural span must be ordered: {span:?}"
+                );
+                IndexedSpan { span, value }
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Self {
+                nodes: Box::new([]),
+            };
+        }
+
+        let mut nodes = Vec::new();
+        nodes.push(ContainingSpanNode::placeholder());
+        let mut pending = vec![(0_usize, entries)];
+        while let Some((node_index, mut entries)) = pending.pop() {
+            let middle = entries.len() / 2;
+            entries.select_nth_unstable_by_key(middle, |entry| {
+                entry.span.start_byte + (entry.span.end_byte - entry.span.start_byte) / 2
+            });
+            let pivot = entries[middle].span;
+            let center = pivot.start_byte + (pivot.end_byte - pivot.start_byte) / 2;
+            let mut left = Vec::new();
+            let mut spanning = Vec::new();
+            let mut right = Vec::new();
+            for entry in entries {
+                if entry.span.end_byte < center {
+                    left.push(entry);
+                } else if entry.span.start_byte > center {
+                    right.push(entry);
+                } else {
+                    spanning.push(entry);
+                }
+            }
+            assert!(
+                !spanning.is_empty(),
+                "the pivot interval must cross its own midpoint"
+            );
+
+            let left_index = (!left.is_empty()).then(|| {
+                let child = nodes.len();
+                nodes.push(ContainingSpanNode::placeholder());
+                pending.push((child, left));
+                child
+            });
+            let right_index = (!right.is_empty()).then(|| {
+                let child = nodes.len();
+                nodes.push(ContainingSpanNode::placeholder());
+                pending.push((child, right));
+                child
+            });
+            nodes[node_index] = ContainingSpanNode {
+                center,
+                spanning: spanning.into_boxed_slice(),
+                left: left_index,
+                right: right_index,
+            };
+        }
+        Self {
+            nodes: nodes.into_boxed_slice(),
+        }
+    }
+
+    fn best_containing_by_key<K: Ord>(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+        mut key: impl FnMut(T) -> K,
+    ) -> Option<T> {
+        assert!(
+            start_byte <= end_byte,
+            "reference source range must be ordered"
+        );
+        let mut best: Option<(K, T)> = None;
+        let mut cursor = (!self.nodes.is_empty()).then_some(0_usize);
+        while let Some(node_index) = cursor {
+            let node = &self.nodes[node_index];
+            for entry in &node.spanning {
+                if entry.span.start_byte <= start_byte && end_byte <= entry.span.end_byte {
+                    let candidate_key = key(entry.value);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_key, _)| candidate_key < *best_key)
+                    {
+                        best = Some((candidate_key, entry.value));
+                    }
+                }
+            }
+            cursor = if end_byte < node.center {
+                node.left
+            } else if start_byte > node.center {
+                node.right
+            } else {
+                None
+            };
+        }
+        best.map(|(_, value)| value)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NearestDeclaration {
+    kind: NormalizedKind,
+    name: Option<Span>,
+}
+
+/// Reusable per-file index for source-level reference classification.
+///
+/// Construction reads one immutable structural-facts snapshot and performs one
+/// file-sized pass. Later target lookups use interval indexes for the selected
+/// call/field site and nearest containing fact, plus precomputed declaration
+/// and assignment ancestry. No lookup scans or sorts the file's node arena.
+pub(crate) struct ReferenceSiteClassifier<'analyzer> {
+    analyzer: &'analyzer dyn IAnalyzer,
+    facts: Arc<FileFacts>,
+    named_accesses: ContainingSpanIndex<u32>,
+    containing_nodes: ContainingSpanIndex<u32>,
+    nearest_declarations: Box<[Option<NearestDeclaration>]>,
+    nearest_assignments: Box<[Option<u32>]>,
+    site_identities: SiteIdentityIndex,
+}
+
+impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
+    /// Build the classifier from the analyzer's one facts snapshot for `file`.
+    /// Returns `None` when the file has no structural adapter or facts.
+    pub(crate) fn new(analyzer: &'analyzer dyn IAnalyzer, file: &ProjectFile) -> Option<Self> {
+        let language = crate::analyzer::common::language_for_file(file);
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == language)?
+            .structural_facts(file)?;
+
+        let mut named_accesses = Vec::new();
+        let mut containing_nodes = Vec::with_capacity(facts.nodes().len());
+        let mut site_identity_nodes = HashMap::default();
+        let mut nearest_declarations: Vec<Option<NearestDeclaration>> =
+            Vec::with_capacity(facts.nodes().len());
+        let mut nearest_assignments: Vec<Option<u32>> = Vec::with_capacity(facts.nodes().len());
+        for (index, node) in facts.nodes().iter().enumerate() {
+            let id = u32::try_from(index).expect("structural fact id must fit u32");
+            containing_nodes.push((node.span(), id));
+            if node.kind == NormalizedKind::Identifier {
+                site_identity_nodes
+                    .entry((node.range.start_byte, node.range.end_byte))
+                    .or_insert(id);
+            }
+            if matches!(
+                node.kind,
+                NormalizedKind::Call | NormalizedKind::FieldAccess
+            ) && let Some(name) = node.name
+            {
+                named_accesses.push((name, id));
+            }
+
+            let parent_declaration = node.parent.and_then(|parent| {
+                assert!(
+                    (parent as usize) < index,
+                    "structural parent must precede its child: {parent} -> {id}"
+                );
+                nearest_declarations[parent as usize]
+            });
+            nearest_declarations.push(if node.kind.satisfies(NormalizedKind::Declaration) {
+                Some(NearestDeclaration {
+                    kind: node.kind,
+                    name: node.name,
+                })
+            } else {
+                parent_declaration
+            });
+
+            let parent_assignment = node.parent.and_then(|parent| {
+                assert!(
+                    (parent as usize) < index,
+                    "structural parent must precede its child: {parent} -> {id}"
+                );
+                nearest_assignments[parent as usize]
+            });
+            nearest_assignments.push(if node.kind == NormalizedKind::Assignment {
+                Some(id)
+            } else {
+                parent_assignment
+            });
+        }
+
+        let site_identities = SiteIdentityIndex {
+            content_identity: Some(facts.source_identity()),
+            by_range: site_identity_nodes,
+        };
+        Some(Self {
+            analyzer,
+            facts,
+            named_accesses: ContainingSpanIndex::new(named_accesses),
+            containing_nodes: ContainingSpanIndex::new(containing_nodes),
+            nearest_declarations: nearest_declarations.into_boxed_slice(),
+            nearest_assignments: nearest_assignments.into_boxed_slice(),
+            site_identities,
+        })
+    }
+
+    /// Classify one exact source range against its resolved declaration.
+    pub(crate) fn classify_reference_kind(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+        target: &CodeUnit,
+    ) -> Option<ReferenceKind> {
+        let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
+        let candidate = self
+            .named_accesses
+            .best_containing_by_key(start_byte, end_byte, |id| {
+                let node = self.facts.node(id);
+                (
+                    usize::from(node.kind != NormalizedKind::Call),
+                    node.range.end_byte - node.range.start_byte,
+                    id,
+                )
+            });
+        if let Some(id) = candidate {
+            let node = self.facts.node(id);
+            let receiver_role = if node.kind == NormalizedKind::FieldAccess {
+                Role::Object
+            } else {
+                Role::Receiver
+            };
+            let receiver = self
+                .facts
+                .role_targets(id, receiver_role)
+                .next()
+                .map(|role| role.span.text(self.facts.source()).trim());
+            if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
+                return Some(ReferenceKind::SuperCall);
+            }
+            let static_receiver = self
+                .analyzer
+                .parent_of(target)
+                .filter(|owner| owner.is_class())
+                .is_some_and(|owner| receiver == Some(owner.short_name()));
+            if static_receiver {
+                return Some(ReferenceKind::StaticReference);
+            }
+            if node.kind == NormalizedKind::Call {
+                return Some(
+                    if target.is_class() || target.kind().display_lowercase() == "constructor" {
+                        ReferenceKind::ConstructorCall
+                    } else {
+                        ReferenceKind::MethodCall
+                    },
+                );
+            }
+            if let Some(assignment) = self.nearest_assignments[id as usize] {
+                return Some(
+                    if self
+                        .facts
+                        .role_targets(assignment, Role::Left)
+                        .any(|role| covers(role.span))
+                    {
+                        ReferenceKind::FieldWrite
+                    } else {
+                        ReferenceKind::FieldRead
+                    },
+                );
+            }
+            return Some(ReferenceKind::FieldRead);
+        }
+
+        if target.is_class()
+            && let Some(nearest) =
+                self.containing_nodes
+                    .best_containing_by_key(start_byte, end_byte, |id| {
+                        let node = self.facts.node(id);
+                        (node.range.end_byte - node.range.start_byte, id)
+                    })
+            && let Some(declaration) = self.nearest_declarations[nearest as usize]
+            && declaration.kind == NormalizedKind::Class
+            && declaration.name.is_none_or(|name| !covers(name))
+        {
+            return Some(ReferenceKind::Inheritance);
+        }
+        target.is_class().then_some(ReferenceKind::TypeReference)
+    }
+
+    /// The enclosing structural call shape that owns a selected identifier,
+    /// when that identifier is a call's callee. Usage surfaces for
+    /// constructors report the allocation expression, while inverse edges
+    /// remain anchored to the exact reference token.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn call_range_containing_reference(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Option<Range> {
+        let id = self
+            .named_accesses
+            .best_containing_by_key(start_byte, end_byte, |id| {
+                let node = self.facts.node(id);
+                (
+                    usize::from(node.kind != NormalizedKind::Call),
+                    node.range.end_byte - node.range.start_byte,
+                    id,
+                )
+            })?;
+        let node = self.facts.node(id);
+        (node.kind == NormalizedKind::Call).then_some(node.range)
+    }
+
+    /// Exact content-scoped AST identity for an identifier at this byte range.
+    /// `None` means the structural snapshot has no identifier with that exact
+    /// range; this method never guesses from containment or source text.
+    pub(crate) fn ast_id(&self, start_byte: usize, end_byte: usize) -> Option<String> {
+        self.site_identities.ast_id_for_bytes(start_byte, end_byte)
+    }
+
+    /// The identifier token that spans exactly these bytes, read from the
+    /// file's structural facts rather than from the source text.
+    ///
+    /// `None` means no identifier node has that exact span, which is the
+    /// honest answer for a range the parser did not produce an identifier for.
+    /// A caller comparing this against a declaration's `short_name` must
+    /// normalize a Rust raw identifier with
+    /// `symbol_path::strip_raw_identifier_prefix`.
+    pub(crate) fn identifier_at(&self, start_byte: usize, end_byte: usize) -> Option<&str> {
+        let node = *self.site_identities.by_range.get(&(start_byte, end_byte))?;
+        Some(self.facts.node(node).span().text(self.facts.source()))
+    }
+}
+
 pub fn classify_reference_kind(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -197,12 +575,18 @@ pub fn classify_reference_kind(
     end_byte: usize,
     target: &CodeUnit,
 ) -> Option<ReferenceKind> {
-    let language = crate::analyzer::common::language_for_file(file);
-    let facts = analyzer
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == language)?
-        .structural_facts(file)?;
+    ReferenceSiteClassifier::new(analyzer, file)?
+        .classify_reference_kind(start_byte, end_byte, target)
+}
+
+#[cfg(test)]
+fn classify_reference_kind_scan_oracle(
+    analyzer: &dyn IAnalyzer,
+    facts: &FileFacts,
+    start_byte: usize,
+    end_byte: usize,
+    target: &CodeUnit,
+) -> Option<ReferenceKind> {
     let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
     let mut candidates = facts
         .nodes()
@@ -302,8 +686,10 @@ pub struct EdgeSite {
     pub file: ProjectFile,
     pub range: Range,
     /// The content-scoped AST identity of the site token, present exactly when
-    /// the producer can address the token as a facts-arena node (forward rows
-    /// always can; inverse rows gain it in the classification milestone).
+    /// the producer can address the token as a facts-arena node. Occurrence-row
+    /// forward edges carry it directly; native fact and inverse rows may still
+    /// be addressed exactly by file plus byte range while their AST join is
+    /// unavailable.
     /// Never fabricated: `None` means the site is addressed by `file` plus
     /// byte range over the same content, which is exact, not heuristic.
     pub ast_id: Option<String>,
@@ -347,6 +733,48 @@ impl ReferenceEdgeRow {
     pub fn included_in(&self, surface: UsageHitSurface) -> bool {
         self.usage_kind.included_in(surface)
     }
+
+    /// Whether this source range overlaps any declaration span belonging to
+    /// the target graph node in the same file.
+    ///
+    /// This predicate is intentionally independent of usage surface. A
+    /// consumer may need the incumbent definition-overlap exclusion for a
+    /// retained editor-only row such as an unproven self-receiver without
+    /// reclassifying that row as an external usage.
+    pub fn overlaps_target_definition_spans(
+        &self,
+        target_definition_spans: &[(ProjectFile, Range)],
+    ) -> bool {
+        target_definition_spans.iter().any(|(file, target)| {
+            file == &self.site.file
+                && target.start_byte < self.site.range.end_byte
+                && self.site.range.start_byte < target.end_byte
+        })
+    }
+
+    /// Whether this row can enter the external workspace usage graph before
+    /// graph-node membership is applied.
+    ///
+    /// The canonical row inventory deliberately retains self type/path
+    /// references for editor and query consumers. The workspace graph has the
+    /// narrower incumbent contract: it excludes every reference whose source
+    /// range overlaps any declaration belonging to the target graph node in
+    /// that file. `target_definition_spans` must contain file-tagged ranges from
+    /// the same generation as this row, including every declaration grouped
+    /// into a C++ or C# graph node. Graph-node membership and grouped self-edge
+    /// exclusion remain the consumer's separate responsibility.
+    pub fn included_in_external_usage_graph(
+        &self,
+        target_definition_spans: &[(ProjectFile, Range)],
+    ) -> bool {
+        if !self.included_in(UsageHitSurface::ExternalUsages) {
+            return false;
+        }
+        if self.site.enclosing.is_none() {
+            return false;
+        }
+        !self.overlaps_target_definition_spans(target_definition_spans)
+    }
 }
 
 /// Why an edge derivation's rows are less than the whole truth.
@@ -364,6 +792,9 @@ pub enum EdgeIncompleteReason {
     UsageAnalysisFailed { reason_kind: String, reason: String },
     /// The usage query was cancelled before completing.
     Cancelled,
+    /// A selected inverse query reached its soft time budget after confirming
+    /// only part of the requested candidate-blob inventory.
+    TimeBudgetExceeded,
     /// The file's occurrence rows do not cover these reference-producing
     /// roles, so forward edges at sites of those roles may be missing. Roles
     /// the file does cover are unaffected: a consumer narrowed to one role
@@ -372,6 +803,40 @@ pub enum EdgeIncompleteReason {
     OccurrenceRowsIncomplete {
         uncovered_roles: Vec<OccurrenceRole>,
     },
+    /// The native selected source could not prove that it enumerated every
+    /// reference occurrence in the requested snapshot.
+    ReferenceEnumerationIncomplete,
+    /// One admitted native reference retained an open binding, so omitted
+    /// target edges may still exist even though every retained target remains
+    /// available as unproven inventory.
+    ForwardResolutionIncomplete,
+    /// One native reference retained an open receiver/admission boundary, so
+    /// its known channels remain available but another graph channel may
+    /// still exist.
+    ForwardAdmissionIncomplete,
+    /// Exact source occurrence or declaration correspondence was unavailable
+    /// for at least one native reference edge.
+    ForwardMetadataIncomplete,
+    /// A selected native inverse index could not prove that it enumerated
+    /// every reference occurrence in its generation-bound workspace.
+    InverseIndexReferenceEnumerationIncomplete,
+    /// A selected native inverse index retained an open binding, so a target's
+    /// indexed incoming rows may omit additional references.
+    InverseIndexResolutionIncomplete,
+    /// A selected native inverse index retained an open receiver/admission
+    /// boundary, so a target's indexed incoming rows may omit another channel.
+    InverseIndexAdmissionIncomplete,
+    /// A selected native inverse index lacked required source or declaration
+    /// correspondence for at least one reference edge.
+    InverseIndexMetadataIncomplete,
+    /// The requested declaration is not in the selected inverse index's exact
+    /// covered target universe, so an empty bucket cannot prove absence.
+    InverseIndexTargetUncovered,
+    /// The language's registered selected inverse provider built no index for
+    /// this generation, so no declaration in that language has a selected
+    /// inverse answer. `reason_kind` names which refusal the provider gave and
+    /// `reason` carries its exact detail.
+    SelectedInverseIndexUnavailable { reason_kind: String, reason: String },
 }
 
 /// Which axes this derivation layer answers.
@@ -410,6 +875,31 @@ impl EdgeCompleteness {
                 EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => {
                     axis == EdgeAxis::ForwardProjection
                 }
+                EdgeIncompleteReason::ReferenceEnumerationIncomplete
+                | EdgeIncompleteReason::ForwardResolutionIncomplete
+                | EdgeIncompleteReason::ForwardAdmissionIncomplete => {
+                    axis == EdgeAxis::ForwardProjection
+                }
+                EdgeIncompleteReason::ForwardMetadataIncomplete => matches!(
+                    axis,
+                    EdgeAxis::ForwardProjection
+                        | EdgeAxis::KindClassification
+                        | EdgeAxis::OwnerClassification
+                ),
+                EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
+                | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
+                | EdgeIncompleteReason::InverseIndexTargetUncovered
+                | EdgeIncompleteReason::TimeBudgetExceeded
+                | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
+                    axis == EdgeAxis::InverseProjection
+                }
+                EdgeIncompleteReason::InverseIndexMetadataIncomplete => matches!(
+                    axis,
+                    EdgeAxis::InverseProjection
+                        | EdgeAxis::KindClassification
+                        | EdgeAxis::OwnerClassification
+                ),
                 EdgeIncompleteReason::NoStructuralAdapter | EdgeIncompleteReason::Cancelled => true,
             }),
         }
@@ -511,6 +1001,20 @@ impl<'a> ReferenceEngine<'a> {
         };
         let candidate_files = query.candidate_files.len();
         let scanned_source_bytes = query.scanned_source_bytes;
+        if let FuzzyResult::Incomplete { diagnostics, .. } = &query.result {
+            reasons.extend(diagnostics.iter().map(|diagnostic| {
+                EdgeIncompleteReason::UsageAnalysisFailed {
+                    reason_kind: diagnostic.reason_kind.clone(),
+                    reason: format!("{diagnostic:?}"),
+                }
+            }));
+            if diagnostics.is_empty() {
+                reasons.push(EdgeIncompleteReason::UsageAnalysisFailed {
+                    reason_kind: "semantic_incomplete".to_string(),
+                    reason: "Usage analysis did not complete semantic enumeration".to_string(),
+                });
+            }
+        }
         if let FuzzyResult::Failure {
             reason_kind,
             reason,
@@ -705,6 +1209,17 @@ impl EdgeDerivationResult {
                     }
                     EdgeIncompleteReason::UsageListingTruncated
                     | EdgeIncompleteReason::UsageAnalysisFailed { .. } => false,
+                    EdgeIncompleteReason::ReferenceEnumerationIncomplete
+                    | EdgeIncompleteReason::ForwardResolutionIncomplete
+                    | EdgeIncompleteReason::ForwardAdmissionIncomplete
+                    | EdgeIncompleteReason::ForwardMetadataIncomplete => true,
+                    EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
+                    | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                    | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
+                    | EdgeIncompleteReason::InverseIndexMetadataIncomplete
+                    | EdgeIncompleteReason::InverseIndexTargetUncovered
+                    | EdgeIncompleteReason::TimeBudgetExceeded
+                    | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => false,
                 })
             }
         }
@@ -808,6 +1323,68 @@ pub fn classify_owner_relation(
     site_enclosing: Option<&CodeUnit>,
     target: &CodeUnit,
 ) -> OwnerRelation {
+    classify_owner_relation_by(
+        analyzer,
+        site_enclosing,
+        target,
+        |hierarchy, site, target| hierarchy.get_ancestors(site).contains(target),
+    )
+}
+
+/// [`classify_owner_relation`] for one pass over many edges.
+///
+/// Each site type's ancestors are asked of the hierarchy once and kept, keyed
+/// by the type. The edges of one crate stage share few enclosing types: tract's
+/// generated flatbuffers file puts tens of thousands of references inside a
+/// few hundred impl blocks, and every classification walked the same
+/// ancestors again, canonicalising each type on the way. A type's ancestors do
+/// not change within a request. The owner holds one memo per stage and drops
+/// it with the stage, so no memo outlives the stage that filled it.
+#[derive(Default)]
+pub struct OwnerRelationMemo {
+    ancestors: HashMap<CodeUnit, Vec<CodeUnit>>,
+}
+
+impl OwnerRelationMemo {
+    /// The relation [`classify_owner_relation`] states, from this memo's
+    /// ancestors.
+    pub fn classify(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        site_enclosing: Option<&CodeUnit>,
+        target: &CodeUnit,
+    ) -> OwnerRelation {
+        let ancestors = &mut self.ancestors;
+        classify_owner_relation_by(
+            analyzer,
+            site_enclosing,
+            target,
+            |hierarchy, site, target| {
+                ancestors
+                    .entry(site.clone())
+                    .or_insert_with(|| hierarchy.get_ancestors(site))
+                    .contains(target)
+            },
+        )
+    }
+}
+
+/// The owner-relation rule, with the inheritance test supplied by the caller:
+/// `inherits(hierarchy, site, target)` says whether `target` is among `site`'s
+/// ancestors.
+/// A same-owner value reference is a member reference only when its target
+/// belongs to a declaration rather than directly to a namespace. Sharing a
+/// module does not turn a free function or constant into a self receiver.
+pub(crate) fn is_same_owner_member_reference(relation: OwnerRelation, target: &CodeUnit) -> bool {
+    relation == OwnerRelation::SameOwner && target.fq().namespace_prefix().is_none()
+}
+
+fn classify_owner_relation_by(
+    analyzer: &dyn IAnalyzer,
+    site_enclosing: Option<&CodeUnit>,
+    target: &CodeUnit,
+    inherits: impl FnOnce(&dyn TypeHierarchyProvider, &CodeUnit, &CodeUnit) -> bool,
+) -> OwnerRelation {
     let Some(enclosing) = site_enclosing else {
         return OwnerRelation::Unknown;
     };
@@ -823,7 +1400,7 @@ pub fn classify_owner_relation(
         (Owner::Type(site), Owner::Type(target)) if site == target => OwnerRelation::SameOwner,
         (Owner::Type(site), Owner::Type(target)) => match analyzer.type_hierarchy_provider() {
             Some(hierarchy) => {
-                if hierarchy.get_ancestors(&site).contains(&target) {
+                if inherits(hierarchy, &site, &target) {
                     OwnerRelation::InheritedOwner
                 } else {
                     OwnerRelation::External
@@ -924,43 +1501,60 @@ fn classify_forward_usage_kind_from_evidence(
     UsageHitKind::Reference
 }
 
-/// Per-file map from an identifier token's exact byte range to its
-/// facts-arena AST identity, built once per file so a batch of inverse hits
-/// pays one arena pass instead of one per hit.
+/// Per-file map from an identifier token's exact byte range to its facts-arena
+/// node, built once per file so a batch of inverse hits pays one arena pass
+/// instead of one per hit. The externally owned AST-id string is rendered only
+/// for a published site instead of eagerly allocating one for every identifier.
 ///
 /// The lookup is exact, not heuristic: the facts snapshot and the usage hit
 /// address the same analyzed content, so range equality over it is the same
 /// join the forward producer states through `OccurrenceRow::ast_id`.
 struct SiteIdentityIndex {
-    by_range: HashMap<(usize, usize), String>,
+    content_identity: Option<ContentIdentity>,
+    by_range: HashMap<(usize, usize), u32>,
 }
 
 impl SiteIdentityIndex {
+    fn from_facts(facts: &FileFacts) -> Self {
+        let mut by_range = HashMap::default();
+        for (node, fact) in facts.nodes().iter().enumerate() {
+            if fact.kind == NormalizedKind::Identifier {
+                by_range
+                    .entry((fact.range.start_byte, fact.range.end_byte))
+                    .or_insert_with(|| {
+                        u32::try_from(node).expect("structural fact id must fit u32")
+                    });
+            }
+        }
+        Self {
+            content_identity: Some(facts.source_identity()),
+            by_range,
+        }
+    }
+
     fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
         let language = crate::analyzer::common::language_for_file(file);
-        let facts = analyzer
+        analyzer
             .structural_fact_providers()
             .into_iter()
             .find(|provider| provider.structural_language() == language)
-            .and_then(|provider| provider.structural_facts(file));
-        let mut by_range = HashMap::default();
-        if let Some(facts) = facts {
-            let identity = facts.source_identity();
-            for (node, fact) in facts.nodes().iter().enumerate() {
-                if fact.kind == NormalizedKind::Identifier {
-                    by_range
-                        .entry((fact.range.start_byte, fact.range.end_byte))
-                        .or_insert_with(|| ast_id(identity, node as u32));
-                }
-            }
-        }
-        Self { by_range }
+            .and_then(|provider| provider.structural_facts(file))
+            .as_deref()
+            .map(Self::from_facts)
+            .unwrap_or_else(|| Self {
+                content_identity: None,
+                by_range: HashMap::default(),
+            })
+    }
+
+    fn ast_id_for_bytes(&self, start_byte: usize, end_byte: usize) -> Option<String> {
+        let content_identity = self.content_identity?;
+        let node = *self.by_range.get(&(start_byte, end_byte))?;
+        Some(ast_id(content_identity, node))
     }
 
     fn ast_id(&self, range: &Range) -> Option<String> {
-        self.by_range
-            .get(&(range.start_byte, range.end_byte))
-            .cloned()
+        self.ast_id_for_bytes(range.start_byte, range.end_byte)
     }
 }
 
@@ -1099,6 +1693,121 @@ fn exact_import_target_range(targets: &[ExactImportTarget], hit: &ReferenceHit) 
         return hit.range;
     };
     matching_ranges.next().map_or(range.range, |_| hit.range)
+}
+
+/// One language's whole-workspace selected inverse reference index.
+///
+/// The index is that language's own answer to "which sites refer to this
+/// declaration", derived once from its selected resolution facts and bound to
+/// the analyzer generation it was derived in. A declaration the index does not
+/// cover receives an explicit incomplete result, never a manufactured complete
+/// empty one.
+pub trait SelectedInverseReferenceIndex: Send + Sync {
+    /// The analyzer generation the index was built in.
+    fn generation(&self) -> u64;
+
+    /// Every selected inverse edge of one declaration.
+    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult;
+}
+
+/// What one build of a language's selected inverse index produced.
+pub enum SelectedInverseIndexOutcome {
+    Ready(Arc<dyn SelectedInverseReferenceIndex>),
+    /// The selected facts the index is derived from do not exist for this
+    /// workspace.
+    Unavailable(String),
+    /// The workspace generation moved while the index was being built.
+    Stale(String),
+    /// The build observed the caller's cancellation.
+    Cancelled,
+    /// The analyzer store refused a read the build needs.
+    StoreError(String),
+}
+
+/// The registered builder of one language's selected inverse index.
+///
+/// Registering a provider makes the selected index that language's only
+/// inverse-edge authority for every consumer holding a
+/// [`SelectedInverseEdgeCache`], so a refusal is reported as an incomplete
+/// answer rather than worked around by deriving the same question a second
+/// way.
+pub trait SelectedInverseReferenceProvider: Send + Sync {
+    fn build_selected_inverse_index(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        cancellation: Option<&CancellationToken>,
+    ) -> SelectedInverseIndexOutcome;
+}
+
+/// One language's state in a request's selected inverse memo.
+enum SelectedInverseLanguage {
+    Ready(Arc<dyn SelectedInverseReferenceIndex>),
+    Refused(EdgeIncompleteReason),
+}
+
+/// Per-request memo of the selected inverse indexes of the languages that
+/// register a provider.
+///
+/// One index per language per request: the index covers the whole workspace,
+/// so building it per declaration would repeat the workspace walk for every
+/// subject an `edges_of` query or an edge assert names.
+#[derive(Default)]
+pub struct SelectedInverseEdgeCache {
+    languages: HashMap<crate::analyzer::Language, SelectedInverseLanguage>,
+}
+
+impl SelectedInverseEdgeCache {
+    /// The selected inverse answer for `declaration`, or `None` when its
+    /// language registers no selected inverse provider and the caller derives
+    /// the answer through [`inverse_edges_for_declaration`] instead.
+    pub fn inverse_for(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        declaration: &CodeUnit,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<EdgeDerivationResult> {
+        let language = crate::analyzer::common::language_for_file(declaration.source());
+        let provider = crate::analyzer::languages::language_support(language)?
+            .selected_inverse_reference_provider()?;
+        let state = self.languages.entry(language).or_insert_with(|| {
+            match provider.build_selected_inverse_index(analyzer, cancellation) {
+                SelectedInverseIndexOutcome::Ready(index) => SelectedInverseLanguage::Ready(index),
+                SelectedInverseIndexOutcome::Cancelled => {
+                    SelectedInverseLanguage::Refused(EdgeIncompleteReason::Cancelled)
+                }
+                SelectedInverseIndexOutcome::Unavailable(reason) => {
+                    SelectedInverseLanguage::Refused(
+                        EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                            reason_kind: "unavailable".to_string(),
+                            reason,
+                        },
+                    )
+                }
+                SelectedInverseIndexOutcome::Stale(reason) => SelectedInverseLanguage::Refused(
+                    EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                        reason_kind: "stale".to_string(),
+                        reason,
+                    },
+                ),
+                SelectedInverseIndexOutcome::StoreError(reason) => {
+                    SelectedInverseLanguage::Refused(
+                        EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                            reason_kind: "store_error".to_string(),
+                            reason,
+                        },
+                    )
+                }
+            }
+        });
+        Some(match state {
+            SelectedInverseLanguage::Ready(index) => index.inverse_for(declaration),
+            SelectedInverseLanguage::Refused(reason) => EdgeDerivationResult::incomplete(
+                vec![reason.clone()],
+                EdgeProvenance::Inverse,
+                analyzer.project().analysis_generation(),
+            ),
+        })
+    }
 }
 
 /// Every inverse edge of one seed declaration: the sites the usage index can
@@ -1286,6 +1995,7 @@ fn forward_edges_from_occurrences(
     generation: u64,
 ) -> Result<EdgeDerivationResult, OccurrencesCancelled> {
     let import_target_nodes = import_target_nodes_for_file(analyzer, file).unwrap_or_default();
+    let reference_sites = ReferenceSiteClassifier::new(analyzer, file);
     let mut edges = Vec::new();
     for row in &occurrences.rows {
         let OccurrenceTarget::Resolved(units) = &row.target else {
@@ -1297,13 +2007,9 @@ fn forward_edges_from_occurrences(
             UsageProof::Unproven
         };
         for unit in units {
-            let kind = classify_reference_kind(
-                analyzer,
-                file,
-                row.range.start_byte,
-                row.range.end_byte,
-                unit,
-            );
+            let kind = reference_sites.as_ref().and_then(|sites| {
+                sites.classify_reference_kind(row.range.start_byte, row.range.end_byte, unit)
+            });
             let owner_relation = classify_owner_relation(analyzer, row.enclosing.as_ref(), unit);
             edges.push(ReferenceEdgeRow {
                 site: EdgeSite {
@@ -1364,7 +2070,11 @@ fn forward_edges_from_occurrences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+    use crate::analyzer::java::JavaAnalyzer;
+    use crate::analyzer::{
+        AnalyzerConfig, CodeUnitIndex, Language, Project, TestProject, WorkspaceAnalyzer,
+    };
+    use crate::inline_project::InlineTestProject;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1411,6 +2121,231 @@ mod tests {
                 .find(|unit| unit.fq_name().ends_with(fq_suffix))
                 .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
         }
+    }
+
+    fn token_range(source: &str, marker: &str, token: &str) -> (usize, usize) {
+        let marker_start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("fixture must contain marker {marker:?}"));
+        let token_offset = marker
+            .find(token)
+            .unwrap_or_else(|| panic!("marker {marker:?} must contain token {token:?}"));
+        let start = marker_start + token_offset;
+        (start, start + token.len())
+    }
+
+    const JAVA_REFERENCE_KIND_SITES: &str = r#"package fixture;
+
+class Base {
+    void ping() {}
+    static void staticPing() {}
+}
+
+class Child extends Base {
+    int field;
+    void method() {}
+    void use(Base other) {
+        method();
+        Base.staticPing();
+        super.ping();
+        int read = this.field;
+        this.field = read;
+        Base local = other;
+    }
+}
+"#;
+
+    /// The reusable index is a semantics-preserving acceleration of the former
+    /// arena scan. Exercise every source classification branch against that
+    /// scan oracle, the public delegating function, and the exact AST-id join.
+    #[test]
+    fn indexed_reference_sites_match_the_scan_oracle_for_every_kind() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/ReferenceKinds.java", JAVA_REFERENCE_KIND_SITES)
+            .build();
+        let file = project.file("src/ReferenceKinds.java");
+        let analyzer = JavaAnalyzer::new(project.project_dyn());
+        let declaration = |fq_suffix: &str| {
+            analyzer
+                .all_declarations()
+                .find(|unit| unit.fq_name().ends_with(fq_suffix))
+                .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
+        };
+        let classifier =
+            ReferenceSiteClassifier::new(&analyzer, &file).expect("Java must provide facts");
+        let base = declaration("Base");
+        let cases = [
+            (
+                "method call",
+                "        method();",
+                "method",
+                declaration("Child.method"),
+                ReferenceKind::MethodCall,
+            ),
+            (
+                "static call",
+                "        Base.staticPing();",
+                "staticPing",
+                declaration("Base.staticPing"),
+                ReferenceKind::StaticReference,
+            ),
+            (
+                "super call",
+                "        super.ping();",
+                "ping",
+                declaration("Base.ping"),
+                ReferenceKind::SuperCall,
+            ),
+            (
+                "field read",
+                "        int read = this.field;",
+                "field",
+                declaration("Child.field"),
+                ReferenceKind::FieldRead,
+            ),
+            (
+                "field write",
+                "        this.field = read;",
+                "field",
+                declaration("Child.field"),
+                ReferenceKind::FieldWrite,
+            ),
+            (
+                "type reference",
+                "        Base local = other;",
+                "Base",
+                base.clone(),
+                ReferenceKind::TypeReference,
+            ),
+            (
+                "inheritance",
+                "class Child extends Base",
+                "Base",
+                base,
+                ReferenceKind::Inheritance,
+            ),
+        ];
+
+        for (label, marker, token, target, expected) in cases {
+            let (start_byte, end_byte) = token_range(JAVA_REFERENCE_KIND_SITES, marker, token);
+            let indexed = classifier.classify_reference_kind(start_byte, end_byte, &target);
+            let scanned = classify_reference_kind_scan_oracle(
+                &analyzer,
+                &classifier.facts,
+                start_byte,
+                end_byte,
+                &target,
+            );
+            assert_eq!(indexed, scanned, "indexed/scanned disagreement at {label}");
+            assert_eq!(indexed, Some(expected), "wrong kind at {label}");
+            assert_eq!(
+                classify_reference_kind(&analyzer, &file, start_byte, end_byte, &target),
+                indexed,
+                "public delegator disagrees at {label}"
+            );
+            let identifier = classifier
+                .facts
+                .nodes()
+                .iter()
+                .enumerate()
+                .find(|(_, node)| {
+                    node.kind == NormalizedKind::Identifier
+                        && node.range.start_byte == start_byte
+                        && node.range.end_byte == end_byte
+                })
+                .map(|(id, _)| u32::try_from(id).expect("structural fact id must fit u32"))
+                .unwrap_or_else(|| panic!("exact identifier fact missing at {label}"));
+            assert_eq!(
+                classifier.ast_id(start_byte, end_byte),
+                Some(ast_id(classifier.facts.source_identity(), identifier)),
+                "wrong exact identifier AST id at {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_usage_graph_excludes_only_target_definition_overlap() {
+        const SOURCE: &str = r#"package fixture;
+
+class External {}
+
+class Target {
+    Target child() { return this; }
+    External external() { return null; }
+}
+"#;
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("src/Target.java", SOURCE)
+            .build();
+        let file = project.file("src/Target.java");
+        let analyzer = JavaAnalyzer::new(project.project_dyn());
+        let declaration = |fq_suffix: &str| {
+            analyzer
+                .all_declarations()
+                .find(|unit| unit.fq_name().ends_with(fq_suffix))
+                .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
+        };
+        let target = declaration("Target");
+        let external = declaration("External");
+        let child = declaration("Target.child");
+        let external_method = declaration("Target.external");
+        let (self_start, self_end) = token_range(SOURCE, "    Target child()", "Target");
+        let (external_start, external_end) =
+            token_range(SOURCE, "    External external()", "External");
+        let row = |start_byte, end_byte, enclosing, target| ReferenceEdgeRow {
+            site: EdgeSite {
+                file: file.clone(),
+                range: Range {
+                    start_byte,
+                    end_byte,
+                    start_line: 1,
+                    end_line: 1,
+                },
+                ast_id: None,
+                enclosing: Some(enclosing),
+            },
+            target,
+            reference_kind: Some(ReferenceKind::TypeReference),
+            proof: UsageProof::Proven,
+            usage_kind: UsageHitKind::Reference,
+            site_class: SiteClass::UseSite,
+            owner_relation: OwnerRelation::SameOwner,
+            provenance: EdgeProvenance::Forward,
+            generation: analyzer.project().analysis_generation(),
+        };
+        let self_type = row(self_start, self_end, child, target.clone());
+        let external_type = row(
+            external_start,
+            external_end,
+            external_method,
+            external.clone(),
+        );
+
+        assert!(self_type.included_in(UsageHitSurface::ExternalUsages));
+        assert!(external_type.included_in(UsageHitSurface::ExternalUsages));
+        let target_spans = analyzer
+            .ranges(&target)
+            .into_iter()
+            .map(|range| (target.source().clone(), range))
+            .collect::<Vec<_>>();
+        let external_spans = analyzer
+            .ranges(&external)
+            .into_iter()
+            .map(|range| (external.source().clone(), range))
+            .collect::<Vec<_>>();
+        assert!(!self_type.included_in_external_usage_graph(&target_spans));
+        assert!(external_type.included_in_external_usage_graph(&external_spans));
+
+        let mut self_receiver = self_type.clone();
+        self_receiver.usage_kind = UsageHitKind::SelfReceiver;
+        assert!(
+            !self_receiver.included_in(UsageHitSurface::ExternalUsages),
+            "querying definition overlap must not reclassify a self-receiver as external"
+        );
+        assert!(
+            self_receiver.overlaps_target_definition_spans(&target_spans),
+            "definition overlap remains available independently of usage surface"
+        );
     }
 
     const JAVA_TARGET: &str =
@@ -1592,6 +2527,41 @@ mod tests {
         assert_eq!(
             classify_owner_relation(analyzer, None, &base_ping),
             OwnerRelation::Unknown
+        );
+    }
+
+    /// The memo states the relation the plain classifier states, on the first
+    /// ask of a site type and on every later one.
+    #[test]
+    fn the_owner_relation_memo_answers_the_classifier() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/Base.java", JAVA_BASE),
+                ("src/Derived.java", JAVA_DERIVED),
+            ],
+        );
+        let analyzer = fixture.analyzer();
+        let units = [
+            fixture.declaration("Base.ping"),
+            fixture.declaration("Derived.run"),
+            fixture.declaration("Derived.helper"),
+        ];
+        let mut memo = OwnerRelationMemo::default();
+        for _ in 0..2 {
+            for site in units.iter().map(Some).chain([None]) {
+                for target in &units {
+                    assert_eq!(
+                        memo.classify(analyzer, site, target),
+                        classify_owner_relation(analyzer, site, target),
+                        "{site:?} -> {target:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            memo.classify(analyzer, Some(&units[1]), &units[0]),
+            OwnerRelation::InheritedOwner
         );
     }
 

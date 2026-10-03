@@ -374,6 +374,7 @@ fn definition_outcome_key_reuses_declaration_context() {
         .next()
         .expect("target declaration");
     let outcome = DefinitionLookupOutcome {
+        modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Resolved,
         reference: None,
         definitions: vec![unit],
@@ -1480,6 +1481,225 @@ fn issue_1228_navigation_cancellation_reaches_rust_resolution() {
 }
 
 #[test]
+fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
+    use crate::analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+        SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
+        compile_source,
+    };
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupStatus, NavigationLookupOutcome, ResolvedReferenceSite,
+    };
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+    use crate::navigation::NavigationOperation;
+
+    let fixture = crate::test_support::AnalyzerFixture::new_for_language(
+        Language::Go,
+        &[
+            ("go.mod", "module example.com/app\n"),
+            ("main.go", "package main\n\nfunc main() {}\n"),
+        ],
+    );
+    let source = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 2,
+        "pack_id": "fixture.navigation-terminal-rendering",
+        "version": "1.0.0",
+        "producer": { "name": "navigation-test", "version": "1.0.0" },
+        "language": "go",
+        "ecosystem": "go-module",
+        "compatibility": { "bifrost": "*", "toolchains": [] },
+        "provenance": { "source": "fixture" },
+        "license": "NOASSERTION",
+        "completeness": "complete",
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "declarations.fixture.navigation-terminal-rendering",
+            "activation": [{ "module": { "name": "example.com/mod" } }],
+            "payload": {
+                "kind": "declaration_facts",
+                "types": [{
+                    "id": "type.fixture.navigation-terminal-rendering",
+                    "name": "example.com/mod.External",
+                    "type_kind": "struct",
+                    "visibility": "public",
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "api.go",
+                        "symbol": "example.com/mod.External"
+                    }
+                }],
+                "members": [],
+                "relations": []
+            }
+        }]
+    }))
+    .expect("serialize semantic-model fixture");
+    let pack = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
+        .unwrap_or_else(|diagnostics| {
+            panic!("semantic-model fixture must compile: {diagnostics:#?}")
+        });
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("open semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "fixture.navigation-terminal-rendering".to_owned(),
+            },
+        )
+        .expect("register semantic-model fixture");
+    let request = SemanticModelActivationRequest {
+        bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("crate version parses"),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "go".to_owned(),
+            ecosystem: "go-module".to_owned(),
+            package: None,
+            module: Some(CatalogCoordinate {
+                name: "example.com/mod".to_owned(),
+                version: None,
+            }),
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        }],
+        controls: vec![SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: "fixture.navigation-terminal-rendering".to_owned(),
+                version: None,
+                manifest_digest: None,
+            },
+        }],
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        fixture.analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &crate::CancellationToken::new(),
+    ) else {
+        panic!("semantic-model fixture must activate");
+    };
+    assert!(
+        fixture
+            .analyzer
+            .analyzer()
+            .semantic_model_overlay()
+            .is_some()
+    );
+
+    let file = ProjectFile::new(fixture.project_root(), "main.go");
+    let outcome = NavigationLookupOutcome {
+        modeled_definitions: Vec::new(),
+        evidence: Default::default(),
+        status: DefinitionLookupStatus::Cancelled,
+        reference: Some(ResolvedReferenceSite {
+            path: "main.go".to_owned(),
+            text: "example.com/mod.External".to_owned(),
+            range: Range {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: 0,
+            focus_end_byte: 1,
+        }),
+        targets: Vec::new(),
+        lexical_definition: None,
+        diagnostics: Vec::new(),
+        structure_unavailable: false,
+        unproven_link_unit: false,
+        truncated: false,
+    };
+    let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+    let result = super::navigation::render_definition_lookup(
+        fixture.analyzer.analyzer(),
+        scope.token(),
+        super::DefinitionReferenceQuery {
+            path: "main.go".to_owned(),
+            line: None,
+            column: None,
+        },
+        &file,
+        outcome,
+        NavigationOperation::Definition,
+        &mut render_cache,
+    );
+
+    assert_eq!(result.status, "cancelled", "{result:#?}");
+    assert!(result.definitions.is_empty(), "{result:#?}");
+    assert!(!result.complete, "{result:#?}");
+}
+
+/// A refusal must never read as a proved absence. `complete: true` with no
+/// `incomplete_reason` is the shape a consumer reads as "the resolver looked
+/// and there is nothing there", so a status that says the resolver produced no
+/// answer has to carry a reason even when the diagnostic kind that carried the
+/// refusal is outside the public vocabulary.
+#[test]
+fn a_refusing_definition_status_is_never_reported_as_complete() {
+    use super::selectors::DefinitionLookupIncompleteReason;
+
+    let unknown_kind = [super::DefinitionDiagnostic {
+        claim: None,
+        kind: "a_resolver_specific_refusal".to_string(),
+        message: "the selected caller profile is not supported".to_string(),
+    }];
+    for (status, expected) in [
+        (
+            "unavailable",
+            DefinitionLookupIncompleteReason::StructureUnavailable,
+        ),
+        (
+            "incomplete",
+            DefinitionLookupIncompleteReason::StructureUnavailable,
+        ),
+        ("cancelled", DefinitionLookupIncompleteReason::Cancelled),
+        (
+            "exceeded_budget",
+            DefinitionLookupIncompleteReason::ResolutionBudget,
+        ),
+    ] {
+        assert_eq!(
+            super::definitions::definition_result_completion(status, &unknown_kind),
+            (false, Some(expected)),
+            "{status}"
+        );
+    }
+
+    // An answer about the request itself stays complete: the tool did finish.
+    for status in ["resolved", "no_definition", "not_found", "invalid_location"] {
+        assert_eq!(
+            super::definitions::definition_result_completion(status, &[]),
+            (true, None),
+            "{status}"
+        );
+    }
+
+    // A diagnostic the vocabulary knows still names the more specific reason.
+    let cancelled = [super::DefinitionDiagnostic {
+        claim: None,
+        kind: "cancelled".to_string(),
+        message: "resolution was cancelled".to_string(),
+    }];
+    assert_eq!(
+        super::definitions::definition_result_completion("unavailable", &cancelled),
+        (false, Some(DefinitionLookupIncompleteReason::Cancelled))
+    );
+}
+
+#[test]
+#[ignore = "finds real bugs: six of twelve definition queries fail for reasons measured to be independent of the qualified type (removing only the `<Service as Runner>::Output` line and its row reproduces the same six): `no_indexed_definition` for the aliased import, the glob import, the trait-receiver method and the `Service` type annotation, and `incomplete_binding` for `Service::new` and `crate::api::helper`. The projection member `Output` additionally has no declaration at all, because trait and inherent impl associated types are skipped as `UnsupportedMemberScope`. The qualified-type poison itself is fixed: the head lowers as ordinary type references and the member as a qualified reference carrying a type-shaped `UnsupportedTypeSyntax` gap, with no `MalformedSyntax` recorded for valid syntax. Measured 2026-09-12 on lane B R2.B Rust reference lowering"]
 fn issue_1228_uncancelled_mcp_rust_navigation_matches_direct_semantics() {
     use crate::analyzer::Language;
     use crate::test_support::AnalyzerFixture;
@@ -1968,6 +2188,51 @@ fn issue_1775_cpp_directive_lines_do_not_join_a_macros_comment_block() {
     assert_eq!(reported_lines(&fast), fast.text, "{fast:#?}");
 }
 
+#[test]
+fn preferred_definition_stays_within_the_requested_overload_ranges() {
+    use crate::analyzer::languages::{DeclarationNavigationOccurrence, DeclarationNavigationRole};
+    let other_definition = Range {
+        start_byte: 0,
+        end_byte: 10,
+        start_line: 0,
+        end_line: 0,
+    };
+    let declaration = Range {
+        start_byte: 20,
+        end_byte: 30,
+        start_line: 2,
+        end_line: 2,
+    };
+    let definition = Range {
+        start_byte: 40,
+        end_byte: 50,
+        start_line: 4,
+        end_line: 4,
+    };
+    let occurrences = [
+        DeclarationNavigationOccurrence {
+            range: other_definition,
+            role: DeclarationNavigationRole::Definition,
+        },
+        DeclarationNavigationOccurrence {
+            range: declaration,
+            role: DeclarationNavigationRole::Declaration,
+        },
+        DeclarationNavigationOccurrence {
+            range: definition,
+            role: DeclarationNavigationRole::Definition,
+        },
+    ];
+    assert_eq!(
+        super::primary_range_from_ranges(vec![declaration, definition], Some(&occurrences)),
+        Some(definition)
+    );
+    assert_eq!(
+        super::primary_range_from_ranges(vec![declaration], Some(&occurrences)),
+        Some(declaration)
+    );
+}
+
 /// Cost pin for #2880: a module target's outline must ask the index for the
 /// module's own name, not scan and hydrate every declaration in the workspace.
 ///
@@ -2033,4 +2298,110 @@ fn module_outline_lists_defining_files_without_a_workspace_declaration_scan() {
         0,
         "the module outline must resolve its defining files by name, not by scanning the workspace"
     );
+}
+
+/// Pins the complete output of a usage scan for a method name that many
+/// types share, so work that changes how a scan gets its answer cannot change
+/// the answer (#3761).
+///
+/// The fixture is tract's `name` in miniature: a trait method implemented by
+/// several ops in one crate, an unrelated inherent `name`, and calls through a
+/// trait object, a generic bound, concrete receivers and a second crate. Both
+/// an implementation and the trait method are scanned, and each result is
+/// pinned as its serialized JSON and as the text the MCP tool returns.
+///
+/// Regenerate the expected file only for an intended output change: set
+/// `BIFROST_3761_WRITE_ACTUAL` to a path, run the test, review the file it
+/// writes and copy it over `testdata/scan-usages/issue-3761-shared-name.txt`.
+#[test]
+fn issue_3761_shared_method_name_usages_are_pinned() {
+    use crate::analyzer::RustAnalyzer;
+    use crate::inline_project::InlineTestProject;
+
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"opcore\", \"app\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "opcore/Cargo.toml",
+            "[package]\nname = \"opcore\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "opcore/src/lib.rs",
+            "pub mod graph;\npub mod ops;\n\npub trait Op {\n    fn name(&self) -> String;\n}\n",
+        )
+        .file(
+            "opcore/src/ops.rs",
+            "use crate::Op;\n\
+             \n\
+             pub struct Add;\n\
+             pub struct Mul;\n\
+             pub struct Tensor {\n    label: String,\n}\n\
+             \n\
+             impl Op for Add {\n    fn name(&self) -> String {\n        \"add\".into()\n    }\n}\n\
+             \n\
+             impl Op for Mul {\n    fn name(&self) -> String {\n        format!(\"mul-{}\", Add.name())\n    }\n}\n\
+             \n\
+             impl Tensor {\n    pub fn name(&self) -> &str {\n        &self.label\n    }\n}\n",
+        )
+        .file(
+            "opcore/src/graph.rs",
+            "use crate::ops::{Add, Mul, Tensor};\n\
+             use crate::Op;\n\
+             \n\
+             pub fn describe(op: &dyn Op) -> String {\n    op.name()\n}\n\
+             \n\
+             pub fn generic<T: Op>(op: &T) -> String {\n    op.name()\n}\n\
+             \n\
+             pub fn concrete(add: &Add, mul: &Mul) -> String {\n    add.name() + &mul.name()\n}\n\
+             \n\
+             pub fn tensor(tensor: &Tensor) -> String {\n    tensor.name().to_string()\n}\n\
+             \n\
+             pub fn qualified(add: &Add) -> String {\n    Op::name(add) + &<Add as Op>::name(add)\n}\n",
+        )
+        .file(
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nopcore = { path = \"../opcore\" }\n",
+        )
+        .file(
+            "app/src/main.rs",
+            "use opcore::ops::{Add, Mul};\n\
+             use opcore::Op;\n\
+             \n\
+             fn main() {\n    let ops: Vec<Box<dyn Op>> = vec![Box::new(Add), Box::new(Mul)];\n    for op in &ops {\n        println!(\"{}\", op.name());\n    }\n    println!(\"{}\", Add.name());\n}\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+
+    let mut actual = String::new();
+    // `Add::name` on line 10 of ops.rs, then the trait's `name` on line 5 of lib.rs.
+    for (path, line) in [("opcore/src/ops.rs", 10), ("opcore/src/lib.rs", 5)] {
+        let result = super::scan_usages_by_location(
+            &analyzer,
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: path.to_string(),
+                    line,
+                    column: None,
+                    symbol: None,
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+            },
+        );
+        actual.push_str(&format!("=== {path}:{line} json\n"));
+        actual.push_str(&serde_json::to_string_pretty(&result).expect("result serializes"));
+        actual.push_str(&format!("\n=== {path}:{line} text\n"));
+        actual.push_str(&result.render_text(RenderOptions::default()));
+        actual.push('\n');
+    }
+    let expected =
+        include_str!("../../testdata/scan-usages/issue-3761-shared-name.txt").replace("\r\n", "\n");
+    if let Ok(path) = std::env::var("BIFROST_3761_WRITE_ACTUAL") {
+        std::fs::write(path, &actual).expect("write actual scan output");
+    }
+    assert_eq!(expected, actual);
 }

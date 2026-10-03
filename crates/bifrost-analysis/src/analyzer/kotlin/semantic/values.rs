@@ -168,9 +168,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if let Some(binding) = name
                 .parent()
                 .filter(|parent| parent.kind() == "variable_declaration")
-                && let Some(written) = kotlin_binding_type_node(binding)
             {
-                self.bind_carrier(value, Some(written), KotlinCarrier::Unrelated);
+                if let Some(written) = kotlin_binding_type_node(binding) {
+                    self.bind_carrier(value, Some(written), KotlinCarrier::Unrelated);
+                }
+                if binding
+                    .parent()
+                    .is_some_and(|property| property_delegate_expression(property).is_some())
+                {
+                    self.delegated_locals.insert(value);
+                }
             }
             self.locals
                 .entry(text.into())
@@ -362,6 +369,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             (None, ValueFlowKind::Local)
         };
+        if let Some(source) = source
+            && self.delegated_locals.contains(&source)
+        {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "reading a delegated local calls the delegate's getValue, which is not yet a call site",
+            )?;
+        }
         if let Some(source) = source
             && source != target
         {

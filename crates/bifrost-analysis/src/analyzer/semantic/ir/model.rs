@@ -705,6 +705,12 @@ pub enum MemoryLocationKind {
         constant_index: Option<u128>,
         identity: IndexedLocationIdentity,
     },
+    /// The whole object named by a pointer value. This is not a field of the
+    /// pointer value; the address resolves to the storage being read or
+    /// written.
+    Dereference {
+        address: ValueId,
+    },
     /// A creator-local mutable cell backing a lexical binding.  This is the
     /// principled source for shared/mutable captures in languages whose
     /// closure conversion boxes locals; it is not an indexed heap access.
@@ -743,6 +749,7 @@ impl MemoryLocationKind {
             Self::Property { .. } => "property",
             Self::Static { .. } => "static",
             Self::Index { .. } => "index",
+            Self::Dereference { .. } => "dereference",
             Self::LexicalCell { .. } => "lexical_cell",
             Self::Capture { .. } => "capture",
         }
@@ -755,6 +762,7 @@ impl MemoryLocationKind {
             Self::Field { base, .. } => *base == value,
             Self::Property { base, .. } => *base == value,
             Self::Index { base, index, .. } => *base == value || *index == Some(value),
+            Self::Dereference { address } => *address == value,
             Self::LexicalCell { binding } => *binding == value,
             Self::Capture { binding, .. } => *binding == Some(value),
             Self::Static { .. } => false,
@@ -923,6 +931,11 @@ pub enum CallableReferenceKind {
     Function,
     BoundMethod,
     UnboundMethod,
+    /// A callable selected through a proven imported module namespace. The
+    /// qualifier participates in name lookup but is not a bound receiver.
+    ModuleQualified {
+        qualifier: ValueId,
+    },
     /// A member selected through a proven type object. The resolved method's
     /// receiver contract decides whether the qualifier or a written actual
     /// supplies its receiver; the qualifier is not itself a bound receiver.
@@ -940,6 +953,7 @@ impl CallableReferenceKind {
             Self::Function => "function",
             Self::BoundMethod => "bound_method",
             Self::UnboundMethod => "unbound_method",
+            Self::ModuleQualified { .. } => "module_qualified",
             Self::TypeQualifiedMethod { .. } => "type_qualified_method",
             Self::StaticMethod => "static_method",
             Self::Constructor => "constructor",
@@ -971,6 +985,7 @@ pub struct CallableValue {
 pub enum CallerReceiverBinding {
     Absent,
     Bound(ValueId),
+    ModuleQualified(ValueId),
     TypeQualified(ValueId),
 }
 
@@ -1043,6 +1058,8 @@ pub struct SemanticCallSite {
     /// this fact; `Unknown` is never interpreted as synchronous execution.
     pub execution_timing: ExecutionTiming,
     pub callee: ValueId,
+    /// The evaluated call receiver, or a module namespace qualifier when the
+    /// callable reference is `ModuleQualified`.
     pub receiver: Option<ValueId>,
     pub arguments: Box<[SemanticCallArgument]>,
     /// Ordered normal results for a language call that returns more than one
@@ -1130,6 +1147,21 @@ pub struct StatementEntrySite {
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
     pub point: ProgramPointId,
+}
+
+/// One producer-attested source loop: the point each new iteration re-enters
+/// and the entry of the loop body.
+///
+/// The header is the target of the loop's own repeat: the condition or loop
+/// point of a `while` or `for`, and the body entry of a `do`. A labeled loop
+/// may share its header with the label. The source mapping names the loop
+/// statement itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LoopSite {
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+    pub header: ProgramPointId,
+    pub body: ProgramPointId,
 }
 
 /// Whether the evidence actually establishes the attached fact.
@@ -1915,6 +1947,7 @@ pub enum MemoryAccessKind {
     Property,
     Static,
     Index,
+    Dereference,
     LexicalCell,
     Capture,
 }
@@ -1926,6 +1959,7 @@ impl MemoryAccessKind {
             Self::Property => "property",
             Self::Static => "static",
             Self::Index => "index",
+            Self::Dereference => "dereference",
             Self::LexicalCell => "lexical_cell",
             Self::Capture => "capture",
         }
@@ -2576,6 +2610,7 @@ pub struct ProcedureSemanticsParts {
     pub call_sites: Vec<SemanticCallSite>,
     pub source_mappings: Vec<SourceMapping>,
     pub statement_entries: Vec<StatementEntrySite>,
+    pub loop_sites: Vec<LoopSite>,
     pub evidence_rows: Vec<Evidence>,
     pub gaps: Vec<SemanticGap>,
     pub blocks: Vec<BasicBlock>,
@@ -2608,6 +2643,7 @@ impl ProcedureSemanticsParts {
             call_sites: Vec::new(),
             source_mappings: Vec::new(),
             statement_entries: Vec::new(),
+            loop_sites: Vec::new(),
             evidence_rows: Vec::new(),
             gaps: Vec::new(),
             blocks: Vec::new(),

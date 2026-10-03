@@ -22,61 +22,111 @@ const MAX_GO_LIST_STDOUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GO_STDERR_BYTES: usize = 1024 * 1024;
 const MAX_GO_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-struct GoEnvironment {
-    goroot: PathBuf,
-    gopath: PathBuf,
-    gomodcache: PathBuf,
-    goversion: String,
-    gowork: String,
-    goos: String,
-    goarch: String,
+pub struct GoEnvironment {
+    pub goroot: PathBuf,
+    pub gopath: PathBuf,
+    pub gomodcache: PathBuf,
+    pub goversion: String,
+    pub gowork: String,
+    pub goos: String,
+    pub goarch: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct GoModule {
-    path: String,
+pub struct GoModule {
+    pub path: String,
     #[serde(default)]
-    version: String,
+    pub version: String,
     #[serde(default)]
-    sum: String,
+    pub sum: String,
     #[serde(default)]
-    dir: PathBuf,
+    pub dir: PathBuf,
     #[serde(default)]
-    main: bool,
+    pub main: bool,
     #[serde(default)]
-    go_mod: PathBuf,
-    replace: Option<Box<GoModule>>,
+    pub go_mod: PathBuf,
+    pub replace: Option<Box<GoModule>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct GoPackageError {
-    err: String,
+pub struct GoPackageError {
+    pub err: String,
+    #[serde(default)]
+    pub import_stack: Vec<String>,
+    #[serde(default)]
+    pub pos: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct GoPackage {
-    import_path: String,
+pub struct GoPackage {
+    pub import_path: String,
     #[serde(default)]
-    name: String,
+    pub name: String,
     #[serde(default)]
-    dir: PathBuf,
+    pub dir: PathBuf,
     #[serde(default)]
-    standard: bool,
+    pub standard: bool,
     #[serde(default)]
-    incomplete: bool,
-    error: Option<GoPackageError>,
-    module: Option<GoModule>,
+    pub incomplete: bool,
+    pub error: Option<GoPackageError>,
+    pub module: Option<GoModule>,
     #[serde(default)]
-    go_files: Vec<PathBuf>,
+    pub go_files: Vec<PathBuf>,
     #[serde(default)]
-    cgo_files: Vec<PathBuf>,
+    pub cgo_files: Vec<PathBuf>,
     #[serde(default)]
-    ignored_go_files: Vec<PathBuf>,
+    pub ignored_go_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub imports: Vec<String>,
+    #[serde(default)]
+    pub import_map: BTreeMap<String, String>,
+    #[serde(default)]
+    pub for_test: String,
+    #[serde(default)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
+        )
+    )]
+    pub test_go_files: Vec<PathBuf>,
+    #[serde(default)]
+    #[serde(rename = "XTestGoFiles")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
+        )
+    )]
+    pub x_test_go_files: Vec<PathBuf>,
+    #[serde(default)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
+        )
+    )]
+    pub test_imports: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "XTestImports")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Canonical descriptive test inventory is retained for diagnostics; only selected GoFiles and Imports authorize membership"
+        )
+    )]
+    pub x_test_imports: Vec<String>,
+    #[serde(default)]
+    pub deps_errors: Vec<GoPackageError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,13 +198,55 @@ impl GoCommandRunner for SystemGoCommandRunner {
     }
 }
 
+/// One bounded discovery invocation's primary (CGO_ENABLED=0) Go tool records.
+/// This is transient build input, not revision-selected authority or a cache.
+/// ImportPath is an opaque tool identity, including test variant suffixes;
+/// ForTest and ImportMap retain structured variant/provider relationships.
+#[derive(Debug)]
+pub struct GoPackageDiscovery {
+    pub packages: Vec<GoPackage>,
+    pub environment: GoEnvironment,
+    pub goos: String,
+    pub goarch: String,
+    pub build_tags: Vec<String>,
+    pub workspace_patterns: Vec<String>,
+    pub vendor: bool,
+}
+
+/// Canonical source membership and the independently filtered semantic product.
+/// None means discovery was disabled or failed before decoding primary records.
+#[derive(Debug)]
+pub struct GoDiscoveryOutcome {
+    pub canonical: Option<GoPackageDiscovery>,
+    pub semantic_packs: DependencyDiscoveryOutcome,
+}
+
+impl From<DependencyDiscoveryOutcome> for GoDiscoveryOutcome {
+    fn from(semantic_packs: DependencyDiscoveryOutcome) -> Self {
+        Self {
+            canonical: None,
+            semantic_packs,
+        }
+    }
+}
+
 pub fn resolve_go_semantic_pack_dependencies(
     config: &GoAnalyzerConfig,
     project: &dyn Project,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
-    resolve_with_runner(
+    discover_go_packages(config, project, limits, cancellation).semantic_packs
+}
+
+/// Run during reconciliation; never rerun against live files for an old revision.
+pub fn discover_go_packages(
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> GoDiscoveryOutcome {
+    discover_with_runner(
         config,
         project,
         limits,
@@ -163,6 +255,7 @@ pub fn resolve_go_semantic_pack_dependencies(
     )
 }
 
+#[cfg(test)]
 fn resolve_with_runner(
     config: &GoAnalyzerConfig,
     project: &dyn Project,
@@ -170,15 +263,25 @@ fn resolve_with_runner(
     cancellation: Option<&CancellationToken>,
     runner: &dyn GoCommandRunner,
 ) -> DependencyDiscoveryOutcome {
+    discover_with_runner(config, project, limits, cancellation, runner).semantic_packs
+}
+
+fn discover_with_runner(
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    runner: &dyn GoCommandRunner,
+) -> GoDiscoveryOutcome {
     let discovery = &config.dependency_discovery;
     if discovery.mode == GoDependencyDiscoveryMode::Disabled {
-        return DependencyDiscoveryOutcome::complete(Vec::new());
+        return DependencyDiscoveryOutcome::complete(Vec::new()).into();
     }
     if let Err(error) = validate_config(discovery) {
-        return failed_outcome("go.config_invalid", error, cancellation, limits);
+        return failed_outcome("go.config_invalid", error, cancellation, limits).into();
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return cancelled_outcome();
+        return cancelled_outcome().into();
     }
     let executable = discovery
         .go_executable
@@ -212,7 +315,7 @@ fn resolve_with_runner(
         cancellation,
     ) {
         Ok(bytes) => bytes,
-        Err(error) => return failed_outcome("go.env_failed", error, cancellation, limits),
+        Err(error) => return failed_outcome("go.env_failed", error, cancellation, limits).into(),
     };
     let environment: GoEnvironment = match serde_json::from_slice(&env_bytes) {
         Ok(environment) => environment,
@@ -222,7 +325,8 @@ fn resolve_with_runner(
                 format!("Go environment discovery returned invalid JSON: {error}"),
                 cancellation,
                 limits,
-            );
+            )
+            .into();
         }
     };
     let goos = discovery.goos.as_deref().unwrap_or(&environment.goos);
@@ -233,7 +337,8 @@ fn resolve_with_runner(
             "Go environment discovery did not return a target GOOS and GOARCH".to_owned(),
             cancellation,
             limits,
-        );
+        )
+        .into();
     }
     let vendor = project.root().join("vendor").join("modules.txt").is_file();
     let mut list_args = vec![
@@ -269,19 +374,32 @@ fn resolve_with_runner(
         cancellation,
     ) {
         Ok(bytes) => bytes,
-        Err(error) => return failed_outcome("go.list_failed", error, cancellation, limits),
+        Err(error) => return failed_outcome("go.list_failed", error, cancellation, limits).into(),
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return cancelled_outcome();
+        return cancelled_outcome().into();
     }
     let mut packages = match parse_package_stream(&package_bytes) {
         Ok(packages) => packages,
         Err(error) => {
-            return failed_outcome("go.list_invalid_json", error, cancellation, limits);
+            return failed_outcome("go.list_invalid_json", error, cancellation, limits).into();
         }
     };
+    let canonical = GoPackageDiscovery {
+        packages: packages.clone(),
+        environment: environment.clone(),
+        goos: goos.to_owned(),
+        goarch: goarch.to_owned(),
+        build_tags: discovery.build_tags.clone(),
+        workspace_patterns: discovery.workspace_patterns.clone(),
+        vendor,
+    };
+    let finish = |semantic_packs| GoDiscoveryOutcome {
+        canonical: Some(canonical),
+        semantic_packs,
+    };
     if discovery.mode == GoDependencyDiscoveryMode::CuratedPackEvidence {
-        return build_curated_pack_evidence_outcome(
+        return finish(build_curated_pack_evidence_outcome(
             packages,
             &environment,
             goos,
@@ -289,7 +407,7 @@ fn resolve_with_runner(
             discovery,
             vendor,
             limits,
-        );
+        ));
     }
     debug_assert_eq!(discovery.mode, GoDependencyDiscoveryMode::FullProduction);
     if packages.iter().any(|package| {
@@ -313,13 +431,23 @@ fn resolve_with_runner(
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
-                return failed_outcome("go.cgo_probe_failed", error, cancellation, limits);
+                return finish(failed_outcome(
+                    "go.cgo_probe_failed",
+                    error,
+                    cancellation,
+                    limits,
+                ));
             }
         };
         let cgo_packages = match parse_package_stream(&cgo_bytes) {
             Ok(packages) => packages,
             Err(error) => {
-                return failed_outcome("go.cgo_probe_invalid_json", error, cancellation, limits);
+                return finish(failed_outcome(
+                    "go.cgo_probe_invalid_json",
+                    error,
+                    cancellation,
+                    limits,
+                ));
             }
         };
         let cgo_files = cgo_packages
@@ -333,7 +461,7 @@ fn resolve_with_runner(
             }
         }
     }
-    build_outcome(
+    finish(build_outcome(
         packages,
         &environment,
         project.root(),
@@ -342,7 +470,7 @@ fn resolve_with_runner(
         discovery,
         vendor,
         limits,
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1274,6 +1402,129 @@ mod tests {
     }
 
     #[test]
+    fn canonical_discovery_preserves_main_packages_imports_and_test_variants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+        let project = TestProject::new(root, Language::Go);
+        let package = serde_json::json!({
+            "ImportPath": "example.test/app [example.test/app.test]",
+            "Name": "different_name",
+            "Dir": root,
+            "Module": { "Path": "example.test/app", "Main": true, "Dir": root,
+                "GoMod": root.join("go.mod"),
+                "Replace": { "Path": "../provider", "Dir": root.join("provider") } },
+            "GoFiles": ["app.go", "app_test.go"],
+            "IgnoredGoFiles": ["ignored_test.go"],
+            "TestGoFiles": ["app_test.go"],
+            "XTestGoFiles": ["external_test.go"],
+            "Imports": ["example.test/provider [example.test/app.test]"],
+            "ImportMap": {"example.test/provider": "example.test/provider [example.test/app.test]"},
+            "ForTest": "example.test/app",
+            "TestImports": ["testing"],
+            "XTestImports": ["example.test/app"],
+            "Incomplete": true,
+            "Error": {"Err": "package failure", "Pos": "app.go:3:1", "ImportStack": ["example.test/app"]},
+            "DepsErrors": [{"Err": "dependency failure", "ImportStack": ["example.test/app", "example.test/provider"]}]
+        });
+        for mode in [
+            GoDependencyDiscoveryMode::FullProduction,
+            GoDependencyDiscoveryMode::CuratedPackEvidence,
+        ] {
+            let mut config = config();
+            config.dependency_discovery.mode = mode;
+            let runner = FakeRunner::with_outputs([
+                environment(root),
+                serde_json::to_vec(&package).unwrap(),
+            ]);
+            let result = discover_with_runner(
+                &config,
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+                &runner,
+            );
+            let discovery = result.canonical.unwrap();
+            assert_eq!(discovery.packages.len(), 1);
+            let found = &discovery.packages[0];
+            assert_eq!(
+                found.import_path,
+                "example.test/app [example.test/app.test]"
+            );
+            assert_eq!(found.name, "different_name");
+            assert_eq!(found.for_test, "example.test/app");
+            assert_eq!(found.import_map["example.test/provider"], found.imports[0]);
+            assert_eq!(
+                found.go_files,
+                [PathBuf::from("app.go"), PathBuf::from("app_test.go")]
+            );
+            assert_eq!(found.test_go_files, [PathBuf::from("app_test.go")]);
+            assert_eq!(found.x_test_go_files, [PathBuf::from("external_test.go")]);
+            assert_eq!(found.test_imports, ["testing"]);
+            assert_eq!(found.x_test_imports, ["example.test/app"]);
+            assert!(found.module.as_ref().unwrap().main);
+            assert_eq!(
+                found.module.as_ref().unwrap().replace.as_ref().unwrap().dir,
+                root.join("provider")
+            );
+            assert!(found.incomplete);
+            assert_eq!(found.error.as_ref().unwrap().pos, "app.go:3:1");
+            assert_eq!(
+                found.error.as_ref().unwrap().import_stack,
+                ["example.test/app"]
+            );
+            assert_eq!(found.deps_errors[0].err, "dependency failure");
+            assert_eq!(discovery.goos, "linux");
+            assert_eq!(discovery.goarch, "arm64");
+            assert_eq!(discovery.environment.goversion, "go1.25.1");
+            assert_eq!(discovery.build_tags, ["integration", "safe"]);
+            assert_eq!(discovery.workspace_patterns, ["./cmd/..."]);
+            assert!(!discovery.vendor);
+            // Semantic pack filtering remains independent of native membership.
+            assert!(result.semantic_packs.dependencies.is_empty());
+            assert_eq!(runner.invocations.borrow().len(), 2);
+        }
+    }
+
+    #[test]
+    fn canonical_membership_survives_cgo_probe_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let package = serde_json::json!({
+            "ImportPath": "example.test/app", "Name": "app", "Dir": temporary.path(),
+            "GoFiles": ["app.go"], "IgnoredGoFiles": ["cgo.go"],
+            "Module": {"Path": "example.test/app", "Main": true}
+        });
+        let runner = FakeRunner::with_outputs([
+            environment(temporary.path()),
+            serde_json::to_vec(&package).unwrap(),
+        ]);
+        runner
+            .outputs
+            .borrow_mut()
+            .push_back(Err("probe unavailable".to_owned()));
+        let result = discover_with_runner(
+            &config(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+            &runner,
+        );
+        let canonical = result.canonical.unwrap();
+        assert_eq!(canonical.packages[0].go_files, [PathBuf::from("app.go")]);
+        assert!(canonical.packages[0].cgo_files.is_empty());
+        assert_eq!(
+            canonical.packages[0].ignored_go_files,
+            [PathBuf::from("cgo.go")]
+        );
+        assert!(!result.semantic_packs.complete);
+        assert_eq!(
+            result.semantic_packs.diagnostics[0].code,
+            "go.cgo_probe_failed"
+        );
+    }
+
+    #[test]
     fn discovery_uses_only_hardened_metadata_invocations() {
         let temporary = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temporary.path().join("goroot/src")).unwrap();
@@ -1618,13 +1869,20 @@ mod tests {
         let runner =
             FakeRunner::with_outputs([environment(temporary.path()), packages, cgo_packages]);
         let project = TestProject::new(temporary.path(), Language::Go);
-        let outcome = resolve_with_runner(
+        let result = discover_with_runner(
             &config(),
             &project,
             &DependencyPackLimits::default(),
             None,
             &runner,
         );
+        let primary = result.canonical.unwrap();
+        assert!(primary.packages[0].cgo_files.is_empty());
+        assert_eq!(
+            primary.packages[0].ignored_go_files,
+            [PathBuf::from("cgo_unix.go")]
+        );
+        let outcome = result.semantic_packs;
         assert!(!outcome.complete);
         assert!(
             outcome

@@ -8,7 +8,9 @@
 //! the rest of the C# seam already used.
 
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-use brokk_bifrost_core::analyzer::model::{CallableArity, DispatchExtensibility};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, DispatchExtensibility, SignatureMetadata,
+};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
@@ -166,8 +168,9 @@ pub fn csharp_using_directive_target_node(node: Node<'_>) -> Option<Node<'_>> {
     }
     let alias = node.child_by_field_name("name");
     let mut cursor = node.walk();
+    // Comments are named extras too; only the non-alias syntax child is the target.
     node.named_children(&mut cursor)
-        .find(|child| alias.is_none_or(|alias| child != &alias))
+        .find(|child| !child.is_extra() && alias.is_none_or(|alias| child != &alias))
 }
 
 pub fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
@@ -325,6 +328,25 @@ pub fn csharp_source_name_segment(segment: &str) -> &str {
 
 pub fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String {
     csharp_type_node_identity_with_terminal_suffix(node, source, "")
+}
+
+/// The declared value type spelling, preserving array wrappers on the already
+/// normalized type identity. Primary properties and current-expression analysis
+/// share this interpretation; `var` does not name a declared type.
+pub fn csharp_declared_type_spelling(node: Node<'_>, type_identity: &str) -> Option<String> {
+    if node.kind() == "implicit_type" || type_identity.is_empty() {
+        return None;
+    }
+    let mut spelling = type_identity.to_owned();
+    let mut current = node;
+    while current.kind() == "array_type" {
+        spelling.push_str("[]");
+        let Some(inner) = current.child_by_field_name("type") else {
+            break;
+        };
+        current = inner;
+    }
+    Some(spelling)
 }
 
 fn csharp_type_node_identity_with_terminal_suffix(
@@ -1255,69 +1277,20 @@ pub fn csharp_unqualified_invocation_for_name(
     .then_some((invocation, explicit_generic_arity))
 }
 
-pub fn csharp_signature_arity(signature: Option<&str>) -> usize {
-    let Some(signature) = signature else {
-        return 0;
-    };
-    let inner = signature
-        .split_once('(')
-        .and_then(|(_, rest)| rest.split_once(')').map(|(inner, _)| inner))
-        .unwrap_or(signature)
-        .trim();
-    if inner.is_empty() {
-        return 0;
-    }
-    count_top_level_comma_separated(inner)
+/// A callable arity is proven only when all primary metadata alternatives agree.
+/// Missing metadata and conflicting malformed declarations remain unavailable.
+pub fn csharp_callable_arity(index: &dyn CodeUnitIndex, unit: &CodeUnit) -> Option<CallableArity> {
+    csharp_callable_arity_from_metadata(&index.signature_metadata(unit))
 }
 
-pub fn csharp_method_generic_arity(signature: Option<&str>) -> usize {
-    signature
-        .and_then(|signature| signature.strip_prefix('`'))
-        .and_then(|signature| signature.split_once('(').map(|(arity, _)| arity))
-        .and_then(|arity| arity.parse().ok())
-        .unwrap_or(0)
-}
-
-pub fn csharp_callable_arity(index: &dyn CodeUnitIndex, unit: &CodeUnit) -> CallableArity {
-    index
-        .signature_metadata(unit)
-        .into_iter()
-        .find_map(|metadata| metadata.callable_arity())
-        .unwrap_or_else(|| CallableArity::exact(csharp_signature_arity(unit.signature())))
-}
-
-pub fn csharp_signature_return_type(signature: &str, name: &str) -> Option<String> {
-    type_text_before_name(signature, name)
-}
-
-fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
-    let before_name = signature.trim().rsplit_once(name)?.0.trim();
-    let before_name = before_name.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
-    let type_text = before_name
-        .split_whitespace()
-        .rfind(|part| !member_modifier(part))?;
-    let type_text = normalize_csharp_type_fragment(type_text);
-    (!type_text.is_empty()).then_some(type_text)
-}
-
-fn member_modifier(part: &str) -> bool {
-    matches!(
-        part,
-        "public"
-            | "private"
-            | "protected"
-            | "internal"
-            | "static"
-            | "readonly"
-            | "volatile"
-            | "const"
-            | "new"
-            | "virtual"
-            | "override"
-            | "abstract"
-            | "sealed"
-            | "required"
-    )
+pub fn csharp_callable_arity_from_metadata(
+    metadata: &[SignatureMetadata],
+) -> Option<CallableArity> {
+    let arity = metadata.first()?.callable_arity()?;
+    metadata
+        .iter()
+        .all(|metadata| metadata.callable_arity() == Some(arity))
+        .then_some(arity)
 }
 
 pub fn normalize_csharp_type_fragment(reference: &str) -> String {
@@ -1330,55 +1303,6 @@ pub fn normalize_csharp_type_fragment(reference: &str) -> String {
         .unwrap_or(without_arrays)
         .trim()
         .to_string()
-}
-
-fn count_top_level_comma_separated(text: &str) -> usize {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let mut count = 1;
-    let mut angle_depth: usize = 0;
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-    let mut string_quote: Option<char> = None;
-    let mut escaped = false;
-
-    for ch in text.chars() {
-        if let Some(quote) = string_quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quote {
-                string_quote = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' | '\'' => string_quote = Some(ch),
-            '<' => angle_depth = angle_depth.saturating_add(1),
-            '>' if angle_depth > 0 => angle_depth -= 1,
-            '(' => paren_depth = paren_depth.saturating_add(1),
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth = bracket_depth.saturating_add(1),
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            '{' => brace_depth = brace_depth.saturating_add(1),
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            ',' if angle_depth == 0
-                && paren_depth == 0
-                && bracket_depth == 0
-                && brace_depth == 0 =>
-            {
-                count += 1;
-            }
-            _ => {}
-        }
-    }
-
-    count
 }
 
 #[cfg(test)]

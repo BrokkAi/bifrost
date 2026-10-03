@@ -374,11 +374,17 @@ impl ImportAnalysisProvider for JavaAnalyzer {
                 return;
             }
             let owned_imports;
-            let imports = if let Some(imports) = import_infos.and_then(|all| all.get(file)) {
-                imports.as_slice()
-            } else {
-                owned_imports = self.inner.import_info_of(token, file);
-                &owned_imports
+            let imports = match import_infos {
+                Some(all) => {
+                    let Some(imports) = all.get(file) else {
+                        continue;
+                    };
+                    imports.as_slice()
+                }
+                None => {
+                    owned_imports = self.inner.import_info_of(token, file);
+                    &owned_imports
+                }
             };
             definitions.extend(imports.iter().filter_map(java_import_dependency_fqn));
         }

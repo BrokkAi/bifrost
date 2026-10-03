@@ -33,7 +33,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     RewriteDomainKind, RewriteOrigin, RewriteOutcome, RewritePath, RewriteTrace,
 };
-use brokk_bifrost_rust::graph_support::resolve_module_package_traced;
+use brokk_bifrost_rust::graph_support::resolve_module_package_traced_while;
 
 /// Why a file's rewrite-path derivation is not the complete answer.
 ///
@@ -43,6 +43,7 @@ use brokk_bifrost_rust::graph_support::resolve_module_package_traced;
 /// unreliable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewritePathIncompleteReason {
+    CanonicalFactsUnavailable,
     /// The workspace has no Rust analyzer, so a Rust file's alias chase cannot
     /// be run at all.
     NoDomainAnalyzer(RewriteDomainKind),
@@ -77,6 +78,7 @@ impl RewritePathCompleteness {
         !self.reasons().iter().any(|reason| match reason {
             RewritePathIncompleteReason::NoDomainAnalyzer(blocked) => *blocked == domain,
             RewritePathIncompleteReason::Cancelled
+            | RewritePathIncompleteReason::CanonicalFactsUnavailable
             | RewritePathIncompleteReason::NoIndexedSource => true,
         })
     }
@@ -197,12 +199,28 @@ fn rust_import_alias_paths(
             continue;
         }
         let mut trace = RewriteTrace::default();
-        // The production resolution, instrumented. Its answer is discarded
-        // here on purpose: this layer reports how the chase terminated, and
-        // the resolution result is the resolver's own business.
-        let _resolved =
-            resolve_module_package_traced(rust, scope.token(), file, local_name, Some(&mut trace))
-                .is_some();
+        // The resolved name is not this consumer's output, but failure still
+        // prevents a complete account of how the instrumented chase terminated.
+        if let Err(error) = resolve_module_package_traced_while(
+            rust,
+            scope.token(),
+            file,
+            local_name,
+            Some(&mut trace),
+            &|| !request.cancellation.is_cancelled(),
+        ) {
+            use brokk_bifrost_rust::graph_support::{ReferenceContextError, RustCargoRouteError};
+            reasons.push(match error {
+                ReferenceContextError::CargoRoutes(RustCargoRouteError::Unavailable) => {
+                    RewritePathIncompleteReason::CanonicalFactsUnavailable
+                }
+                ReferenceContextError::Interrupted
+                | ReferenceContextError::CargoRoutes(RustCargoRouteError::Cancelled) => {
+                    RewritePathIncompleteReason::Cancelled
+                }
+            });
+            break;
+        }
         let (declared_bound, steps, outcome) = trace.into_parts();
         // A specifier whose root no alias rewrites never engaged the domain,
         // so it is not a path through it.

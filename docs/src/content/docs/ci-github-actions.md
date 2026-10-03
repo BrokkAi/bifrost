@@ -96,6 +96,7 @@ does not contain the CLI threshold decision. Library callers with a
 | `policy-files` | empty | Space-separated workspace-relative `.rqlp` files. |
 | `fail-on` | `warning` | Severity gate: `never`, `finding`, `note`, `warning`, or `error`. |
 | `diff-base` | empty | Git revision to diff against. Only findings absent from that revision gate. |
+| `full-evaluation` | `false` | Disable incremental evidence reuse and pass `--no-incremental` for a full evaluation. |
 | `sarif-file` | `bifrost-policy.sarif` | SARIF output path, relative to `working-directory`. |
 | `policy-timings` | `false` | Collect per-policy timings; requires a runner supporting `--policy-timings`. |
 | `artifact-name` | empty | Upload the SARIF report as an artifact before gating; use a unique name per scan. |
@@ -115,17 +116,33 @@ The action exposes these outputs for later steps:
 
 ## Analyzer cache
 
-With `cache: true`, the action selects an isolated analyzer cache root and uses
-that same path for restore, execution, and save, overriding inherited
-`BIFROST_CACHE_ROOT` and `BIFROST_CACHE_DIR` for the scan. `cache: false` leaves
-those environment settings untouched. Cache entries are separated by runner OS,
-architecture, version, exact compiled-input build identity, and working directory.
-There is no fallback to a different build identity. Bifrost still validates its
-schema and analyzer epochs and keys stored content by Git blob identity.
+With `cache: true`, the action restores and saves Bifrost's standard
+`.bifrost/cache` store, the same store used by ordinary CLI and MCP scans. A
+workspace nested in a checkout uses the primary Git repository root; a nested
+Git repository uses its own root. The action sets `BIFROST_CACHE_DIR` to that
+exact directory for the scan and clears an inherited `BIFROST_CACHE_ROOT`;
+`cache: false` leaves both environment settings untouched. GitHub cache
+snapshots are separated by runner OS, architecture, version, exact
+compiled-input build identity, and working-directory identity.
+Restore prefixes omit only the per-invocation suffix, so a snapshot from another
+build or workspace is never restored. Bifrost still validates its schema and
+analyzer epochs and keys stored content by Git blob identity.
 
-The cache is saved after a scan produces a report, including when its policy gate
-fails. A cache hit reuses the existing immutable entry. Build changes can still
-require a cold scan; this cache does not certify that a policy result is complete.
+GitHub cache entries are immutable. Each action invocation therefore uses a
+fresh save key and can publish the cache state produced by its scan, even when
+it restored a compatible earlier snapshot. Only a structurally valid SARIF
+report with successful invocations, `complete` policy-run completion, and CLI
+status `0` or `1` is saved. Reliable but non-exhaustive `proven_subset` and
+`proven_by_summary` runs do not qualify. The qualification also checks execution
+termination, report diagnostic completeness, and baseline qualification when
+`diff-base` is set. Status `1` still represents a completed scan whose policy
+gate found a violation; unreliable, malformed, or capture-failed runs do not
+publish a snapshot.
+
+Incremental evidence reuse is on by default, including for `diff-base` scans.
+Set `full-evaluation: true` to pass `--no-incremental` and request a full
+evaluation for comparison. The action forwards this existing CLI control; it
+does not implement a separate slicing algorithm.
 
 The action logs execution, policy work, completeness, and incremental evidence
 from its single SARIF scan. `policy-timings: true` adds per-policy timing details

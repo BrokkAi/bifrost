@@ -1,7 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 7,
   "pack_id": "bifrost.go.concurrency",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "producer": { "name": "bifrost", "version": "0.11.3" },
   "language": "go",
   "ecosystem": "go",
@@ -296,6 +296,55 @@
       "payload": {
         "kind": "procedure_summaries",
         "summaries": [
+          {
+            "id": "time.now",
+            "target": { "path": "src/time/time.go", "symbol": "time.Now()", "has_receiver": false, "parameter_count": 0 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.since",
+            "target": { "path": "src/time/time.go", "symbol": "time.Since(t time.Time)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.until",
+            "target": { "path": "src/time/time.go", "symbol": "time.Until(t time.Time)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.new-ticker",
+            "target": { "path": "src/time/tick.go", "symbol": "time.NewTicker(d time.Duration)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.new-timer",
+            "target": { "path": "src/time/sleep.go", "symbol": "time.NewTimer(d time.Duration)", "has_receiver": false, "parameter_count": 1 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.ticker.stop",
+            "target": { "path": "src/time/tick.go", "symbol": "time.Ticker.Stop()", "has_receiver": true, "parameter_count": 0 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
+          {
+            "id": "time.ticker.reset",
+            "target": { "path": "src/time/tick.go", "symbol": "time.Ticker.Reset(d time.Duration)", "has_receiver": true, "parameter_count": 1 },
+            "completeness": "complete",
+            "no_concurrency_effects": true,
+            "transfers": []
+          },
           {
             "id": "time.after-func",
             "target": { "path": "src/time/sleep.go", "symbol": "time.AfterFunc(d time.Duration, f func())", "has_receiver": false, "parameter_count": 2 },

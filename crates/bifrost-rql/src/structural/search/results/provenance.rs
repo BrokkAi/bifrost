@@ -247,6 +247,17 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         ordinal: u64,
     },
+    ResultSubjectUse {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_id: Option<String>,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        range: Option<CodeQueryRange>,
+        proof: &'static str,
+        completeness: &'static str,
+        outcome: CodeQueryResultSubjectOutcome,
+    },
     CallArgumentGroup {
         id: String,
         site_id: String,
@@ -692,6 +703,7 @@ impl CodeQueryResultRef {
             Self::MemberFamilyEdge { .. } => "member_family_edge",
             Self::CallShape { .. } => "call_shape",
             Self::CallResult { .. } => "call_result",
+            Self::ResultSubjectUse { .. } => "result_subject_use",
             Self::CallArgumentGroup { .. } => "call_argument_group",
             Self::CallArgument { .. } => "call_argument",
             Self::CallBinding { .. } => "call_binding",
@@ -774,6 +786,7 @@ impl CodeQueryResultRef {
             | Self::MemberFamilyEdge { path, .. }
             | Self::CallShape { path, .. }
             | Self::CallResult { path, .. }
+            | Self::ResultSubjectUse { path, .. }
             | Self::CallArgumentGroup { path, .. }
             | Self::CallArgument { path, .. }
             | Self::CallBinding { path, .. }

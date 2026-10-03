@@ -1,9 +1,22 @@
 use super::selectors::*;
 use super::*;
+use crate::analyzer::languages::LanguageGraphBackend;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, c_label_usage_ranges, resolve_lexical_binding,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::resolution::{
+    FactReferenceEdgeCatalog, FactResolutionSource, ResolutionBatchMetrics,
+    SelectedFactResolutionSnapshot,
+};
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::store::Result as StoreResult;
 use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
+#[cfg(any(test, feature = "test-support"))]
+use crate::analyzer::usages::workspace_graph::build_selected_workspace_usage_graph_projection;
+use crate::analyzer::usages::workspace_graph::{
+    SelectedWorkspaceUsageGraphProjection, SelectedWorkspaceUsageGraphProjectionOutcome,
+};
 use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, DeclarationId, QueryScope};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::BoundedDefinitionLookup;
@@ -219,6 +232,8 @@ pub enum ScanUsagesIncompleteReason {
     SourceBytes,
     /// An admitted source file or its syntax could not be loaded.
     SourceUnavailable,
+    /// Structured resolution could not enumerate every semantic reference.
+    SemanticAnalysis,
     Callsites,
     ResponseBudget,
     /// The selector matched more declarations than the tool will resolve, so
@@ -870,6 +885,13 @@ pub(crate) struct ScanUsagesExecutionContext {
 }
 
 impl ScanUsagesExecutionContext {
+    pub(crate) fn for_composite_query(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
             cancellation,
@@ -1197,6 +1219,9 @@ fn fuzzy_result_has_hits(result: &FuzzyResult) -> bool {
         FuzzyResult::Success {
             hits_by_overload, ..
         }
+        | FuzzyResult::Incomplete {
+            hits_by_overload, ..
+        }
         | FuzzyResult::Ambiguous {
             hits_by_overload, ..
         } => hits_by_overload.values().any(|hits| !hits.is_empty()),
@@ -1252,6 +1277,10 @@ fn incomplete_recovery_message(
             "Source or syntax was unavailable for an admitted file; {} could not complete the reference scan.",
             surface.tool_name()
         ),
+        ScanUsagesIncompleteReason::SemanticAnalysis => {
+            "Usage analysis did not complete semantic enumeration; absence is unverified."
+                .to_string()
+        }
         ScanUsagesIncompleteReason::Callsites => format!(
             "usage analysis exhausted its callsite budget; narrow `paths` or use a more specific selector, then re-call {}",
             surface.tool_name()
@@ -2825,6 +2854,15 @@ fn scan_usages_backend_on_pool(
         } else {
             query_incomplete_reason(query.completion, interruption_reason)
         };
+        let soft_time_budget_incomplete = !interrupted
+            && matches!(
+                &query.result,
+                FuzzyResult::Incomplete { diagnostics, .. }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.reason_kind == "time_budget")
+            );
+        if soft_time_budget_incomplete {
+            incomplete_reason = Some(ScanUsagesIncompleteReason::TimeBudget);
+        }
         // An interrupted scan that already proved sites reports them as a
         // partial usage entry. Collapsing to an Incomplete entry here would
         // render "0 usages" for a symbol we know is referenced.
@@ -2832,6 +2870,7 @@ fn scan_usages_backend_on_pool(
             incomplete_reason,
             Some(ScanUsagesIncompleteReason::Cancelled | ScanUsagesIncompleteReason::TimeBudget)
         ) && !fuzzy_result_has_hits(&query.result)
+            && !soft_time_budget_incomplete
         {
             work_entries.push(incomplete_work_entry(
                 request,
@@ -2851,11 +2890,23 @@ fn scan_usages_backend_on_pool(
                     omitted_count: sample.omitted_count,
                 });
 
+        let semantic_note = if let FuzzyResult::Incomplete { diagnostics, .. } = &query.result {
+            incomplete_reason.get_or_insert(ScanUsagesIncompleteReason::SemanticAnalysis);
+            Some(format!("Usage analysis is incomplete: {diagnostics:?}"))
+        } else {
+            None
+        };
         match query.result {
             FuzzyResult::Success {
                 hits_by_overload,
                 unproven_by_overload,
                 unproven_total_by_overload,
+            }
+            | FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                ..
             } => {
                 let hits: Vec<UsageHit> = hits_by_overload
                     .into_values()
@@ -2880,7 +2931,7 @@ fn scan_usages_backend_on_pool(
                     filtered.hits,
                     unproven_total,
                     filtered_unproven.hits,
-                    None,
+                    semantic_note,
                     reference_only_absence_note(&overloads, &reference_only_sibling_extensions),
                     filtered.same_owner,
                     include_same_owner,
@@ -3374,6 +3425,224 @@ pub struct UsageGraphResult {
     pub incomplete_reasons: Vec<UsageGraphIncompleteReason>,
 }
 
+/// Atomic selected-Java result for the exact whole-workspace usage-graph
+/// boundary used by the private comparison harness.
+///
+/// The scope is deliberately fixed to the incumbent unscoped
+/// `include_tests=true, depth=1` operation. `Incomplete` retains sound positive
+/// nodes and proven edge sites but cannot certify absence. Cancellation,
+/// generation drift, and store failure publish no `UsageGraphResult` prefix.
+#[cfg(any(test, feature = "test-support"))]
+pub enum SelectedUsageGraphBuildOutcome {
+    Complete(UsageGraphResult),
+    Incomplete(UsageGraphResult),
+    Cancelled,
+    Stale,
+}
+
+/// Stable operation-local work and output counts for one selected graph build.
+///
+/// The sink is published atomically with a complete public result. Cancelled,
+/// stale, and failed operations leave the caller-provided default value
+/// unchanged, so telemetry can never describe a discarded graph prefix.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectedUsageGraphTelemetry {
+    pub published: bool,
+    pub complete: bool,
+    pub generation: u64,
+    pub reference_count: usize,
+    pub projected_edge_count: usize,
+    pub batch_count: usize,
+    pub root_binding_metrics: ResolutionBatchMetrics,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub site_count: usize,
+    pub truncated_symbol_count: usize,
+    pub incomplete_reason_count: usize,
+}
+
+/// Build the selected-Java counterpart of
+/// `usage_graph(include_tests=true, paths=None, depth=1)`.
+///
+/// Snapshot collection and canonical catalog construction remain explicit
+/// inputs so a benchmark can include them inside the same timer without
+/// exposing a second graph implementation. The canonical workspace reducer
+/// remains the only admission, proof, cap, and topology authority.
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_selected_unscoped_usage_graph<S>(
+    analyzer: &dyn IAnalyzer,
+    selected: &SelectedFactResolutionSnapshot<'_, S>,
+    edge_catalog: &FactReferenceEdgeCatalog<'_>,
+    maximum_batch_size: usize,
+    cancellation: &CancellationToken,
+    telemetry: &mut SelectedUsageGraphTelemetry,
+) -> StoreResult<SelectedUsageGraphBuildOutcome>
+where
+    S: FactResolutionSource,
+{
+    assert_eq!(
+        *telemetry,
+        SelectedUsageGraphTelemetry::default(),
+        "selected Java usage-graph telemetry is one-operation state"
+    );
+    let projection = build_selected_workspace_usage_graph_projection(
+        analyzer,
+        selected,
+        edge_catalog,
+        maximum_batch_size,
+        cancellation,
+    )?;
+    let (projection_complete, projection) = match projection {
+        SelectedWorkspaceUsageGraphProjectionOutcome::Complete(projection) => (true, projection),
+        SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(projection) => (false, projection),
+        SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled => {
+            return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+        }
+        SelectedWorkspaceUsageGraphProjectionOutcome::Stale => {
+            return Ok(SelectedUsageGraphBuildOutcome::Stale);
+        }
+        SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason) => {
+            return Err(crate::analyzer::store::StoreError::new(reason));
+        }
+    };
+    let pending_telemetry = SelectedUsageGraphTelemetry {
+        published: true,
+        complete: false,
+        generation: projection.generation,
+        reference_count: projection.reference_count,
+        projected_edge_count: projection.projected_edge_count,
+        batch_count: projection.batch_count,
+        root_binding_metrics: projection.root_binding_metrics,
+        ..SelectedUsageGraphTelemetry::default()
+    };
+    let generation = pending_telemetry.generation;
+    let Some(result) = selected_usage_graph_result(projection, projection_complete, cancellation)
+    else {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    };
+    if cancellation.is_cancelled() {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return Ok(SelectedUsageGraphBuildOutcome::Stale);
+    }
+    let mut site_count = 0_usize;
+    for edge in &result.edges {
+        if cancellation.is_cancelled() {
+            return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+        }
+        site_count = site_count
+            .checked_add(edge.sites.len())
+            .expect("selected Java usage-graph site count must fit usize");
+    }
+    let pending_telemetry = SelectedUsageGraphTelemetry {
+        complete: result.complete,
+        node_count: result.nodes.len(),
+        edge_count: result.edges.len(),
+        site_count,
+        truncated_symbol_count: result.truncated_symbols.len(),
+        incomplete_reason_count: result.incomplete_reasons.len(),
+        ..pending_telemetry
+    };
+    if cancellation.is_cancelled() {
+        return Ok(SelectedUsageGraphBuildOutcome::Cancelled);
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return Ok(SelectedUsageGraphBuildOutcome::Stale);
+    }
+    *telemetry = pending_telemetry;
+    if result.complete {
+        Ok(SelectedUsageGraphBuildOutcome::Complete(result))
+    } else {
+        Ok(SelectedUsageGraphBuildOutcome::Incomplete(result))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn selected_usage_graph_result(
+    projection: SelectedWorkspaceUsageGraphProjection,
+    projection_complete: bool,
+    cancellation: &CancellationToken,
+) -> Option<UsageGraphResult> {
+    let SelectedWorkspaceUsageGraphProjection {
+        nodes,
+        edges,
+        forward_completeness,
+        kind_projection_complete,
+        unresolved_names,
+        ..
+    } = projection;
+    let mut incomplete = BTreeSet::new();
+    if !projection_complete {
+        incomplete.insert((
+            "selected_reference_graph_incomplete".to_string(),
+            format!(
+                "selected canonical forward graph is incomplete: forward={forward_completeness:?}, kind_projection_complete={kind_projection_complete}, unresolved_names={unresolved_names:?}"
+            ),
+        ));
+    }
+    let mut unproven_inbound = 0_usize;
+    for node in &nodes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        unproven_inbound = unproven_inbound
+            .checked_add(node.unproven_inbound)
+            .expect("selected Java unproven inbound count must fit usize");
+    }
+    if unproven_inbound > 0 {
+        incomplete.insert((
+            "unproven_reference_edges".to_string(),
+            format!(
+                "selected canonical graph retained {unproven_inbound} unproven inbound reference sites"
+            ),
+        ));
+    }
+    let catalog = WorkspaceUsageCatalog::from_reduced_nodes(nodes, cancellation)?;
+    // The ranking reducer's raw cap counts distinct byte offsets. The public
+    // contract caps distinct `(path, line)` sites, so its finalizer must derive
+    // truncation from the retained site inventory rather than importing the
+    // ranking-only `truncated_inbound` marker.
+    let truncated_by_id = BTreeMap::new();
+    let mut edge_sites = BTreeMap::new();
+    for edge in edges {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let from = catalog.nodes[edge.from].primary.clone();
+        let to = catalog.nodes[edge.to].primary.clone();
+        let mut sites = Vec::with_capacity(edge.sites.len());
+        for (file, line) in edge.sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            sites.push(UsageGraphCallSite {
+                path: rel_path_string(&file),
+                line,
+            });
+        }
+        let previous = edge_sites.insert(
+            (from.declaration_id(), to.declaration_id()),
+            (from, to, sites),
+        );
+        assert!(
+            previous.is_none(),
+            "one reduced selected graph edge exists per exact endpoint pair"
+        );
+    }
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    finalize_selected_usage_graph_result(
+        catalog,
+        edge_sites,
+        truncated_by_id,
+        incomplete,
+        cancellation,
+    )
+}
+
 type UsageGraphSiteKey = (String, usize, String, String);
 type UsageGraphEndpointPair = (DeclarationId, DeclarationId);
 type UsageGraphExactSites = HashMap<UsageGraphSiteKey, BTreeSet<UsageGraphEndpointPair>>;
@@ -3401,7 +3670,38 @@ type UsageGraphExactSites = HashMap<UsageGraphSiteKey, BTreeSet<UsageGraphEndpoi
 /// declaration inventory. Without `paths`, every workspace declaration is a
 /// root and depth one is the complete graph.
 pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
+    usage_graph_with_cancellation(analyzer, params, CancellationToken::default())
+}
+
+/// Build a usage graph under the caller's cooperative cancellation authority.
+pub fn usage_graph_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: UsageGraphParams,
+    cancellation: CancellationToken,
+) -> UsageGraphResult {
+    usage_graph_with_passes(
+        analyzer,
+        params,
+        &crate::analyzer::languages::edge_passes(),
+        &cancellation,
+    )
+}
+
+fn usage_graph_with_passes(
+    analyzer: &dyn IAnalyzer,
+    params: UsageGraphParams,
+    passes: &[crate::analyzer::languages::EdgePassEntry],
+    cancellation: &CancellationToken,
+) -> UsageGraphResult {
     let _scope = profiling::scope("searchtools::usage_graph");
+    if cancellation.is_cancelled() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &[],
+            "cancelled",
+            "usage graph was cancelled".into(),
+        );
+    }
     // One request boundary for the whole scan. The exact layer resolves every
     // file's occurrence batch through the definition resolver, and each batch
     // opens its own nested AnalyzerQueryScope; without this outer scope the
@@ -3411,11 +3711,20 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     // lookups across files -- 32.5k calls for 2.7k distinct names on the
     // issue #2679 reproduction, 12x pure repetition.
     let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    let generation = analyzer.project().analysis_generation();
     assert!(params.depth > 0, "usage_graph depth must be positive");
 
     let rooted = params.paths.is_some();
     let built_path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
     let unmatched_paths = built_path_filter.unmatched_paths;
+    let cancelled = || {
+        unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "cancelled",
+            "usage graph was cancelled".into(),
+        )
+    };
     let path_filter = built_path_filter.filter;
     let test_files = test_file_exclusion(analyzer, params.include_tests);
 
@@ -3441,12 +3750,102 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     } else {
         eligible_files.clone()
     };
+
+    // An unavailable declaration catalog may be empty. Check input authority
+    // before the catalog build, without building any edge indexes.
+    //
+    // The question is asked of the files this request will resolve. A rooted
+    // request resolves the files it named, so it neither pays for nor is
+    // failed by a file it never named. An unrooted request resolves the
+    // workspace, and there the set has to be the *analyzable* inventory
+    // rather than `analyzed_files`: publication readiness is part of the
+    // analyzed-file predicate, so a file whose canonical facts were never
+    // published is missing from that listing for exactly the reason the
+    // preflight exists to report. `source_file_inventory` is the listing that
+    // keeps it -- "source files owned by this analyzer, including files whose
+    // parse products are unavailable" -- and it reads the project's shared
+    // file listing, not the store.
+    let preflight_files: Vec<ProjectFile> = if rooted {
+        root_files.clone()
+    } else {
+        analyzer
+            .source_file_inventory()
+            .rows
+            .into_iter()
+            .filter(|file| {
+                test_files
+                    .as_ref()
+                    .is_none_or(|exclusion| !exclusion.excludes(file))
+            })
+            .collect()
+    };
+    let mut unavailable_passes = HashSet::default();
+    let mut incomplete: BTreeSet<(String, String)> = BTreeSet::new();
+    for entry in passes {
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        if rooted
+            && !root_files.iter().any(|file| {
+                UsageEcosystem::of(crate::analyzer::common::language_for_file(file))
+                    == entry.ecosystem
+            })
+        {
+            continue;
+        }
+        if let Some(failure) = entry.backend.input_failure(analyzer, &preflight_files) {
+            unavailable_passes.insert(entry.id);
+            incomplete.insert((
+                "unavailable_canonical_facts".to_string(),
+                format!(
+                    "{}: {}; files: {:?}",
+                    entry.id.as_str(),
+                    failure.reason,
+                    failure.files
+                ),
+            ));
+        }
+    }
+
     let root_catalog = {
         let _scope = profiling::scope("usage_graph::root_catalog_build");
         if rooted {
-            WorkspaceUsageCatalog::build_for_files(analyzer, &root_files)
+            let Some(catalog) = WorkspaceUsageCatalog::build_for_files_with_cancellation(
+                analyzer,
+                &root_files,
+                cancellation,
+            ) else {
+                return cancelled();
+            };
+            catalog
         } else {
-            WorkspaceUsageCatalog::build(analyzer)
+            let Some(catalog) =
+                WorkspaceUsageCatalog::build_with_cancellation(analyzer, cancellation)
+            else {
+                if cancellation.is_cancelled() {
+                    return cancelled();
+                }
+                if incomplete.is_empty() {
+                    incomplete.insert((
+                        "unavailable_canonical_facts".to_string(),
+                        "the workspace declaration catalog was unavailable".to_string(),
+                    ));
+                }
+                let catalog = WorkspaceUsageCatalog::from_declarations(
+                    Vec::new(),
+                    &CancellationToken::default(),
+                )
+                .expect("uncancelled unavailable usage graph catalog construction");
+                return finalize_usage_graph_result(
+                    analyzer,
+                    &unmatched_paths,
+                    catalog,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    incomplete,
+                );
+            };
+            catalog
         }
     };
 
@@ -3486,7 +3885,6 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         (DeclarationId, DeclarationId),
         (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
     > = BTreeMap::new();
-    let mut incomplete: BTreeSet<(String, String)> = BTreeSet::new();
     let mut truncated_by_id: BTreeMap<DeclarationId, usize> = BTreeMap::new();
     let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let mut endpoints_by_name: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
@@ -3498,12 +3896,21 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     // iteration of `params.depth`, which just re-clones and re-sorts the
     // same, unchanged prefix each time.
     let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
+    let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
+    let mut native_admitted_callers = HashSet::default();
 
-    for _ in 0..params.depth {
-        if frontier.is_empty() {
+    for layer in 0..params.depth {
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        if frontier.is_empty() && layer > 0 {
             break;
         }
         let mut scan_files = BTreeSet::new();
+        if layer == 0 {
+            // Empty files still need a native reference-inventory certificate.
+            scan_files.extend(root_files.iter().cloned());
+        }
         for id in &frontier {
             if let Some(files) = files_by_id.get(id) {
                 scan_files.extend(files.iter().cloned());
@@ -3525,14 +3932,15 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             .is_none_or(|(built_len, _)| *built_len != declarations.len())
         {
             let _scope = profiling::scope("usage_graph::layer_catalog_build");
-            let mut catalog = WorkspaceUsageCatalog::from_declarations(
+            let Some(mut catalog) = WorkspaceUsageCatalog::from_declarations(
                 declarations
                     .iter()
                     .map(|(unit, _)| (unit.clone(), None))
                     .collect(),
-                &CancellationToken::default(),
-            )
-            .expect("uncancelled exact layer catalog construction");
+                cancellation,
+            ) else {
+                return cancelled();
+            };
             catalog.join_members(&merged_members);
             layer_catalog_once = Some((declarations.len(), catalog));
         }
@@ -3545,8 +3953,141 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         let mut logical_family_edges: HashSet<(UsageEcosystem, String, String)> =
             HashSet::default();
         let mut legacy_truncated: BTreeMap<(UsageEcosystem, String), usize> = BTreeMap::new();
-        for entry in crate::analyzer::languages::edge_passes() {
+        for entry in passes {
+            if cancellation.is_cancelled() {
+                return cancelled();
+            }
+            if unavailable_passes.contains(&entry.id) {
+                continue;
+            }
             let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
+            let pass = match entry.backend {
+                LanguageGraphBackend::Legacy(pass) => pass,
+                LanguageGraphBackend::Native(provider) => {
+                    let files = scan_files
+                        .iter()
+                        .filter(|file| {
+                            entry
+                                .languages
+                                .contains(&crate::analyzer::common::language_for_file(file))
+                                && !native_admitted_callers.contains(*file)
+                                && test_files
+                                    .as_ref()
+                                    .is_none_or(|exclusion| !exclusion.excludes(file))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if files.is_empty() {
+                        continue;
+                    }
+                    let (complete, projection) =
+                        match provider.project(analyzer, &files, cancellation) {
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(
+                                projection,
+                            )) => (true, projection),
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(
+                                projection,
+                            )) => (false, projection),
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "cancelled",
+                                    "native graph projection was cancelled".into(),
+                                );
+                            }
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "stale_generation",
+                                    "native graph projection lost selected generation authority"
+                                        .into(),
+                                );
+                            }
+                            Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                                reason,
+                            )) => {
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "unavailable_canonical_facts",
+                                    reason,
+                                );
+                            }
+                            Err(error) => {
+                                analyzer.record_query_failure(error.clone());
+                                return unavailable_usage_graph_result(
+                                    analyzer,
+                                    &unmatched_paths,
+                                    "native_graph_failed",
+                                    error.to_string(),
+                                );
+                            }
+                        };
+                    if cancellation.is_cancelled() {
+                        return cancelled();
+                    }
+                    if projection.generation != generation
+                        || analyzer.project().analysis_generation() != generation
+                    {
+                        return unavailable_usage_graph_result(
+                            analyzer,
+                            &unmatched_paths,
+                            "stale_generation",
+                            "workspace changed during native graph projection".into(),
+                        );
+                    }
+                    let expected_callers = files.into_iter().collect::<HashSet<_>>();
+                    assert_eq!(
+                        projection.admitted_callers(),
+                        &expected_callers,
+                        "native graph providers must retain exact caller admission"
+                    );
+                    native_admitted_callers.extend(expected_callers);
+                    if !complete {
+                        incomplete.insert((
+                            "selected_reference_graph_incomplete".into(),
+                            format!(
+                                "{}: forward={:?}; kind_projection_complete={}; unresolved_names={:?}",
+                                entry.id.as_str(),
+                                projection.forward_completeness,
+                                projection.kind_projection_complete,
+                                projection.unresolved_names
+                            ),
+                        ));
+                    }
+                    let unproven = projection
+                        .nodes
+                        .iter()
+                        .filter(|node| node.unproven_inbound > 0)
+                        .map(|node| (node.key.id.clone(), node.unproven_inbound))
+                        .collect::<Vec<_>>();
+                    if !unproven.is_empty() {
+                        incomplete.insert((
+                            "unproven_reference_edges".into(),
+                            format!("{}: unproven inbound sites {unproven:?}", entry.id.as_str()),
+                        ));
+                    }
+                    for node in &projection.nodes {
+                        if layer == 0
+                            && projection
+                                .admitted_callers()
+                                .contains(node.primary.source())
+                            && visited.insert(node.key.id.clone())
+                        {
+                            frontier.insert(node.key.id.clone());
+                            files_by_id
+                                .entry(node.key.id.clone())
+                                .or_default()
+                                .extend(node.declaration_files.iter().cloned());
+                            declarations.push((node.primary.clone(), node.primary_range));
+                        }
+                    }
+                    native_projections.push(projection);
+                    continue;
+                }
+            };
             let plugin_callers = declarations
                 .iter()
                 .map(|(unit, _)| unit)
@@ -3583,10 +4124,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 scoped_callers: &scoped_callers,
                 keep_file: &keep_file,
             };
-            match entry.pass.edge_sites(&ctx) {
+            match pass.edge_sites(&ctx) {
                 Some(crate::analyzer::languages::LanguageEdgeSites::Fqn(result)) => {
                     for ((from, to), sites) in result.edges {
-                        if entry.pass.permits_logical_family_targets() {
+                        if pass.permits_logical_family_targets() {
                             logical_family_edges.insert((
                                 entry.ecosystem,
                                 from.clone(),
@@ -3683,6 +4224,17 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                             .and_modify(|current| *current = (*current).max(count))
                             .or_insert(count);
                     }
+                }
+                Some(crate::analyzer::languages::LanguageEdgeSites::Unavailable(failure)) => {
+                    incomplete.insert((
+                        "unavailable_canonical_facts".to_string(),
+                        format!(
+                            "{}: {}; files: {:?}",
+                            entry.id.as_str(),
+                            failure.reason,
+                            failure.files
+                        ),
+                    ));
                 }
                 None => {}
             }
@@ -3785,6 +4337,35 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         };
 
         let mut next = BTreeSet::new();
+
+        // Retain file-major native products across layers: a later frontier
+        // can reach another caller in an already scanned file without asking
+        // the provider to resolve that file a second time.
+        for projection in &native_projections {
+            for edge in &projection.edges {
+                let source = &projection.nodes[edge.from];
+                let target = &projection.nodes[edge.to];
+                if !frontier.contains(&source.key.id) {
+                    continue;
+                }
+                if visited.insert(target.key.id.clone()) {
+                    next.insert(target.key.id.clone());
+                    files_by_id
+                        .entry(target.key.id.clone())
+                        .or_default()
+                        .extend(target.declaration_files.iter().cloned());
+                    declarations.push((target.primary.clone(), target.primary_range));
+                }
+                let sites = &mut edge_sites
+                    .entry((source.key.id.clone(), target.key.id.clone()))
+                    .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
+                    .2;
+                sites.extend(edge.sites.iter().map(|(file, line)| UsageGraphCallSite {
+                    path: rel_path_string(file),
+                    line: *line,
+                }));
+            }
+        }
 
         // A file referenced by many ambiguous edges was hitting the slow
         // `get_definition` fallback once per edge, and each call built a
@@ -3968,18 +4549,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                         ));
                     }
 
-                    // This scan's `ReferenceEngine` never carries a real
-                    // deadline (no `.with_cancellation` above), so the
-                    // interruptible, per-candidate importer scan
-                    // `references_to_edges` uses by default buys nothing
-                    // here -- it only protects a caller that can actually be
-                    // cancelled mid-scan. Passing the import-graph provider
-                    // explicitly routes candidate discovery through the
-                    // cached reverse-import-index path instead, which a
-                    // workspace the size of a large monorepo otherwise
-                    // re-scans from scratch for every ambiguous target
-                    // (bifrost#15).
+                    // Keep the indexed import candidate provider while allowing
+                    // the request token to interrupt reference resolution.
                     let exact = ReferenceEngine::new()
+                        .with_cancellation(cancellation.clone())
                         .with_file_filter(|file| admitted_files.contains(file))
                         .references_to_edges_with_provider(
                             analyzer,
@@ -4339,9 +4912,80 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         frontier = next;
     }
 
+    if cancellation.is_cancelled() {
+        return cancelled();
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "stale_generation",
+            "workspace changed during usage graph construction".into(),
+        );
+    }
+    let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
+        return cancelled();
+    };
+    let result = finalize_usage_graph_result(
+        analyzer,
+        &unmatched_paths,
+        catalog,
+        edge_sites,
+        truncated_by_id,
+        incomplete,
+    );
+    if let Some(error) = _analyzer_query.store_error() {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "graph_input_failed",
+            error.to_string(),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return cancelled();
+    }
+    if analyzer.project().analysis_generation() != generation {
+        return unavailable_usage_graph_result(
+            analyzer,
+            &unmatched_paths,
+            "stale_generation",
+            "workspace changed while finalizing usage graph".into(),
+        );
+    }
+    result
+}
+
+fn unavailable_usage_graph_result(
+    analyzer: &dyn IAnalyzer,
+    unmatched_paths: &[String],
+    reason_kind: &str,
+    reason: String,
+) -> UsageGraphResult {
     let catalog =
-        WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
-            .expect("uncancelled usage graph result catalog construction");
+        WorkspaceUsageCatalog::from_declarations(Vec::new(), &CancellationToken::default())
+            .expect("uncancelled empty graph catalog construction");
+    finalize_usage_graph_result(
+        analyzer,
+        unmatched_paths,
+        catalog,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeSet::from([(reason_kind.to_string(), reason)]),
+    )
+}
+
+fn finalize_usage_graph_result(
+    analyzer: &dyn IAnalyzer,
+    unmatched_paths: &[String],
+    catalog: WorkspaceUsageCatalog,
+    edge_sites: BTreeMap<
+        (DeclarationId, DeclarationId),
+        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
+    >,
+    mut truncated_by_id: BTreeMap<DeclarationId, usize>,
+    mut incomplete: BTreeSet<(String, String)>,
+) -> UsageGraphResult {
     let mut nodes: Vec<UsageGraphNode> = catalog
         .nodes
         .iter()
@@ -4475,6 +5119,203 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         truncated_symbols,
         incomplete_reasons,
     }
+}
+
+/// Cancellation-polled twin of the incumbent result finalizer.
+///
+/// The production legacy operation remains byte-for-byte on its established
+/// vector/sort path above. The selected comparison path uses ordered insertion
+/// instead, which provides a deterministic poll between every node, site, and
+/// edge without publishing a partially sorted public result.
+#[cfg(any(test, feature = "test-support"))]
+fn finalize_selected_usage_graph_result(
+    catalog: WorkspaceUsageCatalog,
+    edge_sites: BTreeMap<
+        (DeclarationId, DeclarationId),
+        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
+    >,
+    mut truncated_by_id: BTreeMap<DeclarationId, usize>,
+    incomplete: BTreeSet<(String, String)>,
+    cancellation: &CancellationToken,
+) -> Option<UsageGraphResult> {
+    let mut nodes_by_order = BTreeMap::new();
+    for node in &catalog.nodes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let node = UsageGraphNode {
+            id: node.key.id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            path: rel_path_string(node.primary.source()),
+            start_line: node
+                .primary_range
+                .map(|range| range.start_line)
+                .unwrap_or(0),
+            kind: code_unit_kind_name(node.primary.kind()).to_string(),
+            signature: node.primary.signature().map(str::to_string),
+        };
+        let previous = nodes_by_order.insert(
+            (node.language.clone(), node.fqn.clone(), node.id.clone()),
+            node,
+        );
+        assert!(previous.is_none(), "usage graph node ordering key is exact");
+    }
+    let mut nodes = Vec::with_capacity(nodes_by_order.len());
+    for node in nodes_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        nodes.push(node);
+    }
+
+    let max_callsites = crate::analyzer::usages::inverted_edges::MAX_CALLSITES;
+    let mut inbound_sites: HashMap<DeclarationId, HashSet<(String, usize)>> = HashMap::default();
+    for ((_, to_id), (_, _, sites)) in &edge_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let target_sites = inbound_sites.entry(to_id.clone()).or_default();
+        for site in sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            target_sites.insert((site.path.clone(), site.line));
+        }
+    }
+    for (id, sites) in &inbound_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if sites.len() > max_callsites {
+            truncated_by_id
+                .entry(id.clone())
+                .and_modify(|current| *current = (*current).max(sites.len()))
+                .or_insert(sites.len());
+        }
+    }
+    let mut truncated_ids = HashSet::default();
+    for id in truncated_by_id.keys() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        truncated_ids.insert(id.clone());
+    }
+    let mut truncated_by_order = BTreeMap::new();
+    for (id, total_callsites) in &truncated_by_id {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let index = catalog
+            .index_for_id(id)
+            .expect("every exact edge endpoint is cataloged");
+        let node = &catalog.nodes[index];
+        let symbol = UsageGraphTruncatedSymbol {
+            node_id: id.clone(),
+            fqn: node.key.fqn.clone(),
+            language: node.language_label().to_string(),
+            total_callsites: *total_callsites,
+            limit: max_callsites,
+        };
+        let previous = truncated_by_order.insert(
+            (
+                symbol.language.clone(),
+                symbol.fqn.clone(),
+                symbol.node_id.clone(),
+            ),
+            symbol,
+        );
+        assert!(
+            previous.is_none(),
+            "usage graph truncation ordering key is exact"
+        );
+    }
+    let mut truncated_symbols = Vec::with_capacity(truncated_by_order.len());
+    for symbol in truncated_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        truncated_symbols.push(symbol);
+    }
+
+    let mut edges_by_order = BTreeMap::new();
+    for ((from_id, to_id), (from, to, sites)) in edge_sites {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if truncated_ids.contains(&to_id) {
+            continue;
+        }
+        let mut canonical_sites = BTreeSet::new();
+        for site in sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            canonical_sites.insert(site);
+        }
+        let mut sites = Vec::with_capacity(canonical_sites.len());
+        for site in canonical_sites {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            sites.push(site);
+        }
+        let edge = UsageGraphEdge {
+            from_id,
+            to_id,
+            from: from.fq_name(),
+            to: to.fq_name(),
+            language: UsageEcosystem::of(language_for_target(&to))
+                .as_str()
+                .to_string(),
+            weight: sites.len(),
+            sites,
+        };
+        let previous = edges_by_order.insert(
+            (
+                edge.language.clone(),
+                edge.from.clone(),
+                edge.to.clone(),
+                edge.from_id.clone(),
+                edge.to_id.clone(),
+            ),
+            edge,
+        );
+        assert!(previous.is_none(), "usage graph edge ordering key is exact");
+    }
+    let mut edges = Vec::with_capacity(edges_by_order.len());
+    for edge in edges_by_order.into_values() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        edges.push(edge);
+    }
+
+    let mut incomplete_reasons =
+        Vec::with_capacity(incomplete.len() + usize::from(!truncated_symbols.is_empty()));
+    for (code, message) in incomplete {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        incomplete_reasons.push(UsageGraphIncompleteReason { code, message });
+    }
+    if !truncated_symbols.is_empty() {
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            code: "callsites_truncated".to_string(),
+            message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
+        });
+    }
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    Some(UsageGraphResult {
+        session_subset: None,
+        complete: incomplete_reasons.is_empty(),
+        nodes,
+        edges,
+        truncated_symbols,
+        incomplete_reasons,
+    })
 }
 
 fn ecosystem_languages(ecosystem: UsageEcosystem) -> &'static [Language] {
@@ -4894,19 +5735,19 @@ pub(super) fn external_usage_definition_ranges(
     if language_for_target(target) == Language::Cpp
         && target.is_callable()
         && ranges.len() > 1
-        && let Some(source) = analyzer.indexed_source(target.source())
-        && let Some(classifier) = cpp_occurrence_classifier_for(&source)
+        && let Some(occurrences) = declaration_navigation_occurrences(analyzer, target)
     {
-        let physical_definitions: Vec<_> = ranges
+        let physical_definitions: Vec<_> = occurrences
             .iter()
-            .copied()
-            .filter(|range| {
-                matches!(
-                    classifier.classify(target, range),
-                    crate::analyzer::CppOccurrenceRole::Definition
-                        | crate::analyzer::CppOccurrenceRole::Both
-                )
+            .filter(|occurrence| {
+                ranges.contains(&occurrence.range)
+                    && matches!(
+                        occurrence.role,
+                        crate::analyzer::languages::DeclarationNavigationRole::Definition
+                            | crate::analyzer::languages::DeclarationNavigationRole::Both
+                    )
             })
+            .map(|occurrence| occurrence.range)
             .collect();
         if !physical_definitions.is_empty() {
             ranges = physical_definitions;
@@ -5183,6 +6024,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                     ScanUsagesIncompleteReason::CandidateFiles => "candidate_files_budget",
                     ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
                     ScanUsagesIncompleteReason::SourceUnavailable => "source_unavailable",
+                    ScanUsagesIncompleteReason::SemanticAnalysis => "semantic_incomplete",
                     ScanUsagesIncompleteReason::Callsites => "callsites_budget",
                     ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
                     ScanUsagesIncompleteReason::ResolutionCandidates => {
@@ -5259,6 +6101,8 @@ pub(super) fn classify_usage_entry(
     // unverified-absence caveats.
     let status = if usage.total_hits > 0 {
         ScanUsagesStatus::Found
+    } else if incomplete_reason == Some(ScanUsagesIncompleteReason::TimeBudget) {
+        ScanUsagesStatus::UnverifiedAbsent
     } else if usage.same_owner_sites.is_some_and(|count| count > 0) {
         ScanUsagesStatus::NoExternalUsages
     } else if caveats.is_empty() {
@@ -6569,8 +7413,668 @@ pub(super) fn classify_resolved_test_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::structural::reference_edges::EdgeCompleteness;
+    use crate::analyzer::usages::inverted_edges::{MAX_CALLSITES, UsageReferenceCounts};
+    use crate::analyzer::usages::workspace_graph::{
+        CanonicalWorkspaceUsageProjectedEdge, SelectedWorkspaceUsageGraphProjection,
+    };
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
     use crate::test_support::AnalyzerFixture;
+
+    /// A rooted `usage_graph` naming only Rust files must not make the Rust
+    /// provider demand canonical Rust facts for a file the Rust adapter does
+    /// not own.
+    ///
+    /// The native preflight walks the live mounts. A mixed-language workspace
+    /// puts C++ and Python paths in the same snapshot, and reaching one of
+    /// them records "canonical Rust source is absent from the live snapshot"
+    /// and fails the whole request.
+    #[test]
+    fn rooted_rust_usage_graph_ignores_other_languages_in_a_mixed_workspace() {
+        use crate::analyzer::{AnalyzerConfig, ProjectFile, WorkspaceAnalyzer};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        for (relative_path, source) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn target() -> usize { 1 }\npub fn caller() -> usize { target() }\n",
+            ),
+            ("include/widget.h", "struct Widget { int value; };\n"),
+            ("scripts/build.py", "def helper():\n    return 1\n"),
+        ] {
+            ProjectFile::new(root.clone(), relative_path)
+                .write(source)
+                .expect("write mixed-language fixture");
+        }
+        let project = crate::analyzer::TestProject::from_root_with_inferred_languages(&root)
+            .expect("infer fixture languages");
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(project),
+            AnalyzerConfig::default(),
+        )
+        .expect("mixed-language workspace");
+        let analyzer = workspace.analyzer();
+
+        let graph = usage_graph(
+            analyzer,
+            UsageGraphParams {
+                include_tests: true,
+                paths: Some(vec!["src/lib.rs".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(graph.complete, "{graph:#?}");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from.ends_with("caller") && edge.to.ends_with("target")),
+            "{graph:#?}"
+        );
+        assert!(
+            graph.incomplete_reasons.is_empty(),
+            "a Rust-rooted request must not read a non-Rust file as a Rust source: {:?}",
+            graph.incomplete_reasons
+        );
+    }
+
+    #[test]
+    fn usage_graph_observes_request_cancellation_during_native_projection() {
+        use crate::analyzer::JavaAnalyzer;
+        use crate::analyzer::languages::{EdgePassEntry, EdgePassId, NativeWorkspaceGraphProvider};
+        use crate::inline_project::InlineTestProject;
+        use std::sync::Mutex;
+
+        struct CancellingProvider;
+        static REQUEST: Mutex<Option<CancellationToken>> = Mutex::new(None);
+        impl NativeWorkspaceGraphProvider for CancellingProvider {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+            fn project(
+                &self,
+                _analyzer: &dyn IAnalyzer,
+                _admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> crate::analyzer::store::Result<SelectedWorkspaceUsageGraphProjectionOutcome>
+            {
+                REQUEST.lock().unwrap().as_ref().unwrap().cancel();
+                Ok(if cancellation.is_cancelled() {
+                    SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled
+                } else {
+                    SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                        "native provider received an unrelated request token".into(),
+                    )
+                })
+            }
+        }
+        static PROVIDER: CancellingProvider = CancellingProvider;
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("A.java", "class A { static void call() {} }")
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let cancellation = CancellationToken::new();
+        *REQUEST.lock().unwrap() = Some(cancellation.clone());
+        let result = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: None,
+                include_tests: true,
+                depth: 1,
+            },
+            &[EdgePassEntry {
+                id: EdgePassId::Java,
+                ecosystem: UsageEcosystem::Jvm,
+                languages: vec![Language::Java],
+                backend: LanguageGraphBackend::Native(&PROVIDER),
+            }],
+            &cancellation,
+        );
+        assert!(cancellation.is_cancelled());
+        assert!(!result.complete);
+        assert!(result.nodes.is_empty() && result.edges.is_empty());
+        assert!(
+            result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "cancelled"),
+            "{result:?}"
+        );
+        *REQUEST.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn usage_graph_observes_request_cancellation_before_catalog_construction() {
+        use crate::analyzer::JavaAnalyzer;
+        use crate::inline_project::InlineTestProject;
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("A.java", "class A { static void call() {} }")
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        for paths in [None, Some(vec!["A.java".to_owned()])] {
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let result = usage_graph_with_cancellation(
+                &analyzer,
+                UsageGraphParams {
+                    paths,
+                    include_tests: true,
+                    depth: 1,
+                },
+                cancellation,
+            );
+            assert!(!result.complete);
+            assert!(result.nodes.is_empty() && result.edges.is_empty());
+            assert!(
+                result
+                    .incomplete_reasons
+                    .iter()
+                    .any(|reason| reason.code == "cancelled"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_graph_dispatch_reuses_files_across_depth_and_preserves_ranking_edges() {
+        use crate::analyzer::JavaAnalyzer;
+        use crate::analyzer::languages::{EdgePassEntry, EdgePassId, NativeWorkspaceGraphProvider};
+        use crate::analyzer::usages::workspace_graph::{
+            WorkspaceUsageGraphBuildOutcome, build_workspace_usage_graph_with_passes,
+        };
+        use crate::inline_project::InlineTestProject;
+        use std::sync::Mutex;
+
+        struct NativeChain {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl NativeWorkspaceGraphProvider for NativeChain {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+
+            fn project(
+                &self,
+                analyzer: &dyn IAnalyzer,
+                admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> crate::analyzer::store::Result<SelectedWorkspaceUsageGraphProjectionOutcome>
+            {
+                let mut files = admitted_callers
+                    .iter()
+                    .map(rel_path_string)
+                    .collect::<Vec<_>>();
+                files.sort();
+                self.calls.lock().unwrap().push(files);
+                let catalog = WorkspaceUsageCatalog::from_declarations(
+                    analyzer
+                        .all_declarations()
+                        .filter(|unit| unit.is_function())
+                        .map(|unit| {
+                            let range = analyzer.ranges(&unit).first().copied();
+                            (unit, range)
+                        })
+                        .collect(),
+                    cancellation,
+                )
+                .unwrap();
+                let index = |name: &str| {
+                    catalog
+                        .nodes
+                        .iter()
+                        .position(|node| node.primary.identifier() == name)
+                        .unwrap()
+                };
+                let mut edges = Vec::new();
+                let mut raw_proven_inbound = vec![0; catalog.nodes.len()];
+                for (caller, target) in [("start", "mid"), ("mid", "late"), ("late", "end")] {
+                    let from = index(caller);
+                    let to = index(target);
+                    let source = catalog.nodes[from].primary.source();
+                    if !admitted_callers.contains(source) {
+                        continue;
+                    }
+                    raw_proven_inbound[to] += 1;
+                    edges.push(CanonicalWorkspaceUsageProjectedEdge {
+                        from,
+                        to,
+                        counts: UsageReferenceCounts {
+                            calls: 1,
+                            ..Default::default()
+                        },
+                        sites: vec![(source.clone(), 1)],
+                    });
+                }
+                let edge_count = edges.len();
+                Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(
+                    SelectedWorkspaceUsageGraphProjection {
+                        nodes: catalog.nodes,
+                        edges,
+                        raw_proven_inbound,
+                        admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
+                        unresolved_names: Some(std::collections::BTreeSet::new()),
+                        forward_completeness: EdgeCompleteness::Complete,
+                        kind_projection_complete: true,
+                        generation: analyzer.project().analysis_generation(),
+                        reference_count: edge_count,
+                        projected_edge_count: edge_count,
+                        batch_count: 1,
+                        root_binding_metrics: ResolutionBatchMetrics::default(),
+                        resolved_ecosystems: vec![UsageEcosystem::Jvm],
+                    },
+                ))
+            }
+        }
+        static PROVIDER: NativeChain = NativeChain {
+            calls: Mutex::new(Vec::new()),
+        };
+        struct UnavailableDependency;
+        impl NativeWorkspaceGraphProvider for UnavailableDependency {
+            fn id(&self) -> EdgePassId {
+                EdgePassId::Java
+            }
+
+            fn project(
+                &self,
+                analyzer: &dyn IAnalyzer,
+                admitted_callers: &[ProjectFile],
+                cancellation: &CancellationToken,
+            ) -> crate::analyzer::store::Result<SelectedWorkspaceUsageGraphProjectionOutcome>
+            {
+                if admitted_callers
+                    .iter()
+                    .any(|file| file.rel_path() == std::path::Path::new("B.java"))
+                {
+                    Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                        "fixture dependency unavailable".into(),
+                    ))
+                } else {
+                    PROVIDER.project(analyzer, admitted_callers, cancellation)
+                }
+            }
+        }
+        static UNAVAILABLE: UnavailableDependency = UnavailableDependency;
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("A.java", "class A { static void start() { B.mid(); } }\n")
+            .file(
+                "B.java",
+                "class B { static void mid() { late(); } static void late() { C.end(); } }\n",
+            )
+            .file("C.java", "class C { static void end() {} }\n")
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let passes = [EdgePassEntry {
+            id: EdgePassId::Java,
+            ecosystem: UsageEcosystem::Jvm,
+            languages: vec![Language::Java],
+            backend: LanguageGraphBackend::Native(&PROVIDER),
+        }];
+        PROVIDER.calls.lock().unwrap().clear();
+        let public = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: Some(vec!["A.java".into()]),
+                include_tests: true,
+                depth: 3,
+            },
+            &passes,
+            &CancellationToken::default(),
+        );
+        assert!(public.complete, "{:?}", public.incomplete_reasons);
+        assert_eq!(public.edges.len(), 3);
+        assert_eq!(
+            *PROVIDER.calls.lock().unwrap(),
+            vec![vec!["A.java".to_string()], vec!["B.java".to_string()]]
+        );
+
+        PROVIDER.calls.lock().unwrap().clear();
+        let WorkspaceUsageGraphBuildOutcome::Complete(ranking) =
+            build_workspace_usage_graph_with_passes(
+                &analyzer,
+                WorkspaceUsageCatalog::build(&analyzer),
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &CancellationToken::default(),
+                &passes,
+            )
+        else {
+            panic!("complete native inventory must build a ranking graph");
+        };
+        assert_eq!(ranking.edges.len(), 3);
+        assert_eq!(
+            *PROVIDER.calls.lock().unwrap(),
+            vec![vec![
+                "A.java".to_string(),
+                "B.java".to_string(),
+                "C.java".to_string()
+            ]]
+        );
+        let ranked_pairs = ranking
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    &ranking.nodes[edge.from].key.id,
+                    &ranking.nodes[edge.to].key.id,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let public_pairs = public
+            .edges
+            .iter()
+            .map(|edge| (&edge.from_id, &edge.to_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ranked_pairs, public_pairs);
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(matches!(
+            build_workspace_usage_graph_with_passes(
+                &analyzer,
+                WorkspaceUsageCatalog::build(&analyzer),
+                &BTreeSet::from([UsageEcosystem::Jvm]),
+                &cancellation,
+                &passes,
+            ),
+            WorkspaceUsageGraphBuildOutcome::Cancelled
+        ));
+        assert_eq!(
+            PROVIDER.calls.lock().unwrap().len(),
+            1,
+            "cancelled admission never invokes a provider"
+        );
+
+        let failed = usage_graph_with_passes(
+            &analyzer,
+            UsageGraphParams {
+                paths: Some(vec!["A.java".into()]),
+                include_tests: true,
+                depth: 3,
+            },
+            &[EdgePassEntry {
+                id: EdgePassId::Java,
+                ecosystem: UsageEcosystem::Jvm,
+                languages: vec![Language::Java],
+                backend: LanguageGraphBackend::Native(&UNAVAILABLE),
+            }],
+            &CancellationToken::default(),
+        );
+        assert!(!failed.complete);
+        assert!(
+            failed.nodes.is_empty() && failed.edges.is_empty(),
+            "operational failure discards the earlier successful layer"
+        );
+        assert!(
+            failed
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.message.contains("fixture dependency unavailable"))
+        );
+    }
+
+    #[test]
+    fn semantic_incomplete_scan_retains_hits_and_never_verifies_absence() {
+        let hit = UsageHitRow {
+            path: "src/lib.rs".to_string(),
+            line: 2,
+            column: None,
+            end_line: None,
+            end_column: None,
+            start_offset: 10,
+            end_offset: 16,
+            enclosing: "caller".to_string(),
+            kind: UsageHitKind::Reference,
+            snippet: "target()".to_string(),
+            confidence: 1.0,
+        };
+        for (hits, status) in [
+            (Vec::new(), ScanUsagesStatus::UnverifiedAbsent),
+            (vec![hit], ScanUsagesStatus::Found),
+        ] {
+            let count = hits.len();
+            let state = SymbolUsageRenderState::new(
+                "target".to_string(),
+                None,
+                false,
+                0,
+                hits,
+                0,
+                Vec::new(),
+                Some("Unresolved structured reference in another file".to_string()),
+                None,
+                Vec::new(),
+                false,
+            );
+            let entry = classify_scan_usages_entry(&ScanUsagesWorkEntry::Usage {
+                request: ScanUsageRequest::symbol(0, "target".to_string()),
+                state,
+                candidate_files_sample: None,
+                target_is_method: false,
+                incomplete_reason: Some(ScanUsagesIncompleteReason::SemanticAnalysis),
+            });
+            assert_eq!(entry.status, status);
+            assert_eq!(entry.total_hits, Some(count));
+            assert!(!entry.complete);
+            assert_eq!(
+                entry.incomplete_reason,
+                Some(ScanUsagesIncompleteReason::SemanticAnalysis)
+            );
+            assert!(
+                entry
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("Unresolved structured reference"))
+            );
+        }
+    }
+
+    #[test]
+    fn composite_usage_queries_preserve_the_ordinary_result_contract() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"observed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn target() {}\npub fn caller() { target(); }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let observed = ScanUsagesExecutionContext::default();
+        let composite =
+            ScanUsagesExecutionContext::for_composite_query(CancellationToken::default());
+        let query = |context: &ScanUsagesExecutionContext| {
+            scan_usages_by_reference_with_context(
+                &analyzer,
+                token,
+                ScanUsagesByReferenceParams {
+                    symbols: vec!["target".to_string()],
+                    include_tests: true,
+                    paths: None,
+                    include_same_owner: true,
+                },
+                context,
+            )
+        };
+        let (ordinary, nested) = rayon::join(|| query(&observed), || query(&composite));
+        assert_eq!(ordinary.summary.total_hits, 1, "{ordinary:#?}");
+        assert_eq!(
+            serde_json::to_value(&ordinary).expect("ordinary result"),
+            serde_json::to_value(&nested).expect("composite result"),
+        );
+        let repeated = query(&observed);
+        assert_eq!(
+            serde_json::to_value(&ordinary).expect("ordinary result"),
+            serde_json::to_value(&repeated).expect("repeated ordinary result"),
+        );
+        observed.cancellation.cancel();
+        let cancelled = query(&observed);
+        assert!(cancelled.summary.partial);
+    }
+
+    fn selected_usage_graph_projection(
+        site_lines: impl IntoIterator<Item = usize>,
+        raw_truncated_inbound: Option<usize>,
+        unproven_inbound: usize,
+    ) -> SelectedWorkspaceUsageGraphProjection {
+        let root = std::env::current_dir().expect("the test working directory must exist");
+        let caller_file = ProjectFile::new(root.clone(), "src/Caller.java");
+        let target_file = ProjectFile::new(root, "src/Target.java");
+        let caller = CodeUnit::new(
+            caller_file.clone(),
+            CodeUnitType::Function,
+            "fixture",
+            "Caller.run",
+        );
+        let target = CodeUnit::new(target_file, CodeUnitType::Function, "fixture", "Target.run");
+        let range = Range {
+            start_byte: 0,
+            end_byte: 80,
+            start_line: 1,
+            end_line: 3,
+        };
+        let catalog = WorkspaceUsageCatalog::from_declarations(
+            vec![(caller.clone(), Some(range)), (target.clone(), Some(range))],
+            &CancellationToken::default(),
+        )
+        .expect("the selected public-result fixture catalog must build");
+        let mut nodes = catalog.nodes;
+        let caller_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&caller.declaration_id()))
+            .expect("the caller must be cataloged");
+        let target_index = nodes
+            .iter()
+            .position(|node| node.declaration_ids.contains(&target.declaration_id()))
+            .expect("the target must be cataloged");
+        nodes[target_index].truncated_inbound = raw_truncated_inbound;
+        nodes[target_index].unproven_inbound = unproven_inbound;
+        let sites = site_lines
+            .into_iter()
+            .map(|line| (caller_file.clone(), line))
+            .collect::<Vec<_>>();
+        let mut raw_proven_inbound = vec![0; nodes.len()];
+        raw_proven_inbound[target_index] = raw_truncated_inbound.unwrap_or(sites.len());
+        SelectedWorkspaceUsageGraphProjection {
+            nodes,
+            raw_proven_inbound,
+            admitted_callers: HashSet::from_iter([caller_file]),
+            unresolved_names: Some(std::collections::BTreeSet::new()),
+            edges: vec![CanonicalWorkspaceUsageProjectedEdge {
+                from: caller_index,
+                to: target_index,
+                counts: UsageReferenceCounts {
+                    calls: 1,
+                    ..UsageReferenceCounts::default()
+                },
+                sites,
+            }],
+            forward_completeness: EdgeCompleteness::Complete,
+            kind_projection_complete: true,
+            generation: 11,
+            reference_count: 1,
+            projected_edge_count: 1,
+            batch_count: 1,
+            root_binding_metrics: ResolutionBatchMetrics::default(),
+            resolved_ecosystems: vec![UsageEcosystem::Jvm],
+        }
+    }
+
+    #[test]
+    fn selected_public_graph_preserves_sites_and_ignores_the_raw_ranking_cap() {
+        let projection = selected_usage_graph_projection([9, 7, 7], Some(MAX_CALLSITES + 1), 1);
+        let result = selected_usage_graph_result(projection, true, &CancellationToken::default())
+            .expect("an uncancelled selected public result must finish");
+
+        assert!(!result.complete, "unproven rows make absence inconclusive");
+        assert_eq!(1, result.edges.len());
+        assert_eq!(2, result.edges[0].weight);
+        assert_eq!(
+            vec![
+                UsageGraphCallSite {
+                    path: "src/Caller.java".to_string(),
+                    line: 7,
+                },
+                UsageGraphCallSite {
+                    path: "src/Caller.java".to_string(),
+                    line: 9,
+                },
+            ],
+            result.edges[0].sites
+        );
+        assert!(result.truncated_symbols.is_empty());
+        assert_eq!(
+            vec!["unproven_reference_edges"],
+            result
+                .incomplete_reasons
+                .iter()
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(result.nodes.windows(2).all(|nodes| {
+            (&nodes[0].language, &nodes[0].fqn, &nodes[0].id)
+                < (&nodes[1].language, &nodes[1].fqn, &nodes[1].id)
+        }));
+    }
+
+    #[test]
+    fn selected_public_graph_caps_exactly_after_max_distinct_lines_and_cancels_atomically() {
+        let at_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the exact-cap selected public result must finish");
+        assert!(at_cap.complete);
+        assert_eq!(1, at_cap.edges.len());
+        assert_eq!(MAX_CALLSITES, at_cap.edges[0].weight);
+        assert!(at_cap.truncated_symbols.is_empty());
+
+        let past_cap = selected_usage_graph_result(
+            selected_usage_graph_projection(1..=MAX_CALLSITES + 1, None, 0),
+            true,
+            &CancellationToken::default(),
+        )
+        .expect("the over-cap selected public result must finish");
+        assert!(!past_cap.complete);
+        assert!(past_cap.edges.is_empty());
+        assert_eq!(1, past_cap.truncated_symbols.len());
+        assert_eq!(
+            MAX_CALLSITES + 1,
+            past_cap.truncated_symbols[0].total_callsites
+        );
+        assert_eq!(
+            vec!["callsites_truncated"],
+            past_cap
+                .incomplete_reasons
+                .iter()
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(
+            selected_usage_graph_result(
+                selected_usage_graph_projection([7], None, 0),
+                true,
+                &cancellation,
+            )
+            .is_none(),
+            "cancellation publishes no public graph prefix"
+        );
+    }
 
     #[test]
     fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
@@ -6709,6 +8213,47 @@ mod tests {
             analyzer.test_hooks().full_declaration_scan_count_for_test(),
             0,
             "a rooted usage graph must not hydrate the workspace declaration inventory"
+        );
+    }
+
+    #[test]
+    fn rooted_rust_usage_graph_preserves_exact_edge_sites_on_caller_thread() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"rooted_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn left() -> usize { 1 }\npub fn right() -> usize { 2 }\npub fn caller() -> usize { left() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+
+        let graph = usage_graph(
+            &analyzer,
+            UsageGraphParams {
+                include_tests: true,
+                paths: Some(vec!["src/lib.rs".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(graph.complete, "rooted Rust usage graph: {graph:#?}");
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from.ends_with(".caller") && edge.to.ends_with(".left"))
+            .expect("rooted Rust graph must retain the exact caller-to-left edge");
+        assert_eq!(edge.weight, 1);
+        assert_eq!(
+            edge.sites,
+            vec![UsageGraphCallSite {
+                path: "src/lib.rs".to_string(),
+                line: 3,
+            }]
         );
     }
 
@@ -7186,6 +8731,33 @@ mod tests {
         (temp, analyzer)
     }
 
+    fn soft_deadline_partial_fixture()
+    -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"soft_budget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub mod target;\npub mod caller_a;\npub mod caller_b;\n",
+            )
+            .file("src/target.rs", "pub fn collect_it() -> i32 { 1 }\n")
+            .file(
+                "src/caller_a.rs",
+                "use crate::target::collect_it;\npub fn call_a() -> i32 { collect_it() }\n",
+            )
+            .file(
+                "src/caller_b.rs",
+                "use crate::target::collect_it;\npub fn call_b() -> i32 { collect_it() }\n",
+            )
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        (fixture, analyzer)
+    }
+
     fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
         scan_usages_by_reference_with_cancellation(
             analyzer,
@@ -7220,9 +8792,11 @@ mod tests {
         )
     }
 
+    /// A request budget returns the first complete caller blob and marks later
+    /// blobs incomplete, preserving its proven call site and retry guidance.
     #[test]
     fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
-        let (_temp, analyzer) = partial_scan_fixture();
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
 
         let complete = scan_with(&analyzer, CancellationToken::default());
         let complete_entry = &complete.results[0];
@@ -7233,21 +8807,10 @@ mod tests {
             .expect("complete scan counts hits");
         assert!(complete_hits > 0, "fixture must produce hits");
 
-        // The check count is deterministic for a fixed fixture, so sweeping it
-        // deterministically visits the window where the scan has proved sites
-        // but has not finished. That entry must show them.
-        let partial = (1..=4_000)
-            .map(|checks| {
-                scan_with(
-                    &analyzer,
-                    CancellationToken::cancel_after_checks_for_test(checks),
-                )
-            })
-            .find(|result| {
-                let entry = &result.results[0];
-                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
-            })
-            .expect("an interrupted scan must be able to report the sites it proved");
+        let partial = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
 
         let entry = &partial.results[0];
         assert_eq!(
@@ -7257,7 +8820,7 @@ mod tests {
         );
         assert!(!entry.complete);
         assert_eq!(
-            Some(ScanUsagesIncompleteReason::Cancelled),
+            Some(ScanUsagesIncompleteReason::TimeBudget),
             entry.incomplete_reason
         );
         assert!(
@@ -7278,14 +8841,11 @@ mod tests {
         );
     }
 
+    /// Location scans follow the same budget contract and retain recovery
+    /// guidance for a partial result.
     #[test]
     fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
-        let (_temp, analyzer) = partial_scan_fixture();
-        // Warm the lazy Rust indexes first, as the reference-surface sibling
-        // above does. Since #1636 a cancelled scan no longer publishes the
-        // usage index it was building, so an all-cancelled sweep repays the
-        // whole cold build every iteration and never reaches the scan that
-        // proves a site -- the entry stays a bare cancelled Failure.
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
         let complete = scan_location_with(&analyzer, CancellationToken::default());
         let complete_entry = &complete.results[0];
         assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
@@ -7295,23 +8855,15 @@ mod tests {
             .expect("complete location scan counts hits");
         assert!(complete_hits > 0, "fixture must produce location hits");
 
-        let partial = (1..=4_000)
-            .map(|checks| {
-                scan_location_with(
-                    &analyzer,
-                    CancellationToken::cancel_after_checks_for_test(checks),
-                )
-            })
-            .find(|result| {
-                let entry = &result.results[0];
-                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
-            })
-            .expect("an interrupted location scan must report the sites it proved");
+        let partial = scan_location_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(3),
+        );
 
         let entry = &partial.results[0];
         assert_eq!(ScanUsagesStatus::Found, entry.status);
         assert_eq!(
-            Some(ScanUsagesIncompleteReason::Cancelled),
+            Some(ScanUsagesIncompleteReason::TimeBudget),
             entry.incomplete_reason
         );
         assert!(
@@ -7325,6 +8877,36 @@ mod tests {
         assert!(
             entry.total_hits.is_some_and(|hits| hits <= complete_hits),
             "a partial location hit list cannot exceed the complete one"
+        );
+    }
+
+    #[test]
+    fn issue_3761_time_budget_before_any_blob_is_unverified_absent() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let result = scan_with(
+            &analyzer,
+            CancellationToken::soft_deadline_after_checks_for_test(0),
+        );
+        let entry = &result.results[0];
+
+        assert_eq!(
+            ScanUsagesStatus::UnverifiedAbsent,
+            entry.status,
+            "{result:#?}"
+        );
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::TimeBudget),
+            entry.incomplete_reason
+        );
+        assert!(result.summary.partial);
+        assert!(!entry.absence_caveats.is_empty());
+        assert!(
+            entry.message.iter().chain(&entry.notes).any(|guidance| {
+                guidance.contains("wall-clock time budget")
+                    && guidance.contains("scan_usages_by_reference")
+            }),
+            "an empty partial result must include time-budget recovery guidance: {entry:#?}"
         );
     }
 

@@ -51,6 +51,7 @@ require_count 'bifrost-semantic-pack' exactly 0
 require_count 'bifrost-semantic-pack.sha256' exactly 0
 require_count 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz' exactly 1
 require_count 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz.sha256' exactly 1
+require_count 'bifrost-semantic-packs-*' exactly 0
 
 installer_name="$(basename -- "$(find "$bundle" -type f -name 'bifrost-semantic-pack-v*-x86_64-unknown-linux-gnu.tar.gz' -print -quit)")"
 release_tag="${installer_name#bifrost-semantic-pack-}"

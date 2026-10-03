@@ -103,6 +103,10 @@ fn classify_reason(
     reason: &RewritePathIncompleteReason,
 ) -> (CodeQueryDiagnosticCode, &'static str) {
     match reason {
+        RewritePathIncompleteReason::CanonicalFactsUnavailable => (
+            CodeQueryDiagnosticCode::RewritePathDerivationIncomplete,
+            "canonical source facts required by the derivation are unavailable",
+        ),
         RewritePathIncompleteReason::NoDomainAnalyzer(_) => (
             CodeQueryDiagnosticCode::RewriteDomainUnsupported,
             "the workspace has no analyzer for the domain's language",
@@ -315,6 +319,7 @@ mod tests {
             reasons: vec![
                 RewritePathIncompleteReason::NoDomainAnalyzer(RewriteDomainKind::RustImportAlias),
                 RewritePathIncompleteReason::Cancelled,
+                RewritePathIncompleteReason::CanonicalFactsUnavailable,
             ],
         };
         let mut diagnostics = Vec::new();
@@ -325,7 +330,7 @@ mod tests {
             7,
             &mut diagnostics,
         );
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert!(
             diagnostics
                 .iter()
@@ -339,7 +344,7 @@ mod tests {
             7,
             &mut diagnostics,
         );
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert!(!completeness.covers(RewriteDomainKind::RustImportAlias));
     }
 }

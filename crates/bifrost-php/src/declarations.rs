@@ -6,18 +6,28 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredImportPathKind, StructuredTypeIdentity, StructuredTypeIdentityBuilder,
     StructuredTypeName,
 };
-use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::parsed_file::{
+    ParsedFile, ParsedSourceFacts, SourceDeclarationMetadataLink,
+};
+use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
+use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+
+use crate::structural::{PHP_KIND_TABLE, PHP_STRUCTURAL_SPEC};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
 use crate::aliases::{
     PhpFileContext, PhpFileContextIndex, PhpUseAliases, module_constant_fq,
-    php_file_context_from_tree_at, php_use_aliases_from_node, resolve_php_type_node,
+    php_use_aliases_from_node, resolve_php_type_node,
 };
 use crate::graph::syntax::{instanceof_type_node, object_creation_type, static_member_parts};
+use crate::source_properties::PhpSourcePropertyCollector;
+use brokk_bifrost_core::analyzer::php_facts::PhpDeclaredSourceType;
 
 /// Intern one qualified-name segment in the process-global interner.
 fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -56,6 +66,8 @@ pub fn parse_php_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFi
         file,
         source,
         parsed: &mut parsed,
+        source_facts: PrimarySourceFactCollector::new(source),
+        properties: PhpSourcePropertyCollector::new(),
     };
     // The walk starts in the global namespace, which is what PHP has in force
     // before the file's first `namespace` declaration; every declaration takes
@@ -339,24 +351,208 @@ struct PhpVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
     parsed: &'a mut ParsedFile,
+    source_facts: PrimarySourceFactCollector<'a>,
+    properties: PhpSourcePropertyCollector,
 }
 
 impl<'a> PhpVisitor<'a> {
-    fn visit_children(&mut self, node: Node<'_>, scope: &PhpScope) {
-        let mut stack = vec![PhpWork::Container(PhpContainer {
-            node,
-            scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
-        })];
-        while let Some(work) = stack.pop() {
-            match work {
-                PhpWork::Container(container) => {
-                    push_php_child_work(container.node, container.scope, self.source, &mut stack);
+    fn visit_children(&mut self, root: Node<'_>, scope: &PhpScope) {
+        let grammar = tree_sitter_php::LANGUAGE_PHP.into();
+        let kinds = CompiledKinds::compile(&grammar, PHP_KIND_TABLE);
+        let context = PHP_STRUCTURAL_SPEC.call_site_context(root, self.source);
+        let mut structural = StructuralFactCollector::new(
+            &PHP_STRUCTURAL_SPEC,
+            self.source,
+            &context,
+            ParentIndex::new(root),
+            usize::MAX,
+            None,
+        );
+        // Declaration admission remains independent from structural admission.
+        // A method body or closure still contributes expression facts even
+        // when its nested declarations are outside the display inventory.
+        let mut declaration_work = HashMap::default();
+        let mut scheduled = Vec::new();
+        push_php_child_work(root, scope.clone(), self.source, &mut scheduled);
+        Self::schedule_declarations(self.source, &mut declaration_work, scheduled);
+        enum Frame<'tree> {
+            Enter(Node<'tree>, Option<u32>),
+            RestoreContext(brokk_bifrost_core::analyzer::php_facts::PhpSourceContextId),
+        }
+        let mut stack = vec![Frame::Enter(root, None)];
+        while let Some(frame) = stack.pop() {
+            let (node, enclosing) = match frame {
+                Frame::Enter(node, enclosing) => (node, enclosing),
+                Frame::RestoreContext(context) => {
+                    self.properties.context = context;
+                    continue;
                 }
-                PhpWork::Node(work) => {
-                    self.visit_node(work.node, &work.scope, &mut stack);
+            };
+            if node.kind() == "namespace_definition" {
+                if node.child_by_field_name("body").is_some() {
+                    stack.push(Frame::RestoreContext(self.properties.context));
+                }
+                let namespace = node
+                    .child_by_field_name("name")
+                    .map(|name| php_namespace_package_name(name, self.source))
+                    .unwrap_or_default();
+                self.properties.enter_namespace(namespace);
+            }
+            if node.kind() == "namespace_use_declaration" {
+                let syntax = crate::imports::parse_php_import_syntax(node, self.source);
+                let aliases = crate::imports::project_alias_source_facts(
+                    &syntax,
+                    self.properties.imports.len(),
+                );
+                self.properties
+                    .imports
+                    .extend(crate::imports::project_source_imports(
+                        &syntax,
+                        node,
+                        self.source,
+                        &mut self.source_facts,
+                    ));
+                self.properties.add_aliases(aliases);
+            }
+            self.properties
+                .capture(node, self.source, &mut self.source_facts);
+            self.properties
+                .capture_write(node, self.source, &mut self.source_facts);
+            self.properties.capture_trait_use(node);
+            let mut structural_parent = enclosing;
+            if node.is_named()
+                && let Some(kind) = kinds.kind_of(&node)
+                && PHP_STRUCTURAL_SPEC.should_extract(node, kind)
+            {
+                let kind = PHP_STRUCTURAL_SPEC.refine_kind(
+                    node,
+                    kind,
+                    enclosing.map(|id| structural.normalized_kind(id)),
+                    self.source,
+                    &context,
+                );
+                let id = structural
+                    .enter(node, kind, enclosing, &mut self.source_facts)
+                    .expect("complete PHP preparation has no structural admission limit");
+                let mut sink = structural.role_sink(&mut self.source_facts);
+                PHP_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+                structural
+                    .accept_roles(id, sink.into_parts())
+                    .expect("complete PHP preparation has no structural admission limit");
+                structural_parent = Some(id);
+            }
+            if let Some(scope) = declaration_work.remove(&node.id()) {
+                let mut scheduled = Vec::new();
+                self.visit_node(node, &scope, &mut scheduled);
+                Self::schedule_declarations(self.source, &mut declaration_work, scheduled);
+            }
+            for index in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(index) {
+                    stack.push(Frame::Enter(child, structural_parent));
                 }
             }
         }
+        assert!(
+            declaration_work.is_empty(),
+            "all PHP declaration events were visited"
+        );
+        let source_facts = std::mem::replace(
+            &mut self.source_facts,
+            PrimarySourceFactCollector::new(self.source),
+        )
+        .finish();
+        let imports = std::mem::take(&mut self.properties.imports);
+        self.parsed.imports = imports
+            .iter()
+            .map(|import| import.import_info(&source_facts))
+            .collect();
+        let generic_imports = (0..imports.len())
+            .map(|index| SourceImportId::try_from_index(index).expect("PHP import ids fit in u32"))
+            .collect();
+        let php = std::mem::take(&mut self.properties.facts);
+        assert!(
+            php.valid_links(&source_facts, &imports),
+            "PHP source properties must have valid canonical links"
+        );
+        self.parsed.source_facts = Some(ParsedSourceFacts {
+            cpp: None,
+            php: Some(php),
+            go: None,
+            java: None,
+            js_ts: None,
+            scala: None,
+            ruby: None,
+            python: None,
+            source_bytes: self.source.len(),
+            occurrences: source_facts,
+            structural: structural
+                .finish()
+                .expect("complete PHP preparation has no structural admission limit"),
+            native_site_occurrences: Vec::new(),
+            native_declaration_sources: Vec::new(),
+            declaration_visibilities: None,
+            rust_declaration_properties: Vec::new(),
+            rust_modules: None,
+            rust_types: Vec::new(),
+            rust_items: Default::default(),
+            imports,
+            generic_imports,
+            rust_import_contexts: Vec::new(),
+        });
+    }
+
+    fn schedule_declarations(
+        source: &str,
+        pending: &mut HashMap<usize, PhpScope>,
+        mut scheduled: Vec<PhpWork<'_>>,
+    ) {
+        while let Some(work) = scheduled.pop() {
+            match work {
+                PhpWork::Container(container) => {
+                    push_php_child_work(container.node, container.scope, source, &mut scheduled);
+                }
+                PhpWork::Node(work) => {
+                    assert!(
+                        pending.insert(work.node.id(), work.scope).is_none(),
+                        "one PHP node has one declaration event"
+                    );
+                }
+            }
+        }
+    }
+
+    fn link_declaration(&mut self, unit: &CodeUnit, node: Node<'_>, name: Node<'_>) {
+        let declaration = self
+            .properties
+            .capture(node, self.source, &mut self.source_facts)
+            .expect("display declaration has canonical PHP source properties");
+        let name_occurrence = self.source_facts.intern_node(name);
+        debug_assert_eq!(
+            self.source_facts.declaration(declaration).name,
+            Some(name_occurrence)
+        );
+        self.parsed
+            .source_declaration_units
+            .push((declaration, unit.clone()));
+    }
+
+    fn add_source_signature_metadata(
+        &mut self,
+        unit: CodeUnit,
+        node: Node<'_>,
+        metadata: SignatureMetadata,
+    ) {
+        let declaration = self.properties.declaration(node).declaration;
+        let metadata_ordinal = self
+            .parsed
+            .add_signature_with_metadata(unit.clone(), metadata);
+        self.parsed
+            .source_declaration_metadata
+            .push(SourceDeclarationMetadataLink {
+                declaration,
+                unit,
+                metadata_ordinal,
+            });
     }
 
     fn visit_node<'tree>(
@@ -441,6 +637,7 @@ impl<'a> PhpVisitor<'a> {
             short_name,
             fq,
         );
+        self.link_declaration(&code_unit, node, name_node);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
             php_declaration_range(node, self.source),
@@ -450,7 +647,7 @@ impl<'a> PhpVisitor<'a> {
         self.parsed
             .add_signature(code_unit.clone(), php_type_signature(node, self.source));
         self.parsed
-            .set_raw_supertypes(code_unit.clone(), extract_php_supertypes(node, self.source));
+            .set_raw_supertypes(code_unit.clone(), self.properties.raw_supertypes(node));
 
         if let Some(body) = php_class_body(node) {
             stack.push(PhpWork::Container(PhpContainer {
@@ -488,6 +685,7 @@ impl<'a> PhpVisitor<'a> {
             short_name,
             fq,
         );
+        self.link_declaration(&code_unit, node, name_node);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
             php_declaration_range(node, self.source),
@@ -495,9 +693,12 @@ impl<'a> PhpVisitor<'a> {
             None,
         );
         let signature = php_function_signature(node, self.source);
-        self.parsed.add_signature_with_metadata(
+        self.add_source_signature_metadata(
             code_unit,
-            php_signature_metadata(signature, node, self.source),
+            node,
+            php_signature_metadata(signature, node, self.source).with_return_type_identity(
+                source_declared_type_identity(&self.properties.declaration(node).declared_type),
+            ),
         );
     }
 
@@ -538,6 +739,7 @@ impl<'a> PhpVisitor<'a> {
                     .clone()
                     .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
+            self.link_declaration(&code_unit, child, name_node);
             self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
                 php_declaration_range(node, self.source),
@@ -555,11 +757,14 @@ impl<'a> PhpVisitor<'a> {
             } else {
                 format!("{modifiers}{type_prefix}{raw_name};")
             };
-            self.parsed.add_signature_with_metadata(
+            self.add_source_signature_metadata(
                 code_unit,
+                child,
                 SignatureMetadata::new(signature, Vec::new())
                     .with_return_type_text(php_declared_type_text(node, self.source))
-                    .with_return_type_identity(php_declared_type_identity(node, self.source)),
+                    .with_return_type_identity(source_declared_type_identity(
+                        &self.properties.declaration(child).declared_type,
+                    )),
             );
         }
     }
@@ -605,6 +810,7 @@ impl<'a> PhpVisitor<'a> {
                 short_name,
                 fq,
             );
+            self.link_declaration(&code_unit, child, name_node);
             self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
                 php_declaration_range(node, self.source),
@@ -645,6 +851,7 @@ impl<'a> PhpVisitor<'a> {
                 .clone()
                 .with_pushed(php_segment(&name, SegmentKind::Member)),
         );
+        self.link_declaration(&code_unit, node, name_node);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
             php_declaration_range(node, self.source),
@@ -687,6 +894,7 @@ impl<'a> PhpVisitor<'a> {
                     .clone()
                     .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
+            self.link_declaration(&code_unit, parameter, name_node);
             self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
                 php_declaration_range(parameter, self.source),
@@ -697,11 +905,14 @@ impl<'a> PhpVisitor<'a> {
                 "{};",
                 normalize_php_snippet(&php_node_text(parameter, self.source)).trim_end_matches(',')
             );
-            self.parsed.add_signature_with_metadata(
+            self.add_source_signature_metadata(
                 code_unit,
+                parameter,
                 SignatureMetadata::new(signature, Vec::new())
                     .with_return_type_text(php_declared_type_text(parameter, self.source))
-                    .with_return_type_identity(php_declared_type_identity(parameter, self.source)),
+                    .with_return_type_identity(source_declared_type_identity(
+                        &self.properties.declaration(parameter).declared_type,
+                    )),
             );
         }
     }
@@ -811,50 +1022,6 @@ fn php_type_signature(node: Node<'_>, source: &str) -> String {
     format!("{} {{", head.trim_end())
 }
 
-fn extract_php_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut raw = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if matches!(child.kind(), "base_clause" | "class_interface_clause") {
-            collect_php_supertype_nodes(child, source, &mut raw);
-        }
-    }
-    if node.kind() == "class_declaration"
-        && let Some(body) = php_class_body(node)
-    {
-        let mut body_cursor = body.walk();
-        for child in body.named_children(&mut body_cursor) {
-            if child.kind() == "use_declaration" {
-                collect_php_supertype_nodes(child, source, &mut raw);
-            }
-        }
-    }
-    raw
-}
-
-fn collect_php_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if matches!(
-            current.kind(),
-            "name" | "namespace_name" | "qualified_name" | "fully_qualified_name"
-        ) {
-            let text = php_node_text(current, source);
-            let text = text.trim();
-            if !text.is_empty() {
-                raw.push(text.to_string());
-            }
-            continue;
-        }
-
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-}
-
 fn php_function_signature(node: Node<'_>, source: &str) -> String {
     let declaration_range = php_declaration_range(node, source);
     if let Some(body) = node.child_by_field_name("body") {
@@ -883,7 +1050,6 @@ fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> Si
     let parameters = php_parameter_metadata(&signature, node, source);
     SignatureMetadata::new(signature, parameters)
         .with_return_type_text(php_declared_type_text(node, source))
-        .with_return_type_identity(php_declared_type_identity(node, source))
         .with_callable_modifiers(
             php_callable_is_static(node),
             false,
@@ -955,15 +1121,14 @@ fn php_declared_type_text(node: Node<'_>, source: &str) -> Option<String> {
 /// absolute component path. Alias and namespace resolution happen while the
 /// parser tree is present, so readers of this nominal case never reconstruct
 /// PHP type syntax from signature text.
-fn php_declared_type_identity(node: Node<'_>, source: &str) -> Option<StructuredTypeIdentity> {
-    let type_node = php_declared_type_node(node)?;
-    let mut root = node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    let context = php_file_context_from_tree_at(root, source, node.start_byte(), || true)?;
-    let resolved = resolve_php_type_node(type_node, source, &context, || true)?;
-    let path = joined_segments(&resolved, PHP_PACKAGE_SEPARATOR)
+fn source_declared_type_identity(ty: &PhpDeclaredSourceType) -> Option<StructuredTypeIdentity> {
+    let PhpDeclaredSourceType::Nominal(arms) = ty else {
+        return None;
+    };
+    let [resolved] = arms.as_slice() else {
+        return None;
+    };
+    let path = joined_segments(resolved, PHP_PACKAGE_SEPARATOR)
         .map(str::to_string)
         .collect::<Vec<_>>();
     let name = StructuredTypeName::new(path, Vec::new(), true)?;
@@ -1253,6 +1418,179 @@ fn php_range(start_byte: usize, start: Point, end_byte: usize, end: Point) -> Ra
         end_byte,
         start_line: start.row + 1,
         end_line: end.row + 1,
+    }
+}
+
+#[cfg(test)]
+mod source_fact_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::php_facts::{PhpDeclarationKind, PhpFieldWriteKind};
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    use std::path::PathBuf;
+
+    fn parsed(source: &str) -> ParsedFile {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), PathBuf::from("m4-php.php"));
+        parse_php_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn primary_php_facts_share_declaration_and_structural_identity() {
+        let source = r#"<?php
+namespace App;
+use Vendor\{Value as V, Other};
+class Holder {
+    public V $first, $second;
+    public function __construct(public V $promoted) {
+        $this->first = new V();
+        $callback = function () { return new Other(); };
+    }
+}
+"#;
+        let parsed = parsed(source);
+        let source_facts = parsed.source_facts.as_ref().unwrap();
+        let php = source_facts.php.as_ref().unwrap();
+        assert!(php.valid_links(&source_facts.occurrences, &source_facts.imports));
+        assert_eq!(source_facts.imports.len(), 2);
+        assert_eq!(parsed.imports.len(), 2);
+        let properties = php
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.kind == PhpDeclarationKind::Property)
+            .collect::<Vec<_>>();
+        assert_eq!(properties.len(), 2);
+        assert_ne!(properties[0].declaration, properties[1].declaration);
+        for declaration in &php.declarations {
+            if matches!(
+                declaration.kind,
+                PhpDeclarationKind::Property | PhpDeclarationKind::PromotedProperty
+            ) {
+                assert_eq!(
+                    declaration.declared_type,
+                    PhpDeclaredSourceType::Nominal(vec!["Vendor.Value".to_owned()])
+                );
+            }
+        }
+        for node in source_facts
+            .structural
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind, NormalizedKind::Class | NormalizedKind::Method))
+        {
+            assert!(parsed.source_declaration_units.iter().any(|(id, _)| {
+                source_facts.occurrences.declaration(*id).occurrence == node.occurrence
+            }));
+        }
+        assert!(
+            source_facts
+                .structural
+                .nodes()
+                .iter()
+                .any(|node| node.kind == NormalizedKind::Lambda)
+        );
+        assert_eq!(
+            source_facts
+                .structural
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == NormalizedKind::Call)
+                .count(),
+            2
+        );
+        assert_eq!(php.writes.len(), 1);
+        assert_eq!(php.writes[0].kind, PhpFieldWriteKind::Instance);
+        assert!(php.writes[0].directly_in_constructor);
+        assert_eq!(
+            php.writes[0].value_type,
+            PhpDeclaredSourceType::Nominal(vec!["Vendor.Value".to_owned()])
+        );
+    }
+
+    #[test]
+    fn primary_php_contexts_and_doc_types_keep_namespace_boundaries() {
+        let parsed = parsed(
+            r#"<?php
+namespace One { use First\Value as V; /** @return V */ function first() {} }
+namespace Two { use Second\Value as V; /** @return V */ function second() {} }
+"#,
+        );
+        let source = parsed.source_facts.as_ref().unwrap();
+        let facts = source.php.as_ref().unwrap();
+        let functions = facts
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.kind == PhpDeclarationKind::Function)
+            .collect::<Vec<_>>();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(
+            functions[0].doc_nominal_type.as_deref(),
+            Some("First.Value")
+        );
+        assert_eq!(
+            functions[1].doc_nominal_type.as_deref(),
+            Some("Second.Value")
+        );
+        assert_ne!(functions[0].context, functions[1].context);
+    }
+
+    #[test]
+    fn primary_php_keeps_source_only_nested_declarations_and_conflicting_writes() {
+        let mut parsed = parsed(
+            r#"<?php
+class Value {}
+class Holder {
+    public $value;
+    function __construct() { $this->value = new Value(); }
+    function replace() { $this->value = unknown(); function hidden(): Value {} }
+}
+"#,
+        );
+        let units = parsed.take_declarations();
+        assert!(!units.iter().any(|unit| unit.identifier() == "hidden"));
+        let source = parsed.source_facts.as_ref().unwrap();
+        let facts = source.php.as_ref().unwrap();
+        assert!(
+            facts
+                .declarations
+                .iter()
+                .any(|declaration| declaration.kind == PhpDeclarationKind::Function)
+        );
+        assert_eq!(facts.writes.len(), 2);
+        assert!(
+            facts
+                .writes
+                .iter()
+                .any(|write| !write.directly_in_constructor)
+        );
+        assert!(
+            facts
+                .writes
+                .iter()
+                .any(|write| write.value_type == PhpDeclaredSourceType::Unknown)
+        );
+    }
+    #[test]
+    fn primary_php_malformed_imports_preserve_structural_and_source_publication() {
+        for source in [
+            "<?php use ; class C {}",
+            "<?php use Vendor\\Thing as ;",
+            "<?php class { function broken( {}",
+            "<html>Hi</html><?php use Vendor\\Thing; ?>tail",
+        ] {
+            let parsed = parsed(source);
+            let source_facts = parsed.source_facts.as_ref().unwrap();
+            assert!(
+                source_facts
+                    .php
+                    .as_ref()
+                    .unwrap()
+                    .valid_links(&source_facts.occurrences, &source_facts.imports)
+            );
+        }
     }
 }
 

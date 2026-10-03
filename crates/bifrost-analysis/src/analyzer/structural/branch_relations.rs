@@ -169,7 +169,7 @@ pub fn java_member_sites(
         if visited > MAX_TREE_NODES || node.child_count() > MAX_TREE_NODES {
             return Err(BranchOpenReason::ComparisonBudget);
         }
-        if in_arm && is_nested_callable(node) {
+        if in_arm && is_nested_callable(node, Language::Java) {
             continue;
         }
         if in_arm && matches!(node.kind(), "field_access" | "method_invocation") {
@@ -213,26 +213,34 @@ pub fn relations_for_if(
     env: &EnvironmentFileResult,
     members: &JavaMemberProofs,
 ) -> Vec<BranchRelationRow> {
-    if !matches!(
-        language,
-        Language::Java | Language::JavaScript | Language::TypeScript | Language::Python
-    ) {
-        return Vec::new();
-    }
+    let if_kinds: &[&str] = match language {
+        Language::Java
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Python
+        | Language::CSharp
+        | Language::Go
+        | Language::Php
+        | Language::Cpp => &["if_statement"],
+        Language::Kotlin | Language::Rust | Language::Scala => &["if_expression"],
+        Language::Ruby => &["if", "unless"],
+        _ => return Vec::new(),
+    };
     let Some(node) = syntax
         .tree()
         .root_node()
         .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-        .filter(|node| {
-            node.kind() == "if_statement"
-                && node.start_byte() == range.start_byte
-                && node.end_byte() == range.end_byte
-        })
+        .filter(|node| node.start_byte() == range.start_byte && node.end_byte() == range.end_byte)
     else {
         return open_rows(range, BranchOpenReason::SyntaxRecovery);
     };
     if node.has_error() {
         return open_rows(range, BranchOpenReason::SyntaxRecovery);
+    }
+    // Other conditionals share the `If` fact (a C# `switch`, a Kotlin
+    // `when`); these relations compare `if` arms only.
+    if !if_kinds.contains(&node.kind()) {
+        return Vec::new();
     }
     let arms = match collect_arms(node, language) {
         Ok(arms) => arms,
@@ -248,6 +256,7 @@ pub fn relations_for_if(
     };
     let chain = Chain {
         language,
+        owner: node_range(node),
         source: syntax.source(),
         env,
         members,
@@ -305,50 +314,75 @@ pub fn relations_for_if(
             });
         }
     }
-    if let Some(true_body) = node.child_by_field_name("consequence") {
-        let false_body = if let Some(alternative) = node.child_by_field_name("alternative") {
-            if alternative.kind() == "else_clause" {
-                alternative.named_child(0)
-            } else {
-                Some(alternative)
-            }
-        } else if node.parent().is_some_and(|parent| {
-            !parent.has_error()
-                && match language {
-                    Language::Java | Language::Python => parent.kind() == "block",
-                    Language::JavaScript | Language::TypeScript => {
-                        parent.kind() == "statement_block"
-                    }
-                    _ => false,
-                }
-        }) {
-            let mut following = node.next_named_sibling();
-            while following.is_some_and(|sibling| sibling.is_extra()) {
-                following = following.and_then(|sibling| sibling.next_named_sibling());
-            }
-            following.filter(|sibling| sibling.kind() == "return_statement")
-        } else {
-            None
-        };
-        if let Some(false_body) = false_body
-            && let Some(outcome) = classify_boolean_branches(language, true_body, false_body)
-        {
-            rows.push(BranchRelationRow {
-                kind: BranchRelationKind::RedundantBooleanReturn,
-                verdict: BranchRelationVerdict::Proven,
-                owner: node_range(node),
-                earlier: node_range(true_body),
-                later: node_range(false_body),
-                earlier_ordinal: 0,
-                later_ordinal: 1,
-                orientation: Some(match outcome {
-                    BooleanBranchOutcome::Condition => "condition",
-                    BooleanBranchOutcome::NegatedCondition => "negated_condition",
-                }),
-            });
-        }
-    }
+    rows.extend(redundant_boolean_row(syntax, language, node));
     rows
+}
+
+/// The redundant Boolean return pair of one `if`: its two arms, or its true
+/// arm and the return that follows it in the same block.
+fn redundant_boolean_row(
+    syntax: &PreparedSyntaxTree,
+    language: Language,
+    node: Node<'_>,
+) -> Option<BranchRelationRow> {
+    let true_body = node.child_by_field_name(consequence_field(language))?;
+    let false_body = if let Some(alternative) = node.child_by_field_name("alternative") {
+        if alternative.kind() == "else_clause" {
+            alternative.named_child(0)?
+        } else {
+            alternative
+        }
+    } else {
+        // A Rust `if` in statement position is wrapped in an expression
+        // statement, whose siblings are the block's other statements.
+        let statement = match node.parent() {
+            Some(parent)
+                if language == Language::Rust && parent.kind() == "expression_statement" =>
+            {
+                parent
+            }
+            _ => node,
+        };
+        let parent = statement.parent().filter(|parent| !parent.has_error())?;
+        let blocks: &[&str] = match language {
+            Language::Java | Language::Python | Language::CSharp | Language::Rust => &["block"],
+            Language::Php | Language::Cpp => &["compound_statement"],
+            Language::JavaScript | Language::TypeScript => &["statement_block"],
+            Language::Go => &["statement_list"],
+            Language::Kotlin => &["statements"],
+            Language::Scala => &["block", "indented_block"],
+            Language::Ruby => &["body_statement"],
+            _ => return None,
+        };
+        if !blocks.contains(&parent.kind()) {
+            return None;
+        }
+        let mut following = statement.next_named_sibling()?;
+        while following.is_extra() {
+            following = following.next_named_sibling()?;
+        }
+        following
+    };
+    let outcome = classify_boolean_branches(language, syntax.source(), true_body, false_body)?;
+    // The first arm of a Ruby `unless` runs when its condition is false.
+    let outcome = match (node.kind(), outcome) {
+        ("unless", BooleanBranchOutcome::Condition) => BooleanBranchOutcome::NegatedCondition,
+        ("unless", BooleanBranchOutcome::NegatedCondition) => BooleanBranchOutcome::Condition,
+        (_, outcome) => outcome,
+    };
+    Some(BranchRelationRow {
+        kind: BranchRelationKind::RedundantBooleanReturn,
+        verdict: BranchRelationVerdict::Proven,
+        owner: node_range(node),
+        earlier: node_range(true_body),
+        later: node_range(false_body),
+        earlier_ordinal: 0,
+        later_ordinal: 1,
+        orientation: Some(match outcome {
+            BooleanBranchOutcome::Condition => "condition",
+            BooleanBranchOutcome::NegatedCondition => "negated_condition",
+        }),
+    })
 }
 
 fn open_rows(range: Range, reason: BranchOpenReason) -> Vec<BranchRelationRow> {
@@ -378,6 +412,7 @@ fn collect_arms<'tree>(
     if is_chain_child(node) {
         return Ok(Vec::new());
     }
+    let body_field = consequence_field(language);
     let mut arms = Vec::new();
     let mut current = node;
     loop {
@@ -391,7 +426,7 @@ fn collect_arms<'tree>(
                     .ok_or(BranchOpenReason::MissingBranchField)?,
             ),
             body: current
-                .child_by_field_name("consequence")
+                .child_by_field_name(body_field)
                 .ok_or(BranchOpenReason::MissingBranchField)?,
         });
         if arms.len() > 16 {
@@ -425,6 +460,45 @@ fn collect_arms<'tree>(
             }
             return Ok(arms);
         }
+        if language == Language::Php {
+            let mut cursor = current.walk();
+            let alternatives = current
+                .children_by_field_name("alternative", &mut cursor)
+                .collect::<Vec<_>>();
+            let mut next = None;
+            for alternative in alternatives {
+                let body = alternative
+                    .child_by_field_name("body")
+                    .ok_or(BranchOpenReason::MissingBranchField)?;
+                match alternative.kind() {
+                    "else_if_clause" => arms.push(Arm {
+                        condition: Some(
+                            alternative
+                                .child_by_field_name("condition")
+                                .ok_or(BranchOpenReason::MissingBranchField)?,
+                        ),
+                        body,
+                    }),
+                    // `else if` (two words) nests another `if` statement.
+                    "else_clause" if body.kind() == "if_statement" => next = Some(body),
+                    "else_clause" => arms.push(Arm {
+                        condition: None,
+                        body,
+                    }),
+                    _ => return Err(BranchOpenReason::MissingBranchField),
+                }
+                if arms.len() > 16 {
+                    return Err(BranchOpenReason::ComparisonBudget);
+                }
+            }
+            match next {
+                Some(next) => {
+                    current = next;
+                    continue;
+                }
+                None => return Ok(arms),
+            }
+        }
         let Some(mut alternative) = current.child_by_field_name("alternative") else {
             return Ok(arms);
         };
@@ -433,7 +507,20 @@ fn collect_arms<'tree>(
                 .named_child(0)
                 .ok_or(BranchOpenReason::MissingBranchField)?;
         }
-        if alternative.kind() == "if_statement" {
+        // A Kotlin `else if` is an `if` expression that is the whole body of
+        // the `else` arm.
+        if let Some(nested) = kotlin_else_if(alternative) {
+            alternative = nested;
+        }
+        if matches!(
+            alternative.kind(),
+            "if_statement" | "if_expression" | "elsif"
+        ) {
+            // A Go `else if` initializer runs between two conditions of the
+            // chain.
+            if alternative.child_by_field_name("initializer").is_some() {
+                return Err(BranchOpenReason::EffectfulCondition);
+            }
             current = alternative;
             continue;
         }
@@ -448,18 +535,47 @@ fn collect_arms<'tree>(
     }
 }
 
+/// The field that holds an `if`'s true arm.
+pub(crate) fn consequence_field(language: Language) -> &'static str {
+    if language == Language::Php {
+        "body"
+    } else {
+        "consequence"
+    }
+}
+
 fn is_chain_child(node: Node<'_>) -> bool {
+    // PHP gives an `if` one `alternative` field per `elseif`/`else` clause.
+    let is_alternative = |owner: Node<'_>, child: Node<'_>| {
+        let mut cursor = owner.walk();
+        owner
+            .children_by_field_name("alternative", &mut cursor)
+            .any(|alternative| alternative.id() == child.id())
+    };
     let Some(parent) = node.parent() else {
         return false;
     };
-    if parent.kind() == "if_statement" {
-        return parent.child_by_field_name("alternative") == Some(node);
+    if matches!(
+        parent.kind(),
+        "if_statement" | "if_expression" | "if" | "elsif"
+    ) {
+        return is_alternative(parent, node);
     }
-    parent.kind() == "else_clause"
+    matches!(parent.kind(), "else_clause" | "control_structure_body")
+        && (parent.kind() != "control_structure_body" || kotlin_else_if(parent) == Some(node))
         && parent.parent().is_some_and(|owner| {
-            owner.kind() == "if_statement"
-                && owner.child_by_field_name("alternative") == Some(parent)
+            matches!(owner.kind(), "if_statement" | "if_expression")
+                && is_alternative(owner, parent)
         })
+}
+
+/// The `if` expression that is the whole body of a Kotlin `else` arm.
+fn kotlin_else_if(body: Node<'_>) -> Option<Node<'_>> {
+    if body.kind() != "control_structure_body" || body.named_child_count() != 1 {
+        return None;
+    }
+    body.named_child(0)
+        .filter(|nested| nested.kind() == "if_expression")
 }
 
 fn node_range(node: Node<'_>) -> Range {
@@ -475,6 +591,8 @@ fn node_range(node: Node<'_>) -> Range {
 #[derive(Clone, Copy)]
 struct Chain<'a> {
     language: Language,
+    /// The `if` whose chain is compared.
+    owner: Range,
     source: &'a str,
     env: &'a EnvironmentFileResult,
     members: &'a JavaMemberProofs,
@@ -492,6 +610,7 @@ struct Chain<'a> {
 fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> BranchRelationVerdict {
     let Chain {
         language,
+        owner,
         source,
         env,
         members,
@@ -514,6 +633,24 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
         }
         if left.has_error() || right.has_error() || left.is_missing() || right.is_missing() {
             return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
+        }
+        // A Ruby arm is a `then` or an `else`, each a statement list; only
+        // their statements are compared.
+        let ruby_arm = |node: Node<'_>| matches!(node.kind(), "then" | "else");
+        if language == Language::Ruby && ruby_arm(left) && ruby_arm(right) {
+            let (left_statements, right_statements) =
+                (named_statements(left), named_statements(right));
+            if left_statements.len() != right_statements.len() {
+                return BranchRelationVerdict::Distinct;
+            }
+            stack.extend(
+                left_statements
+                    .into_iter()
+                    .zip(right_statements)
+                    .rev()
+                    .map(|(left, right)| (left, right, nested)),
+            );
+            continue;
         }
         if left.kind() != right.kind() {
             // `this.value` and a bare `value` can name one Java field, which
@@ -550,8 +687,12 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
             }
             return BranchRelationVerdict::Distinct;
         }
-        let nested = nested || is_nested_callable(left);
+        let nested = nested || is_nested_callable(left, language);
         deferred |= nested;
+        if position_dependent(left, language, source) || position_dependent(right, language, source)
+        {
+            return BranchRelationVerdict::Distinct;
+        }
         if left.kind() == "field_access" {
             let (Some(left_field), Some(right_field), Some(left_object), Some(right_object)) = (
                 left.child_by_field_name("field"),
@@ -645,6 +786,7 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
         let is_name = matches!(
             left.kind(),
             "identifier"
+                | "simple_identifier"
                 | "type_identifier"
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
@@ -662,7 +804,7 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
         };
         if matches!(
             left.kind(),
-            "identifier" | "shorthand_property_identifier_pattern"
+            "identifier" | "simple_identifier" | "shorthand_property_identifier_pattern"
         ) {
             // A declaration inside each arm is a pair of distinct bindings
             // that stand for each other, like a block local in each arm.
@@ -709,7 +851,7 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
                 (None, None) => {}
             }
         }
-        if left.kind() == "identifier" {
+        if matches!(left.kind(), "identifier" | "simple_identifier") {
             match (identifier_role(left), identifier_role(right)) {
                 // A declaration the environment does not place inside its arm.
                 (IdentifierRole::Binder, IdentifierRole::Binder) => {
@@ -741,10 +883,24 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
         ) else {
             return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
         };
-        let (a, b) = match (
-            binding_of(env, name, left.start_byte(), Some(Namespace::Value)),
-            binding_of(env, other_name, right.start_byte(), Some(Namespace::Value)),
-        ) {
+        // A Ruby assignment target is its own binder: the environment starts
+        // that binding after the assignment, so a lookup at the target would
+        // find an earlier assignment's row or nothing.
+        let resolve = |node: Node<'_>, spelling: &str| {
+            let own = (language == Language::Ruby)
+                .then(|| {
+                    env.bindings_named(spelling).iter().copied().find(|index| {
+                        let range = env.bindings[*index].range;
+                        range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
+                    })
+                })
+                .flatten();
+            match own {
+                Some(index) => BindingOfOutcome::Reached(index),
+                None => binding_of(env, spelling, node.start_byte(), Some(Namespace::Value)),
+            }
+        };
+        let (a, b) = match (resolve(left, name), resolve(right, other_name)) {
             (BindingOfOutcome::Reached(a), BindingOfOutcome::Reached(b)) => (a, b),
             (
                 BindingOfOutcome::Shadowed { winner: a, .. },
@@ -772,6 +928,34 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
                 return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
             }
         };
+        // A pattern binder that a chain condition declares, such as Rust's
+        // `if let Some(v) = ..`, is in effect in some arms only, but the
+        // environment states its interval as the whole `if`. In an arm where
+        // it is not in effect, the same spelling names another binding.
+        let declared_by_condition = |index: usize| {
+            let range = env.bindings[index].range;
+            let within =
+                |start: usize, end: usize| start <= range.start_byte && range.end_byte <= end;
+            env.bindings[index].kind == BindingKind::PatternBinder
+                && within(owner.start_byte, owner.end_byte)
+                && !within(earlier.start_byte(), earlier.end_byte())
+                && !within(later.start_byte(), later.end_byte())
+        };
+        if declared_by_condition(a) || declared_by_condition(b) {
+            return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
+        }
+        // Every assignment to a Ruby local is a binding row of its own, but
+        // all of them in one method are the same variable. In valid Go, two
+        // declarations of one name in one block are a `:=` redeclaration,
+        // which assigns the existing variable.
+        if matches!(language, Language::Ruby | Language::Go)
+            && name == other_name
+            && env.bindings[a].kind == BindingKind::Local
+            && env.bindings[b].kind == BindingKind::Local
+            && env.bindings[a].declaring_scope == env.bindings[b].declaring_scope
+        {
+            continue;
+        }
         if let Some(mapped) = renamed.get(&a) {
             if *mapped != b {
                 return BranchRelationVerdict::Distinct;
@@ -801,6 +985,132 @@ fn compare_trees(earlier: Node<'_>, later: Node<'_>, chain: &Chain<'_>) -> Branc
     }
 }
 
+/// Whether a C or C++ binding's declaration makes its value stable between two
+/// condition tests: it is not `volatile`, and in C++ its declared type is a
+/// built-in type, so no overloaded operator can run.
+fn cpp_stable_declaration(
+    env: &EnvironmentFileResult,
+    index: usize,
+    reference: Node<'_>,
+    source: &str,
+    c_dialect: bool,
+) -> bool {
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let range = env.bindings[index].range;
+    let Some(name) = root.named_descendant_for_byte_range(range.start_byte, range.end_byte) else {
+        return false;
+    };
+    let Some(declaration) =
+        std::iter::successors(name.parent(), |node| node.parent()).find(|node| {
+            matches!(
+                node.kind(),
+                "declaration"
+                    | "parameter_declaration"
+                    | "optional_parameter_declaration"
+                    | "for_range_loop"
+            )
+        })
+    else {
+        return false;
+    };
+    let mut cursor = declaration.walk();
+    let volatile = declaration.children(&mut cursor).any(|child| {
+        child.kind() == "type_qualifier" && source.get(child.byte_range()) == Some("volatile")
+    });
+    !volatile
+        && (c_dialect
+            || declaration
+                .child_by_field_name("type")
+                .is_some_and(|written| written.kind() == "primitive_type"))
+}
+
+/// Whether a Scala or C# binding is declared with the written Boolean type
+/// (`Boolean`, `bool`).
+fn declared_boolean(
+    env: &EnvironmentFileResult,
+    index: usize,
+    reference: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let range = env.bindings[index].range;
+    let Some(name) = root.named_descendant_for_byte_range(range.start_byte, range.end_byte) else {
+        return false;
+    };
+    let Some(declaration) = name.parent() else {
+        return false;
+    };
+    // A C# declarator's type is on its enclosing variable declaration.
+    let (names_binding, typed) = match declaration.kind() {
+        "val_definition" | "var_definition" => (
+            declaration.child_by_field_name("pattern"),
+            Some(declaration),
+        ),
+        "parameter" => (declaration.child_by_field_name("name"), Some(declaration)),
+        "variable_declarator" => (
+            declaration.child_by_field_name("name"),
+            declaration.parent(),
+        ),
+        _ => (None, None),
+    };
+    names_binding.is_some_and(|binding| binding.id() == name.id())
+        && matches!(
+            typed
+                .and_then(|typed| typed.child_by_field_name("type"))
+                .and_then(|written| source.get(written.byte_range())),
+            Some("Boolean" | "bool")
+        )
+}
+
+/// Whether `node` evaluates to its own source position, so two spellings of
+/// it at different positions are different values: Rust's `line!()` and
+/// `column!()`, PHP's case-insensitive `__LINE__` and Ruby's `__LINE__`.
+fn position_dependent(node: Node<'_>, language: Language, source: &str) -> bool {
+    match language {
+        Language::Php => {
+            return node.kind() == "name"
+                && source
+                    .get(node.byte_range())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("__LINE__"));
+        }
+        // The Ruby grammar spells `__LINE__` as an identifier.
+        Language::Ruby => {
+            return node.kind() == "line"
+                || (node.kind() == "identifier"
+                    && source.get(node.byte_range()) == Some("__LINE__"));
+        }
+        // `__LINE__` and `__COUNTER__` are macros the preprocessor replaces
+        // with the line and a running count.
+        Language::Cpp => {
+            return node.kind() == "identifier"
+                && matches!(
+                    source.get(node.byte_range()),
+                    Some("__LINE__" | "__COUNTER__")
+                );
+        }
+        Language::Rust => {}
+        _ => return false,
+    }
+    if node.kind() != "macro_invocation" {
+        return false;
+    }
+    let Some(mut name) = node.child_by_field_name("macro") else {
+        return false;
+    };
+    if name.kind() == "scoped_identifier"
+        && let Some(last) = name.child_by_field_name("name")
+    {
+        name = last;
+    }
+    matches!(source.get(name.byte_range()), Some("line" | "column"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IdentifierRole {
     Value,
@@ -823,6 +1133,17 @@ fn identifier_role(node: Node<'_>) -> IdentifierRole {
     }
     if parent.kind() == "method_invocation" && field.flatten() != Some("object") {
         return IdentifierRole::NonValue;
+    }
+    // Kotlin spells no fields: a member follows `.` in a navigation suffix, a
+    // named argument's label precedes its `=`, and a local's name is the
+    // direct child of its variable declaration.
+    match parent.kind() {
+        "navigation_suffix" => return IdentifierRole::NonValue,
+        "value_argument" if node.next_sibling().is_some_and(|next| next.kind() == "=") => {
+            return IdentifierRole::NonValue;
+        }
+        "variable_declaration" => return IdentifierRole::Binder,
+        _ => {}
     }
     match field.flatten() {
         Some("name") if parent.kind() == "variable_declarator" => IdentifierRole::Binder,
@@ -892,6 +1213,13 @@ fn stable_binding(env: &EnvironmentFileResult, index: usize) -> bool {
     false
 }
 
+fn named_statements(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect()
+}
+
 fn non_extra_children(node: Node<'_>) -> Vec<(Option<&str>, Node<'_>)> {
     (0..node.child_count())
         .filter_map(|index| {
@@ -923,7 +1251,22 @@ fn explicit_this_receiver(invocation: Node<'_>) -> bool {
 /// open rather than inferred from matching syntax. The kinds cover the Java,
 /// JavaScript, TypeScript and Python grammars; a Python decorated definition
 /// is covered by the definition it wraps.
-fn is_nested_callable(node: Node<'_>) -> bool {
+fn is_nested_callable(node: Node<'_>, language: Language) -> bool {
+    // A Ruby `block` is a closure; elsewhere a `block` is a statement block.
+    if language == Language::Ruby {
+        return node.is_named()
+            && matches!(
+                node.kind(),
+                "method"
+                    | "singleton_method"
+                    | "block"
+                    | "do_block"
+                    | "lambda"
+                    | "class"
+                    | "module"
+                    | "singleton_class"
+            );
+    }
     node.is_named()
         && matches!(
             node.kind(),
@@ -949,6 +1292,42 @@ fn is_nested_callable(node: Node<'_>) -> bool {
                 | "function_definition"
                 | "lambda"
                 | "class_definition"
+                // Rust. An async block's body runs when it is awaited.
+                | "closure_expression"
+                | "function_item"
+                | "impl_item"
+                | "trait_item"
+                | "mod_item"
+                | "async_block"
+                // Go.
+                | "func_literal"
+                // C and C++, beyond the shared lambda and function kinds.
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                // C#, beyond the shared lambda and class-like kinds.
+                | "anonymous_method_expression"
+                | "local_function_statement"
+                | "struct_declaration"
+                | "record_struct_declaration"
+                // Kotlin, beyond the shared function, class and
+                // `anonymous_function` (PHP's closure kind too) kinds.
+                | "lambda_literal"
+                | "object_declaration"
+                | "object_literal"
+                | "companion_object"
+                // PHP, beyond the shared function, method, class, interface,
+                // enum and arrow-function kinds.
+                | "anonymous_function"
+                | "anonymous_class"
+                | "trait_declaration"
+                // Scala, beyond the shared `lambda_expression`,
+                // `function_definition` and `class_definition`. `new T { .. }`
+                // is an anonymous class.
+                | "object_definition"
+                | "trait_definition"
+                | "given_definition"
+                | "instance_expression"
         )
 }
 
@@ -993,7 +1372,7 @@ fn pattern_binders<'tree, 'source>(
             return Err(BranchOpenReason::ComparisonBudget);
         }
         // A pattern inside a lambda or anonymous class binds only there.
-        if is_nested_callable(node) {
+        if is_nested_callable(node, language) {
             continue;
         }
         let binder = pattern_binding_name(node);
@@ -1016,7 +1395,8 @@ fn condition_stability(
     syntax: &PreparedSyntaxTree,
     env: &EnvironmentFileResult,
 ) -> BranchRelationVerdict {
-    let baseline = basic_condition_stability(condition, language, syntax.source(), env);
+    let c_dialect = syntax.dialect() == crate::analyzer::LanguageDialect::CppC;
+    let baseline = basic_condition_stability(condition, language, c_dialect, syntax.source(), env);
     if language != Language::Java
         || !matches!(
             baseline,
@@ -1031,6 +1411,7 @@ fn condition_stability(
 fn basic_condition_stability(
     condition: Node<'_>,
     language: Language,
+    c_dialect: bool,
     source: &str,
     env: &EnvironmentFileResult,
 ) -> BranchRelationVerdict {
@@ -1105,19 +1486,165 @@ fn basic_condition_stability(
                     | "("
                     | ")"
             ),
+            // C and C++ comparisons and logic over locals and literals. C has
+            // no operator overloading; a C++ operand must be declared with a
+            // built-in type. A `volatile` local can change between tests.
+            Language::Cpp => matches!(
+                kind,
+                "identifier"
+                    | "number_literal"
+                    | "char_literal"
+                    | "true"
+                    | "false"
+                    | "null"
+                    | "nullptr"
+                    | "condition_clause"
+                    | "parenthesized_expression"
+                    | "binary_expression"
+                    | "unary_expression"
+                    | "=="
+                    | "!="
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+                    | "&&"
+                    | "||"
+                    | "!"
+                    | "-"
+                    | "("
+                    | ")"
+            ),
+            // Go has no operator overloading: comparing and negating local
+            // values runs no user code. A dereference, an address, a channel
+            // receive, a member and a call are excluded.
+            Language::Go => matches!(
+                kind,
+                "identifier"
+                    | "int_literal"
+                    | "float_literal"
+                    | "rune_literal"
+                    | "interpreted_string_literal"
+                    | "interpreted_string_literal_content"
+                    | "raw_string_literal"
+                    | "raw_string_literal_content"
+                    | "escape_sequence"
+                    | "true"
+                    | "false"
+                    | "nil"
+                    | "parenthesized_expression"
+                    | "binary_expression"
+                    | "unary_expression"
+                    | "=="
+                    | "!="
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+                    | "&&"
+                    | "||"
+                    | "!"
+                    | "-"
+                    | "\""
+                    | "`"
+                    | "("
+                    | ")"
+            ),
+            // A C# condition of a user type runs its `operator true`, and `!`
+            // and `==` can be user operators. A local declared `bool`,
+            // negated with the built-in `!`, is stable.
+            Language::CSharp => matches!(
+                kind,
+                "identifier"
+                    | "boolean_literal"
+                    | "parenthesized_expression"
+                    | "prefix_unary_expression"
+                    | "!"
+                    | "("
+                    | ")"
+            ),
+            // Kotlin has no truthiness conversion, so a condition name is a
+            // `Boolean`, and `!` on it is built in. `==` calls `equals`;
+            // `===` and `!==` compare identity.
+            Language::Kotlin => matches!(
+                kind,
+                "simple_identifier"
+                    | "boolean_literal"
+                    | "null_literal"
+                    | "parenthesized_expression"
+                    | "prefix_expression"
+                    | "equality_expression"
+                    | "!"
+                    | "==="
+                    | "!=="
+                    | "("
+                    | ")"
+            ),
+            // A Rust comparison or `!` dispatches to a trait that user code
+            // can implement, so only a bare `bool` local is stable.
+            Language::Rust => matches!(
+                kind,
+                "identifier" | "boolean_literal" | "parenthesized_expression" | "(" | ")"
+            ),
+            // Ruby truthiness runs no method, but `==`, `!` and `not` are
+            // method calls and a constant read can call `const_missing`.
+            Language::Ruby => matches!(
+                kind,
+                "identifier" | "nil" | "true" | "false" | "parenthesized_statements" | "(" | ")"
+            ),
+            // PHP loose `==` can call `__toString`, and a property or element
+            // read can call `__get` or `offsetGet`. Variables, constants and
+            // literals compared with `===`/`!==` or negated run no user code.
+            Language::Php => matches!(
+                kind,
+                "variable_name"
+                    | "name"
+                    | "$"
+                    | "boolean"
+                    | "null"
+                    | "integer"
+                    | "string"
+                    | "string_content"
+                    | "'"
+                    | "parenthesized_expression"
+                    | "binary_expression"
+                    | "unary_op_expression"
+                    | "==="
+                    | "!=="
+                    | "!"
+                    | "("
+                    | ")"
+            ),
+            // Scala `==` calls `equals`, and a condition of another type runs
+            // an implicit conversion. A local declared `Boolean`, negated with
+            // the built-in `!`, is stable.
+            Language::Scala => matches!(
+                kind,
+                "identifier"
+                    | "boolean_literal"
+                    | "parenthesized_expression"
+                    | "prefix_expression"
+                    | "!"
+                    | "("
+                    | ")"
+            ),
             _ => false,
         };
         if !allowed {
             return BranchRelationVerdict::Open(BranchOpenReason::UnsupportedCondition);
         }
-        if kind == "identifier" {
+        if matches!(kind, "identifier" | "simple_identifier") {
             let Some(name) = source.get(node.byte_range()) else {
                 return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
             };
             match binding_of(env, name, node.start_byte(), Some(Namespace::Value)) {
                 BindingOfOutcome::Reached(index)
                 | BindingOfOutcome::Shadowed { winner: index, .. }
-                    if stable_binding(env, index) => {}
+                    if stable_binding(env, index)
+                        && (!matches!(language, Language::Scala | Language::CSharp)
+                            || declared_boolean(env, index, node, source))
+                        && (language != Language::Cpp
+                            || cpp_stable_declaration(env, index, node, source, c_dialect)) => {}
                 BindingOfOutcome::Reached(_) | BindingOfOutcome::Shadowed { .. } => {
                     return BranchRelationVerdict::Open(BranchOpenReason::NonLocalReference);
                 }

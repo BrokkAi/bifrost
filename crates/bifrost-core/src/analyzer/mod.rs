@@ -12,21 +12,30 @@ pub mod cognitive_complexity;
 pub mod common;
 pub mod config;
 pub mod configuration;
+pub mod cpp_facts;
 pub mod definition_lookup;
 pub mod dense_id;
 pub mod exception_handling;
 pub mod fq_name;
+pub mod go_facts;
 pub mod identifier;
+pub mod java_facts;
 pub mod model;
 pub mod parsed_file;
+pub mod php_facts;
 pub mod pool_memo;
 pub mod prepared_syntax;
 pub mod project;
+pub mod python_facts;
 pub mod query_batch;
 pub mod query_token;
+pub mod resolution_facts;
+pub mod ruby_facts;
 pub mod rust_facts;
+pub mod scala_facts;
 pub mod semantic_diagnostics;
 pub mod source_content;
+pub mod source_facts;
 pub mod structural;
 pub mod symbol_path;
 pub mod test_assertions;
@@ -50,3 +59,5 @@ pub use model::{
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
 };
+
+pub mod js_ts_facts;

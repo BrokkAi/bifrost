@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 BIFROST INSTALLER BUNDLE JAVA_HOME SCRATCH_ROOT" >&2
+if [[ $# -ne 8 ]]; then
+  echo "usage: $0 BIFROST INSTALLER BUNDLE POLICY_ROOT PACK_CACHE_ROOT RECEIPT JAVA_HOME SCRATCH_ROOT" >&2
   exit 2
 fi
 
 bifrost=$(realpath "$1")
 installer=$(realpath "$2")
 bundle=$(realpath "$3")
-java_home=$(realpath "$4")
-scratch=$(realpath -m "$5")
+policy_root=$(realpath "$4")
+pack_cache=$(realpath -m "$5")
+receipt=$(realpath "$6")
+java_home=$(realpath "$7")
+scratch=$(realpath -m "$8")
 
 for executable in "$bifrost" "$installer"; do
   [[ -x "$executable" ]] || { echo "not executable: $executable" >&2; exit 2; }
 done
 [[ -f "$bundle/index.json" ]] || { echo "bundle has no index.json: $bundle" >&2; exit 2; }
+[[ -d "$policy_root" ]] || { echo "policy pack root is not a directory: $policy_root" >&2; exit 2; }
+mkdir -p -- "$pack_cache"
+[[ -d "$pack_cache" ]] || { echo "pack cache root is not a directory: $pack_cache" >&2; exit 2; }
+cache_write_probe=$(mktemp "$pack_cache/.bifrost-write-test.XXXXXX")
+rm -f -- "$cache_write_probe"
+[[ -s "$receipt" ]] || { echo "pack selection receipt is missing: $receipt" >&2; exit 2; }
+node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$receipt"
 [[ -x "$java_home/bin/java" && -d "$java_home/jmods" ]] || {
   echo "JAVA_HOME is not a complete JDK: $java_home" >&2
   exit 2
@@ -23,6 +33,7 @@ done
 
 rm -rf "$scratch"
 mkdir -p "$scratch/workspace/src/main/java/fixture" "$scratch/empty-home"
+cp "$receipt" "$scratch/open-packs-receipt.json"
 workspace="$scratch/workspace"
 catalog="$workspace/.bifrost/semantic-pack-catalog"
 mkdir -p "$workspace/.bifrost"
@@ -67,18 +78,30 @@ JAVA
 run_scan() {
   local label=$1
   local mounted_java_home=/jdk
+  local -a open_semantic_env=()
   if [[ "$label" == "missing" ]]; then
     mounted_java_home=
+  fi
+  if [[ "$label" == "missing" || "$label" == "positive" ]]; then
+    open_semantic_env+=(
+      BIFROST_SEMANTIC_PACK_CACHE_ROOT=/open-packs/cache
+      BIFROST_OPEN_SEMANTIC_PACK_BUNDLE=/open-packs/semantic
+    )
   fi
   set +e
   docker run --rm --network none \
     --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$(dirname "$bifrost"),dst=/release,readonly" \
     --mount "type=bind,src=$java_home,dst=/jdk,readonly" \
+    --mount "type=bind,src=$bundle,dst=/open-packs/semantic,readonly" \
+    --mount "type=bind,src=$policy_root,dst=/open-packs/policy,readonly" \
+    --mount "type=bind,src=$pack_cache,dst=/open-packs/cache" \
     --mount "type=bind,src=$scratch,dst=/work" \
     ubuntu:22.04 \
     env -i PATH=/usr/bin:/bin HOME=/work/empty-home USERPROFILE=/work/empty-home \
       JAVA_HOME="$mounted_java_home" BIFROST_SEMANTIC_PACK_DOWNLOAD=off \
+      BIFROST_OPEN_POLICY_PACK_ROOT=/open-packs/policy \
+      "${open_semantic_env[@]}" \
       "/release/$(basename "$bifrost")" --root /work/workspace --policy \
       --policy-id bifrost.security.java.system-getenv-to-runtime-exec \
       --format json --fail-on never --evaluation-date 2026-09-17 \
@@ -93,8 +116,8 @@ run_scan() {
   fi
 }
 
-# Missing explicit state must fail before installation, even though the exact
-# runtime toolchain is available and the facade's acquisition provider exists.
+# Missing explicit Java toolchain state must remain incomplete while using the
+# exact integrity-verified external pack set selected for this engine profile.
 run_scan missing
 
 "$installer" verify "$bundle" > "$scratch/bundle-verify.txt"
@@ -209,6 +232,11 @@ for (const label of ["missing", "corrupt", "incompatible"]) {
   if (value.runs?.some((candidate) => candidate.completion?.type === "complete" && candidate.findings?.length === 0)) {
     throw new Error(`${label} catalog produced a complete clean policy run`);
   }
+}
+
+const missing = readJson("missing");
+if (missing.packs?.decisions?.some((decision) => decision.pack.startsWith("bifrost.jdk@") && decision.status === "selected")) {
+  throw new Error("the missing-JAVA_HOME acceptance unexpectedly selected a curated JDK pack");
 }
 
 fs.writeFileSync(

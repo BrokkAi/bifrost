@@ -184,3 +184,213 @@ end
         );
     }
 }
+
+#[cfg(test)]
+mod canonical_source_tests {
+    use super::*;
+    use crate::analyzer::OverlayProject;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_ruby::graph_support::RubySource;
+
+    #[test]
+    fn ruby_dirty_load_and_autoload_facts_are_isolated_across_a_b_a() {
+        let source_a = "module Outer\n  autoload :First, \"first\"\nend\n";
+        let source_b = "module Outer\n  autoload :Second, \"second\"\nend\n";
+        let fixture = InlineTestProject::with_language(Language::Ruby)
+            .file("main.rb", source_a)
+            .file("first.rb", "class Outer::First; end\n")
+            .file("second.rb", "class Outer::Second; end\n")
+            .build();
+        let file = fixture.file("main.rb");
+        let mut analyzer = RubyAnalyzer::new(fixture.project_dyn());
+        analyzer.inner.clear_retained_file_states_for_test();
+        assert!(analyzer.canonical_sources_ready());
+        assert!(
+            analyzer
+                .autoload_constant_files()
+                .unwrap()
+                .contains_key("Outer$First")
+        );
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(file.abs_path(), source_b.to_owned()));
+        let dirty = analyzer.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
+        // Ordinary primary preparation establishes the dirty source authority.
+        dirty
+            .inner
+            .prepare_canonical_source_facts(&file, source_b.to_owned())
+            .unwrap();
+        let loads = dirty.source_facts(&file).unwrap().loads;
+        assert_eq!(
+            loads[0].autoload_constant.as_deref().unwrap(),
+            ["Outer", "Second"]
+        );
+        let index = dirty.autoload_constant_files().unwrap();
+        assert!(index.contains_key("Outer$Second"));
+        assert!(!index.contains_key("Outer$First"));
+        assert!(
+            analyzer
+                .autoload_constant_files()
+                .unwrap()
+                .contains_key("Outer$First")
+        );
+        assert!(overlay.set(file.abs_path(), source_a.to_owned()));
+        let again = analyzer.clone_with_project(overlay as Arc<dyn Project>);
+        assert_eq!(
+            again.source_facts(&file).unwrap().loads[0]
+                .autoload_constant
+                .as_deref()
+                .unwrap(),
+            ["Outer", "First"]
+        );
+        let index = again.autoload_constant_files().unwrap();
+        assert!(index.contains_key("Outer$First"));
+        assert!(!index.contains_key("Outer$Second"));
+    }
+
+    #[test]
+    fn ruby_cold_missing_publication_does_not_parse_or_cache_failed_autoload() {
+        let source = "autoload :Ready, \"ready\"\n";
+        let fixture = InlineTestProject::with_language(Language::Ruby)
+            .file("main.rb", source)
+            .build();
+        let file = fixture.file("main.rb");
+        let mut analyzer = RubyAnalyzer::new(fixture.project_dyn());
+        analyzer.inner.clear_retained_file_states_for_test();
+        let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
+        analyzer
+            .inner
+            .analyzer_store()
+            .mark_parsed_blob_incomplete_for_test(oid, "ruby");
+        analyzer.inner.reset_full_hydration_count_for_test();
+        assert!(analyzer.source_facts(&file).is_none());
+        assert!(analyzer.autoload_constant_files().is_none());
+        assert!(!analyzer.canonical_sources_ready());
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        use crate::analyzer::QueryScope;
+        assert!(
+            analyzer
+                .import_info_of_checked(scope.token(), &file)
+                .is_none()
+        );
+        assert!(analyzer.import_info_of(scope.token(), &file).is_empty());
+        assert!(analyzer.autoload_constant_files.get().is_none());
+        assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
+        analyzer
+            .inner
+            .prepare_canonical_source_facts(&file, source.to_owned())
+            .unwrap();
+        assert!(analyzer.canonical_sources_ready());
+        assert!(
+            analyzer
+                .autoload_constant_files()
+                .unwrap()
+                .contains_key("Ready")
+        );
+        assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
+    }
+}
+
+#[cfg(test)]
+mod canonical_lookup_tests {
+    use super::*;
+    use crate::analyzer::usages::get_definition::{BoundedResolution, resolve_ruby_bounded};
+    use crate::analyzer::usages::get_type::resolve_ruby_type_bounded;
+    use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+    use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn ruby_edge_build_does_not_publish_missing_inputs_after_a_successful_preflight() {
+        let source = "class Ready; end\n";
+        let fixture = InlineTestProject::with_language(Language::Ruby)
+            .file("main.rb", source)
+            .build();
+        let mut analyzer = RubyAnalyzer::new(fixture.project_dyn());
+        analyzer.inner.clear_retained_file_states_for_test();
+        assert!(analyzer.canonical_sources_ready());
+        analyzer
+            .inner
+            .analyzer_store()
+            .mark_parsed_blob_incomplete_for_test(
+                git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
+                "ruby",
+            );
+        analyzer.inner.reset_full_hydration_count_for_test();
+        let edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
+            &analyzer,
+            &HashSet::default(),
+            |_| true,
+        );
+        assert!(edges.is_none());
+        assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn ruby_cold_definition_and_type_lookup_report_unavailable_source_authority() {
+        let source = "class Ready; end\nReady\n";
+        let fixture = InlineTestProject::with_language(Language::Ruby)
+            .file("main.rb", source)
+            .build();
+        let file = fixture.file("main.rb");
+        let mut analyzer = RubyAnalyzer::new(fixture.project_dyn());
+        analyzer.inner.clear_retained_file_states_for_test();
+        analyzer
+            .inner
+            .analyzer_store()
+            .mark_parsed_blob_incomplete_for_test(
+                git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap(),
+                "ruby",
+            );
+        analyzer.inner.reset_full_hydration_count_for_test();
+        let tree = parse_ruby_tree(source).unwrap();
+        let start = source.rfind("Ready").unwrap();
+        let site = ResolvedReferenceSite {
+            path: "main.rb".to_owned(),
+            text: "Ready".to_owned(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + 5,
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + 5,
+        };
+        let BoundedResolution::Complete { value, .. } = resolve_ruby_bounded(
+            &analyzer,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        ) else {
+            panic!("unavailable facts must produce an explicit diagnostic");
+        };
+        assert!(value.definitions.is_empty());
+        assert!(
+            value
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "ruby_source_facts_unavailable")
+        );
+        let BoundedResolution::Complete { value, .. } = resolve_ruby_type_bounded(
+            &analyzer,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        ) else {
+            panic!("unavailable facts must produce an explicit diagnostic");
+        };
+        assert!(
+            value
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "ruby_source_facts_unavailable")
+        );
+        assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
+    }
+}

@@ -202,6 +202,22 @@ pub(crate) fn analyzer_stop_deadline(
     if tool_name != "run_policy" {
         return deadline;
     }
+    deadline_before_grace(accepted_at, deadline)
+}
+
+pub(crate) fn usage_scan_soft_deadline(
+    tool_name: &str,
+    accepted_at: Instant,
+    deadline: Instant,
+) -> Option<Instant> {
+    matches!(
+        tool_name,
+        "scan_usages_by_location" | "scan_usages_by_reference"
+    )
+    .then(|| deadline_before_grace(accepted_at, deadline))
+}
+
+fn deadline_before_grace(accepted_at: Instant, deadline: Instant) -> Instant {
     let remaining = deadline.saturating_duration_since(accepted_at);
     let grace = POLICY_REPORT_GRACE.min(remaining / 4);
     deadline.checked_sub(grace).unwrap_or(deadline)
@@ -1363,12 +1379,26 @@ mod shared_tests {
                 deadline
             );
         }
+        for tool_name in ["scan_usages_by_location", "scan_usages_by_reference"] {
+            assert_eq!(
+                usage_scan_soft_deadline(tool_name, accepted_at, deadline),
+                Some(deadline - POLICY_REPORT_GRACE)
+            );
+        }
+        assert_eq!(
+            usage_scan_soft_deadline("get_summaries", accepted_at, deadline),
+            None
+        );
         // A budget shorter than the grace keeps most of its own window: the
         // reserve never becomes the whole request.
         let short = accepted_at + Duration::from_secs(4);
         assert_eq!(
             analyzer_stop_deadline("run_policy", accepted_at, short),
             short - Duration::from_secs(1)
+        );
+        assert_eq!(
+            usage_scan_soft_deadline("scan_usages_by_location", accepted_at, short),
+            Some(short - Duration::from_secs(1))
         );
     }
 

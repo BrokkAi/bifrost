@@ -568,6 +568,69 @@ fn validate_wrapper(
                 }
             }
         }
+        RqlForm::AbsentMember => {
+            let options = &args[..args.len().saturating_sub(1)];
+            if !options.len().is_multiple_of(2) {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "absent-member expects option/value pairs followed by a query",
+                );
+            }
+            let steps = query_to_json(query)
+                .ok()
+                .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+                .unwrap_or(0);
+            let step_path = format!("{}[{steps}]", rql_query_child_path(path, "steps"));
+            let mut seen = std::collections::HashSet::new();
+            for pair in options.chunks_exact(2) {
+                let Some(option) = pair[0]
+                    .as_symbol()
+                    .and_then(|label| QueryStepOp::AbsentMember.option_for_rql_label(label))
+                else {
+                    analysis.error(
+                        pair[0].range.clone(),
+                        "unknown-property",
+                        "absent-member accepts only :proof",
+                    );
+                    continue;
+                };
+                let field = option.field();
+                analysis.add_help(
+                    pair[0].range.clone(),
+                    field.signature(),
+                    field.description(),
+                );
+                if !seen.insert(field) {
+                    analysis.error(
+                        pair[0].range.clone(),
+                        "duplicate-property",
+                        "duplicate absent-member option ':proof'",
+                    );
+                }
+                analysis.path(
+                    format!("{step_path}.{}", field.label()),
+                    pair[1].range.clone(),
+                );
+                let allowed = constrained_step_option_labels(field);
+                match pair[1].as_symbol().or_else(|| pair[1].as_string()) {
+                    Some(label) if allowed.contains(&label) => {}
+                    Some(label) => analysis.error(
+                        pair[1].range.clone(),
+                        "invalid-query-step-option",
+                        format!(
+                            "unknown proof tier '{label}'; expected one of {}",
+                            allowed.join(", ")
+                        ),
+                    ),
+                    None => analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        format!("proof must be one of {}", allowed.join(", ")),
+                    ),
+                }
+            }
+        }
         RqlForm::Witness => {
             let options = &args[..args.len().saturating_sub(1)];
             if !options.len().is_multiple_of(2) {
@@ -772,12 +835,12 @@ fn validate_wrapper(
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
         | RqlForm::ResultContractUses
+        | RqlForm::ResultSubjectUses
         | RqlForm::ResultContractOperationUses
         | RqlForm::NilnessOperations
         | RqlForm::SwitchCoverage
         | RqlForm::ConcurrentAccessConflicts
         | RqlForm::ClassSet
-        | RqlForm::AbsentMember
         | RqlForm::DetachedTaskTransfers
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
@@ -2771,6 +2834,7 @@ fn validate_property_value(
         | super::schema::ValueShape::CallIdentity
         | super::schema::ValueShape::ReceiverTypeConstraint
         | super::schema::ValueShape::CallProof
+        | super::schema::ValueShape::AbsentMemberProof
         | super::schema::ValueShape::RowPredicates
         | super::schema::ValueShape::RowProjectionColumns
         | super::schema::ValueShape::JsxElementIdentity => {

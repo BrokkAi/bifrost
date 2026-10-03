@@ -11,7 +11,7 @@
 //! back across the crate line, which is why this module owns the fact type and
 //! the decoder but not the accessor.
 
-use crate::declarations::{is_descendable_container, qualified_internal_name, ruby_node_text};
+use crate::declarations::{qualified_internal_name, ruby_node_text};
 use crate::graph_support::RubySource;
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -24,39 +24,23 @@ pub struct RubyForwardMixinSpec {
     pub raw_target: String,
 }
 
-pub fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
-    let Some(body) = node.child_by_field_name("body") else {
+pub(crate) fn mixin_specs_for_call(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
+    let Some(kind) = mixin_call_kind(node, source) else {
         return Vec::new();
     };
-    let mut specs = Vec::new();
-    let mut stack = vec![body];
-    while let Some(current) = stack.pop() {
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
-            match child.kind() {
-                "call" => {
-                    let Some(kind) = mixin_call_kind(child, source) else {
-                        continue;
-                    };
-                    let Some(arguments) = child.child_by_field_name("arguments") else {
-                        continue;
-                    };
-                    let mut arg_cursor = arguments.walk();
-                    let mut call_specs = Vec::new();
-                    for argument in arguments.named_children(&mut arg_cursor) {
-                        if matches!(argument.kind(), "constant" | "scope_resolution")
-                            && let Some(raw_target) = qualified_internal_name(argument, source)
-                        {
-                            call_specs.push(RubyForwardMixinSpec { kind, raw_target });
-                        }
-                    }
-                    specs.extend(call_specs.into_iter().rev());
-                }
-                kind if is_descendable_container(kind) => stack.push(child),
-                _ => {}
-            }
-        }
-    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    let mut specs = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| matches!(argument.kind(), "constant" | "scope_resolution"))
+        .filter_map(|argument| {
+            qualified_internal_name(argument, source)
+                .map(|raw_target| RubyForwardMixinSpec { kind, raw_target })
+        })
+        .collect::<Vec<_>>();
+    specs.reverse();
     specs
 }
 

@@ -11,8 +11,7 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_python::declarations::python_module_name;
-use brokk_bifrost_python::graph_support::extract_type_identifiers;
+use brokk_bifrost_python::declarations::{collect_python_identifiers, python_module_name};
 use brokk_bifrost_python::imports::{
     PythonImportDetails, extract_package_from_python_wildcard, python_import_details,
     resolve_import_bindings, resolve_import_files_batched, resolve_imports_batched,
@@ -106,11 +105,23 @@ impl ImportAnalysisProvider for PythonAnalyzer {
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        let Some(source) = self.inner.get_source(code_unit, false) else {
+        let Some(prepared) = self.inner.prepared_syntax(token, code_unit.source()) else {
             return HashSet::default();
         };
-
-        let extracted = extract_type_identifiers(&source);
+        // Relevant imports depend on the executable identifiers in this unit.
+        // Visit its exact nodes in the admitted file tree; declaration snippets
+        // must not create an independent parser or source snapshot.
+        let mut extracted = HashSet::default();
+        let root = prepared.tree().root_node();
+        for range in self.inner.ranges(code_unit) {
+            let Some(node) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
+            else {
+                continue;
+            };
+            if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+                collect_python_identifiers(node, prepared.source(), &mut extracted);
+            }
+        }
         if extracted.is_empty() {
             return HashSet::default();
         }

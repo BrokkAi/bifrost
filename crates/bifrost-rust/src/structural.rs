@@ -105,6 +105,17 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("block", NormalizedKind::Block),
 ];
 
+/// Remove transparent receiver parentheses without descending recursively.
+pub fn rust_receiver_operand(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(operand) = node.named_child(0) else {
+            return node;
+        };
+        node = operand;
+    }
+    node
+}
+
 // Attribute wrappers carry syntax ownership but are not separate semantic
 // values. Role targets must name the payload that becomes a structural fact.
 fn attach_rust_role<'tree>(
@@ -117,7 +128,7 @@ fn attach_rust_role<'tree>(
     sink.role_maybe_named(role, target, name_of(target));
 }
 
-fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
+pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = unwrap_attributes(expression);
     loop {
         current = unwrap_attributes(current);
@@ -125,7 +136,10 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
             "identifier" | "field_identifier" | "type_identifier" | "self" | "super" | "crate" => {
                 return Some(current);
             }
-            "scoped_identifier" => current = current.child_by_field_name("name")?,
+            "scoped_identifier" | "scoped_type_identifier" | "struct_expression" => {
+                current = current.child_by_field_name("name")?
+            }
+            "generic_type" => current = current.child_by_field_name("type")?,
             "generic_function" => current = current.child_by_field_name("function")?,
             "field_expression" => current = current.child_by_field_name("field")?,
             "call_expression" => current = current.child_by_field_name("function")?,
@@ -145,7 +159,7 @@ fn attach_scoped_receiver(sink: &mut RoleSink<'_>, function: Node<'_>) {
     }
 }
 
-fn call_function_target(mut function: Node<'_>) -> Node<'_> {
+pub(crate) fn call_function_target(mut function: Node<'_>) -> Node<'_> {
     while function.kind() == "generic_function" {
         let Some(inner) = function.child_by_field_name("function") else {
             break;
@@ -303,7 +317,7 @@ fn rust_is_in_use_tree(node: Node<'_>) -> bool {
 /// `identifier` token, so `let r#type = ...` reaches the same binder arm as any
 /// other let pattern. Stripping the `r#` prefix is a spelling concern, not a
 /// role concern.
-fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     if !matches!(
         node.kind(),
         "identifier" | "field_identifier" | "type_identifier"
@@ -313,6 +327,11 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 
     let mut anchor = node;
     let mut parent = anchor.parent()?;
+    // Lifetimes and loop labels have their own Rust namespaces. They are
+    // neither value nor type references in the source occurrence inventory.
+    if parent.kind() == "lifetime" {
+        return None;
+    }
     while matches!(
         parent.kind(),
         "scoped_identifier" | "scoped_type_identifier"
@@ -339,7 +358,7 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         "closure_parameters" | "ref_pattern" | "mut_pattern" | "tuple_pattern"
         | "slice_pattern" | "captured_pattern" => OccurrenceRole::Binder,
         "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
-        "field_pattern" if field == Some("name") => OccurrenceRole::LabelOrKey,
+        "field_pattern" if field == Some("name") => OccurrenceRole::MemberPosition,
         "tuple_struct_pattern" => match field {
             Some("type") => OccurrenceRole::PatternPosition,
             _ => OccurrenceRole::Binder,
@@ -350,7 +369,7 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             Some("value") => OccurrenceRole::ReceiverPosition,
             _ => OccurrenceRole::ValueReference,
         },
-        "field_initializer" if field == Some("field") => OccurrenceRole::LabelOrKey,
+        "field_initializer" if field == Some("field") => OccurrenceRole::MemberPosition,
         _ if node.kind() == "type_identifier" => OccurrenceRole::TypeOperand,
         _ if node.kind() == "field_identifier" => OccurrenceRole::MemberPosition,
         _ => OccurrenceRole::ValueReference,
@@ -789,8 +808,8 @@ impl StructuralSpec for RustStructuralSpec {
 #[cfg(test)]
 mod attribute_element_tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
     use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
-    use brokk_bifrost_core::hash::HashMap;
 
     #[test]
     fn collection_elements_exclude_attributes_and_target_expression_payloads() {
@@ -804,33 +823,30 @@ mod attribute_element_tests {
                 "{}",
                 tree.root_node().to_sexp()
             );
-            let mut facts = HashMap::default();
+            let mut facts = PrimarySourceFactCollector::new(source);
             let mut collection = None;
             let mut calls = Vec::new();
             let mut stack = vec![tree.root_node()];
             while let Some(node) = stack.pop() {
-                let id = facts.len() as u32;
-                facts.insert(node.id(), id);
                 if matches!(node.kind(), "array_expression" | "tuple_expression") {
                     collection = Some(node);
                 }
                 if node.kind() == "call_expression" {
-                    calls.push((node.start_byte(), id));
+                    calls.push((node.start_byte(), node.id()));
                 }
                 let mut cursor = node.walk();
                 stack.extend(node.named_children(&mut cursor));
             }
             calls.sort_unstable();
-            let mut roles = Vec::new();
-            let mut occurrences = Vec::new();
             let parents = ParentIndex::new(tree.root_node());
-            let mut sink = RoleSink::new(&facts, &mut roles, &mut occurrences, 32, None, &parents);
+            let mut sink = RoleSink::new(&mut facts, 32, None, &parents);
             RUST_STRUCTURAL_SPEC.extract(
                 collection.unwrap(),
                 NormalizedKind::CollectionLiteral,
                 &mut sink,
             );
-            assert_eq!(sink.into_parts().1, None);
+            let (_, roles, _, stop) = sink.into_parts();
+            assert_eq!(stop, None);
             assert_eq!(
                 roles.iter().map(|role| role.role).collect::<Vec<_>>(),
                 [Role::Element, Role::Element]
@@ -838,16 +854,19 @@ mod attribute_element_tests {
             assert_eq!(
                 roles
                     .iter()
-                    .map(|role| role.span.text(source))
+                    .map(
+                        |role| &source[facts.occurrence(role.occurrence).range.start_byte
+                            ..facts.occurrence(role.occurrence).range.end_byte]
+                    )
                     .collect::<Vec<_>>(),
                 ["first()", "second()"]
             );
             assert_eq!(
-                roles.iter().map(|role| role.node).collect::<Vec<_>>(),
-                calls
-                    .into_iter()
-                    .map(|(_, id)| Some(id))
-                    .collect::<Vec<_>>()
+                roles
+                    .iter()
+                    .map(|role| role.target_node)
+                    .collect::<Vec<_>>(),
+                calls.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
             );
         }
     }

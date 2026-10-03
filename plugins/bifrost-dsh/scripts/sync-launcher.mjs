@@ -14,6 +14,11 @@ const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const agentPackageDir = path.resolve(packageDir, "..", "bifrost-agent");
 
 export const SYNCED_FILES = [
+  ...["open-packs.mjs", "open-packs.d.mts", "pack-release.schema.json", "pack-release.v1.schema.json"].map((file) => ({
+    source: path.join(agentPackageDir, "bin", file),
+    target: path.join(packageDir, "bin", file),
+    mode: 0o644,
+  })),
   {
     source: path.join(agentPackageDir, "bin", "bifrost-launcher.mjs"),
     target: path.join(packageDir, "bin", "bifrost-launcher.mjs"),

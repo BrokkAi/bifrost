@@ -81,6 +81,30 @@ pub struct PhpFileContext {
     pub aliases: PhpUseAliases,
 }
 
+/// The namespace kind attached to one PHP `use` clause.
+pub type PhpImportKind = PhpUseKind;
+
+/// One parser-derived PHP import clause.
+///
+/// `target` and `alias` retain the exact AST nodes that spell the imported
+/// binding and local name. `path_segments` carries the complete path,
+/// including a grouped declaration's prefix.
+#[derive(Debug, Clone)]
+pub struct PhpImport<'tree> {
+    pub target: Option<Node<'tree>>,
+    pub alias: Option<Node<'tree>>,
+    pub path_segments: Vec<String>,
+    pub kind: PhpImportKind,
+    pub is_global: bool,
+}
+
+/// The single structured interpretation of one PHP `namespace_use_declaration`.
+#[derive(Debug, Clone)]
+pub struct PhpImportSyntax<'tree> {
+    pub aliases: PhpUseAliases,
+    pub imports: Vec<PhpImport<'tree>>,
+}
+
 #[derive(Debug, Clone)]
 struct PhpAliasEvent {
     start: usize,
@@ -516,6 +540,158 @@ fn php_alias_events_from_children(
     Some(events)
 }
 
+/// Interpret one PHP `namespace_use_declaration` directly from its syntax tree.
+///
+/// The returned leaves include malformed clauses with no recoverable target.
+/// Those leaves carry no path or alias-map entry, but preserve the declaration
+/// identity for bounded producers. Every successful path and alias is read from
+/// parser nodes; this function never scans source text.
+pub fn parse_php_import_syntax<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+) -> PhpImportSyntax<'tree> {
+    assert_eq!(
+        declaration.kind(),
+        "namespace_use_declaration",
+        "PHP import syntax must start at a namespace_use_declaration"
+    );
+    parse_php_import_syntax_bounded(declaration, source, &mut || true)
+        .expect("unbounded PHP import syntax interpretation cannot stop")
+}
+
+fn parse_php_import_syntax_bounded<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpImportSyntax<'tree>> {
+    if !step() {
+        return None;
+    }
+    if declaration.child_by_field_name("type").is_some() && !step() {
+        return None;
+    }
+    let default_kind = php_use_kind(declaration.child_by_field_name("type"), source);
+    let body = declaration.child_by_field_name("body");
+    let (prefix, prefix_is_global) = if let Some(body) = body {
+        let mut cursor = declaration.walk();
+        let mut prefix = Vec::new();
+        let mut is_global = false;
+        for child in declaration.named_children(&mut cursor) {
+            if !step() {
+                return None;
+            }
+            if child.id() == body.id() {
+                continue;
+            }
+            if child.kind() == "namespace_name" {
+                prefix = php_path_segments(child, source, step)?;
+                is_global = php_path_has_leading_separator(child, step)?;
+                break;
+            }
+        }
+        (prefix, is_global)
+    } else {
+        (Vec::new(), false)
+    };
+
+    let clause_parent = body.unwrap_or(declaration);
+    let mut aliases = PhpUseAliases::default();
+    let mut imports = Vec::new();
+    let mut cursor = clause_parent.walk();
+    for clause in clause_parent.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if clause.kind() != "namespace_use_clause" {
+            continue;
+        }
+        let alias = clause.child_by_field_name("alias");
+        let path_node = php_use_clause_target(clause, alias, step)?;
+        let target = path_node.and_then(php_path_tail_node);
+        let mut path_segments = if let Some(path_node) = path_node {
+            php_path_segments(path_node, source, step)?
+        } else {
+            Vec::new()
+        };
+        if !prefix.is_empty() {
+            let mut full = Vec::with_capacity(prefix.len() + path_segments.len());
+            full.extend(prefix.iter().cloned());
+            full.append(&mut path_segments);
+            path_segments = full;
+        }
+        let kind = match clause.child_by_field_name("type") {
+            Some(node) => php_use_kind(Some(node), source),
+            None => default_kind,
+        };
+        let target_is_global = if let Some(path_node) = path_node {
+            php_path_has_leading_separator(path_node, step)?
+        } else {
+            false
+        };
+        let import = PhpImport {
+            target,
+            alias,
+            path_segments,
+            kind,
+            is_global: prefix_is_global || target_is_global,
+        };
+        add_php_import_alias(&import, source, &mut aliases, step)?;
+        imports.push(import);
+    }
+
+    if imports.is_empty() {
+        imports.push(PhpImport {
+            target: None,
+            alias: None,
+            path_segments: Vec::new(),
+            kind: default_kind,
+            is_global: prefix_is_global,
+        });
+    }
+    Some(PhpImportSyntax { aliases, imports })
+}
+
+fn php_use_clause_target<'tree>(
+    clause: Node<'tree>,
+    alias: Option<Node<'tree>>,
+    step: &mut impl FnMut() -> bool,
+) -> Option<Option<Node<'tree>>> {
+    let mut cursor = clause.walk();
+    for child in clause.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if alias.is_some_and(|alias| alias.id() == child.id()) {
+            continue;
+        }
+        if matches!(child.kind(), "name" | "qualified_name" | "namespace_name") {
+            return Some(Some(child));
+        }
+    }
+    Some(None)
+}
+
+fn add_php_import_alias(
+    import: &PhpImport<'_>,
+    source: &str,
+    aliases: &mut PhpUseAliases,
+    step: &mut impl FnMut() -> bool,
+) -> Option<()> {
+    let Some(last) = import.path_segments.last() else {
+        return Some(());
+    };
+    let local = if let Some(alias) = import.alias {
+        if !step() {
+            return None;
+        }
+        php_leaf_text(alias, source)?.to_string()
+    } else {
+        last.clone()
+    };
+    aliases.insert(import.kind, local, import.path_segments.join("."));
+    Some(())
+}
+
 /// Builds the PHP namespace/import context visible at `byte` from a complete
 /// structured index. `step` is honored during the whole index build; a
 /// cancellation never returns a partially collected alias map.
@@ -678,13 +854,20 @@ pub fn php_use_aliases_from_node(
 
 /// The token that spells the last segment of a written path.
 fn php_path_tail_node<'tree>(path: Node<'tree>) -> Option<Node<'tree>> {
-    match path.kind() {
-        "name" => Some(path),
-        _ => (0..path.named_child_count())
-            .rev()
-            .filter_map(|index| path.named_child(index))
-            .find_map(php_path_tail_node),
+    let mut tail = None;
+    let mut stack = vec![path];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "name" {
+            tail = Some(current);
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
     }
+    tail
 }
 
 /// Interpret one `namespace_use_clause`.
@@ -714,7 +897,9 @@ fn php_use_clause_binding(
             break;
         }
     }
-    let imported_node = imported_node?;
+    let Some(imported_node) = imported_node else {
+        return Some(None);
+    };
     let mut imported = php_path_segments(imported_node, source, step)?;
     if imported.is_empty() {
         return Some(None);
@@ -1222,6 +1407,15 @@ fn php_join_structured_segments(
 
 fn php_leaf_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok().map(str::trim)
+}
+
+/// Collect a conservative whole-file alias summary from an already parsed tree.
+/// Scoped aliases are merged through the lexical context index, retaining all
+/// distinct targets when one local name is reused in different namespaces.
+pub fn php_use_aliases_from_tree(root: Node<'_>, source: &str) -> PhpUseAliases {
+    PhpFileContextIndex::from_tree(root, source, || true)
+        .map(|index| index.merged_aliases())
+        .unwrap_or_default()
 }
 
 pub fn parse_php_use_aliases_from_source(source: &str) -> PhpUseAliases {

@@ -1002,3 +1002,80 @@ pub(super) const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Yield => "yield",
     }
 }
+
+/// Procedure syntax roles for the shared JavaScript/TypeScript lowering.
+/// Procedures are exactly the nodes [`callable_shape`] lowers, so the
+/// assessment and the producer agree on ownership.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: js_ts_statement_kind,
+        loop_site: js_ts_loop_site,
+        procedure_matches: |_, node| callable_shape(node).is_some(),
+        nested_procedure: |node| node.kind() == "class_body" || callable_shape(node).is_some(),
+    };
+
+/// A `for` header without a condition spells it as `;` or an empty statement.
+fn js_ts_loop_site(node: Node<'_>) -> Option<crate::analyzer::loop_facts::LoopSyntax<'_>> {
+    use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+    let kind = match node.kind() {
+        "while_statement" => LoopKind::While,
+        "for_statement" => LoopKind::For,
+        "do_statement" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node
+            .child_by_field_name("condition")
+            .filter(|condition| !matches!(condition.kind(), ";" | "empty_statement")),
+    })
+}
+
+/// Classify an executable JavaScript or TypeScript statement. Hoisted
+/// function declarations, type-only declarations and class declarations are
+/// excluded. A `var` without an initializer is excluded because only its
+/// hoisted binding exists; nothing runs at its position. A `for` header's
+/// initializer and condition are not statements, although the grammar spells
+/// them with statement nodes.
+fn js_ts_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "for_statement"
+        && parent
+            .child_by_field_name("body")
+            .is_none_or(|body| body.id() != node.id())
+    {
+        return None;
+    }
+    Some(match node.kind() {
+        "statement_block" => "block",
+        "expression_statement" => "expression",
+        "variable_declaration" => {
+            let mut cursor = node.walk();
+            let initialized = node
+                .named_children(&mut cursor)
+                .any(|declarator| declarator.child_by_field_name("value").is_some());
+            if !initialized {
+                return None;
+            }
+            "local_declaration"
+        }
+        "lexical_declaration" => "local_declaration",
+        "return_statement" => "return",
+        "throw_statement" => "throw",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "do_statement" => "do",
+        "for_statement" => "for",
+        "for_in_statement" => "for_in",
+        "switch_statement" => "switch",
+        "try_statement" => "try",
+        "with_statement" => "with",
+        "labeled_statement" => "labeled",
+        "debugger_statement" => "debugger",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
+}

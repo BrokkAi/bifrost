@@ -184,6 +184,82 @@ impl GoWorkspacePathIndex {
     }
 }
 
+/// Source-inventory role from the selected path and declared package clause.
+/// This does not claim tool-selected build or synthetic test-variant admission.
+pub fn source_inventory_role(file: &ProjectFile, declared_package: &str) -> &'static str {
+    if declared_package_parts(file, declared_package).1 {
+        "xtest"
+    } else if is_go_test_file(file) {
+        "test"
+    } else {
+        "go"
+    }
+}
+
+/// Whether a source filename or parsed leading comment excludes package
+/// inventory from Go-tool-independent completion.
+pub fn source_file_has_build_constraints(file: &ProjectFile, has_build_directive: bool) -> bool {
+    if has_build_directive {
+        return true;
+    }
+    let Some(stem) = file.rel_path().file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let stem = stem.strip_suffix("_test").unwrap_or(stem);
+    const GOOS: &[&str] = &[
+        "aix",
+        "android",
+        "darwin",
+        "dragonfly",
+        "freebsd",
+        "illumos",
+        "ios",
+        "js",
+        "linux",
+        "netbsd",
+        "openbsd",
+        "plan9",
+        "solaris",
+        "wasip1",
+        "windows",
+        "zos",
+    ];
+    const GOARCH: &[&str] = &[
+        "386",
+        "amd64",
+        "amd64p32",
+        "arm",
+        "armbe",
+        "arm64",
+        "arm64be",
+        "loong64",
+        "mips",
+        "mipsle",
+        "mips64",
+        "mips64le",
+        "mips64p32",
+        "mips64p32le",
+        "ppc",
+        "ppc64",
+        "ppc64le",
+        "riscv",
+        "riscv64",
+        "s390",
+        "s390x",
+        "sparc",
+        "sparc64",
+        "wasm",
+    ];
+    GOOS.iter()
+        .chain(GOARCH)
+        .any(|suffix| stem.ends_with(&format!("_{suffix}")))
+        || GOOS.iter().any(|os| {
+            GOARCH
+                .iter()
+                .any(|arch| stem.ends_with(&format!("_{os}_{arch}")))
+        })
+}
+
 fn is_go_test_file(file: &ProjectFile) -> bool {
     file.rel_path()
         .file_name()
@@ -509,7 +585,7 @@ pub fn read_go_module_path(dir: &Path) -> Option<String> {
 /// input, duplicate directives, extra module arguments, or invalid module paths
 /// return `None`, making workspace authority incomplete rather than publishing
 /// a guessed identity.
-fn go_module_path_from_source(contents: &str) -> Option<String> {
+pub fn go_module_path_from_source(contents: &str) -> Option<String> {
     let tokens = go_mod_tokens(contents)?;
     let mut module_path = None;
     let mut cursor = 0;
@@ -712,7 +788,7 @@ mod tests {
     use super::{
         GoWorkspacePathIndex, canonical_go_package_name, canonical_go_workspace_package_name,
         go_mod_probe_attempts, go_module_path_from_source, go_vendor_package_alias,
-        invalidate_nearest_go_module_cache,
+        invalidate_nearest_go_module_cache, source_file_has_build_constraints,
     };
     use crate::declarations::go_package_fq;
     use brokk_bifrost_core::analyzer::fq_name::segment_interner;
@@ -755,6 +831,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn source_inventory_build_constraints_cover_goos_and_goarch_suffixes() {
+        let root = std::env::current_dir().expect("test working directory must be available");
+        for path in [
+            "pkg/files_linux.go",
+            "pkg/files_arm64.go",
+            "pkg/files_linux_arm64.go",
+            "pkg/files_linux_test.go",
+        ] {
+            assert!(source_file_has_build_constraints(
+                &ProjectFile::new(root.clone(), path),
+                false
+            ));
+        }
+        for path in [
+            "pkg/files_test.go",
+            "pkg/linux.go",
+            "pkg/files_unsupported.go",
+        ] {
+            assert!(!source_file_has_build_constraints(
+                &ProjectFile::new(root.clone(), path),
+                false
+            ));
+        }
+        assert!(source_file_has_build_constraints(
+            &ProjectFile::new(root, "pkg/files.go"),
+            true
+        ));
     }
 
     fn write_file(root: &std::path::Path, rel_path: &str, contents: &str) {

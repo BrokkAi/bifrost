@@ -384,6 +384,75 @@ pub fn python_import_bindings_from_tree(root: Node<'_>, source: &str) -> Vec<Pyt
         .collect()
 }
 
+/// Build import bindings from the canonical generic import projection.
+///
+/// The producer has already interpreted each path and retained lexical scope
+/// byte ranges in the import facts. This adapter only maps those ranges back
+/// to the caller's prepared tree to recover the nearest function or lambda
+/// scope; it never reparses source or reconstructs import syntax.
+pub fn python_import_bindings_from_imports(
+    imports: &[ImportInfo],
+    root: Node<'_>,
+    source_len: usize,
+) -> Vec<PythonImportBinding> {
+    let mut bindings = imports
+        .iter()
+        .filter_map(|import| {
+            let path = import.path.as_ref()?;
+            let details = python_import_details(import)?;
+            let mut binding_scope = None;
+            for scope in path.lexical_scopes.iter().rev() {
+                let node = root.descendant_for_byte_range(scope.start_byte, scope.end_byte)?;
+                if node.start_byte() != scope.start_byte || node.end_byte() != scope.end_byte {
+                    return None;
+                }
+                if matches!(node.kind(), "function_definition" | "lambda") {
+                    binding_scope = Some((scope.start_byte, scope.end_byte, true));
+                    break;
+                }
+            }
+            let (scope_start_byte, scope_end_byte, function_scoped) =
+                binding_scope.unwrap_or((0, source_len, false));
+            let start_byte = path.declaration_start_byte;
+            match details {
+                PythonImportDetails::Import { module, alias } => {
+                    let consumed_attributes = if alias.is_some() {
+                        0
+                    } else {
+                        path.segments.len().saturating_sub(1)
+                    };
+                    Some(PythonImportBinding {
+                        start_byte,
+                        scope_start_byte,
+                        scope_end_byte,
+                        function_scoped,
+                        local_name: alias.or_else(|| path.segments.first().cloned())?,
+                        qualified_name: module,
+                        consumed_attributes,
+                    })
+                }
+                PythonImportDetails::FromImport {
+                    module,
+                    name,
+                    alias,
+                    wildcard: false,
+                } => Some(PythonImportBinding {
+                    start_byte,
+                    scope_start_byte,
+                    scope_end_byte,
+                    function_scoped,
+                    local_name: alias.unwrap_or_else(|| name.clone()),
+                    qualified_name: format!("{module}.{name}"),
+                    consumed_attributes: 0,
+                }),
+                PythonImportDetails::FromImport { wildcard: true, .. } => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.start_byte);
+    bindings
+}
+
 fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usize, bool) {
     let mut parent = node.parent();
     while let Some(scope) = parent {
@@ -557,14 +626,36 @@ _sys.modules[__name__] = _canonical
     }
 }
 
+/// Borrow each statement's contiguous canonical leaves without reinterpreting
+/// target or alias syntax in executable binding timelines.
+pub(crate) fn python_imports_by_statement(imports: &[ImportInfo]) -> HashMap<usize, &[ImportInfo]> {
+    let mut statement_imports = HashMap::default();
+    for group in imports.chunk_by(|left, right| {
+        left.path.as_ref().map(|path| path.declaration_start_byte)
+            == right.path.as_ref().map(|path| path.declaration_start_byte)
+    }) {
+        if let Some(path) = &group[0].path {
+            assert!(
+                statement_imports
+                    .insert(path.declaration_start_byte, group)
+                    .is_none(),
+                "canonical Python import leaves must remain in statement order"
+            );
+        }
+    }
+    statement_imports
+}
+
 pub fn module_replacement_of(
     python: &dyn PythonSource,
     file: &ProjectFile,
     source: &str,
+    imports: &[ImportInfo],
 ) -> Option<PythonModuleReplacement> {
     let tree = parse_python_tree(source)?;
     let root = tree.root_node();
     let mut bindings: HashMap<String, ImportBinding> = HashMap::default();
+    let statement_imports = python_imports_by_statement(imports);
     let mut replacement = None;
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
@@ -578,8 +669,9 @@ pub fn module_replacement_of(
         };
         match statement.kind() {
             "import_statement" | "import_from_statement" => {
-                let imports = python_import_infos_from_node(statement, source);
-                bindings.extend(import_binder_from_imports(python, file, &imports).bindings);
+                if let Some(imports) = statement_imports.get(&statement.start_byte()) {
+                    bindings.extend(import_binder_from_imports(python, file, imports).bindings);
+                }
             }
             "assignment" => {
                 if let Some(next) = module_replacement_from_assignment(statement, source, &bindings)
@@ -1046,10 +1138,37 @@ pub enum PythonImportDetails {
     },
 }
 
+/// One import leaf interpreted directly from the Python AST.
+///
+/// The generic [`ImportInfo`] remains the display/query projection. The
+/// source nodes are retained beside it so the coordinated primary producer can
+/// intern declaration, binder, and alias occurrences without matching names or
+/// byte ranges after the tree has been walked.
+#[derive(Debug, Clone)]
+pub struct PythonImportSyntax<'tree> {
+    pub info: ImportInfo,
+    pub declaration: Node<'tree>,
+    pub target: Option<Node<'tree>>,
+    pub alias: Option<Node<'tree>>,
+}
+
 pub fn python_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    python_import_syntaxes_from_node(node, source)
+        .into_iter()
+        .map(|syntax| syntax.info)
+        .collect()
+}
+
+/// Interpret every import leaf in one statement and retain its exact AST
+/// binder nodes. Malformed leaves are omitted with the same admission rules as
+/// the historical generic import projection.
+pub fn python_import_syntaxes_from_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<PythonImportSyntax<'tree>> {
     match node.kind() {
-        "import_statement" => python_namespace_import_infos(node, source),
-        "import_from_statement" => python_from_import_infos(node, source),
+        "import_statement" => python_namespace_import_syntaxes(node, source),
+        "import_from_statement" => python_from_import_syntaxes(node, source),
         _ => Vec::new(),
     }
 }
@@ -1061,8 +1180,8 @@ pub fn python_import_details(import: &ImportInfo) -> Option<PythonImportDetails>
             module: join_python_import_segments(&path.segments),
             alias: import.alias.clone(),
         }),
-        // Python has no static imports; the variant belongs to Java.
-        StructuredImportPathKind::StaticMember => None,
+        // These declaration forms belong to Java and Rust, not Python.
+        StructuredImportPathKind::StaticMember | StructuredImportPathKind::ExternCrate => None,
         StructuredImportPathKind::ImportFrom => {
             let (name, module_segments) = if import.is_wildcard {
                 ("*".to_string(), path.segments.as_slice())
@@ -1080,7 +1199,10 @@ pub fn python_import_details(import: &ImportInfo) -> Option<PythonImportDetails>
     }
 }
 
-fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+fn python_namespace_import_syntaxes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<PythonImportSyntax<'tree>> {
     let mut infos = Vec::new();
     let mut cursor = node.walk();
     for imported in node.children_by_field_name("name", &mut cursor) {
@@ -1101,15 +1223,16 @@ fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo
         }
         // `import a.b` binds `a`: the first segment's own token. A renamed
         // import binds its alias token instead.
-        let binder_span = alias
-            .is_some()
-            .then_some(alias_node)
-            .flatten()
-            .or_else(|| python_first_segment_node(module_node))
+        let target = alias
+            .is_none()
+            .then(|| python_first_segment_node(module_node))
+            .flatten();
+        let binder_span = alias_node
+            .or(target)
             .map(brokk_bifrost_core::analyzer::common::node_span);
         let module = join_python_import_segments(&segments);
         let identifier = alias.clone().or_else(|| segments.first().cloned());
-        infos.push(ImportInfo {
+        let info = ImportInfo {
             raw_snippet: if let Some(alias) = &alias {
                 format!("import {module} as {alias}")
             } else {
@@ -1127,12 +1250,21 @@ fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo
                 declaration_start_byte: node.start_byte(),
             }),
             binder_span,
+        };
+        infos.push(PythonImportSyntax {
+            info,
+            declaration: node,
+            target,
+            alias: alias_node,
         });
     }
     infos
 }
 
-fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+fn python_from_import_syntaxes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<PythonImportSyntax<'tree>> {
     let Some(module_node) = node.child_by_field_name("module_name") else {
         return Vec::new();
     };
@@ -1151,7 +1283,7 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
     let imported_names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
     if has_wildcard_import {
         let module = join_python_import_segments(&module_segments);
-        infos.push(ImportInfo {
+        let info = ImportInfo {
             raw_snippet: format!("from {module} import *"),
             is_wildcard: true,
             is_global: false,
@@ -1165,6 +1297,12 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
                 declaration_start_byte: node.start_byte(),
             }),
             binder_span: None,
+        };
+        infos.push(PythonImportSyntax {
+            info,
+            declaration: node,
+            target: None,
+            alias: None,
         });
         return infos;
     }
@@ -1190,21 +1328,22 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
         }
         // `from m import x` binds `x`'s own token; a rename binds the alias
         // token. A multi-segment imported name binds no single token.
-        let binder_span = alias
-            .is_some()
-            .then_some(alias_node)
-            .flatten()
-            .or_else(|| {
+        let target = alias
+            .is_none()
+            .then(|| {
                 (name_segments.len() == 1)
                     .then(|| python_first_segment_node(name_node))
                     .flatten()
             })
+            .flatten();
+        let binder_span = alias_node
+            .or(target)
             .map(brokk_bifrost_core::analyzer::common::node_span);
         let imported_name = join_python_import_segments(&name_segments);
         let mut segments = module_segments.clone();
         segments.extend(name_segments);
         let module = join_python_import_segments(&module_segments);
-        infos.push(ImportInfo {
+        let info = ImportInfo {
             raw_snippet: if let Some(alias) = &alias {
                 format!("from {module} import {imported_name} as {alias}")
             } else {
@@ -1222,6 +1361,12 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
                 declaration_start_byte: node.start_byte(),
             }),
             binder_span,
+        };
+        infos.push(PythonImportSyntax {
+            info,
+            declaration: node,
+            target,
+            alias: alias_node,
         });
     }
     infos

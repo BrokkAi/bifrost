@@ -31,6 +31,7 @@ use crate::definition::{
 pub enum RowScalar {
     StableId(String),
     String(String),
+    StringList(Vec<String>),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(String),
@@ -43,6 +44,7 @@ impl RowScalar {
         match self {
             Self::StableId(_) => CodeQueryRowScalarType::StableId,
             Self::String(_) => CodeQueryRowScalarType::String,
+            Self::StringList(_) => CodeQueryRowScalarType::StringList,
             Self::Integer(_) => CodeQueryRowScalarType::Integer,
             Self::Boolean(_) => CodeQueryRowScalarType::Boolean,
             Self::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
@@ -62,6 +64,7 @@ impl fmt::Display for RowScalar {
             | Self::DeclarationIdentity(value) => formatter.write_str(value),
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Boolean(value) => write!(formatter, "{value}"),
+            Self::StringList(value) => write!(formatter, "{value:?}"),
         }
     }
 }
@@ -71,6 +74,7 @@ impl From<CodeQueryRowScalarRef<'_>> for RowScalar {
         match value {
             CodeQueryRowScalarRef::StableId(value) => Self::StableId(value.to_string()),
             CodeQueryRowScalarRef::String(value) => Self::String(value.to_string()),
+            CodeQueryRowScalarRef::StringList(value) => Self::StringList(value.to_vec()),
             CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
             CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
             CodeQueryRowScalarRef::ConstrainedEnum(value) => {

@@ -7,32 +7,41 @@
 //! lacks the accessed member produces an [`AbsentMemberFinding`] carrying the
 //! site, the class, the origin site that introduced the class, the root, and
 //! the witness path. A set with any Unknown reports `partial` (or
-//! `inconclusive`) and produces no finding, so a guess is never presented as
-//! a bug. A root method receiver may be known under the workspace-closed-world
+//! `inconclusive`) and produces no Proven finding, so a guess is never
+//! presented as a bug. A partial set whose remainders only say that some other
+//! value may also reach the site can still produce an
+//! [`AbsentMemberProof::Conditional`] finding for a class whose arrival and
+//! member absence are both proven; the finding names those remainders.
+//! A root method receiver may be known under the workspace-closed-world
 //! rule: its enclosing workspace class has no known workspace descendants,
 //! unresolved base, or dynamic-attribute hook. External subclasses are outside
 //! that rule, matching workspace member lookup's existing boundary.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
 use brokk_bifrost_core::profiling;
 
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmRequest, GenKillFacts, dominators, reaching_definitions,
+};
 use crate::analyzer::semantic::{
-    CandidateCoverage, ClassAtom, ClassIdentity, DispatchHint, DispatchHintCallSiteKey,
-    DispatchHintSet, DispatchHints, IcfgProvider, MemberAccessKind, MemberLookup, MemberLookupHit,
-    ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SourceSite, SourceSiteKind,
-    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider,
+    CancellationToken, CandidateCoverage, ClassAtom, ClassIdentity, ControlEdgeKind, DispatchHint,
+    DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, IcfgProvider, MemberAccessKind,
+    MemberLookup, MemberLookupHit, ProcedureHandle, ProgramPointId, SemanticBudget,
+    SemanticBudgetExceeded, SemanticEffect, SemanticValueKind, SourceSite, SourceSiteKind,
+    SourceSpan, TypeFlowAdapter, UnknownReason, ValueFlowKind, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use crate::analyzer::{AnalyzerQueryScope, WorkspaceAnalyzer};
+use crate::analyzer::{AnalyzerQueryScope, ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::{
     DataflowRequest, PathQuality, SolverBudget, SolverBudgetExceeded, SolverTermination,
     SolverWork, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
     WitnessRetentionLimits,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
     ClosureLimits, DurableProcedureKey, ValueFlowCache, ValueFlowCarrier, ValueFlowMeeting,
     ValueFlowSinkId, ValueFlowSinkOutcome, ValueFlowSolveError, ValueFlowSummaryResult,
@@ -125,6 +134,39 @@ pub struct AbsentMemberFinding {
     /// truncation cause. An `Err` preserves why evidence could not be
     /// reconstructed without weakening the finding's class-set proof.
     pub witness: Result<SummaryWitness, SummaryWitnessError>,
+    pub proof: AbsentMemberProof,
+    /// Later accesses masked by the first failing access, in stable source order.
+    pub also_fails_at: Vec<(ProjectFile, SourceSpan)>,
+}
+
+/// How strongly an [`AbsentMemberFinding`] is established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbsentMemberProof {
+    /// The receiver set is complete: every value that reaches the site is
+    /// classified, so the class is one of a closed set of alternatives.
+    Proven,
+    /// The class certainly reaches the site and certainly lacks the member,
+    /// but other values may also reach it. `remainders` is the sorted set of
+    /// Unknown reasons the receiver set carried; each one names another
+    /// alternative rather than doubting this class.
+    Conditional { remainders: Vec<UnknownReason> },
+}
+
+impl AbsentMemberProof {
+    /// Every tier label, in enum declaration order. Row-field registries read
+    /// this so the publishable value set cannot drift from the enum.
+    pub const LABELS: &[&str] = &["proven", "conditional"];
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::Conditional { .. } => "conditional",
+        }
+    }
+
+    pub const fn is_proven(&self) -> bool {
+        matches!(self, Self::Proven)
+    }
 }
 
 /// Whether one live root result may be persisted by a higher projection
@@ -1250,6 +1292,7 @@ fn interpret(
             distinct_findings.push(finding);
         }
     }
+    collapse_absent_member_findings(&mut distinct_findings);
     TypeFlowRootResult {
         root: root.clone(),
         class_sets,
@@ -1341,6 +1384,10 @@ fn reached_class_set(
     let mut class_meetings: Vec<&ValueFlowMeeting> = Vec::new();
     let mut member_declarations = Vec::new();
     let mut unknown: Vec<UnknownReason> = Vec::new();
+    // These reasons can describe the value that brought a candidate class to
+    // the sink, rather than another class's member lookup. The flow graph does
+    // not retain enough class attribution to tell which candidate they doubt.
+    let mut value_flow_has_member_surface_uncertainty = false;
     let mut dynamic_writes = Vec::new();
     for meeting in meetings {
         if meeting.is_uncertain() {
@@ -1385,18 +1432,17 @@ fn reached_class_set(
                     class_meetings.push(meeting);
                 }
             }
-            ClassAtom::Unknown(reason) => push_reason(&mut unknown, reason.clone()),
+            ClassAtom::Unknown(reason) => {
+                value_flow_has_member_surface_uncertainty |= is_member_surface_uncertainty(reason);
+                push_reason(&mut unknown, reason.clone());
+            }
         }
     }
     let mut ordered_classes = classes.into_iter().zip(class_meetings).collect::<Vec<_>>();
     ordered_classes.sort_unstable_by(|((left, _), _), ((right, _), _)| class_order(left, right));
     let (classes, class_meetings): (Vec<(ClassIdentity, SourceSite)>, Vec<&ValueFlowMeeting>) =
         ordered_classes.into_iter().unzip();
-    unknown.sort_unstable_by(|left, right| {
-        left.label()
-            .cmp(right.label())
-            .then_with(|| left.cmp(right))
-    });
+    sort_unknown_reasons(&mut unknown);
     let mut status = if !unknown.is_empty() {
         ClassSetStatus::Partial
     } else if classes.is_empty() {
@@ -1409,14 +1455,19 @@ fn reached_class_set(
         // and dispatch evidence, but the open remainder prevents an Absent
         // result from authorizing a finding or an exhaustive dispatch hint.
         let complete_receiver_set = status == ClassSetStatus::Known;
+        // Classes whose own lookup proves the member absent and whose own
+        // survey records no dynamic write that could install it. Recorded for
+        // every set status; the set-level gate below decides the tier.
         let mut absent: Vec<usize> = Vec::new();
         for (index, (identity, _)) in classes.iter().enumerate() {
             let lookup = adapter.member_lookup(workspace, site.kind, identity, &site.member);
+            let mut own_dynamic_writes = false;
             if matches!(
                 lookup,
                 MemberLookup::Absent | MemberLookup::DeclarationAbsent
             ) {
                 for evidence in field_slots.dynamic_write_evidence(workspace, adapter, identity) {
+                    own_dynamic_writes = true;
                     if !dynamic_writes.contains(evidence) {
                         dynamic_writes.push(evidence.clone());
                     }
@@ -1435,7 +1486,7 @@ fn reached_class_set(
                     identity,
                     &site.member,
                 ) {
-                    MemberStoreEvidence::NoStore if complete_receiver_set => absent.push(index),
+                    MemberStoreEvidence::NoStore if !own_dynamic_writes => absent.push(index),
                     MemberStoreEvidence::NoStore => {}
                     MemberStoreEvidence::Stored if site.kind == MemberAccessKind::Load => {}
                     // A stored value is not a callable declaration. Keep the
@@ -1444,7 +1495,7 @@ fn reached_class_set(
                         push_reason(&mut unknown, UnknownReason::FieldSlotIncomplete)
                     }
                 },
-                MemberLookup::Absent if complete_receiver_set => absent.push(index),
+                MemberLookup::Absent if !own_dynamic_writes => absent.push(index),
                 MemberLookup::Absent => {}
                 MemberLookup::Unknown(reason) => push_reason(&mut unknown, reason),
             }
@@ -1461,10 +1512,45 @@ fn reached_class_set(
                     class: identity.clone(),
                     origin: origin.clone(),
                     witness: best_witness(result, class_meetings[index]),
+                    proof: AbsentMemberProof::Proven,
+                    also_fails_at: Vec::new(),
                 });
             }
-        } else if complete_receiver_set {
-            status = ClassSetStatus::Partial;
+        } else {
+            debug_assert!(
+                !unknown.is_empty(),
+                "a set that is not complete names at least one remainder"
+            );
+            if complete_receiver_set {
+                status = ClassSetStatus::Partial;
+            }
+            if !value_flow_has_member_surface_uncertainty
+                && unknown.iter().all(remainder_names_another_alternative)
+            {
+                let mut remainders = unknown.clone();
+                sort_unknown_reasons(&mut remainders);
+                for index in absent {
+                    let (identity, origin) = &classes[index];
+                    // A guard-only origin does not admit the class as a value,
+                    // and an uncertain meeting does not prove that it arrives.
+                    if !conditional_origin_admits_class(origin.kind)
+                        || class_meetings[index].is_uncertain()
+                    {
+                        continue;
+                    }
+                    findings.push(AbsentMemberFinding {
+                        root: root.clone(),
+                        site: site.clone(),
+                        class: identity.clone(),
+                        origin: origin.clone(),
+                        witness: best_witness(result, class_meetings[index]),
+                        proof: AbsentMemberProof::Conditional {
+                            remainders: remainders.clone(),
+                        },
+                        also_fails_at: Vec::new(),
+                    });
+                }
+            }
         }
     }
     ReceiverClassSet {
@@ -1477,6 +1563,84 @@ fn reached_class_set(
     }
 }
 
+/// Whether one reason in a partial receiver set still permits a Conditional
+/// finding for a class whose own arrival, meeting, and member lookup are
+/// clean. An allowed reason says only that some other value or class may also
+/// reach the site. A blocking reason can mean that this class should have been
+/// filtered out on this path, or that the answer was cut short.
+///
+/// The member-lookup reasons (`UnresolvedBase`, `DynamicAttributes`,
+/// `ClassCreation`, `FieldSlotIncomplete`, `DynamicFieldWrite`) are allowed
+/// because a class whose own lookup raised one is never a candidate: its
+/// lookup is not `Absent`, its store evidence is not `NoStore`, or its own
+/// dynamic-write survey is not empty. When one of these reasons arrives as a
+/// value-flow atom, class attribution is unavailable and the Conditional tier
+/// is suppressed for the whole set. `UncertainFlow` is allowed because the
+/// caller separately requires the class's own representative meeting to be
+/// certain.
+fn remainder_names_another_alternative(reason: &UnknownReason) -> bool {
+    match reason {
+        UnknownReason::RootParameter
+        | UnknownReason::VariadicParameter
+        | UnknownReason::SelfReceiver
+        | UnknownReason::UnresolvedCall
+        | UnknownReason::AmbiguousCallee
+        | UnknownReason::UnmodeledLoad
+        | UnknownReason::Await
+        | UnknownReason::Capture
+        | UnknownReason::ExternalNotModeled
+        | UnknownReason::PackIncomplete
+        | UnknownReason::OpenTypeBound
+        | UnknownReason::ScalarReceiver
+        | UnknownReason::ClassObject
+        | UnknownReason::UncertainFlow
+        | UnknownReason::UnresolvedBase
+        | UnknownReason::DynamicAttributes
+        | UnknownReason::ClassCreation
+        | UnknownReason::FieldSlotIncomplete
+        | UnknownReason::DynamicFieldWrite => true,
+        // The closure stopped at a size limit; paths past it are unexplored.
+        UnknownReason::Truncated => false,
+        // The solver stopped before a fixed point; the set is not final.
+        UnknownReason::SolverBudget => false,
+        // A semantic charge was refused; refinement or filtering may be missing.
+        UnknownReason::SemanticBudget => false,
+        // The root is incomplete for a reason its closure does not name.
+        UnknownReason::IncompleteRoot => false,
+        // An unmodeled guard may have filtered this class out on this path.
+        UnknownReason::UnmodeledGuard { .. } => false,
+        // An unmodeled predicate may have filtered this class out on this path.
+        UnknownReason::UnmodeledPredicate => false,
+    }
+}
+
+fn is_member_surface_uncertainty(reason: &UnknownReason) -> bool {
+    matches!(
+        reason,
+        UnknownReason::UnresolvedBase
+            | UnknownReason::DynamicAttributes
+            | UnknownReason::ClassCreation
+            | UnknownReason::FieldSlotIncomplete
+            | UnknownReason::DynamicFieldWrite
+    )
+}
+
+/// Whether this origin kind establishes that the class can be a runtime value.
+fn conditional_origin_admits_class(kind: SourceSiteKind) -> bool {
+    match kind {
+        SourceSiteKind::ConstructorCall
+        | SourceSiteKind::Literal
+        | SourceSiteKind::ContainerLiteral
+        | SourceSiteKind::NarrowingGuard
+        // Class-bearing Unknown origins are retained or computed runtime
+        // values. Annotations and assumed receivers have explicit kinds.
+        | SourceSiteKind::Unknown => true,
+        SourceSiteKind::DeclaredParameter
+        | SourceSiteKind::RootReceiver
+        | SourceSiteKind::ConditionalNarrowingGuard => false,
+    }
+}
+
 /// Orders a guard-proved origin after every origin that produced a value.
 fn narrowing_guard_rank(site: &SourceSite) -> u8 {
     match site.kind {
@@ -1484,6 +1648,15 @@ fn narrowing_guard_rank(site: &SourceSite) -> u8 {
         SourceSiteKind::NarrowingGuard => 1,
         _ => 0,
     }
+}
+
+/// The canonical order of a reason list: by family label, then by payload.
+pub fn sort_unknown_reasons(reasons: &mut [UnknownReason]) {
+    reasons.sort_unstable_by(|left, right| {
+        left.label()
+            .cmp(right.label())
+            .then_with(|| left.cmp(right))
+    });
 }
 
 fn push_reason(reasons: &mut Vec<UnknownReason>, reason: UnknownReason) {
@@ -1511,14 +1684,329 @@ fn best_witness(
     result.source_witness_for_meeting(meeting, quality, WitnessReconstructionLimits::default())
 }
 
-/// Keep the complete finding whose witness was retained when duplicate
-/// interpretations disagree only about witness availability.
+#[derive(Debug, Clone, Copy)]
+struct ReceiverRead {
+    binding: ValueId,
+    point: ProgramPointId,
+    event_index: usize,
+}
+
+fn is_binding_value(kind: &SemanticValueKind) -> bool {
+    matches!(
+        kind,
+        SemanticValueKind::Local
+            | SemanticValueKind::Parameter { .. }
+            | SemanticValueKind::Receiver { .. }
+    )
+}
+
+fn receiver_read(site: &MemberAccessSite) -> Option<ReceiverRead> {
+    let semantics = site.procedure.semantics();
+    let receiver = semantics.value(site.receiver)?;
+    if is_binding_value(&receiver.kind) {
+        return Some(ReceiverRead {
+            binding: site.receiver,
+            point: site.point.id(),
+            event_index: usize::MAX,
+        });
+    }
+
+    let mut read = None;
+    for point in semantics.points() {
+        for (event_index, event) in point.events.iter().enumerate() {
+            let SemanticEffect::ValueFlow {
+                kind,
+                source,
+                target,
+            } = &event.effect
+            else {
+                continue;
+            };
+            if *target != site.receiver {
+                continue;
+            }
+            if !matches!(
+                kind,
+                ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
+            ) {
+                return None;
+            }
+            let source_value = semantics.value(*source)?;
+            if !is_binding_value(&source_value.kind) {
+                return None;
+            }
+            if read.is_some() {
+                return None;
+            }
+            read = Some(ReceiverRead {
+                binding: *source,
+                point: point.id,
+                event_index,
+            });
+        }
+    }
+    read
+}
+
+fn reaching_binding_definition(procedure: &ProcedureHandle, read: ReceiverRead) -> Option<usize> {
+    let semantics = procedure.semantics();
+    let binding = semantics.value(read.binding)?;
+    let has_entry_definition = matches!(
+        &binding.kind,
+        SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+    );
+    let mut event_definitions = HashMap::default();
+    let initial_definition = has_entry_definition.then_some(0_usize);
+    let mut next_definition = usize::from(has_entry_definition);
+    for point in semantics.points() {
+        for (event_index, event) in point.events.iter().enumerate() {
+            if matches!(
+                &event.effect,
+                SemanticEffect::Assignment { target, .. } if *target == read.binding
+            ) {
+                event_definitions.insert((point.id, event_index), next_definition);
+                next_definition += 1;
+            }
+        }
+    }
+    if next_definition == 0 {
+        return None;
+    }
+
+    let mut facts = GenKillFacts::new(semantics.points().len(), next_definition);
+    let all_definitions = 0..next_definition;
+    for point in semantics.points() {
+        let node_index = point.id.index();
+        let mut last_definition = None;
+        for (event_index, event) in point.events.iter().enumerate() {
+            if matches!(
+                &event.effect,
+                SemanticEffect::Assignment { target, .. } if *target == read.binding
+            ) {
+                last_definition = event_definitions.get(&(point.id, event_index)).copied();
+            }
+        }
+        if let Some(definition) = last_definition {
+            for killed in all_definitions.clone() {
+                facts.record_killed(node_index, killed);
+            }
+            facts.record_generated(node_index, definition);
+        } else if point.id == semantics.entry_point()
+            && let Some(definition) = initial_definition
+        {
+            facts.record_generated(node_index, definition);
+        }
+    }
+
+    let cancellation = CancellationToken::default();
+    let mut budget = CfgAlgorithmBudget::default();
+    let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+    let reaching =
+        reaching_definitions(semantics, semantics.entry_point(), &facts, &mut request).ok()?;
+    let mut definitions = reaching.reaching_in(read.point.index()).collect::<Vec<_>>();
+    if read.point == semantics.entry_point()
+        && let Some(definition) = initial_definition
+    {
+        definitions.push(definition);
+    }
+    let point = semantics.point(read.point)?;
+    if read.event_index == usize::MAX
+        && point.events.iter().any(|event| {
+            matches!(
+                &event.effect,
+                SemanticEffect::Assignment { target, .. } if *target == read.binding
+            )
+        })
+    {
+        return None;
+    }
+    for event_index in 0..read.event_index.min(point.events.len()) {
+        if let Some(definition) = event_definitions.get(&(read.point, event_index)).copied() {
+            definitions.clear();
+            definitions.push(definition);
+        }
+    }
+    (definitions.len() == 1).then(|| definitions[0])
+}
+
+fn reaches_any(
+    procedure: &ProcedureHandle,
+    starts: impl IntoIterator<Item = ProgramPointId>,
+    target: ProgramPointId,
+) -> bool {
+    let semantics = procedure.semantics();
+    let mut reached = vec![false; semantics.points().len()];
+    let mut pending = VecDeque::new();
+    for start in starts {
+        if !reached[start.index()] {
+            reached[start.index()] = true;
+            pending.push_back(start);
+        }
+    }
+    while let Some(point) = pending.pop_front() {
+        if point == target {
+            return true;
+        }
+        for (_, edge) in semantics.successor_edges(point) {
+            if !reached[edge.target_point.index()] {
+                reached[edge.target_point.index()] = true;
+                pending.push_back(edge.target_point);
+            }
+        }
+    }
+    false
+}
+
+fn normal_completion_dominates(first: &MemberAccessSite, later: &MemberAccessSite) -> bool {
+    if first.point.id() == later.point.id() {
+        return false;
+    }
+    let semantics = first.procedure.semantics();
+    let first_point = first.point.id();
+    let later_point = later.point.id();
+    let cancellation = CancellationToken::default();
+    let mut budget = CfgAlgorithmBudget::default();
+    let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+    let Ok(dominators) = dominators(semantics, semantics.entry_point(), &mut request) else {
+        return false;
+    };
+    if !dominators.dominates(semantics, first_point, later_point) {
+        return false;
+    }
+
+    let mut normal_successors = Vec::new();
+    let mut exceptional_successors = Vec::new();
+    for (_, edge) in semantics.successor_edges(first_point) {
+        match edge.kind {
+            ControlEdgeKind::Exceptional
+            | ControlEdgeKind::AsyncExceptional
+            | ControlEdgeKind::Cleanup => exceptional_successors.push(edge.target_point),
+            _ => normal_successors.push(edge.target_point),
+        }
+    }
+    !normal_successors.is_empty()
+        && reaches_any(&first.procedure, normal_successors, later_point)
+        && !reaches_any(&first.procedure, exceptional_successors, later_point)
+}
+
+fn findings_can_collapse(first: &AbsentMemberFinding, later: &AbsentMemberFinding) -> bool {
+    if first.class != later.class
+        || first.origin != later.origin
+        || first.proof.is_proven() != later.proof.is_proven()
+        || first.site.procedure.durable_key() != later.site.procedure.durable_key()
+    {
+        return false;
+    }
+    let Some(first_read) = receiver_read(&first.site) else {
+        return false;
+    };
+    let Some(later_read) = receiver_read(&later.site) else {
+        return false;
+    };
+    if first_read.binding != later_read.binding {
+        return false;
+    }
+    let Some(first_definition) = reaching_binding_definition(&first.site.procedure, first_read)
+    else {
+        return false;
+    };
+    let Some(later_definition) = reaching_binding_definition(&later.site.procedure, later_read)
+    else {
+        return false;
+    };
+    first_definition == later_definition && normal_completion_dominates(&first.site, &later.site)
+}
+
+fn compare_finding_order(
+    first: &AbsentMemberFinding,
+    second: &AbsentMemberFinding,
+) -> std::cmp::Ordering {
+    first
+        .site
+        .file
+        .cmp(&second.site.file)
+        .then_with(|| first.site.span.cmp(&second.site.span))
+        .then_with(|| first.site.member.cmp(&second.site.member))
+        .then_with(|| {
+            first
+                .class
+                .qualified_name()
+                .cmp(second.class.qualified_name())
+        })
+        .then_with(|| match (&first.class, &second.class) {
+            (ClassIdentity::Workspace(first), ClassIdentity::Workspace(second)) => {
+                first.declaration_id().cmp(&second.declaration_id())
+            }
+            (
+                ClassIdentity::External {
+                    symbol_id: first, ..
+                },
+                ClassIdentity::External {
+                    symbol_id: second, ..
+                },
+            ) => first.cmp(second),
+            (ClassIdentity::Workspace(_), ClassIdentity::External { .. }) => {
+                std::cmp::Ordering::Less
+            }
+            (ClassIdentity::External { .. }, ClassIdentity::Workspace(_)) => {
+                std::cmp::Ordering::Greater
+            }
+        })
+        .then_with(|| first.origin.file.cmp(&second.origin.file))
+        .then_with(|| first.origin.span.cmp(&second.origin.span))
+        .then_with(|| first.proof.is_proven().cmp(&second.proof.is_proven()))
+}
+
+fn sort_additional_sites(finding: &mut AbsentMemberFinding) {
+    finding.also_fails_at.sort_unstable();
+    finding.also_fails_at.dedup();
+}
+
+/// Fold later findings into the first finding only after proving the same
+/// receiver definition and normal-completion dominance within one procedure.
+pub(super) fn collapse_absent_member_findings(findings: &mut Vec<AbsentMemberFinding>) {
+    findings.sort_by(compare_finding_order);
+    let mut retained: Vec<AbsentMemberFinding> = Vec::with_capacity(findings.len());
+    for mut candidate in findings.drain(..) {
+        sort_additional_sites(&mut candidate);
+        let duplicate = retained
+            .iter()
+            .position(|existing| findings_can_collapse(existing, &candidate));
+        if let Some(index) = duplicate {
+            let existing = &mut retained[index];
+            existing
+                .also_fails_at
+                .push((candidate.site.file.clone(), candidate.site.span));
+            existing.also_fails_at.append(&mut candidate.also_fails_at);
+            sort_additional_sites(existing);
+        } else {
+            retained.push(candidate);
+        }
+    }
+    *findings = retained;
+}
+
+/// Keep the stronger of two duplicate findings: a Proven finding replaces a
+/// Conditional one, and within one tier the finding whose witness was
+/// retained replaces one whose witness is unavailable.
 pub(super) fn prefer_retained_finding(
     existing: &mut AbsentMemberFinding,
     candidate: AbsentMemberFinding,
 ) {
-    if existing.witness.is_err() && candidate.witness.is_ok() {
+    let stronger = candidate.proof.is_proven() && !existing.proof.is_proven();
+    let same_tier = candidate.proof.is_proven() == existing.proof.is_proven();
+    if stronger {
         *existing = candidate;
+    } else if same_tier {
+        existing
+            .also_fails_at
+            .extend(candidate.also_fails_at.iter().cloned());
+        sort_additional_sites(existing);
+        if existing.witness.is_err() && candidate.witness.is_ok() {
+            let also_fails_at = std::mem::take(&mut existing.also_fails_at);
+            *existing = candidate;
+            existing.also_fails_at = also_fails_at;
+        }
     }
 }
 

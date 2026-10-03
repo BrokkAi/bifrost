@@ -523,11 +523,11 @@ object Use {
             };
             file.write(source).unwrap();
         }
-
         let project = TestProject::new(root, Language::Scala);
-        let analyzer = ScalaAnalyzer::new(Arc::new(project.clone()));
+        let mut analyzer = ScalaAnalyzer::new(Arc::new(project.clone()));
         let warm_file = ProjectFile::new(project.root().to_path_buf(), "C0.scala");
 
+        analyzer.clear_retained_file_states_for_test();
         analyzer.reset_full_hydration_count_for_test();
         assert!(!analyzer.declarations(&warm_file).is_empty());
         let lru_after_warm = analyzer.full_hydration_count_for_test();

@@ -210,7 +210,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
             pack_version: env!("CARGO_PKG_VERSION").to_owned(),
             ecosystem: "rubygems".to_owned(),
             compatibility: Compatibility {
-                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                bifrost: None,
                 toolchains: Vec::new(),
             },
             activation: vec![ActivationSelector {

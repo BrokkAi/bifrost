@@ -59,8 +59,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::FOUNDRY_PRODUCER_VERSION;
 use super::sanitizer_pack::summary_id;
-use super::{FOUNDRY_BIFROST_REQUIREMENT, FOUNDRY_PRODUCER_VERSION};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -692,6 +692,7 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         target,
         completeness: candidate.completeness,
         ordinary_heap_unchanged: false,
+        no_concurrency_effects: false,
         covers_overrides,
         normal_continuation_absent: false,
         normal_result_count: None,
@@ -875,7 +876,8 @@ fn build_pack(
         });
     }
     AuthoredSemanticModelPack {
-        schema_version: 2,
+        schema_version:
+            brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: realm.pack_id.to_owned(),
         version: realm.content_version.to_owned(),
         producer: Producer {
@@ -885,7 +887,7 @@ fn build_pack(
         language: realm.language.to_owned(),
         ecosystem: realm.ecosystem.to_owned(),
         compatibility: Compatibility {
-            bifrost: FOUNDRY_BIFROST_REQUIREMENT.to_owned(),
+            bifrost: None,
             toolchains: realm
                 .toolchain
                 .map(|pin| {

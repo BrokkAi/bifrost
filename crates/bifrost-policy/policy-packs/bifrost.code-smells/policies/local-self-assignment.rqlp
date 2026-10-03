@@ -17,7 +17,7 @@
                         (verdict eq self_assignment)
                         (proof eq exact)
                         (coverage eq exhaustive))
-          (language java javascript typescript python
+          (language java javascript typescript python csharp kotlin go rust
             (assignment-relations
               (procedure-of
                 (callable)))))))

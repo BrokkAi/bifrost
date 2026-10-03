@@ -170,7 +170,8 @@ impl PythonUsageIndex {
                     );
                 }
                 if binder.bindings.values().any(is_sys_namespace_binding)
-                    && let Some(replacement) = module_replacement_of(python, file, facts.source())
+                    && let Some(replacement) =
+                        module_replacement_of(python, file, facts.source(), facts.imports())
                 {
                     replacement_modules.insert(file.clone(), replacement.target_module);
                 }
@@ -181,7 +182,6 @@ impl PythonUsageIndex {
                         file,
                         facts,
                         &module_name,
-                        &binder,
                     )),
                 );
                 import_bindings_by_file.insert(file.clone(), import_bindings);
@@ -189,6 +189,7 @@ impl PythonUsageIndex {
             } else {
                 exports_by_file.insert(file.clone(), python.export_index_of(file));
                 let binder = python.import_binder_of(file);
+                let imports = python.import_info_of(token, file);
                 if let Ok(source) = python.project().read_source(file) {
                     if binder.bindings.values().any(is_importlib_namespace_binding) {
                         literal_importlib_modules_by_file.insert(
@@ -197,12 +198,12 @@ impl PythonUsageIndex {
                         );
                     }
                     if binder.bindings.values().any(is_sys_namespace_binding)
-                        && let Some(replacement) = module_replacement_of(python, file, &source)
+                        && let Some(replacement) =
+                            module_replacement_of(python, file, &source, &imports)
                     {
                         replacement_modules.insert(file.clone(), replacement.target_module);
                     }
                 }
-                let imports = python.import_info_of(token, file);
                 import_bindings_by_file.insert(
                     file.clone(),
                     import_bindings_from_imports(python, file, &imports),
@@ -473,8 +474,8 @@ impl PythonUsageIndex {
     pub fn scope_facts(
         &self,
         file: &ProjectFile,
-        build: impl FnOnce() -> PythonScopeFacts,
-    ) -> Arc<PythonScopeFacts> {
+        build: impl FnOnce() -> Option<PythonScopeFacts>,
+    ) -> Option<Arc<PythonScopeFacts>> {
         if let Some(cached) = self
             .scope_facts_by_file
             .lock()
@@ -482,16 +483,18 @@ impl PythonUsageIndex {
             .get(file)
             .cloned()
         {
-            return cached;
+            return Some(cached);
         }
 
-        let facts = Arc::new(build());
-        self.scope_facts_by_file
-            .lock()
-            .expect("Python scope-facts cache mutex poisoned")
-            .entry(file.clone())
-            .or_insert_with(|| facts.clone())
-            .clone()
+        let facts = Arc::new(build()?);
+        Some(
+            self.scope_facts_by_file
+                .lock()
+                .expect("Python scope-facts cache mutex poisoned")
+                .entry(file.clone())
+                .or_insert_with(|| facts.clone())
+                .clone(),
+        )
     }
 }
 
@@ -637,8 +640,8 @@ pub fn usage_module_binding_timeline(
 pub fn usage_scope_facts(
     python: &dyn PythonUsageSource,
     file: &ProjectFile,
-    build: impl FnOnce() -> PythonScopeFacts,
-) -> Arc<PythonScopeFacts> {
+    build: impl FnOnce() -> Option<PythonScopeFacts>,
+) -> Option<Arc<PythonScopeFacts>> {
     python.usage_index().scope_facts(file, build)
 }
 
@@ -687,10 +690,14 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
 
-        let first_facts = index.scope_facts(&file, PythonScopeFacts::default);
-        let second_facts = index.scope_facts(&file, || {
-            panic!("cached scope facts should avoid rebuilding the file")
-        });
+        let first_facts = index
+            .scope_facts(&file, || Some(PythonScopeFacts::default()))
+            .unwrap();
+        let second_facts = index
+            .scope_facts(&file, || {
+                panic!("cached scope facts should avoid rebuilding the file")
+            })
+            .unwrap();
         assert!(Arc::ptr_eq(&first_facts, &second_facts));
     }
 }

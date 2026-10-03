@@ -66,6 +66,11 @@ pub struct ScalaForwardOwnerFacts {
 pub trait ScalaSource:
     CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider + TypeHierarchyProvider
 {
+    fn canonical_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::scala::source_facts::ScalaFileSourceFacts>>;
+
     /// What every retained surface proves about the bare type name `name` as
     /// written in `file`. See this module's note on why this is not a moved
     /// body: Scala's ladder needs the jar index, the resolved-import set and

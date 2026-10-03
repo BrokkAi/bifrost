@@ -25,9 +25,9 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crate::analyzer::semantic::{
-    CancellationToken, ControlEdgeId, GuardPredicate, ProcedureHandle, ProgramPointId,
-    SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticGapImpact, SemanticValueKind,
-    SemanticWork, ValueId,
+    BindingOriginIndex, CancellationToken, ControlEdgeId, GuardPredicate, ProcedureHandle,
+    ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticGapImpact,
+    SemanticValueKind, SemanticWork, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -169,6 +169,11 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
     }
     charge_reused_preprocessing_inputs(semantics, budget)?;
     check_cancelled(cancellation)?;
+    let binding_origins = BindingOriginIndex::new(procedure);
+    let write_targets = WriteTargets {
+        open_bindings,
+        binding_origins: &binding_origins,
+    };
 
     // Index every definition needed by the surviving relational question.
     let mut definitions = DefinitionTable::new();
@@ -184,6 +189,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
         data_bindings,
         bool_bindings,
         open_bindings,
+        &binding_origins,
         correlation_events,
         budget,
         cancellation,
@@ -197,7 +203,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
         &successors,
         data_bindings,
         bool_bindings,
-        open_bindings,
+        write_targets,
         correlation_events,
         cancellation,
     )?;
@@ -228,6 +234,7 @@ pub(super) fn analyze_correlations_with_boolean_bindings(
             bool_bindings,
             data_bindings,
             open_bindings,
+            &binding_origins,
             correlation_events,
             budget,
             cancellation,
@@ -311,6 +318,12 @@ enum ComponentWrite {
     },
 }
 
+#[derive(Clone, Copy)]
+struct WriteTargets<'a> {
+    open_bindings: &'a HashSet<ValueId>,
+    binding_origins: &'a BindingOriginIndex,
+}
+
 /// Every tracked component one point replaces, in event order.
 ///
 /// Three callers need exactly this list and must agree about it: the
@@ -322,7 +335,7 @@ fn component_writes(
     point: &crate::analyzer::semantic::ProgramPoint,
     data_bindings: &[ValueId],
     bool_bindings: &[ValueId],
-    open_bindings: &HashSet<ValueId>,
+    write_targets: WriteTargets<'_>,
     event_indices: &[usize],
 ) -> Vec<ComponentWrite> {
     fn push(
@@ -374,8 +387,66 @@ fn component_writes(
                     rhs: Some(*source),
                 });
             }
+            SemanticEffect::MemoryStore {
+                location, value, ..
+            } if semantics
+                .memory_location(*location)
+                .is_some_and(|location| {
+                    matches!(
+                        location.kind,
+                        crate::analyzer::semantic::MemoryLocationKind::Dereference { .. }
+                    )
+                }) =>
+            {
+                let Some(address) =
+                    semantics
+                        .memory_location(*location)
+                        .and_then(|location| match location.kind {
+                            crate::analyzer::semantic::MemoryLocationKind::Dereference {
+                                address,
+                            } => Some(address),
+                            _ => None,
+                        })
+                else {
+                    unreachable!("the guard above selected a dereference store")
+                };
+                let origins = write_targets
+                    .binding_origins
+                    .addressed_binding_origins(address);
+                if let Some(binding) = origins.unique_binding() {
+                    push(
+                        &mut writes,
+                        data_bindings,
+                        bool_bindings,
+                        event_index,
+                        binding,
+                        Some(*value),
+                    );
+                } else {
+                    for binding in unknown_write_bindings(
+                        &event.effect,
+                        semantics,
+                        write_targets.open_bindings,
+                        write_targets.binding_origins,
+                    ) {
+                        push(
+                            &mut writes,
+                            data_bindings,
+                            bool_bindings,
+                            event_index,
+                            binding,
+                            None,
+                        );
+                    }
+                }
+            }
             effect => {
-                for binding in unknown_write_bindings(effect, semantics, open_bindings) {
+                for binding in unknown_write_bindings(
+                    effect,
+                    semantics,
+                    write_targets.open_bindings,
+                    write_targets.binding_origins,
+                ) {
                     push(
                         &mut writes,
                         data_bindings,
@@ -417,7 +488,7 @@ fn carried_points(
     successors: &[Vec<ProgramPointId>],
     data_bindings: &[ValueId],
     bool_bindings: &[ValueId],
-    open_bindings: &HashSet<ValueId>,
+    write_targets: WriteTargets<'_>,
     correlation_events: &[Vec<usize>],
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<bool>, CorrelationError> {
@@ -439,7 +510,7 @@ fn carried_points(
                 point,
                 data_bindings,
                 bool_bindings,
-                open_bindings,
+                write_targets,
                 &correlation_events[point.id.index()],
             )
             .is_empty()
@@ -1111,10 +1182,15 @@ impl DefinitionTable {
         data_bindings: &[ValueId],
         bool_bindings: &[ValueId],
         open_bindings: &HashSet<ValueId>,
+        binding_origins: &BindingOriginIndex,
         correlation_events: &[Vec<usize>],
         budget: &mut SemanticBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), CorrelationError> {
+        let write_targets = WriteTargets {
+            open_bindings,
+            binding_origins,
+        };
         for point in semantics.points() {
             check_cancelled(cancellation)?;
             for write in component_writes(
@@ -1122,7 +1198,7 @@ impl DefinitionTable {
                 point,
                 data_bindings,
                 bool_bindings,
-                open_bindings,
+                write_targets,
                 &correlation_events[point.id.index()],
             ) {
                 check_cancelled(cancellation)?;
@@ -1210,17 +1286,22 @@ fn transfer_point(
     bool_bindings: &[ValueId],
     data_bindings: &[ValueId],
     open_bindings: &HashSet<ValueId>,
+    binding_origins: &BindingOriginIndex,
     correlation_events: &[Vec<usize>],
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<FlowState, CorrelationError> {
     let point = semantics.point(point_id).expect("validated point exists");
+    let write_targets = WriteTargets {
+        open_bindings,
+        binding_origins,
+    };
     for write in component_writes(
         semantics,
         point,
         data_bindings,
         bool_bindings,
-        open_bindings,
+        write_targets,
         &correlation_events[point_id.index()],
     ) {
         check_cancelled(cancellation)?;
@@ -1424,6 +1505,7 @@ pub(super) fn unknown_write_bindings(
     effect: &SemanticEffect,
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     open_bindings: &HashSet<ValueId>,
+    binding_origins: &BindingOriginIndex,
 ) -> Vec<ValueId> {
     match effect {
         SemanticEffect::MemoryStore { location, .. } => semantics
@@ -1437,6 +1519,18 @@ pub(super) fn unknown_write_bindings(
                 crate::analyzer::semantic::MemoryLocationKind::Capture {
                     binding: None, ..
                 } => Some(sorted_bindings(open_bindings)),
+                crate::analyzer::semantic::MemoryLocationKind::Dereference { address } => {
+                    let origins = binding_origins.addressed_binding_origins(*address);
+                    let bindings = if origins.is_complete() {
+                        origins.bindings().iter().copied().collect()
+                    } else {
+                        binding_origins
+                            .address_taken_bindings()
+                            .into_iter()
+                            .collect()
+                    };
+                    Some(sorted_bindings(&bindings))
+                }
                 _ => None,
             })
             .unwrap_or_default(),

@@ -23,6 +23,7 @@ use crate::analyzer::{
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
+use brokk_bifrost_jvm::java::graph::resolver::java_callable_arity;
 use brokk_bifrost_jvm::scala::graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
     seed_scala_binding_with_receiver_declaration,
@@ -50,7 +51,7 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_alternative_mismatch, scala_callable_completes_call,
     scala_definition_binder_names, scala_method_value_site, scala_pattern_binder_names,
-    scala_source_facts, template_self_types,
+    template_self_types,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -1344,24 +1345,18 @@ impl<'a> ForwardScalaNameResolver<'a> {
             .into_iter()
             .filter(|unit| unit.is_function() || unit.is_field())
             .filter_map(|unit| {
-                // The declared (side-map) signature is the display form the
-                // extension parsers understand; `unit.signature()` is the
-                // compact overload key and stays a last resort.
-                let signature = self
+                let metadata = self
                     .scala
-                    .signatures(&unit)
+                    .signature_metadata(&unit)
                     .into_iter()
-                    .next()
-                    .or_else(|| unit.signature().map(str::to_string))?;
-                signature
-                    .starts_with("extension ")
-                    .then(|| ForwardScalaExtensionMethod {
-                        fqn: unit.fq_name(),
-                        receiver_type: resolved_extension_receiver_type(
-                            self.scala, token, &unit, &signature,
-                        ),
-                        declaration: unit,
-                    })
+                    .find(scala_signature_is_extension)?;
+                Some(ForwardScalaExtensionMethod {
+                    fqn: unit.fq_name(),
+                    receiver_type: resolved_extension_receiver_type(
+                        self.scala, token, &unit, &metadata,
+                    ),
+                    declaration: unit,
+                })
             })
             .collect()
     }
@@ -4816,20 +4811,14 @@ fn scala_import_value_owner(
         let [field] = fields.as_slice() else {
             return ScalaTypeNamespaceResolution::Ambiguous(fields);
         };
-        let Some(source) = ctx.scala.indexed_source(field.source()) else {
-            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
-        };
-        let Some(facts) = scala_source_facts(&source) else {
+        let Some(facts) = ctx.scala.canonical_source_facts(field.source()) else {
             return ScalaTypeNamespaceResolution::AuthoritativeMiss;
         };
         let field_resolver = scala_name_resolver_for_unit(ctx.scala, token, ctx.support, field);
-        for range in ctx.scala.ranges(field) {
-            let Some(type_path) = facts
-                .field_type_paths_by_range
-                .get(&(range.start_byte, range.end_byte))
-            else {
-                continue;
-            };
+        for type_path in facts
+            .for_unit(field)
+            .filter_map(|fact| fact.field_type_path.as_ref())
+        {
             match field_resolver.resolve_owner_segments(type_path, ScalaOwnerKind::Class) {
                 ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
                 ScalaNameResolution::Ambiguous(tied) => {
@@ -8789,26 +8778,29 @@ fn resolve_java_constructor_from_scala(
         .filter(CodeUnit::is_function)
         .filter(|unit| !unit.is_synthetic())
         .collect::<Vec<_>>();
-    let (constructors, owner_shape_accepts) =
-        java.constructor_context(&exact_owner, callable_candidates, arity);
-    let matching = constructors
+    let Some(context) = java.constructor_context(&exact_owner, callable_candidates, Some(arity))
+    else {
+        return diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            "unavailable_java_constructor_facts",
+            format!("canonical constructor metadata for `{owner_fqn}` is absent or conflicting"),
+        );
+    };
+    let matching = context
+        .constructors
         .iter()
         .filter(|unit| {
-            ctx.analyzer
-                .signature_metadata(unit)
-                .into_iter()
-                .find_map(|metadata| metadata.callable_arity())
-                .unwrap_or_else(|| {
-                    crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
-                })
-                .accepts(arity)
+            // `constructor_context` has already read every direct callable
+            // child and returns `None` on any absent or conflicting arity, so
+            // this filter cannot turn an unknown arity into a negative proof.
+            java_callable_arity(java, unit).is_some_and(|declared| declared.accepts(arity))
         })
         .cloned()
         .collect::<Vec<_>>();
     if !matching.is_empty() {
         return candidates_outcome(matching);
     }
-    if owner_shape_accepts {
+    if context.owner_shape_accepts {
         return candidates_outcome(vec![exact_owner]);
     }
     no_definition(
@@ -10661,21 +10653,12 @@ fn scala_forward_callable_source_alternatives(
     scala: &ScalaAnalyzer,
     target: &CodeUnit,
 ) -> Vec<ScalaCallableSourceAlternative> {
-    let Some(source) = scala.indexed_source(target.source()) else {
+    let Some(bundle) = scala.canonical_source_facts(target.source()) else {
         return Vec::new();
     };
-    let Some(source_facts) = scala_source_facts(&source) else {
-        return Vec::new();
-    };
-    scala
-        .ranges(target)
-        .into_iter()
-        .filter_map(|range| {
-            source_facts
-                .callable_alternatives_by_range
-                .get(&(range.start_byte, range.end_byte))
-                .cloned()
-        })
+    bundle
+        .for_unit(target)
+        .filter_map(|fact| fact.callable.clone())
         .collect()
 }
 
@@ -11940,13 +11923,6 @@ fn scala_imported_member_return_type(
     scala_coherent_function_return_type(ctx, ctx.support.fqn(member_fqn))
 }
 
-fn scala_signature_return_type(signature: &str) -> Option<&str> {
-    let (_, after_colon) = signature.rsplit_once(':')?;
-    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
-    let return_type = after_colon[..end].trim();
-    (!return_type.is_empty()).then_some(return_type)
-}
-
 fn scala_enclosing_class_parameter_type(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -12541,17 +12517,6 @@ fn scala_package_type_fqn(package: &str, type_text: &str) -> Option<String> {
     } else {
         Some(format!("{package}.{simple}"))
     }
-}
-
-fn scala_resolve_type_annotation(resolver: &ScalaNameResolver, type_text: &str) -> Option<String> {
-    let trimmed = type_text.trim();
-    if let Some(base_type) = trimmed.strip_suffix(".type") {
-        return resolver.resolve_singleton(base_type);
-    }
-    let fqn = resolver
-        .resolve(type_text)
-        .or_else(|| scala_type_base_text(trimmed).and_then(|base| resolver.resolve(base)))?;
-    Some(fqn.trim_end_matches('$').to_string())
 }
 
 fn scala_resolve_visible_type_annotation(
@@ -14171,20 +14136,44 @@ fn scala_call_result_type(
 }
 
 fn scala_function_return_type(ctx: ScalaLookupCtx<'_>, unit: &CodeUnit) -> Option<String> {
-    // The declared (side-map) signature carries the return type; the unit's
-    // own signature is the compact overload key, which has none.
-    let signature = ctx
-        .scala
-        .signatures(unit)
-        .into_iter()
-        .next()
-        .or_else(|| unit.signature().map(str::to_string))?;
-    let return_type = scala_signature_return_type(&signature)?;
+    let bundle = ctx.scala.canonical_source_facts(unit.source());
+    let metadata;
+    let (path, singleton) = if let Some(bundle) = &bundle {
+        let callable = bundle
+            .for_unit(unit)
+            .find_map(|fact| fact.callable.as_ref())?;
+        (
+            callable
+                .return_type_expression
+                .as_ref()?
+                .segments
+                .as_slice(),
+            callable.return_type_is_singleton,
+        )
+    } else {
+        if crate::analyzer::common::language_for_file(unit.source()) == Language::Scala {
+            return None;
+        }
+        metadata = ctx.scala.signature_metadata(unit).into_iter().next()?;
+        (
+            metadata.return_type_identity()?.nominal_name()?.path(),
+            false,
+        )
+    };
+    let kind = if singleton {
+        ScalaOwnerKind::SingletonObject
+    } else {
+        ScalaOwnerKind::Class
+    };
     let resolver = scala_name_resolver_for_unit(ctx.scala, ctx.token, ctx.support, unit);
-    scala_resolve_type_annotation(&resolver, return_type).or_else(|| {
-        scala_package_type_fqn(unit.package_name(), return_type)
-            .filter(|fqn| !ctx.support.fqn(fqn).is_empty())
-    })
+    match resolver.resolve_owner_segments(path, kind) {
+        ScalaNameResolution::Resolved(owner) => Some(if singleton {
+            owner.fqn
+        } else {
+            owner.fqn.trim_end_matches('$').to_string()
+        }),
+        _ => None,
+    }
 }
 
 fn scala_coherent_function_return_type(

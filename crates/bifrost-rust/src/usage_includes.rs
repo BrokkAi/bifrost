@@ -48,7 +48,7 @@ use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{Language, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 
-use crate::graph_support::RustFactSource;
+use crate::graph_support::{RustCargoRouteError, RustFactSource};
 use crate::imports::rust_crate_root_package;
 use crate::lexical_scope::lexical_package_at;
 use crate::usage::{ModuleKey, RustSymbolIdentity, RustSymbolNamespace};
@@ -99,27 +99,47 @@ pub struct RustIncludeRoutes<'a> {
 }
 
 impl<'a> RustIncludeRoutes<'a> {
-    pub fn new(analyzer: &'a dyn RustFactSource, token: QueryToken<'a>) -> Self {
-        Self {
+    pub fn new(
+        analyzer: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
+    ) -> Result<Self, RustCargoRouteError> {
+        Ok(Self {
             analyzer,
-            walks: RustUsageWalks::new(analyzer, token),
-        }
+            walks: RustUsageWalks::new(analyzer, token)?,
+        })
+    }
+
+    pub fn new_while(
+        analyzer: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
+        keep_going: &'a (impl Fn() -> bool + Sync),
+    ) -> Result<Self, RustCargoRouteError> {
+        Ok(Self {
+            analyzer,
+            walks: RustUsageWalks::new_while(analyzer, token, keep_going)?,
+        })
     }
 
     /// Every include route that reaches `file`, in a stable order.
     ///
     /// Empty for the overwhelmingly common case of a file nothing includes, at
     /// the cost of one indexed seek on `rust_include_edges.file_name`.
-    pub fn include_routes_for(&self, file: &ProjectFile) -> Arc<Vec<RustIncludeRoute>> {
-        if let Some(cached) = self.analyzer.walk_caches().include_routes.get(file) {
-            return cached;
+    pub fn include_routes_for(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<Vec<RustIncludeRoute>>, RustCargoRouteError> {
+        if self.walks.cancelled() {
+            return Err(RustCargoRouteError::Cancelled);
         }
-        let routes = Arc::new(self.compose_include_routes(file));
+        if let Some(cached) = self.analyzer.walk_caches().include_routes.get(file) {
+            return Ok(cached);
+        }
+        let routes = Arc::new(self.compose_include_routes(file)?);
         self.analyzer
             .walk_caches()
             .include_routes
             .insert(file.clone(), Arc::clone(&routes));
-        routes
+        Ok(routes)
     }
 
     /// Every analyzed file that some other file splices in with `include!`.
@@ -130,24 +150,37 @@ impl<'a> RustIncludeRoutes<'a> {
     /// of `rust_include_edges`, whose row count is the number of `include!`
     /// invocations in the workspace, and it materializes only the resolved
     /// target paths -- no route is composed here.
-    pub fn all_included_files(&self) -> Vec<ProjectFile> {
+    pub fn all_included_files(&self) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
         let live = self.analyzer.live_blobs();
         let mut included = Vec::new();
-        for oid in self.analyzer.rust_include_host_blobs() {
+        for oid in self.analyzer.rust_include_host_blobs()? {
+            if self.walks.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
             for host in live.paths_for_oid(oid) {
-                let Some(facts) = self.analyzer.rust_usage_facts_of_blob(oid) else {
-                    continue;
-                };
+                if self.walks.cancelled() {
+                    return Err(RustCargoRouteError::Cancelled);
+                }
+                let facts = self.analyzer.rust_usage_facts_of_blob(oid)?;
                 for edge in &facts.include_edges {
+                    if self.walks.cancelled() {
+                        return Err(RustCargoRouteError::Cancelled);
+                    }
                     if let Some(target) = resolve_include_target(&host, &edge.relative_path) {
                         included.push(target);
                     }
                 }
             }
         }
+        if self.walks.cancelled() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
         included.sort();
         included.dedup();
-        included
+        if self.walks.cancelled() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        Ok(included)
     }
 
     /// The backward walk itself.
@@ -158,7 +191,10 @@ impl<'a> RustIncludeRoutes<'a> {
     /// pushes the includer back on the queue to have ITS includers found -- the
     /// nested-include case. The visited set is on `(host_file, edge_start)`,
     /// which is what terminates a cyclic `include!` chain.
-    fn compose_include_routes(&self, file: &ProjectFile) -> Vec<RustIncludeRoute> {
+    fn compose_include_routes(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<RustIncludeRoute>, RustCargoRouteError> {
         let mut routes = Vec::new();
         // Each frame is (file whose includers to find, the suffix of the route
         // already composed below it). `suffix` is applied outermost-last, so it
@@ -169,25 +205,26 @@ impl<'a> RustIncludeRoutes<'a> {
         let mut visited: HashSet<(ProjectFile, usize)> = HashSet::default();
         while let Some((included, suffix)) = pending.pop_front() {
             if self.walks.cancelled() {
-                break;
+                return Err(RustCargoRouteError::Cancelled);
             }
-            for (host, edge) in self.verified_includers_of(&included) {
+            for (host, edge) in self.verified_includers_of(&included)? {
                 if !visited.insert((host.clone(), edge.include_start)) {
                     continue;
                 }
                 let mut chain = suffix.clone();
                 chain.push((host.clone(), edge));
-                for seed in self.seed_routes_of(&host) {
-                    if let Some(route) = self.fold_chain(seed, &chain) {
-                        routes.push(route);
-                    }
+                for seed in self.seed_routes_of(&host)? {
+                    routes.push(self.fold_chain(seed, &chain)?);
                 }
                 pending.push_back((host, chain));
             }
         }
+        if self.walks.cancelled() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
         routes.sort();
         routes.dedup();
-        routes
+        Ok(routes)
     }
 
     /// Apply an include chain to a seed route, outermost host first.
@@ -200,12 +237,12 @@ impl<'a> RustIncludeRoutes<'a> {
         &self,
         seed: RustIncludeRoute,
         chain: &[(ProjectFile, RustIncludeEdgeFact)],
-    ) -> Option<RustIncludeRoute> {
+    ) -> Result<RustIncludeRoute, RustCargoRouteError> {
         let mut route = seed;
         for (host, edge) in chain.iter().rev() {
             route = self.compose(route, host, edge)?;
         }
-        Some(route)
+        Ok(route)
     }
 
     /// Extend `route` across one include edge written in `host`.
@@ -214,8 +251,11 @@ impl<'a> RustIncludeRoutes<'a> {
         route: RustIncludeRoute,
         host: &ProjectFile,
         edge: &RustIncludeEdgeFact,
-    ) -> Option<RustIncludeRoute> {
-        let prepared = self.analyzer.prepared_syntax(self.walks.token(), host)?;
+    ) -> Result<RustIncludeRoute, RustCargoRouteError> {
+        let prepared = self
+            .analyzer
+            .prepared_syntax(self.walks.token(), host)
+            .ok_or(RustCargoRouteError::Unavailable)?;
         let module_package =
             lexical_package_at(&route.module_package, prepared.source(), edge.include_start);
         let mut host_bindings = route.host_bindings;
@@ -243,7 +283,7 @@ impl<'a> RustIncludeRoutes<'a> {
                 .then_with(|| left.module_specifier.cmp(&right.module_specifier))
         });
         host_bindings.dedup();
-        Some(RustIncludeRoute {
+        Ok(RustIncludeRoute {
             root_file: route.root_file,
             crate_package: route.crate_package,
             module_package,
@@ -253,16 +293,19 @@ impl<'a> RustIncludeRoutes<'a> {
 
     /// The routes `host` owns before any include is applied: one per owning
     /// root, which is where the Cargo and module provenance enter.
-    fn seed_routes_of(&self, host: &ProjectFile) -> Vec<RustIncludeRoute> {
+    fn seed_routes_of(
+        &self,
+        host: &ProjectFile,
+    ) -> Result<Vec<RustIncludeRoute>, RustCargoRouteError> {
         let mut roots: HashSet<ProjectFile> = HashSet::default();
         if self.walks.is_actual_crate_root(host) {
             roots.insert(host.clone());
         }
-        roots.extend(self.walks.owner_roots_of(host).iter().cloned());
-        roots.extend(self.analyzer.cargo_routes().target_roots_for_file(host));
+        roots.extend(self.walks.owner_roots_of(host)?.iter().cloned());
+        roots.extend(self.walks.cargo_routes().target_roots_for_file(host));
         let mut roots: Vec<_> = roots.into_iter().collect();
         roots.sort();
-        roots
+        Ok(roots
             .into_iter()
             .map(|root| {
                 let crate_package = rust_crate_root_package(&root);
@@ -281,7 +324,7 @@ impl<'a> RustIncludeRoutes<'a> {
                     host_bindings: Vec::new(),
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// The files that actually `include!` `target`, with the edge that does it.
@@ -293,19 +336,22 @@ impl<'a> RustIncludeRoutes<'a> {
     fn verified_includers_of(
         &self,
         target: &ProjectFile,
-    ) -> Vec<(ProjectFile, RustIncludeEdgeFact)> {
+    ) -> Result<Vec<(ProjectFile, RustIncludeEdgeFact)>, RustCargoRouteError> {
         let Some(file_name) = target.rel_path().file_name().and_then(|name| name.to_str()) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut verified = Vec::new();
-        for host in self.walks.queries().files_with_include_named(file_name) {
+        for host in self.walks.queries().files_with_include_named(file_name)? {
             if self.walks.cancelled() {
-                break;
+                return Err(RustCargoRouteError::Cancelled);
             }
-            let Some(facts) = self.walks.queries().facts_of(&host) else {
+            let Some(facts) = self.walks.queries().facts_of(&host)? else {
                 continue;
             };
             for edge in &facts.include_edges {
+                if self.walks.cancelled() {
+                    return Err(RustCargoRouteError::Cancelled);
+                }
                 if edge.file_name != file_name {
                     continue;
                 }
@@ -320,7 +366,10 @@ impl<'a> RustIncludeRoutes<'a> {
                 .cmp(&right.0)
                 .then_with(|| left.1.include_start.cmp(&right.1.include_start))
         });
-        verified
+        if self.walks.cancelled() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        Ok(verified)
     }
 
     /// Resolve one host's `include!` literal against that host's own directory.
@@ -330,7 +379,7 @@ impl<'a> RustIncludeRoutes<'a> {
         source: &str,
         scope_start: usize,
         module_specifier: &str,
-    ) -> Vec<crate::usage::RustResolvedModuleRoute> {
+    ) -> Result<Vec<crate::usage::RustResolvedModuleRoute>, RustCargoRouteError> {
         let lexical_package = lexical_package_at(&route.module_package, source, scope_start);
         let segments = parse_symbol_path(Language::Rust, module_specifier);
         self.walks
@@ -347,52 +396,54 @@ impl<'a> RustIncludeRoutes<'a> {
         scope_start: usize,
         binding: &ImportBinding,
         target_identifier: &str,
-    ) -> HashSet<RustSymbolIdentity> {
+    ) -> Result<HashSet<RustSymbolIdentity>, RustCargoRouteError> {
         if binding.kind == ImportKind::Namespace {
             let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
             let Some((target_name, module_segments)) = segments.split_last() else {
-                return HashSet::default();
+                return Ok(HashSet::default());
             };
             let module_specifier = module_segments.join("::");
-            return self
-                .module_routes_through(route, source, scope_start, &module_specifier)
-                .into_iter()
-                .filter_map(|resolved| {
-                    self.value_identity_in(
-                        &resolved.target_file,
-                        &resolved.target_module,
-                        target_name,
-                    )
-                })
-                .collect();
+            let mut targets = HashSet::default();
+            for resolved in
+                self.module_routes_through(route, source, scope_start, &module_specifier)?
+            {
+                if let Some(identity) = self.value_identity_in(
+                    &resolved.target_file,
+                    &resolved.target_module,
+                    target_name,
+                )? {
+                    targets.insert(identity);
+                }
+            }
+            return Ok(targets);
         }
         let Some(imported_name) = (match binding.kind {
             ImportKind::Named => binding.imported_name.as_deref(),
             ImportKind::Glob => Some(target_identifier),
             _ => None,
         }) else {
-            return HashSet::default();
+            return Ok(HashSet::default());
         };
         let mut targets = HashSet::default();
         for resolved in
-            self.module_routes_through(route, source, scope_start, &binding.module_specifier)
+            self.module_routes_through(route, source, scope_start, &binding.module_specifier)?
         {
             let module_files = vec![resolved.target_file.clone()];
             for (target_file, target_name) in
                 self.walks
-                    .export_targets_from_files(self.analyzer, &module_files, imported_name)
+                    .export_targets_from_files(self.analyzer, &module_files, imported_name)?
             {
-                targets.extend(self.value_identities_named_in(&target_file, &target_name));
+                targets.extend(self.value_identities_named_in(&target_file, &target_name)?);
             }
             if let Some(identity) = self.value_identity_in(
                 &resolved.target_file,
                 &resolved.target_module,
                 imported_name,
-            ) {
+            )? {
                 targets.insert(identity);
             }
         }
-        targets
+        Ok(targets)
     }
 
     /// Resolve a qualified path whose first segment comes from a host import.
@@ -401,36 +452,39 @@ impl<'a> RustIncludeRoutes<'a> {
         route: &RustIncludeRoute,
         binding: &RustIncludeHostBinding,
         suffix: &[&str],
-    ) -> HashSet<RustSymbolIdentity> {
+    ) -> Result<HashSet<RustSymbolIdentity>, RustCargoRouteError> {
         let module_segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
         if module_segments.is_empty() {
-            return HashSet::default();
+            return Ok(HashSet::default());
         }
         let mut member_segments = Vec::new();
         if let Some(imported_name) = &binding.imported_name {
             if imported_name.is_empty() {
-                return HashSet::default();
+                return Ok(HashSet::default());
             }
             member_segments.push(imported_name.clone());
         }
         for segment in suffix {
             if segment.is_empty() {
-                return HashSet::default();
+                return Ok(HashSet::default());
             }
             member_segments.push((*segment).to_string());
         }
         let Some((target_name, owner_segments)) = member_segments.split_last() else {
-            return HashSet::default();
+            return Ok(HashSet::default());
         };
         let mut segments = module_segments;
         segments.extend(owner_segments.iter().cloned());
         let module_specifier = segments.join("::");
-        self.module_routes_through(route, "", 0, &module_specifier)
-            .into_iter()
-            .filter_map(|resolved| {
-                self.value_identity_in(&resolved.target_file, &resolved.target_module, target_name)
-            })
-            .collect()
+        let mut targets = HashSet::default();
+        for resolved in self.module_routes_through(route, "", 0, &module_specifier)? {
+            if let Some(identity) =
+                self.value_identity_in(&resolved.target_file, &resolved.target_module, target_name)?
+            {
+                targets.insert(identity);
+            }
+        }
+        Ok(targets)
     }
 
     /// The value-namespace identity `file` declares as `name` in `module`.
@@ -439,26 +493,32 @@ impl<'a> RustIncludeRoutes<'a> {
         file: &ProjectFile,
         module: &ModuleKey,
         name: &str,
-    ) -> Option<RustSymbolIdentity> {
-        self.walks
+    ) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
+        Ok(self
+            .walks
             .queries()
-            .identities_in_file_named(file, name)
+            .identities_in_file_named(file, name)?
             .into_iter()
             .map(|(identity, _)| identity)
             .find(|identity| {
                 identity.namespace == RustSymbolNamespace::Value && identity.module == *module
-            })
+            }))
     }
 
     /// Every value-namespace identity `file` declares as `name`, in any module.
-    fn value_identities_named_in(&self, file: &ProjectFile, name: &str) -> Vec<RustSymbolIdentity> {
-        self.walks
+    fn value_identities_named_in(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Result<Vec<RustSymbolIdentity>, RustCargoRouteError> {
+        Ok(self
+            .walks
             .queries()
-            .identities_in_file_named(file, name)
+            .identities_in_file_named(file, name)?
             .into_iter()
             .map(|(identity, _)| identity)
             .filter(|identity| identity.namespace == RustSymbolNamespace::Value)
-            .collect()
+            .collect())
     }
 }
 

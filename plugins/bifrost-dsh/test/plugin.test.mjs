@@ -22,6 +22,9 @@ const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 
 test("vendored launcher files are byte-identical to plugins/bifrost-agent", () => {
   const pairs = [
+    ...["open-packs.mjs", "open-packs.d.mts", "pack-release.schema.json", "pack-release.v1.schema.json"].map((file) => [
+      `plugins/bifrost-agent/bin/${file}`, `bin/${file}`,
+    ]),
     ["plugins/bifrost-agent/bin/bifrost-launcher.mjs", "bin/bifrost-launcher.mjs"],
     ["plugins/bifrost-agent/bifrost-release.json", "bifrost-release.json"],
   ];

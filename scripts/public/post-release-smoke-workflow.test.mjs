@@ -25,7 +25,6 @@ const CRATE_PACKAGES = [
   "brokk-bifrost-runtime",
   "brokk-bifrost-semantic-packs",
   "brokk-bifrost-mcp",
-  "brokk-bifrost-lsp",
   "brokk-bifrost",
 ];
 

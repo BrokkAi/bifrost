@@ -38,14 +38,17 @@ At workspace bind, MCP activates semantic packs through the same optional
 `.bifrost/packs.json` contract used by the CLI and LSP hosts. An absent document
 selects compatible packs from every ecosystem serving a language present in the
 workspace. A configured document selects its named `ecosystems`; an empty
-array explicitly disables dependency-pack activation. An omitted `catalog` is
-ephemeral, while a configured catalog must be workspace-relative. Activation
+array explicitly disables dependency-pack activation. An omitted `catalog`
+follows the analyzer's persistence settings and host cache overrides, while a
+configured catalog must be workspace-relative. Activation
 through the generic catalog contract does not download packs or dependencies.
 Compatibility and `review_required` gates remain authoritative, and `enable`
-names the reviewed packs permitted by the workspace. The released
-`brokk-bifrost` facade separately opts into fetching the immutable matching
-public release bundle only for an exact generated production miss; set
-`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path.
+names the reviewed packs permitted by the workspace. Open semantic packs and
+policy rules are distributed by
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). The engine no longer
+fetches content from its own release on a generated-production miss. Host
+plugins acquire verified compatible content into a persistent cache before
+launch; local dependency generation still uses exact artifact identity.
 
 Activation is owned by the bound workspace generation and is reused by
 `run_policy`; the policy result retains the shared activation review. Reports

@@ -181,6 +181,198 @@ impl Default for JsTsDependencyDiscoveryConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PythonAnalyzerConfig {
     pub environment: Option<PythonEnvironmentConfig>,
+    /// Explicit original-wheel to installed-tree bindings used to verify
+    /// runtime Python artifacts without executing dependency code.
+    pub runtime_environments: Vec<PythonRuntimeEnvironmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonRuntimeEnvironmentConfig {
+    /// Workspace-relative path identifying the source tree bound to this
+    /// installed runtime environment.
+    pub source_root: PathBuf,
+    pub artifacts: Vec<PythonRuntimeArtifactConfig>,
+    /// Optional, explicitly declared filesystem-import environment. Its
+    /// semantics describe the declared launch configuration; they do not
+    /// attest to an arbitrary interpreter that may currently be running.
+    #[serde(default)]
+    pub declared_environment: Option<PythonDeclaredEnvironmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonRuntimeArtifactConfig {
+    /// Workspace-relative path to the original wheel archive.
+    pub archive_path: PathBuf,
+    /// Workspace-relative root containing the installed wheel contents.
+    pub installed_root: PathBuf,
+}
+
+/// RFC8785 canonicalization URI used for Python declared projectConfig values.
+pub const PYTHON_DECLARED_PROJECT_CONFIG_CANONICALIZATION_URI: &str =
+    "https://bifrost.brokk.ai/csmi/python/project-config/rfc8785-v1";
+
+/// Host-bindable inputs for one declared Python filesystem-import contract.
+/// Paths are workspace-relative host bindings. The portable projectConfig
+/// digest uses IDs, roles, semantic values, and verified content digests, not
+/// these paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredEnvironmentConfig {
+    /// Version of the producer which authored this declared descriptor.
+    pub producer_version: String,
+    /// Version of the declared resolver semantics, not the running runtime.
+    pub resolver_version: String,
+    pub interpreter: PythonDeclaredInterpreter,
+    pub launch: PythonDeclaredLaunchSemantics,
+    pub entry_point: PythonDeclaredEntryPoint,
+    /// Ordered enabled-extra spellings used by the declaration.
+    pub extras: Vec<String>,
+    /// Exact content inputs used to declare launch and resolver semantics.
+    pub config_inputs: Vec<PythonDeclaredConfigInput>,
+    /// Import roots in declared resolver order.
+    pub root_slots: Vec<PythonDeclaredRootSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredInterpreter {
+    /// Workspace-relative path to the exact interpreter file whose bytes are
+    /// identified by `sha256`.
+    pub path: PathBuf,
+    pub sha256: String,
+    pub implementation: String,
+    pub python_version: String,
+    pub abi: String,
+    pub platform: String,
+}
+
+/// Typed declared-launch settings. The producer rejects modes it cannot
+/// support; this structure intentionally has no environment-trust Boolean.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredLaunchSemantics {
+    pub isolation: PythonDeclaredIsolationMode,
+    pub site_startup: PythonDeclaredSiteStartupMode,
+    pub environment: PythonDeclaredEnvironmentMode,
+    pub import_path: PythonDeclaredImportPathMode,
+    pub finder: PythonDeclaredFinderMode,
+    pub editable_installs: PythonDeclaredEditableInstallMode,
+    pub native_extensions: PythonDeclaredNativeExtensionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredIsolationMode {
+    Isolated,
+    EnvironmentSensitive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredSiteStartupMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredEnvironmentMode {
+    Cleared,
+    ExplicitInputs,
+    Ambient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredImportPathMode {
+    DeclaredRootsOnly,
+    EnvironmentAugmented,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredFinderMode {
+    StandardFilesystem,
+    CustomHooks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredEditableInstallMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredNativeExtensionMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredEntryPoint {
+    pub mode: PythonDeclaredEntryMode,
+    pub root_slot_id: String,
+    /// Entry path relative to its declared root slot.
+    pub relative_path: PathBuf,
+    pub working_directory_root_slot_id: String,
+    /// Working directory relative to its declared root slot.
+    pub working_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredEntryMode {
+    Script,
+    Module,
+    CommandString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredConfigInput {
+    /// Zero-based position in the exact producer-input list.
+    pub ordinal: u32,
+    pub input_id: String,
+    pub role: PythonDeclaredConfigInputRole,
+    /// Workspace-relative path to the exact bytes identified by `sha256`.
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredConfigInputRole {
+    ResolverConfiguration,
+    StartupConfiguration,
+    EnvironmentConfiguration,
+    ExtrasConfiguration,
+    EntryConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDeclaredRootSlot {
+    /// Zero-based position in the declared resolver search order.
+    pub ordinal: u32,
+    pub slot_id: String,
+    pub role: PythonDeclaredRootRole,
+    /// Workspace-relative host binding for this semantic root slot.
+    pub path: PathBuf,
+    /// Required exactly for installed-distribution roots.
+    pub artifact_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonDeclaredRootRole {
+    Source,
+    StandardLibrary,
+    InstalledDistribution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

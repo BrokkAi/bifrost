@@ -53,6 +53,25 @@ Inputs, outputs, diff-aware gating (`diff-base`), committed baselines for
 legacy repositories, caching, and suppression formats are documented at
 [CI Gating with GitHub Actions](https://bifrost.brokk.ai/ci-github-actions/).
 
+Incremental policy evidence reuse is on by default, including for `diff-base`
+scans. Set `full-evaluation: true` to pass `--no-incremental` and evaluate the
+full request for comparison. The action forwards this existing Bifrost CLI
+control and does not implement a separate slicing algorithm.
+
+The `cache` input defaults to `true` and persists Bifrost's standard
+`.bifrost/cache` analyzer store. A workspace nested in a checkout uses the
+primary Git repository root; a nested Git repository uses its own root. GitHub
+cache snapshots are scoped to runner OS, architecture, Bifrost version, exact
+binary build identity, and working-directory identity. Each invocation saves
+under a fresh immutable key after a qualified report, including when it
+restored a compatible snapshot. Only exhaustive `complete` policy-run reports
+publish cache snapshots; reliable but non-exhaustive `proven_subset` and
+`proven_by_summary` reports do not.
+
+The exit-code contract is strict: `0` is a clean completed scan, `1` is a
+completed policy-gate failure, and `2` is unreliable and must never be treated
+as clean.
+
 ## Source
 
 This repository is a generated alias, synced on every release from the

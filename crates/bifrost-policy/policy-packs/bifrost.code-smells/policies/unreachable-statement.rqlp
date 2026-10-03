@@ -1,11 +1,12 @@
-; An exact Java statement has no entry reachable from its procedure entry.
+; An exact Java, JavaScript, TypeScript, Python, C#, Kotlin, Go, Rust or PHP statement has no entry
+; reachable from its callable's entry.
 (policy
   :schema-version 1
   :id "bifrost.correctness.unreachable-statement"
   :name "Unreachable statement"
   :message "this statement cannot execute"
   :severity warning
-  :description "Every producer-authored entry to this exact Java statement is outside the complete bounded control-flow region reachable from the procedure entry. Missing statement entries, unknown control, source mismatch, cancellation, and budget exhaustion remain inconclusive. Review the preceding flow and intended statement before removing code."
+  :description "Every producer-authored entry to this exact Java, JavaScript, TypeScript, Python, C#, Kotlin, Go, Rust or PHP statement is outside the complete bounded control-flow region reachable from its callable's entry. Statements outside callables, such as JavaScript module-level code, are not assessed. Hoisted JavaScript function declarations, a JavaScript var without an initializer, and a Python expression statement containing yield are not reported because they act at compile time or at hoisting rather than at their position. Missing statement entries, unknown control, source mismatch, cancellation, and budget exhaustion remain inconclusive. Review the preceding flow and intended statement before removing code."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "control-flow" "code-smell"]
   :analysis (analysis
@@ -13,7 +14,7 @@
     (bind :name statement
       :query (rql :schema-version 1
         (filter :where ((verdict eq unreachable))
-          (language java
+          (language java javascript typescript python csharp kotlin go rust php
             (statement-reachability
               (procedure-of
                 (callable)))))))

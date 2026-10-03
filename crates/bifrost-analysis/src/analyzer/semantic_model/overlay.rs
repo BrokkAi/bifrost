@@ -1,3 +1,7 @@
+mod java_functional;
+mod java_hierarchy;
+pub use java_hierarchy::{JavaHierarchyAnswer, JavaHierarchyIncomplete, JavaHierarchyWitness};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
@@ -205,9 +209,13 @@ pub struct SemanticModelSymbol {
     #[serde(skip)]
     pub(crate) is_static: bool,
     #[serde(skip)]
+    pub(crate) non_overridable: Option<super::NonOverridableEvidence>,
+    #[serde(skip)]
     declaration_is_abstract: bool,
     #[serde(skip)]
     declaration_is_sealed: bool,
+    #[serde(skip)]
+    callable_surface_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip)]
@@ -658,6 +666,7 @@ pub struct SemanticModelOverlay {
     symbols: Vec<SemanticModelSymbol>,
     has_rust_generated_functions: bool,
     relations: Vec<SemanticModelRelation>,
+    java_hierarchy: HashMap<String, (Vec<String>, Vec<HierarchyFact>)>,
     symbols_by_id: HashMap<String, Vec<usize>>,
     symbols_by_name: HashMap<String, Vec<usize>>,
     symbols_by_uri: HashMap<String, Vec<usize>>,
@@ -779,6 +788,7 @@ impl SemanticModelOverlay {
                 symbols: Vec::new(),
                 has_rust_generated_functions: false,
                 relations: Vec::new(),
+                java_hierarchy: HashMap::default(),
                 symbols_by_id: HashMap::default(),
                 symbols_by_name: HashMap::default(),
                 symbols_by_uri: HashMap::default(),
@@ -915,6 +925,7 @@ impl SemanticModelOverlay {
 
         let mut symbols = Vec::new();
         let mut hierarchy_relations = Vec::new();
+        let mut java_hierarchy = HashMap::default();
         let mut qualified_types = HashMap::default();
         for id in type_ids {
             if cancellation.is_cancelled() {
@@ -930,6 +941,15 @@ impl SemanticModelOverlay {
                     activated.record,
                     ambiguous,
                 );
+                if symbol.language == "java" && !ambiguous {
+                    java_hierarchy.insert(
+                        symbol.id.clone(),
+                        (
+                            activated.record.type_parameters.clone(),
+                            activated.record.hierarchy.clone(),
+                        ),
+                    );
+                }
                 if !ambiguous {
                     qualified_types.insert(symbol.id.clone(), symbol.qualified_name.clone());
                 }
@@ -1046,6 +1066,7 @@ impl SemanticModelOverlay {
                 .any(crate::analyzer::is_rust_generated_function),
             symbols,
             relations,
+            java_hierarchy,
             symbols_by_id: HashMap::default(),
             symbols_by_name: HashMap::default(),
             symbols_by_uri: HashMap::default(),
@@ -2291,6 +2312,24 @@ impl SemanticModelOverlay {
                     .saturating_add(relation.provenance.retained_string_bytes())
             })
             .sum::<usize>();
+        let hierarchy_bytes = self
+            .java_hierarchy
+            .iter()
+            .map(|(id, (parameters, edges))| {
+                id.capacity()
+                    .saturating_add(
+                        parameters
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                    )
+                    .saturating_add(parameters.iter().map(String::capacity).sum::<usize>())
+                    .saturating_add(
+                        edges
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<HierarchyFact>()),
+                    )
+            })
+            .sum::<usize>();
         let mut index_bytes = 0usize;
         for map in [
             &self.symbols_by_id,
@@ -2342,6 +2381,7 @@ impl SemanticModelOverlay {
             std::mem::size_of::<Self>()
                 .saturating_add(symbol_bytes)
                 .saturating_add(relation_bytes)
+                .saturating_add(hierarchy_bytes)
                 .saturating_add(deferred_bytes)
                 .saturating_add(conditional_bytes)
                 .saturating_add(index_bytes),
@@ -2559,6 +2599,12 @@ impl SemanticModelSymbol {
     /// subclasses or prove that a class has no descendants.
     pub fn declaration_is_sealed(&self) -> bool {
         self.declaration_is_sealed
+    }
+
+    /// Positive coverage of this declaration's own externally visible
+    /// callables and direct hierarchy edges, independently of pack coverage.
+    pub fn callable_surface_complete(&self) -> bool {
+        self.callable_surface_complete
     }
 
     pub fn externally_visible(&self) -> bool {
@@ -4589,6 +4635,7 @@ fn emit_rule_match(
                         is_sealed,
                         ..
                     } => SemanticModelSymbol {
+                        non_overridable: None,
                         ambient_use: None,
                         id,
                         owner_id: None,
@@ -4600,6 +4647,7 @@ fn emit_rule_match(
                         is_static: false,
                         declaration_is_abstract: *is_abstract,
                         declaration_is_sealed: *is_sealed,
+                        callable_surface_complete: false,
                         signature: None,
                         structured_signature: None,
                         has_explicit_type_terms: false,
@@ -4639,6 +4687,7 @@ fn emit_rule_match(
                             None => None,
                         };
                         SemanticModelSymbol {
+                            non_overridable: None,
                             ambient_use: None,
                             id,
                             owner_id: owner.clone(),
@@ -4653,6 +4702,7 @@ fn emit_rule_match(
                             is_static: *is_static,
                             declaration_is_abstract: *is_abstract,
                             declaration_is_sealed: false,
+                            callable_surface_complete: false,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
@@ -5060,6 +5110,7 @@ fn type_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        non_overridable: None,
         id: record.id.clone(),
         owner_id: None,
         name: terminal_name(&record.name).to_string(),
@@ -5070,6 +5121,7 @@ fn type_symbol(
         is_static: false,
         declaration_is_abstract: record.is_abstract,
         declaration_is_sealed: record.is_sealed,
+        callable_surface_complete: record.callable_surface_complete,
         signature: None,
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
@@ -5123,6 +5175,7 @@ fn member_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        non_overridable: record.non_overridable,
         id: record.id.clone(),
         owner_id: Some(record.owner.clone()),
         name: record.name.clone(),
@@ -5133,6 +5186,7 @@ fn member_symbol(
         is_static: record.is_static,
         declaration_is_abstract: record.is_abstract,
         declaration_is_sealed: false,
+        callable_surface_complete: false,
         signature: record
             .signature
             .as_ref()
@@ -5616,7 +5670,7 @@ fn render_named_type(name: &str, arguments: &[TypeRef], nullable: bool) -> Strin
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::analyzer::Language;
     use crate::analyzer::semantic_model::ParameterPassingMode;
@@ -5689,6 +5743,7 @@ mod tests {
                 .any(crate::analyzer::is_rust_generated_function),
             symbols,
             relations,
+            java_hierarchy: HashMap::default(),
             symbols_by_id: HashMap::default(),
             symbols_by_name: HashMap::default(),
             symbols_by_uri: HashMap::default(),
@@ -5708,6 +5763,76 @@ mod tests {
             .rebuild_indexes(&crate::CancellationToken::default())
             .expect("indexes build");
         overlay
+    }
+
+    pub(crate) fn go_external_receiver_test_overlay() -> std::sync::Arc<SemanticModelOverlay> {
+        let mut strings_package = class("strings", "go");
+        strings_package.kind = SemanticModelSymbolKind::Module;
+        strings_package.visibility = Visibility::Package;
+        strings_package.aliases = vec!["strings".to_owned()];
+        let mut codec_package = class("example.com/acme/codec", "go");
+        codec_package.kind = SemanticModelSymbolKind::Module;
+        codec_package.visibility = Visibility::Package;
+        codec_package.aliases = vec!["wire".to_owned()];
+        let mut buffer = class("example.com/acme/codec.Buffer", "go");
+        buffer.kind = SemanticModelSymbolKind::Struct;
+        let mut builder = class("strings.Builder", "go");
+        builder.kind = SemanticModelSymbolKind::Struct;
+        let mut len = method(
+            &builder,
+            "strings.Builder.Len",
+            "Len",
+            Some(signature(&[], false)),
+        );
+        len.receiver = Some(ReceiverFact { pointer: false });
+        let mut write_string = method(
+            &builder,
+            "strings.Builder.WriteString",
+            "WriteString",
+            Some(signature(&[Some("value")], false)),
+        );
+        write_string.receiver = Some(ReceiverFact { pointer: true });
+
+        let mut os_package = class("os", "go");
+        os_package.kind = SemanticModelSymbolKind::Module;
+        os_package.visibility = Visibility::Package;
+        os_package.aliases = vec!["os".to_owned()];
+        let mut file = class("os.File", "go");
+        file.kind = SemanticModelSymbolKind::Struct;
+        let mut close = method(&file, "os.File.Close", "Close", Some(signature(&[], false)));
+        close.receiver = Some(ReceiverFact { pointer: true });
+
+        let mut image_package = class("image", "go");
+        image_package.kind = SemanticModelSymbolKind::Module;
+        image_package.visibility = Visibility::Package;
+        image_package.aliases = vec!["image".to_owned()];
+        let mut point = class("image.Point", "go");
+        point.kind = SemanticModelSymbolKind::Struct;
+        let mut string = method(
+            &point,
+            "image.Point.String",
+            "String",
+            Some(signature(&[], false)),
+        );
+        string.receiver = Some(ReceiverFact { pointer: false });
+
+        std::sync::Arc::new(overlay(
+            vec![
+                strings_package,
+                codec_package,
+                buffer,
+                builder,
+                len,
+                write_string,
+                os_package,
+                file,
+                close,
+                image_package,
+                point,
+                string,
+            ],
+            Vec::new(),
+        ))
     }
 
     fn collection_flow_contract(
@@ -5809,6 +5934,7 @@ mod tests {
     /// name one.
     fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         SemanticModelSymbol {
+            non_overridable: None,
             ambient_use: None,
             id: format!("type.{qualified_name}"),
             owner_id: None,
@@ -5824,6 +5950,7 @@ mod tests {
             is_static: false,
             declaration_is_abstract: false,
             declaration_is_sealed: false,
+            callable_surface_complete: false,
             signature: None,
             structured_signature: None,
             has_explicit_type_terms: false,
@@ -5973,6 +6100,7 @@ mod tests {
         signature: Option<Signature>,
     ) -> SemanticModelSymbol {
         let mut symbol = SemanticModelSymbol {
+            non_overridable: None,
             ambient_use: None,
             id: id.to_string(),
             owner_id: Some(owner.id.clone()),
@@ -5984,6 +6112,7 @@ mod tests {
             is_static: false,
             declaration_is_abstract: false,
             declaration_is_sealed: false,
+            callable_surface_complete: false,
             signature: signature
                 .as_ref()
                 .map(|value| render_signature(name, value)),
@@ -6561,6 +6690,40 @@ mod tests {
                 .visible_symbol("example.com/external.Widget")
                 .is_none(),
             "one individually ambiguous record is not visible"
+        );
+    }
+
+    #[test]
+    fn go_modeled_package_identity_uses_exact_declared_name_and_pack_provenance() {
+        use crate::analyzer::go::package_identity::GoOverlayPackages;
+
+        let mut package = class("example.com/acme/codec", "go");
+        package.kind = SemanticModelSymbolKind::Module;
+        package.aliases = vec!["wire".to_owned()];
+        package.provenance.pack_id = "go.api.codec".to_owned();
+        package.provenance.pack_digest = "a1b2".to_owned();
+        package.provenance.record_id = "package:codec".to_owned();
+        let symbol_id = package.id.clone();
+        let overlay = overlay(vec![package], Vec::new());
+
+        assert_eq!(
+            GoOverlayPackages::new(Some(&overlay))
+                .modeled_package_identity("example.com/acme/codec"),
+            Some(
+                crate::analyzer::go::package_identity::GoModeledPackageIdentity {
+                    package_name: "wire".to_owned(),
+                    symbol_id,
+                    pack_id: "go.api.codec".to_owned(),
+                    pack_digest: "a1b2".to_owned(),
+                    record_id: "package:codec".to_owned(),
+                }
+            )
+        );
+        assert!(
+            GoOverlayPackages::new(Some(&overlay))
+                .modeled_package_identity("example.com/acme/other")
+                .is_none(),
+            "a different import path has no package authority"
         );
     }
 
@@ -7146,6 +7309,269 @@ mod tests {
     }
 
     #[test]
+    fn java_functional_return_requires_positive_inventory_and_an_agreeing_method() {
+        let mut object = class("java.lang.Object", "java");
+        object.callable_surface_complete = true;
+        object.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut action = class("fixture.Action", "java");
+        action.kind = SemanticModelSymbolKind::Interface;
+        action.callable_surface_complete = true;
+        action.provenance.completeness = SemanticModelCompleteness::Partial;
+        let void_signature = Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: None,
+        };
+        let value_signature = Signature {
+            returns: Some(TypeRef::Named {
+                name: "int".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }),
+            ..void_signature.clone()
+        };
+        let hash = method(
+            &object,
+            "object.hash",
+            "hashCode",
+            Some(value_signature.clone()),
+        );
+        let mut declared_hash = method(
+            &action,
+            "action.hash",
+            "hashCode",
+            Some(value_signature.clone()),
+        );
+        declared_hash.declaration_is_abstract = true;
+        let mut run = method(&action, "action.run", "run", Some(void_signature));
+        run.declaration_is_abstract = true;
+        let mut factory = method(
+            &action,
+            "action.factory",
+            "factory",
+            Some(value_signature.clone()),
+        );
+        factory.is_static = true;
+        let default = method(
+            &action,
+            "action.size",
+            "size",
+            Some(value_signature.clone()),
+        );
+        for returns in [None, value_signature.returns.clone()] {
+            run.structured_signature.as_mut().unwrap().returns = returns.clone();
+            let model = overlay(
+                vec![
+                    object.clone(),
+                    action.clone(),
+                    hash.clone(),
+                    declared_hash.clone(),
+                    run.clone(),
+                    factory.clone(),
+                    default.clone(),
+                ],
+                Vec::new(),
+            );
+            let mut work = 1000;
+            let cancellation = crate::CancellationToken::default();
+            assert_eq!(
+                model
+                    .java_functional_method(
+                        named(&model, "fixture.Action"),
+                        named(&model, "java.lang.Object"),
+                        &mut work,
+                        &cancellation
+                    )
+                    .map(|method| method
+                        .structured_signature
+                        .as_ref()
+                        .unwrap()
+                        .returns
+                        .is_some()),
+                Some(returns.is_some())
+            );
+            assert!(work < 1000);
+            assert!(
+                model
+                    .java_functional_method(
+                        named(&model, "fixture.Action"),
+                        named(&model, "java.lang.Object"),
+                        &mut 0,
+                        &cancellation
+                    )
+                    .is_none()
+            );
+        }
+        action.callable_surface_complete = false;
+        let model = overlay(
+            vec![object.clone(), action.clone(), hash.clone(), run.clone()],
+            Vec::new(),
+        );
+        assert!(
+            model
+                .java_functional_method(
+                    named(&model, "fixture.Action"),
+                    named(&model, "java.lang.Object"),
+                    &mut 1000,
+                    &crate::CancellationToken::default()
+                )
+                .is_none()
+        );
+        action.callable_surface_complete = true;
+        action.declaration_is_sealed = true;
+        let model = overlay(vec![object, action, hash, run], Vec::new());
+        assert!(
+            model
+                .java_functional_method(
+                    named(&model, "fixture.Action"),
+                    named(&model, "java.lang.Object"),
+                    &mut 1000,
+                    &crate::CancellationToken::default()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_functional_return_respects_inherited_default_overrides() {
+        let mut object = class("java.lang.Object", "java");
+        object.callable_surface_complete = true;
+        let mut parent = class("fixture.Parent", "java");
+        parent.kind = SemanticModelSymbolKind::Interface;
+        parent.callable_surface_complete = true;
+        let mut child = class("fixture.Child", "java");
+        child.kind = SemanticModelSymbolKind::Interface;
+        child.callable_surface_complete = true;
+        let signature = Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: None,
+        };
+        let mut inherited = method(&parent, "parent.run", "run", Some(signature.clone()));
+        inherited.declaration_is_abstract = true;
+        let default = method(&child, "child.run", "run", Some(signature.clone()));
+        let mut own = method(
+            &child,
+            "child.get",
+            "get",
+            Some(Signature {
+                returns: Some(TypeRef::Named {
+                    name: "int".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+                ..signature
+            }),
+        );
+        own.declaration_is_abstract = true;
+        let edge = extends(&child, &parent.qualified_name);
+        let model = overlay(
+            vec![
+                object.clone(),
+                parent,
+                child.clone(),
+                inherited,
+                default,
+                own,
+            ],
+            vec![edge],
+        );
+        assert_eq!(
+            model
+                .java_functional_method(
+                    named(&model, "fixture.Child"),
+                    named(&model, "java.lang.Object"),
+                    &mut 1000,
+                    &crate::CancellationToken::default()
+                )
+                .map(|method| method
+                    .structured_signature
+                    .as_ref()
+                    .unwrap()
+                    .returns
+                    .is_some()),
+            Some(true)
+        );
+        let missing = extends(&child, "fixture.Missing");
+        let model = overlay(vec![object, child], vec![missing]);
+        assert!(
+            model
+                .java_functional_method(
+                    named(&model, "fixture.Child"),
+                    named(&model, "java.lang.Object"),
+                    &mut 1000,
+                    &crate::CancellationToken::default()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_argument_family_requires_complete_inherited_inventory() {
+        let mut parent = class("fixture.Parent", "java");
+        parent.kind = SemanticModelSymbolKind::Interface;
+        parent.callable_surface_complete = true;
+        let mut child = class("fixture.Child", "java");
+        child.kind = SemanticModelSymbolKind::Interface;
+        child.callable_surface_complete = true;
+        let signature = Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: None,
+        };
+        let inherited = method(
+            &parent,
+            "parent.consume",
+            "consume",
+            Some(signature.clone()),
+        );
+        let overload = method(&child, "child.consume", "consume", Some(signature));
+        let edge = extends(&child, &parent.qualified_name);
+        let cancellation = crate::CancellationToken::default();
+        let model = overlay(
+            vec![parent.clone(), child.clone(), inherited.clone()],
+            vec![edge.clone()],
+        );
+        assert_eq!(
+            model
+                .java_single_instance_method(
+                    named(&model, "fixture.Child"),
+                    "consume",
+                    &mut 1000,
+                    &cancellation
+                )
+                .map(|method| method.id.as_str()),
+            Some("parent.consume")
+        );
+        let model = overlay(
+            vec![parent.clone(), child.clone(), inherited.clone(), overload],
+            vec![edge.clone()],
+        );
+        assert!(
+            model
+                .java_single_instance_method(
+                    named(&model, "fixture.Child"),
+                    "consume",
+                    &mut 1000,
+                    &cancellation
+                )
+                .is_none()
+        );
+        parent.callable_surface_complete = false;
+        let model = overlay(vec![parent, child, inherited], vec![edge]);
+        assert!(
+            model
+                .java_single_instance_method(
+                    named(&model, "fixture.Child"),
+                    "consume",
+                    &mut 1000,
+                    &cancellation
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_direct_edge_to_an_unpublished_target_is_reported_rather_than_dropped() {
         let child = class("pkg.Child", "php");
         let edge = extends(&child, "vendor.Base");
@@ -7656,5 +8082,173 @@ mod tests {
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["builtins.object"], closure_names(&surface));
+    }
+
+    fn java_hierarchy_fixture() -> SemanticModelOverlay {
+        let child = class("example.Child", "java");
+        let parent = class("example.Parent", "java");
+        let unrelated = class("example.Other", "java");
+        let mut result = overlay(vec![child, parent, unrelated], Vec::new());
+        for name in ["example.Child", "example.Parent", "example.Other"] {
+            let id = named(&result, name).id.clone();
+            let edges = if name == "example.Child" {
+                vec![HierarchyFact {
+                    hierarchy_kind: HierarchyKind::Extends,
+                    target: TypeRef::Named {
+                        name: "example.Parent".into(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    declaration_ordinal: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            result.java_hierarchy.insert(id, (Vec::new(), edges));
+        }
+        result
+    }
+
+    #[test]
+    fn java_hierarchy_witness_retains_exact_path() {
+        let result = java_hierarchy_fixture();
+        let answer = result.java_reference_widening(
+            named(&result, "example.Child"),
+            named(&result, "example.Parent"),
+            8,
+            None,
+        );
+        assert!(answer.incomplete.is_empty(), "{answer:?}");
+        assert_eq!(answer.witness.unwrap().declarations.len(), 2);
+        assert!(
+            result
+                .java_reference_widening(
+                    named(&result, "example.Parent"),
+                    named(&result, "example.Child"),
+                    8,
+                    None
+                )
+                .witness
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_hierarchy_budget_and_cancellation_stay_typed() {
+        let result = java_hierarchy_fixture();
+        let source = named(&result, "example.Child");
+        let target = named(&result, "example.Parent");
+        let answer = result.java_reference_widening(source, target, 0, None);
+        assert_eq!(
+            answer.incomplete,
+            vec![JavaHierarchyIncomplete::BudgetExhausted]
+        );
+        assert!(answer.witness.is_none());
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+        let answer = result.java_reference_widening(source, target, 8, Some(&cancellation));
+        assert_eq!(answer.incomplete, vec![JavaHierarchyIncomplete::Cancelled]);
+        assert!(answer.witness.is_none());
+    }
+
+    #[test]
+    fn java_hierarchy_partialness_does_not_erase_positive_path() {
+        let mut result = java_hierarchy_fixture();
+        let child = result
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.qualified_name == "example.Child")
+            .unwrap();
+        child.provenance.completeness = SemanticModelCompleteness::Partial;
+        let answer = result.java_reference_widening(
+            named(&result, "example.Child"),
+            named(&result, "example.Parent"),
+            8,
+            None,
+        );
+        assert!(answer.witness.is_some());
+        assert_eq!(
+            answer.incomplete,
+            vec![JavaHierarchyIncomplete::MissingHierarchy]
+        );
+    }
+
+    #[test]
+    fn java_hierarchy_missing_generic_and_ambiguous_do_not_prove_widening() {
+        for reason in [
+            JavaHierarchyIncomplete::MissingHierarchy,
+            JavaHierarchyIncomplete::GenericSubstitution,
+            JavaHierarchyIncomplete::Ambiguous,
+        ] {
+            let mut result = java_hierarchy_fixture();
+            let id = named(&result, "example.Child").id.clone();
+            match reason {
+                JavaHierarchyIncomplete::MissingHierarchy => {
+                    result.java_hierarchy.remove(&id);
+                }
+                JavaHierarchyIncomplete::GenericSubstitution => {
+                    result
+                        .java_hierarchy
+                        .get_mut(&id)
+                        .unwrap()
+                        .0
+                        .push("T".into());
+                }
+                JavaHierarchyIncomplete::Ambiguous => {
+                    result
+                        .symbols
+                        .iter_mut()
+                        .find(|s| s.id == id)
+                        .unwrap()
+                        .provenance
+                        .ambiguous = true;
+                }
+                _ => unreachable!(),
+            }
+            let answer = result.java_reference_widening(
+                named(&result, "example.Child"),
+                named(&result, "example.Parent"),
+                8,
+                None,
+            );
+            assert!(answer.witness.is_none(), "{answer:?}");
+            assert_eq!(answer.incomplete, vec![reason]);
+        }
+    }
+
+    #[test]
+    fn java_hierarchy_implements_and_unrelated_types_keep_distinct_proof() {
+        let mut result = java_hierarchy_fixture();
+        let parent_id = named(&result, "example.Parent").id.clone();
+        result
+            .symbols
+            .iter_mut()
+            .find(|s| s.id == parent_id)
+            .unwrap()
+            .kind = SemanticModelSymbolKind::Interface;
+        let child_id = named(&result, "example.Child").id.clone();
+        result.java_hierarchy.get_mut(&child_id).unwrap().1[0].hierarchy_kind =
+            HierarchyKind::Implements;
+        let answer = result.java_reference_widening(
+            named(&result, "example.Child"),
+            named(&result, "example.Parent"),
+            8,
+            None,
+        );
+        assert_eq!(
+            answer.witness.unwrap().edges[0].hierarchy_kind,
+            HierarchyKind::Implements
+        );
+        assert!(
+            result
+                .java_reference_widening(
+                    named(&result, "example.Other"),
+                    named(&result, "example.Parent"),
+                    8,
+                    None
+                )
+                .witness
+                .is_none()
+        );
     }
 }

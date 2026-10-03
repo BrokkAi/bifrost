@@ -81,6 +81,14 @@ impl ImportAnalysisProvider for GoAnalyzer {
         self.inner.import_info_of(token, file)
     }
 
+    fn import_info_of_checked(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        self.inner.import_info_of_checked(token, file)
+    }
+
     fn imported_files_from_infos(
         &self,
         file: &ProjectFile,
@@ -308,15 +316,36 @@ fn share(grouped: HashMap<String, Vec<ProjectFile>>) -> HashMap<String, Arc<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_analyzer;
     use crate::analyzer::{
         AnalyzerQueryScope, CodeUnitIndex, ImportAnalysisProvider, ImportInfo, ImportReachability,
-        ProjectFile, QueryScope,
+        Language, ProjectFile, QueryScope,
     };
+    use crate::inline_project::InlineTestProject;
+
+    fn test_analyzer(
+        files: &[(&str, &str)],
+    ) -> (
+        crate::inline_project::BuiltInlineTestProject,
+        super::GoAnalyzer,
+    ) {
+        let project = files
+            .iter()
+            .fold(
+                InlineTestProject::with_language(Language::Go)
+                    .file("go.mod", "module example.com/app\n\ngo 1.22\n"),
+                |project, (path, source)| project.file(*path, *source),
+            )
+            .build();
+        let analyzer = super::GoAnalyzer::new(project.project_dyn());
+        (project, analyzer)
+    }
 
     /// Three packages under one module: `app` imports `store`, `unrelated`
     /// imports neither, and `app` has a second file in the same package.
-    fn workspace() -> super::GoAnalyzer {
+    fn workspace() -> (
+        crate::inline_project::BuiltInlineTestProject,
+        super::GoAnalyzer,
+    ) {
         test_analyzer(&[
             (
                 "store/store.go",
@@ -349,7 +378,7 @@ mod tests {
 
     #[test]
     fn reachability_is_decided_from_package_facts() {
-        let analyzer = workspace();
+        let (_project, analyzer) = workspace();
         let store = file(&analyzer, "store/store.go");
         let app = file(&analyzer, "app/app.go");
         let helper = file(&analyzer, "app/helper.go");
@@ -385,7 +414,7 @@ mod tests {
     /// of every file the candidate's imports brought in.
     #[test]
     fn reachability_hydrates_no_file_state_once_warm() {
-        let analyzer = workspace();
+        let (_project, analyzer) = workspace();
         let files: Vec<ProjectFile> = [
             "store/store.go",
             "app/app.go",

@@ -15,14 +15,11 @@
 //!   rebuilding them wholesale.
 
 use crate::declarations::{
-    CppRecoveredExportClassIndex, cpp_file_using_namespaces, cpp_member_fq,
-    extract_function_declarator, node_text, recovered_callable_body_at, recovered_class_body_at,
+    CppRecoveredExportClassIndex, cpp_member_fq, extract_function_declarator, node_text,
+    recovered_callable_body_at, recovered_class_body_at,
 };
 use crate::graph::CppGraphSource;
-use crate::graph::resolver::{
-    VisibilityIndex, cpp_include_closure_reaches, cpp_type_name_components, declarator_name_node,
-    qualified_name_has_concrete_scope_separators,
-};
+use crate::graph::resolver::{VisibilityIndex, cpp_include_closure_reaches};
 use crate::graph_support::CppSource;
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
@@ -35,7 +32,8 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_core::profiling;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::Node;
+use tree_sitter::{Parser, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CppCallableUnitRole {
@@ -45,24 +43,7 @@ pub enum CppCallableUnitRole {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CppOccurrenceRole {
-    DeclarationOnly,
-    Definition,
-    Both,
-    Unknown,
-}
-
-impl CppOccurrenceRole {
-    pub fn api_label(self) -> Option<&'static str> {
-        match self {
-            Self::DeclarationOnly => Some("declaration"),
-            Self::Definition => Some("definition"),
-            Self::Both | Self::Unknown => None,
-        }
-    }
-}
-
+pub use brokk_bifrost_core::analyzer::cpp_facts::CppOccurrenceRole;
 pub struct CppOccurrenceClassifier {
     tree: Tree,
     /// The parsed text. A class role reads the recovered export-macro shapes,
@@ -158,18 +139,16 @@ pub fn cpp_callable_definitions_share_identity_evidence(
     right: &CodeUnit,
     header_body_related: impl Fn(&ProjectFile, &ProjectFile) -> bool,
 ) -> bool {
-    left.source() == right.source()
-        || (left.fq_name() == right.fq_name()
-            && left.signature() == right.signature()
-            && matches!(
+    left.fq_name() == right.fq_name()
+        && left.signature() == right.signature()
+        && (left.source() == right.source()
+            || (matches!(
                 cpp_indexed_callable_linkage(index, left),
                 Some(CallableLinkage::External)
-            )
-            && matches!(
+            ) && matches!(
                 cpp_indexed_callable_linkage(index, right),
                 Some(CallableLinkage::External)
-            )
-            && header_body_related(left.source(), right.source()))
+            ) && header_body_related(left.source(), right.source())))
 }
 
 /// The same evidence, with the signature-string conjunct answered by the
@@ -194,18 +173,16 @@ pub fn cpp_callable_definitions_share_identity_evidence_with_visibility(
     right: &CodeUnit,
     header_body_related: impl Fn(&ProjectFile, &ProjectFile) -> bool,
 ) -> bool {
-    left.source() == right.source()
-        || (left.fq_name() == right.fq_name()
-            && visibility.same_logical_callable(analyzer, left, right)
-            && matches!(
+    left.fq_name() == right.fq_name()
+        && visibility.same_logical_callable(analyzer, left, right)
+        && (left.source() == right.source()
+            || (matches!(
                 cpp_indexed_callable_linkage(analyzer.index, left),
                 Some(CallableLinkage::External)
-            )
-            && matches!(
+            ) && matches!(
                 cpp_indexed_callable_linkage(analyzer.index, right),
                 Some(CallableLinkage::External)
-            )
-            && header_body_related(left.source(), right.source()))
+            ) && header_body_related(left.source(), right.source())))
 }
 
 /// Return whether `node` is one of the names declared by a range-for
@@ -530,6 +507,46 @@ pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
         path.rsplit('.').next(),
         Some("h" | "hin" | "hh" | "hpp" | "hxx")
     )
+}
+
+pub(crate) fn cpp_occurrence_role_for_node(
+    node: Node<'_>,
+    candidate: &CodeUnit,
+) -> CppOccurrenceRole {
+    if !candidate.is_callable() && !candidate.is_class() {
+        return CppOccurrenceRole::Both;
+    }
+    if candidate.is_callable() {
+        return if subtree_contains(node, |descendant| {
+            descendant.kind() == "function_definition"
+                && descendant.child_by_field_name("body").is_some()
+        }) {
+            CppOccurrenceRole::Definition
+        } else {
+            CppOccurrenceRole::DeclarationOnly
+        };
+    }
+    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
+        return CppOccurrenceRole::Definition;
+    }
+    if !subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        )
+    }) {
+        return CppOccurrenceRole::Both;
+    }
+    if subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) && descendant.child_by_field_name("body").is_some()
+    }) {
+        CppOccurrenceRole::Definition
+    } else {
+        CppOccurrenceRole::DeclarationOnly
+    }
 }
 
 pub fn cpp_occurrence_role_for_range(
@@ -1008,8 +1025,15 @@ fn cpp_reconcile_definition_identity(
         .entry(unit.source().clone())
         .or_insert_with(|| {
             Arc::new(
-                cpp.file_source(unit.source())
-                    .map(|source| cpp_file_using_namespaces(&source))
+                cpp.declaration_source_facts(token, unit.source())
+                    .map(|source| {
+                        source
+                            .facts
+                            .using_namespaces
+                            .iter()
+                            .map(|(_, name)| name.clone())
+                            .collect()
+                    })
                     .unwrap_or_default(),
             )
         })
@@ -1051,31 +1075,16 @@ fn cpp_structured_out_of_line_owner_segments(
     token: QueryToken<'_>,
     unit: &CodeUnit,
 ) -> Option<Vec<String>> {
-    let prepared = cpp.prepared_syntax(token, unit.source())?;
-    let root = prepared.tree().root_node();
-    for range in cpp.ranges(unit) {
-        let mut current = cpp_declaration_node_for_range(root, &range)?;
-        let function = loop {
-            if current.kind() == "function_definition" {
-                break current;
-            }
-            current = current.parent()?;
-        };
-        if function.child_by_field_name("body").is_none() {
-            continue;
-        }
-        let declarator = function.child_by_field_name("declarator")?;
-        let name = declarator_name_node(declarator)?;
-        if !qualified_name_has_concrete_scope_separators(name) {
-            continue;
-        }
-        let mut components = cpp_type_name_components(name, prepared.source())?;
-        components.pop()?;
-        if !components.is_empty() {
-            return Some(components);
-        }
-    }
-    None
+    // Reconciliation consumes the provisional physical mount. Asking for the
+    // published unit's merged properties here would re-enter reconciliation.
+    let source = cpp.declaration_source_facts(token, unit.source())?;
+    let mut owners = source
+        .for_unit(unit)
+        .filter(|fact| !fact.written_owner.is_empty());
+    let first = &owners.next()?.written_owner;
+    owners
+        .all(|fact| &fact.written_owner == first)
+        .then(|| first.clone())
 }
 
 #[cfg(test)]

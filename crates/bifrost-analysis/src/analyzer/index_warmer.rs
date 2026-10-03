@@ -120,11 +120,8 @@ impl IndexWarmer {
                     state.running = false;
                     warmer.idle.notify_all();
                     drop(state);
-                    let payload = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("non-string panic payload");
+                    let payload =
+                        brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref());
                     eprintln!(
                         "background index warm failed: {payload}; failed index builds remain unpublished and can retry on demand"
                     );

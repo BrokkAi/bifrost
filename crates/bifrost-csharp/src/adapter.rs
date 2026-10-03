@@ -161,20 +161,6 @@ pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String
         .collect()
 }
 
-pub fn csharp_callable_return_type_text(signature: &str) -> Option<&str> {
-    let declaration_head = signature
-        .split(['(', '{', ';', '='])
-        .next()
-        .unwrap_or(signature)
-        .trim_end();
-    let name = declaration_head.split_whitespace().last()?;
-    let return_type = crate::syntax::csharp_signature_return_type(signature, name)?;
-    signature.find(&return_type).map(|start| {
-        let end = start + return_type.len();
-        &signature[start..end]
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::csharp_nested_owner_short_name_candidates;

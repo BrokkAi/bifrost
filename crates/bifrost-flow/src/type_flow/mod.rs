@@ -37,10 +37,10 @@ pub use plan::{
 };
 pub use report::{TypeFlowReport, TypeFlowRootSolverExhaustion, solve_type_flow_workspace};
 pub use solve::{
-    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, RootExhaustedLane,
-    RootIncompleteEvidence, SemanticExhaustionStage, TypeFlowError,
+    AbsentMemberFinding, AbsentMemberProof, ClassSetStatus, FeedbackLimits, ReceiverClassSet,
+    RootExhaustedLane, RootIncompleteEvidence, SemanticExhaustionStage, TypeFlowError,
     TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
     TypeFlowSolveAttempt, TypeFlowSolvePhase, solve_type_flow_for_root,
-    solve_type_flow_for_root_with_refinements,
+    solve_type_flow_for_root_with_refinements, sort_unknown_reasons,
 };
 pub use summary::{TypeFlowSummaryProfile, TypeFlowSummaryState};

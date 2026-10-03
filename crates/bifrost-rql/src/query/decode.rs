@@ -1,29 +1,30 @@
 use super::ir::{
-    ArityConstraint, AssignmentRelationFilter, AssignmentRelationKind, BindingFilter,
-    BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind, CallArgumentSelector,
-    CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
-    CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
-    ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteFilter,
-    ConfigurationRouteSegmentFilter, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
-    DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
-    FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadKeySelector,
-    KeyedReadValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
-    MAX_CONFIGURATION_FILTER_ENTRIES, MAX_CONFIGURATION_KEY_LENGTH,
-    MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_DECORATOR_BINDING_FILTER_LENGTH,
-    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES,
-    MAX_ROW_PROJECTION_COLUMNS, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter,
-    OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral,
-    QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn,
-    QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter,
-    ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
-    ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate,
-    TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal,
-    WitnessTraversal, intersect_language_scopes,
+    AbsentMemberProofFilter, ArityConstraint, AssignmentRelationFilter, AssignmentRelationKind,
+    BindingFilter, BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind,
+    CallArgumentSelector, CallIdentity, CallInputSelector, CallSiteTraversalFilter,
+    CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan,
+    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, ConfigurationCompletenessFilter,
+    ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationNodeKindFilter,
+    ConfigurationRouteFilter, ConfigurationRouteSegmentFilter, ControlRelationFilter,
+    DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter,
+    ExportSeed, FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    JsxAttributeValueTraversal, KeyedReadKeySelector, KeyedReadValueTraversal, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
+    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS,
+    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES, MAX_ROW_PROJECTION_COLUMNS,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral, QueryRowPredicate,
+    QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallProof,
+    ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
+    ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
+    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    intersect_language_scopes,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -1821,7 +1822,7 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
     if object.len() != 1 {
         return Err(QueryError::new(
             path,
-            "row literal must contain exactly one of string, integer, boolean, or enum",
+            "row literal must contain exactly one of string, string_list, integer, boolean, or enum",
         ));
     }
     if let Some(value) = object.get("string") {
@@ -1829,6 +1830,24 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
             .as_str()
             .map(|value| QueryRowLiteral::String(value.to_owned()))
             .ok_or_else(|| QueryError::new(child_path(path, "string"), "expected a string"));
+    }
+    if let Some(value) = object.get("string_list") {
+        let values = value.as_array().ok_or_else(|| {
+            QueryError::new(
+                child_path(path, "string_list"),
+                "expected an array of strings",
+            )
+        })?;
+        let mut strings = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            strings.push(value.as_str().map(str::to_owned).ok_or_else(|| {
+                QueryError::new(
+                    format!("{}.string_list[{index}]", path),
+                    "expected a string",
+                )
+            })?);
+        }
+        return Ok(QueryRowLiteral::StringList(strings));
     }
     if let Some(value) = object.get("integer") {
         return value.as_u64().map(QueryRowLiteral::Integer).ok_or_else(|| {
@@ -1858,7 +1877,7 @@ fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, Quer
     }
     Err(QueryError::new(
         path,
-        "unknown row literal; expected string, integer, boolean, or enum",
+        "unknown row literal; expected string, string_list, integer, boolean, or enum",
     ))
 }
 
@@ -2175,6 +2194,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
         let failure_use = matches!(step, QueryStep::ResultContractFailureUses(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
+        let absent_member = matches!(step, QueryStep::AbsentMember(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -2238,6 +2258,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CandidateBoundaries,
                 ) if candidate => {}
                 Some(QueryStepField::IncludeShadowed) if binding_of => {}
+                Some(QueryStepField::FindingProof) if absent_member => {}
                 Some(QueryStepField::Resolved) if segments => {}
                 Some(
                     QueryStepField::DeclarationOrigins
@@ -2333,6 +2354,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Resolved
                     | QueryStepField::ResolvesTo
                     | QueryStepField::CallProof
+                    | QueryStepField::FindingProof
                     | QueryStepField::ReceiverType
                     | QueryStepField::FormalName
                     | QueryStepField::FormalIndex
@@ -2457,6 +2479,26 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 None => false,
             };
             step = QueryStep::SegmentsOf(SegmentsOfOptions { resolved });
+        } else if absent_member {
+            let field = QueryStepField::FindingProof.label();
+            let proof = match object.get(field) {
+                Some(value) => value
+                    .as_str()
+                    .and_then(AbsentMemberProofFilter::from_label)
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, field),
+                            format!(
+                                "{field} must be one of {}",
+                                AbsentMemberProofFilter::ALL
+                                    .map(|proof| proof.label())
+                                    .join(", ")
+                            ),
+                        )
+                    })?,
+                None => AbsentMemberProofFilter::default(),
+            };
+            step = QueryStep::AbsentMember(proof);
         } else if binding_of {
             let include_shadowed = match object.get("include_shadowed") {
                 Some(value) => {

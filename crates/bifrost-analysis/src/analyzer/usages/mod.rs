@@ -43,7 +43,6 @@ pub(crate) mod python_graph;
 pub mod receiver_query;
 pub(crate) mod receiver_sites;
 pub(crate) mod ruby_graph;
-pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
 pub mod target_kind;
 mod traits;
@@ -101,14 +100,17 @@ pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
     ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageAnalysisDiagnostic, UsageHit,
-    UsageHitKind, UsageHitSurface, UsageProof,
+    UsageHitKind, UsageHitSurface, UsageProof, UsageProofAuthority,
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
 pub use ruby_graph::RubyUsageGraphStrategy;
-pub use rust_graph::RustExportUsageGraphStrategy;
+// Rust's strategy is the native one; there is no `rust_graph` module left to
+// re-export it from.
+pub use crate::analyzer::rust::RustNativeUsageStrategy;
 pub use scala_graph::ScalaUsageGraphStrategy;
 pub(crate) use traits::GraphUsageAnalyzer;
+pub(crate) use traits::PreparedUsageQuery;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
 use crate::analyzer::{CodeUnit, IAnalyzer};

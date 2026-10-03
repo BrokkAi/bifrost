@@ -23,6 +23,7 @@ pub use identity::*;
 pub use import::*;
 pub use model::*;
 pub use pack::*;
+pub(crate) use python::validate_python_artifact;
 pub use python::{CsmiShapeAuthoringError, author_python_callable_shape_evidence};
 pub(crate) use runtime_contract_validation::validate_runtime_contract_semantics;
 pub(crate) use validate::validate_python_profile_condition;

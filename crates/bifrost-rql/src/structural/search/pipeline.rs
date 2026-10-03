@@ -6,7 +6,8 @@ use crate::analyzer::semantic::{
 };
 use crate::query::ResolvedCallReceiverType;
 use crate::query::{
-    QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand,
+    AbsentMemberProofFilter, QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp,
+    QueryRowPredicateOperand,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
@@ -15,6 +16,7 @@ fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> 
         PipelineValue::CallShape(shape) => Some(&shape.report.outcome.file),
         PipelineValue::CallResultContract(contract) => Some(contract.file()),
         PipelineValue::CallResultObligation(obligation) => Some(obligation.file()),
+        PipelineValue::ResultSubjectUse(result_use) => Some(&result_use.file),
         PipelineValue::ResultContractUse(result_use) => Some(result_use.file()),
         PipelineValue::ResultContractFailureUse(result_use) => Some(result_use.file()),
         _ => None,
@@ -28,6 +30,14 @@ fn semantic_artifact_window_file<'a>(
     if matches!(step, QueryStep::DecoratorBindings(_)) {
         return match value {
             PipelineValue::StructuralMatch(seed) => Some(&seed.file),
+            _ => None,
+        };
+    }
+    if matches!(step, QueryStep::ResultSubjectUses) {
+        return match value {
+            PipelineValue::Semantic(SemanticPipelineValue::CallResult(result)) => {
+                Some(result.file())
+            }
             _ => None,
         };
     }
@@ -55,6 +65,23 @@ fn keyed_endpoint_matches_seed(seed: &SeedMatch, endpoint: &RuntimeKeyedReadEndp
 
 fn same_byte_span(left: crate::analyzer::Range, right: crate::analyzer::Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
+}
+
+fn project_result_subject_assignment(
+    result: &SemanticCallResultValue,
+    evidence: &crate::analyzer::JavaLocalAssignmentEvidence,
+) -> Option<CodeQueryResultSubjectAssignment> {
+    if !evidence.preserves_reference_identity() {
+        return None;
+    }
+    Some(CodeQueryResultSubjectAssignment {
+        source_digest: evidence.source_digest.to_string(),
+        assignment: result.public_range_for_source_range(evidence.assignment),
+        target_binding: result.public_range_for_source_range(evidence.target_binding),
+        source_type_id: evidence.source_reference_type_id()?,
+        target_type_id: evidence.target_reference_type_id()?,
+        conversion: evidence.conversion.kind.label(),
+    })
 }
 
 fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdentity) -> bool {
@@ -153,7 +180,9 @@ fn resolved_call_filter_matches(value: &CallBindingValue, filter: &ResolvedCallF
                     crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
                 )
                 && !row.terminal
-                && row.argument_id.is_some()
+                && (row.argument_id.is_some()
+                    || row.binding_kind
+                        == Some(crate::analyzer::usages::call_binding::CallBindingKind::Receiver))
         }
     }
 }
@@ -183,6 +212,9 @@ fn row_literal_matches(actual: CodeQueryRowScalarRef<'_>, literal: &QueryRowLite
             CodeQueryRowScalarRef::ConstrainedEnum(actual),
             QueryRowLiteral::ConstrainedEnum(expected),
         ) => actual == expected,
+        (CodeQueryRowScalarRef::StringList(actual), QueryRowLiteral::StringList(expected)) => {
+            actual == expected
+        }
         (CodeQueryRowScalarRef::Integer(actual), QueryRowLiteral::Integer(expected)) => {
             actual == *expected
         }
@@ -396,6 +428,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallEffect(_)
                     | PipelineValue::CallResultContract(_)
                     | PipelineValue::CallResultObligation(_)
+                    | PipelineValue::ResultSubjectUse(_)
                     | PipelineValue::ResultContractUse(_)
                     | PipelineValue::ResultContractFailureUse(_)
                     | PipelineValue::NilnessOperation(_)
@@ -499,6 +532,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallResultObligation(_)
                                 | PipelineValue::ResultContractUse(_)
                                 | PipelineValue::ResultContractFailureUse(_)
+                                | PipelineValue::ResultSubjectUse(_)
                                 | PipelineValue::NilnessOperation(_)
                                 | PipelineValue::SwitchCoverage(_)
                                 | PipelineValue::AssignmentRelation(_)
@@ -612,6 +646,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallResultObligation(_)
                         | PipelineValue::ResultContractUse(_)
                         | PipelineValue::ResultContractFailureUse(_)
+                        | PipelineValue::ResultSubjectUse(_)
                         | PipelineValue::NilnessOperation(_)
                         | PipelineValue::SwitchCoverage(_)
                         | PipelineValue::AssignmentRelation(_)
@@ -1088,7 +1123,7 @@ pub(super) fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
         if plan.steps.iter().any(|step| {
             matches!(
                 step,
-                QueryStep::ValueFlow(_) | QueryStep::ClassSet | QueryStep::AbsentMember
+                QueryStep::ValueFlow(_) | QueryStep::ClassSet | QueryStep::AbsentMember(_)
             )
         }) {
             return true;
@@ -1115,7 +1150,7 @@ pub(super) fn python_absent_member_file(
             || plan
                 .steps
                 .iter()
-                .any(|step| matches!(step, QueryStep::AbsentMember));
+                .any(|step| matches!(step, QueryStep::AbsentMember(_)));
         let (languages, globs) = match &plan.source {
             CodeQueryPlanSource::Seed(seed) => (&seed.languages, &seed.where_globs),
             CodeQueryPlanSource::Occurrences(seed) => (&seed.languages, &seed.where_globs),
@@ -1413,17 +1448,25 @@ pub(super) fn apply_pipeline_step(
     ) && semantic
         .as_ref()
         .is_some_and(SemanticQueryContext::can_start_artifact_windows);
+    let window_result_subject_artifacts = matches!(step, QueryStep::ResultSubjectUses)
+        && semantic
+            .as_ref()
+            .is_some_and(SemanticQueryContext::can_start_artifact_windows);
     let window_decorated_parameter_artifacts = matches!(step, QueryStep::DecoratorBindings(_))
         && semantic
             .as_ref()
             .is_some_and(SemanticQueryContext::can_start_artifact_windows);
-    let window_semantic_artifacts =
-        window_result_contract_artifacts || window_decorated_parameter_artifacts;
+    let window_semantic_artifacts = window_result_contract_artifacts
+        || window_result_subject_artifacts
+        || window_decorated_parameter_artifacts;
     let mut rows = rows;
     let window_result_contract_candidates = matches!(step, QueryStep::ResultContractCalls);
     let sort_result_contract_rows =
         window_result_contract_candidates || window_result_contract_artifacts;
-    let sort_artifact_rows = sort_result_contract_rows || window_decorated_parameter_artifacts;
+    let sort_artifact_rows = sort_result_contract_rows
+        || window_result_subject_artifacts
+        || window_decorated_parameter_artifacts;
+    let release_effect_file_windows = sort_result_contract_rows || window_result_subject_artifacts;
     if sort_artifact_rows {
         rows.sort_by(|left, right| {
             semantic_artifact_window_file(&left.value, step)
@@ -1437,8 +1480,11 @@ pub(super) fn apply_pipeline_step(
 
     let mut indexed_declarations = indexed_declarations;
     let mut rows = rows.into_iter();
+    // The strongest absent-member tier is known only after equal findings
+    // from every procedure root have merged below.
+    let merge_absent_member_findings_before_filter = matches!(step, QueryStep::AbsentMember(_));
     'rows: while let Some(mut row) = rows.next() {
-        if output.len() >= max_step_outputs {
+        if output.len() >= max_step_outputs && !merge_absent_member_findings_before_filter {
             break;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1450,7 +1496,7 @@ pub(super) fn apply_pipeline_step(
                 flow_state_cache.release_file_window();
                 control_relation_cache.release_file_window();
             }
-            if sort_result_contract_rows {
+            if release_effect_file_windows {
                 call_cache.effects.release_file_window();
             }
             return (output, true, receiver_truncated);
@@ -1475,7 +1521,7 @@ pub(super) fn apply_pipeline_step(
                         flow_state_cache.release_file_window();
                         control_relation_cache.release_file_window();
                     }
-                    if window_result_contract_candidates {
+                    if window_result_contract_candidates || window_result_subject_artifacts {
                         call_cache.effects.release_file_window();
                     }
                 }
@@ -1952,7 +1998,7 @@ pub(super) fn apply_pipeline_step(
                 .collect(),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
-                QueryStep::AbsentMember,
+                QueryStep::AbsentMember(_),
             ) => semantic
                 .as_mut()
                 .expect("absent-member query service exists for semantic steps")
@@ -2666,6 +2712,7 @@ pub(super) fn apply_pipeline_step(
                     seed,
                     &mut enclosing_declarations,
                     semantic.as_mut(),
+                    cancellation,
                 )
                 .into_iter()
                 .filter(|expansion| match &expansion.value {
@@ -2826,6 +2873,87 @@ pub(super) fn apply_pipeline_step(
                         .collect()
                 })
                 .unwrap_or_default(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::CallResult(result)),
+                QueryStep::ResultSubjectUses,
+            ) => {
+                let expanded = effects::result_subject_use_expansions(
+                    workspace.expect("result-subject use expansion requires a semantic workspace"),
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    flow_state_cache,
+                    limits,
+                    cancellation,
+                    result,
+                );
+                expanded
+                    .uses
+                    .into_iter()
+                    .map(|expanded| {
+                        let mut row = expanded.row;
+                        let certificate_count = expanded.assignment_conversions.len();
+                        let conversion_witnesses = expanded
+                            .assignment_conversions
+                            .iter()
+                            .map(|evidence| project_result_subject_assignment(result, evidence))
+                            .collect::<Option<Vec<_>>>();
+                        match conversion_witnesses {
+                            Some(conversion_witnesses)
+                                if conversion_witnesses.len() == certificate_count =>
+                            {
+                                row.conversion_witnesses = conversion_witnesses;
+                            }
+                            _ => {
+                                row.conversion_witnesses.clear();
+                                row.subject_id = None;
+                                row.proof = "unproven";
+                                row.completeness = "partial";
+                                row.outcome = CodeQueryResultSubjectOutcome::Incomplete;
+                                row.reason =
+                                    Some("result_subject_assignment_witness_projection_incomplete");
+                            }
+                        }
+                        if row.completeness != "complete" {
+                            let code = match row.outcome {
+                                CodeQueryResultSubjectOutcome::Cancelled => {
+                                    CodeQueryDiagnosticCode::Cancelled
+                                }
+                                CodeQueryResultSubjectOutcome::BudgetExhausted => {
+                                    CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                                }
+                                _ => CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            };
+                            let message = format!(
+                                "result_subject_uses: {}",
+                                row.reason.unwrap_or("receiver partition is incomplete")
+                            );
+                            if !diagnostics.iter().any(|diagnostic| {
+                                diagnostic.code == code
+                                    && diagnostic.language == row.language
+                                    && diagnostic.message == message
+                            }) {
+                                diagnostics.push(CodeQueryDiagnostic {
+                                    code,
+                                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                                    branch: Vec::new(),
+                                    language: row.language,
+                                    message,
+                                    exhausted_roots: Vec::new(),
+                                });
+                            }
+                        }
+                        pipeline_expansion(PipelineValue::ResultSubjectUse(Box::new(
+                            ResultSubjectUseValue {
+                                row,
+                                assignment_conversions: expanded.assignment_conversions,
+                                file: result.file().clone(),
+                            },
+                        )))
+                    })
+                    .collect()
+            }
             (PipelineValue::CallArgumentGroup(value), QueryStep::CallArguments) => {
                 call_shape::call_argument_expansions(value)
             }
@@ -3811,6 +3939,7 @@ pub(super) fn apply_pipeline_step(
             QueryStep::CallResultContracts
                 | QueryStep::CallResultObligations
                 | QueryStep::ResultContractUses
+                | QueryStep::ResultSubjectUses
         ) && semantic
             .as_ref()
             .is_some_and(|service| service.work().budget_exhausted)
@@ -3838,6 +3967,8 @@ pub(super) fn apply_pipeline_step(
                     PipelineValue::CallResultContract(value)
                         if !value.terminal && value.result_ordinal.is_some()
                 ))
+                || (window_result_subject_artifacts
+                    && matches!(&expansion.value, PipelineValue::ResultSubjectUse(_)))
                 || (window_decorated_parameter_artifacts
                     && matches!(
                         &expansion.value,
@@ -3880,8 +4011,22 @@ pub(super) fn apply_pipeline_step(
         flow_state_cache.release_file_window();
         control_relation_cache.release_file_window();
     }
-    if sort_result_contract_rows {
+    if release_effect_file_windows {
         call_cache.effects.release_file_window();
+    }
+
+    if let QueryStep::AbsentMember(proof) = step {
+        output.retain(|row| {
+            let PipelineValue::AbsentMemberFinding(finding) = &row.value else {
+                unreachable!("absent_member emits only absent-member findings");
+            };
+            match proof {
+                AbsentMemberProofFilter::Proven => finding.proof.is_proven(),
+                AbsentMemberProofFilter::Conditional => !finding.proof.is_proven(),
+                AbsentMemberProofFilter::Any => true,
+            }
+        });
+        output.truncate(max_step_outputs);
     }
 
     if filter_witnessed_candidate && !filter_selected_candidate {

@@ -46,6 +46,7 @@ impl WorkStager {
         }
     }
 
+    #[track_caller]
     pub(super) fn charge(&mut self, work: SemanticWork) -> Result<(), Interruption> {
         let reported = self.work.conservative_add(work);
         if let Err(exceeded) = self.budget.charge(work) {

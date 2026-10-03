@@ -50,6 +50,22 @@ pub(crate) const JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY: &str = "javascript:jsx";
 pub struct JavascriptAdapter;
 
 impl LanguageAdapter for JavascriptAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn js_ts_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::JavaScript
     }
@@ -191,6 +207,18 @@ pub struct JavascriptAnalyzer {
 }
 
 impl JsTsSource for JavascriptAnalyzer {
+    fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        crate::analyzer::IAnalyzer::source_file_inventory(&self.inner)
+    }
+
+    fn source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>> {
+        self.inner
+            .canonical_js_ts_source_facts(file, &self.memo_caches.source_facts)
+    }
+
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
@@ -237,7 +265,7 @@ impl JsTsSource for JavascriptAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<Arc<JsTsUsageIndex>> {
         cancellation.map_or_else(
-            || Some(providers::jsts_usage_index(self)),
+            || providers::jsts_usage_index(self),
             |token| providers::jsts_usage_index_with_cancellation(self, token),
         )
     }

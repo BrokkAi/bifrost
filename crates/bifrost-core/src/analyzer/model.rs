@@ -628,6 +628,8 @@ impl CodeUnitType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ParameterMetadata {
     label: String,
+    #[serde(default)]
+    name: Option<String>,
     start_byte: usize,
     end_byte: usize,
 }
@@ -721,10 +723,51 @@ pub struct CallableFacts {
     pub is_function: bool,
 }
 
+/// Source classification of a class-like declaration. Absence in metadata means
+/// the producer did not publish the classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClassLikeKind {
+    Class,
+    Interface,
+    Struct,
+    Enum,
+}
+
+impl ClassLikeKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "class" => Some(Self::Class),
+            "interface" => Some(Self::Interface),
+            "struct" => Some(Self::Struct),
+            "enum" => Some(Self::Enum),
+            _ => None,
+        }
+    }
+}
+
 impl ParameterMetadata {
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     pub fn new(label: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
         Self {
             label: label.into(),
+            name: None,
             start_byte,
             end_byte,
         }
@@ -835,6 +878,19 @@ impl DispatchExtensibility {
             _ => None,
         }
     }
+}
+
+/// Source-owned Java type construction shape, independent of native routing
+/// eligibility and of explicit callable constructor metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum JavaTypeConstructorShape {
+    /// This type has no implicit ordinary-class constructor.
+    NoImplicit,
+    /// An ordinary class has no explicit constructor and accepts zero arguments.
+    Default,
+    /// The record's canonical owner shape. Readers prefer applicable explicit
+    /// constructors before using this owner-level fallback.
+    RecordCanonical(CallableArity),
 }
 
 /// Which member of the override-modifier family one callable declaration
@@ -1025,6 +1081,8 @@ pub struct SignatureMetadata {
     /// Whether this class-like declaration is an interface.
     #[serde(default)]
     class_like_is_interface: bool,
+    #[serde(default)]
+    class_like_kind: Option<ClassLikeKind>,
     /// Which override-family modifier this callable declaration states.
     ///
     /// `None` means the adapter never read the declaration's modifier nodes
@@ -1039,6 +1097,10 @@ pub struct SignatureMetadata {
     /// nested class can reach an instance member of an enclosing class.
     #[serde(default)]
     class_like_is_static: bool,
+    /// None means this row does not publish Java type construction shape.
+    /// It is not proof that the type has no implicit constructor.
+    #[serde(default)]
+    java_type_constructor_shape: Option<JavaTypeConstructorShape>,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1409,6 +1471,24 @@ impl StructuredTypeName {
 
     pub const fn is_absolute(&self) -> bool {
         self.absolute
+    }
+
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.path
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.lexical_scope
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.path
+                    .iter()
+                    .chain(&self.lexical_scope)
+                    .map(String::capacity)
+                    .sum(),
+            )
     }
 
     fn is_valid(&self) -> bool {
@@ -1977,6 +2057,25 @@ impl StructuredTypeIdentity {
         })
     }
 
+    /// Heap storage owned by the flat type arena, excluding this value itself.
+    pub fn estimated_retained_bytes(&self) -> usize {
+        self.nodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StructuredTypeNode>())
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .map(|node| match node {
+                        StructuredTypeNode::Named(name) => name.estimated_retained_bytes(),
+                        StructuredTypeNode::Generic { arguments, .. } => arguments
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<StructuredTypeNodeId>()),
+                        _ => 0,
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
     pub fn nominal_name(&self) -> Option<&StructuredTypeName> {
         self.nominal_name_with(|| true)
     }
@@ -2389,7 +2488,9 @@ impl SignatureMetadata {
             callable_is_native: false,
             callable_override_modifier: None,
             class_like_is_interface: false,
+            class_like_kind: None,
             class_like_is_static: false,
+            java_type_constructor_shape: None,
         }
     }
 
@@ -2438,6 +2539,17 @@ impl SignatureMetadata {
         self.callable_is_constructor = is_constructor;
         self.callable_declared_visibility = Some(visibility);
         self.callable_modifiers_recorded = true;
+        self
+    }
+
+    /// Override only the source-owned visibility cell for a declaration.
+    ///
+    /// This is intentionally independent of the callable modifier flags:
+    /// source visibility also covers declarations that have no native
+    /// callable projection, and it must not turn an otherwise-unread metadata
+    /// row into proof that callable modifiers were inspected.
+    pub fn with_source_declared_visibility(mut self, visibility: DeclaredVisibility) -> Self {
+        self.callable_declared_visibility = Some(visibility);
         self
     }
 
@@ -2522,6 +2634,15 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_java_type_constructor_shape(mut self, shape: JavaTypeConstructorShape) -> Self {
+        self.java_type_constructor_shape = Some(shape);
+        self
+    }
+
+    pub fn java_type_constructor_shape(&self) -> Option<JavaTypeConstructorShape> {
+        self.java_type_constructor_shape
+    }
+
     pub fn callable_is_static(&self) -> bool {
         self.callable_is_static
     }
@@ -2546,8 +2667,21 @@ impl SignatureMetadata {
         self.callable_is_native
     }
 
+    pub fn with_class_like_kind(mut self, kind: ClassLikeKind) -> Self {
+        self.class_like_kind = Some(kind);
+        self.class_like_is_interface = false;
+        self
+    }
+
+    pub fn class_like_kind(&self) -> Option<ClassLikeKind> {
+        self.class_like_kind
+    }
+
     pub fn class_like_is_interface(&self) -> bool {
-        self.class_like_is_interface
+        self.class_like_kind
+            .map_or(self.class_like_is_interface, |kind| {
+                kind == ClassLikeKind::Interface
+            })
     }
 
     pub fn class_like_is_static(&self) -> bool {
@@ -4153,18 +4287,23 @@ pub enum StructuredImportPathKind {
     /// `import static a.b.C.member;`). The parser records the token so
     /// consumers never re-derive staticness from `raw_snippet` text.
     StaticMember,
+    /// A Rust `extern crate` declaration. The parser records this distinct
+    /// binding form because it introduces the crate itself rather than the
+    /// names exported by a `use` path.
+    ExternCrate,
 }
 
 impl StructuredImportPathKind {
     /// The spelling this variant is stored under in
     /// `import_statements.path_kind`. That column's `CHECK` lists exactly these
-    /// three strings, so the enum and the schema's closed vocabulary stay one
+    /// four strings, so the enum and the schema's closed vocabulary stay one
     /// declaration apart instead of drifting.
     pub const fn persist_tag(self) -> &'static str {
         match self {
             Self::Namespace => "namespace",
             Self::ImportFrom => "import_from",
             Self::StaticMember => "static_member",
+            Self::ExternCrate => "extern_crate",
         }
     }
 
@@ -4173,8 +4312,31 @@ impl StructuredImportPathKind {
             "namespace" => Some(Self::Namespace),
             "import_from" => Some(Self::ImportFrom),
             "static_member" => Some(Self::StaticMember),
+            "extern_crate" => Some(Self::ExternCrate),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_import_path_kind_tests {
+    use super::StructuredImportPathKind;
+
+    #[test]
+    fn persisted_tags_round_trip_and_preserve_existing_spellings() {
+        for (kind, tag) in [
+            (StructuredImportPathKind::Namespace, "namespace"),
+            (StructuredImportPathKind::ImportFrom, "import_from"),
+            (StructuredImportPathKind::StaticMember, "static_member"),
+            (StructuredImportPathKind::ExternCrate, "extern_crate"),
+        ] {
+            assert_eq!(kind.persist_tag(), tag);
+            assert_eq!(StructuredImportPathKind::from_persist_tag(tag), Some(kind));
+        }
+        assert_eq!(
+            StructuredImportPathKind::from_persist_tag("not-a-path-kind"),
+            None
+        );
     }
 }
 
@@ -4188,10 +4350,10 @@ pub struct StructuredImportScope {
 pub struct ImportInfo {
     pub raw_snippet: String,
     pub is_wildcard: bool,
-    /// The import binds beyond its own file. C#'s `global using` is the only
-    /// language form that sets this; every other adapter leaves it false.
-    /// It is recorded by the parser because consumers otherwise detect the
-    /// form by matching the prefix `global using ` against `raw_snippet`.
+    /// The import is anchored outside its ordinary lexical context. C#'s
+    /// `global using` and Rust's leading-`::` use path are examples. It is
+    /// recorded by the parser because consumers otherwise have to recover the
+    /// anchor from `raw_snippet` text.
     #[serde(default)]
     pub is_global: bool,
     pub identifier: Option<String>,
@@ -4269,6 +4431,9 @@ pub struct SemanticAbsenceProof {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticDiagnosticIncompleteReason {
+    CanonicalFactsUnavailable {
+        detail: String,
+    },
     MissingDependencyDiscovery {
         boundary: BoundaryStatus,
     },
@@ -4695,9 +4860,37 @@ pub enum DeclarationKind {
     LambdaParameter,
     PatternVariable,
     ResourceVariable,
+    /// A named field whose containing type has no workspace CodeUnit.
+    Field,
+    /// An item declared inside an executable or block scope.
+    ///
+    /// Rust items are scope-wide lexical binders even inside a block, so a
+    /// reference resolves to them exactly, but the parser-unit inventory is
+    /// module-owned and cannot represent them. Publishing them as out-of-graph
+    /// canonical source declarations gives navigation a located, honest,
+    /// non-navigable target instead of an unavailable operation.
+    BlockLocalItem,
 }
 
 impl DeclarationKind {
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "parameter" => Some(Self::Parameter),
+            "receiver_parameter" => Some(Self::ReceiverParameter),
+            "import_alias" => Some(Self::ImportAlias),
+            "statement_label" => Some(Self::StatementLabel),
+            "local_variable" => Some(Self::LocalVariable),
+            "catch_parameter" => Some(Self::CatchParameter),
+            "enhanced_for_variable" => Some(Self::EnhancedForVariable),
+            "lambda_parameter" => Some(Self::LambdaParameter),
+            "pattern_variable" => Some(Self::PatternVariable),
+            "resource_variable" => Some(Self::ResourceVariable),
+            "field" => Some(Self::Field),
+            "block_local_item" => Some(Self::BlockLocalItem),
+            _ => None,
+        }
+    }
+
     /// Stable snake_case label for wire output and rendering.
     pub const fn label(self) -> &'static str {
         match self {
@@ -4711,6 +4904,8 @@ impl DeclarationKind {
             Self::LambdaParameter => "lambda_parameter",
             Self::PatternVariable => "pattern_variable",
             Self::ResourceVariable => "resource_variable",
+            Self::Field => "field",
+            Self::BlockLocalItem => "block_local_item",
         }
     }
 }
@@ -5768,5 +5963,37 @@ mod identity_cost_tests {
                 "{path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod source_declared_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn source_visibility_override_preserves_callable_flags_and_read_status() {
+        let unread = SignatureMetadata::new("run()", Vec::new())
+            .with_source_declared_visibility(DeclaredVisibility::Public);
+        assert_eq!(
+            unread.callable_declared_visibility(),
+            Some(DeclaredVisibility::Public)
+        );
+        assert!(!unread.callable_is_static());
+        assert!(!unread.callable_is_constructor());
+        assert!(!unread.callable_modifiers_recorded());
+        assert!(!unread.callable_is_native());
+
+        let recorded = SignatureMetadata::new("run()", Vec::new())
+            .with_callable_modifiers(true, true, DeclaredVisibility::Private)
+            .with_callable_native(true)
+            .with_source_declared_visibility(DeclaredVisibility::Protected);
+        assert_eq!(
+            recorded.callable_declared_visibility(),
+            Some(DeclaredVisibility::Protected)
+        );
+        assert!(recorded.callable_is_static());
+        assert!(recorded.callable_is_constructor());
+        assert!(recorded.callable_modifiers_recorded());
+        assert!(recorded.callable_is_native());
     }
 }

@@ -1,24 +1,18 @@
-use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use semver::{Version, VersionReq};
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use brokk_bifrost_core::analyzer::rust_facts::{
-    RustMacroGateFact, RustModuleRouteFact, RustModuleRouteFacts, RustModuleScopeFact,
-    RustRulesItemMacroDefinition, RustVisibility,
+    RustCfgCondition, RustModuleRouteFact, RustModuleRouteFacts, RustVisibility,
 };
 
-use crate::declarations::{
-    rust_macro_invocation_arguments, rust_package_name, rust_unqualified_macro_invocation_name,
-};
-use crate::imports::{
-    rust_external_module_route, rust_external_module_segments, rust_item_visibility,
-};
-use crate::syntax::{item_has_path_attribute, unwrap_attributes};
+use crate::cargo_manifest::RustCargoManifestDocument;
+use crate::declarations::rust_package_name;
+use crate::imports::{rust_external_module_route, rust_external_module_segments};
 
 // How many times one Cargo-route build has iterated the complete analyzed
 // file set (issue #1817).
@@ -59,24 +53,24 @@ fn workspace_file_sweeps_of(build: impl FnOnce()) -> usize {
     WORKSPACE_FILE_SWEEPS.with(std::cell::Cell::get)
 }
 
-fn read_manifest(root: &Path, directory: &Path) -> Option<toml::Value> {
-    std::fs::read_to_string(root.join(directory).join("Cargo.toml"))
+fn read_manifest(root: &Path, directory: &Path) -> Option<RustCargoManifestDocument> {
+    std::fs::read(root.join(directory).join("Cargo.toml"))
         .ok()
-        .and_then(|source| toml::from_str(&source).ok())
+        .and_then(|source_bytes| {
+            RustCargoManifestDocument::from_source_bytes(source_bytes.into_boxed_slice()).ok()
+        })
 }
 
 fn cargo_crate(
     root: &Path,
     directory: PathBuf,
-    manifest: toml::Value,
-    manifests: &HashMap<PathBuf, toml::Value>,
+    manifest: RustCargoManifestDocument,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
 ) -> Option<CargoCrate> {
     let package_name = cargo_manifest_package_name(&manifest)?;
     let edition = cargo_package_edition(root, &directory, &manifest, manifests);
     let explicit_library = manifest.get("lib");
-    let library = if explicit_library.is_some()
-        || cargo_auto_discovery_enabled(&manifest, "autolib", &edition)
-    {
+    let library = if explicit_library.is_some() || cargo_library_discovery_enabled(&manifest) {
         let library_table = match explicit_library {
             Some(library) => Some(library.as_table()?),
             None => None,
@@ -139,9 +133,8 @@ pub struct RustCargoModuleDeclaration {
     /// Whether this module route imports its child's module-scope macros.
     pub imports_macros: bool,
     /// Whether the `mod x;` item carries a bare `#[cfg(test)]`, so the declared
-    /// file is compiled into test builds only. See
-    /// [`rust_declaration_is_bare_cfg_test_gated`] for why only the bare
-    /// predicate counts.
+    /// file is compiled into test builds only. The canonical route facts carry
+    /// this structured verdict; only the bare predicate counts.
     pub test_gated: bool,
 }
 
@@ -159,7 +152,7 @@ pub enum RustCargoTargetRelation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum RustCargoTargetKind {
+pub(crate) enum RustCargoTargetKind {
     Library,
     Binary,
     Example,
@@ -203,7 +196,7 @@ struct CargoCrate {
     package_name: String,
     library: Option<CargoLibrary>,
     edition: String,
-    manifest: toml::Value,
+    manifest: RustCargoManifestDocument,
 }
 
 struct CargoLibrary {
@@ -212,12 +205,18 @@ struct CargoLibrary {
     root_package: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RustVisibleItemMacroDefinition {
     visible_after: usize,
     scope_start: usize,
     scope_end: usize,
-    passthrough: bool,
+    /// The activation the definition's rules add to each item they replay,
+    /// when the definition decides its invocations: a passthrough whose rules
+    /// add only `cfg` (and documentation) attributes. `None` when it does not,
+    /// as `source_rust_item_macros.decoration_cfg` is NULL, so a `mod` route
+    /// through its invocation is not admitted, exactly as the crate's module
+    /// walk leaves it undecided.
+    decoration: Option<RustCfgCondition>,
 }
 
 impl RustCargoRouteIndex {
@@ -233,8 +232,11 @@ impl RustCargoRouteIndex {
     /// tree's 347 manifests parse in 4.9 ms warm), and the path resolution and
     /// existence checks the content-keyed rows deliberately do not carry.
     ///
-    /// A file missing from `module_route_facts` contributes no module edges,
-    /// which is exactly what a failed hydration did before.
+    /// The composer remains tolerant of missing entries for synthetic callers,
+    /// but this function does not establish canonical publication readiness.
+    /// Production callers must verify that every live root has its canonical
+    /// route witness before composing an index; a missing entry there is
+    /// unavailable, not an empty route result.
     ///
     /// Issue #1817 is the orchestration around that read. It used to rediscover
     /// the whole Cargo topology inside each of its two module-membership
@@ -391,7 +393,7 @@ impl RustCargoRouteIndex {
                                 visible_after,
                                 scope_start,
                                 scope_end,
-                                passthrough: definition.passthrough,
+                                decoration: definition.decoration.clone(),
                             });
                     }
                 }
@@ -450,7 +452,7 @@ impl RustCargoRouteIndex {
                     let before = child_bindings.values().map(Vec::len).sum::<usize>();
                     for (name, definitions) in &bindings {
                         keep_going().then_some(())?;
-                        let Some(passthrough) = rust_latest_visible_item_macro(
+                        let Some(decoration) = rust_latest_visible_item_macro(
                             definitions,
                             edge.declaration_start_byte,
                         ) else {
@@ -460,7 +462,7 @@ impl RustCargoRouteIndex {
                             visible_after: 0,
                             scope_start: child_start,
                             scope_end: child_end,
-                            passthrough,
+                            decoration,
                         };
                         let definitions = child_bindings.entry(name.clone()).or_default();
                         if !definitions.contains(&inherited) {
@@ -473,7 +475,7 @@ impl RustCargoRouteIndex {
                             visible_after: definition.visible_after,
                             scope_start: definition.scope_start,
                             scope_end: definition.scope_end,
-                            passthrough: definition.passthrough,
+                            decoration: definition.decoration.clone(),
                         };
                         let definitions =
                             child_bindings.entry(definition.name.clone()).or_default();
@@ -534,58 +536,6 @@ impl RustCargoRouteIndex {
         index.external_module_declarations = external_module_declarations;
         index.test_only_files = index.build_test_only_files_while(keep_going)?;
         Some(index)
-    }
-
-    /// The index over a caller-supplied module-edge function, with no macro
-    /// expansion stage. Only the manifest topology and the membership it
-    /// implies; the declaration list and the test-only complement stay empty,
-    /// as they did before issue #1817.
-    #[cfg(test)]
-    fn build_from_module_children(
-        files: &[ProjectFile],
-        module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
-    ) -> Self {
-        let keep_going = || true;
-        let Some(root) = files.first().map(ProjectFile::root) else {
-            return Self::default();
-        };
-        let manifest_directories = discover_cargo_manifest_directories(root, files, &keep_going)
-            .expect("uninterrupted Cargo manifest discovery");
-        let topology =
-            CargoManifestTopology::discover(root, files, manifest_directories, &keep_going)
-                .expect("uninterrupted Cargo topology discovery");
-        let target_roots_by_file = topology
-            .target_memberships_while(module_children, &keep_going)
-            .expect("uninterrupted Cargo target membership walk");
-        topology
-            .into_index(target_roots_by_file, &keep_going)
-            .expect("uninterrupted Rust Cargo manifest-route construction")
-    }
-
-    #[cfg(test)]
-    fn build_from_disk(files: &[ProjectFile]) -> Self {
-        Self::build_from_module_children(files, |file, is_crate_root, _target| {
-            let Ok(source) = file.read_to_string() else {
-                return Vec::new();
-            };
-            let mut parser = tree_sitter::Parser::new();
-            if parser
-                .set_language(&tree_sitter_rust::LANGUAGE.into())
-                .is_err()
-            {
-                return Vec::new();
-            }
-            let Some(tree) = parser.parse(&source, None) else {
-                return Vec::new();
-            };
-            rust_external_module_children(
-                file,
-                &source,
-                tree.root_node(),
-                is_crate_root,
-                &HashMap::default(),
-            )
-        })
     }
 
     pub fn candidates_in_same_target_root(
@@ -1158,32 +1108,15 @@ impl CargoManifestTopology {
                         raw_dependency,
                         &manifests,
                     );
-                    let target = dependency
-                        .as_ref()
-                        .and_then(|(dependency, _)| dependency.get("path"))
-                        .and_then(toml::Value::as_str)
-                        .and_then(|path| {
-                            workspace_relative_path(
-                                root,
-                                dependency
-                                    .as_ref()
-                                    .map(|(_, base)| base.as_path())
-                                    .unwrap_or(&cargo_crate.directory),
-                                Path::new(path),
-                            )
-                        })
-                        .or_else(|| {
-                            cargo_patched_dependency_directory(
-                                root,
-                                &cargo_crate.directory,
-                                &cargo_crate.manifest,
-                                exposed_name,
-                                dependency.as_ref().map(|(dependency, _)| *dependency),
-                                raw_dependency,
-                                &manifests,
-                            )
-                        })
-                        .and_then(|directory| crate_by_directory.get(&directory).copied());
+                    let target = cargo_dependency_directory(
+                        root,
+                        &cargo_crate.directory,
+                        &cargo_crate.manifest,
+                        exposed_name,
+                        raw_dependency,
+                        &manifests,
+                    )
+                    .and_then(|directory| crate_by_directory.get(&directory).copied());
                     if let Some(target) = target {
                         let Some(target_library) = crates[target].library.as_ref() else {
                             continue;
@@ -1339,7 +1272,7 @@ fn files_by_target_root(
 /// sit. `auto_cargo_target_kind` matches relative paths of two, three or four
 /// components and nothing else, which
 /// `auto_target_paths_stay_within_the_grouped_depth` pins.
-const AUTO_TARGET_MAX_DEPTH: usize = 4;
+pub(crate) const AUTO_TARGET_MAX_DEPTH: usize = 4;
 const AUTO_TARGET_MIN_DEPTH: usize = 2;
 
 /// Group every analyzed file under each manifest directory that could
@@ -1486,178 +1419,6 @@ fn cargo_target_memberships(
     Some(owners)
 }
 
-/// Extract what the Cargo route index needs from one parsed Rust file.
-///
-/// Called from `parse_rust_file` with the tree that pass already holds, and
-/// content-only by construction: nothing here reads the file's path or the file
-/// system, because the rows are keyed by content hash and two byte-identical
-/// files at different paths share them. Directory resolution, `#[path]`
-/// normalization and the on-disk existence check are
-/// [`module_child_edges`]'s job.
-///
-/// Item-position macro invocations are expanded OPTIMISTICALLY: whether the
-/// invoked name resolves to a macro that replays its item parameters verbatim
-/// depends on the `#[macro_use]` graph across files, which no single file's
-/// bytes can answer. Each route the expansion produces records the invocations
-/// it came out of, and the reader drops it unless every one of them resolves.
-pub fn extract_rust_module_route_facts(
-    root: Node<'_>,
-    source: &str,
-    item_macros: &[RustRulesItemMacroDefinition],
-) -> RustModuleRouteFacts {
-    let mut facts = RustModuleRouteFacts {
-        scopes: vec![RustModuleScopeFact {
-            parent: None,
-            module_name: String::new(),
-            path_attribute: None,
-            imports_macros: true,
-            body_start: root.start_byte(),
-            body_end: root.end_byte(),
-        }],
-        routes: Vec::new(),
-        item_macros: item_macros.to_vec(),
-    };
-    let mut pending_fragments = VecDeque::new();
-    collect_module_route_facts(root, source, 0, 0, &[], &mut pending_fragments, &mut facts);
-    let mut parser = None;
-    while let Some(fragment) = pending_fragments.pop_front() {
-        if parser.is_none() {
-            let mut prepared_parser = Parser::new();
-            if prepared_parser
-                .set_language(&tree_sitter_rust::LANGUAGE.into())
-                .is_err()
-            {
-                break;
-            }
-            parser = Some(prepared_parser);
-        }
-        let Some(parser) = parser.as_mut() else {
-            break;
-        };
-        let Some(tree) = parser.parse(&fragment.source, None) else {
-            continue;
-        };
-        if tree.root_node().has_error() {
-            continue;
-        }
-        collect_module_route_facts(
-            tree.root_node(),
-            &fragment.source,
-            fragment.source_base_byte,
-            fragment.scope,
-            &fragment.gates,
-            &mut pending_fragments,
-            &mut facts,
-        );
-    }
-    facts
-}
-
-/// The item stream of one macro invocation, waiting to be parsed and walked.
-struct RustPendingRouteFragment {
-    source: String,
-    /// Where `source` starts in the declaring file, so every recorded byte
-    /// offset is a file offset.
-    source_base_byte: usize,
-    /// The scope the invocation was written in; a fragment introduces no scope
-    /// of its own, because a macro's items land where it was invoked.
-    scope: usize,
-    gates: Vec<RustMacroGateFact>,
-}
-
-/// Walk one item stream, recording the scopes it opens and the external `mod`
-/// declarations it writes.
-///
-/// Explicit stack, never recursion: this runs over every analyzed Rust file.
-fn collect_module_route_facts(
-    node: Node<'_>,
-    source: &str,
-    source_base_byte: usize,
-    scope: usize,
-    gates: &[RustMacroGateFact],
-    pending_fragments: &mut VecDeque<RustPendingRouteFragment>,
-    facts: &mut RustModuleRouteFacts,
-) {
-    let mut pending_nodes = vec![(node, scope)];
-    while let Some((node, scope)) = pending_nodes.pop() {
-        let mut cursor = node.walk();
-        let named_children: Vec<_> = node.named_children(&mut cursor).collect();
-        // Inline bodies are collected here and pushed in reverse below, so the
-        // stack pops them in source order: the rows are then a plain
-        // source-order pre-order walk, which is what makes a re-analysis of
-        // unchanged bytes produce byte-identical rows.
-        let mut descend = Vec::new();
-        for child in named_children {
-            let child = unwrap_attributes(child);
-            if child.kind() == "macro_invocation" {
-                let Some(name) = rust_unqualified_macro_invocation_name(child, source) else {
-                    continue;
-                };
-                let Some(arguments) = rust_macro_invocation_arguments(child) else {
-                    continue;
-                };
-                let Some(items) = rust_macro_argument_items(arguments, source) else {
-                    continue;
-                };
-                let mut nested = gates.to_vec();
-                nested.push(RustMacroGateFact {
-                    macro_name: name.to_string(),
-                    invocation_start: source_base_byte.saturating_add(child.start_byte()),
-                });
-                pending_fragments.push_back(RustPendingRouteFragment {
-                    source: items.to_string(),
-                    source_base_byte: source_base_byte
-                        .saturating_add(arguments.start_byte().saturating_add(1)),
-                    scope,
-                    gates: nested,
-                });
-                continue;
-            }
-            if child.kind() != "mod_item" {
-                continue;
-            }
-            let Some(name) = child.child_by_field_name("name") else {
-                continue;
-            };
-            let Some(name) = source.get(name.start_byte()..name.end_byte()) else {
-                continue;
-            };
-            let name = strip_raw_identifier_prefix(name);
-            let inherits_macros = facts.scopes[scope].imports_macros;
-            let imports_macros =
-                inherits_macros && item_has_path_attribute(child, source, "macro_use");
-            let path_attribute = rust_path_attribute_value(child, source);
-            if let Some(body) = child.child_by_field_name("body") {
-                facts.scopes.push(RustModuleScopeFact {
-                    parent: Some(scope),
-                    module_name: name.to_string(),
-                    path_attribute,
-                    imports_macros,
-                    body_start: source_base_byte.saturating_add(body.start_byte()),
-                    body_end: source_base_byte.saturating_add(body.end_byte()),
-                });
-                // A scope is appended before its body is walked, so a parent
-                // index is always smaller than its children's -- the pre-order
-                // the stored rows and the reader both rely on.
-                descend.push((body, facts.scopes.len().saturating_sub(1)));
-                continue;
-            }
-            facts.routes.push(RustModuleRouteFact {
-                scope,
-                module_name: name.to_string(),
-                path_attribute,
-                visibility: rust_item_visibility(child, source),
-                imports_macros,
-                test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
-                declaration_start: source_base_byte.saturating_add(child.start_byte()),
-                declaration_end: source_base_byte.saturating_add(child.end_byte()),
-                gates: gates.to_vec(),
-            });
-        }
-        pending_nodes.extend(descend.into_iter().rev());
-    }
-}
-
 /// One scope's resolved directories and qualified module name, for one live
 /// file. Path-derived, so it is recomputed per file and never stored.
 struct ResolvedModuleScope {
@@ -1673,8 +1434,9 @@ struct ResolvedModuleScope {
 /// Resolve one file's persisted module-route facts into the module edges the
 /// index consumes.
 ///
-/// This is the reader half of [`extract_rust_module_route_facts`], and it holds
-/// everything the stored rows deliberately do not: the file's own location,
+/// This is the reader half of the canonical route facts published by
+/// `parse_rust_file`, and it holds everything the stored rows deliberately do
+/// not: the file's own location,
 /// which decides the directory a `mod name;` searches; `#[path]` normalization,
 /// which must run step by step because `canonicalize` resolves symbolic links
 /// at every level; and the on-disk existence check that turns a declaration
@@ -1744,14 +1506,31 @@ fn module_child_edges(
             route.scope < scopes.len(),
             "module route names a scope it does not have: {route:?} in {facts:?}"
         );
-        if !route.gates.iter().all(|gate| {
-            passthrough_macros
+        // A route written inside item-macro invocations is admitted when every
+        // invocation is decided: its macro is a passthrough whose decoration
+        // is known. The crate's module walk admits exactly those routes
+        // (`rust_crate_module_walk.sql`). This index evaluates no profile, so
+        // a decoration is treated as the route's own `cfg` is: a bare
+        // `cfg(test)` marks the edge test-gated, and any other `cfg` is
+        // admitted for the crate's walk to evaluate.
+        let mut test_gated = route.test_gated;
+        let mut decided = true;
+        for gate in &route.gates {
+            match passthrough_macros
                 .get(&gate.macro_name)
                 .and_then(|definitions| {
                     rust_latest_visible_item_macro(definitions, gate.invocation_start)
-                })
-                .unwrap_or(false)
-        }) {
+                }) {
+                Some(Some(decoration)) => {
+                    test_gated |= decoration == RustCfgCondition::Atom("test".to_owned());
+                }
+                Some(None) | None => {
+                    decided = false;
+                    break;
+                }
+            }
+        }
+        if !decided {
             continue;
         }
         let scope = &scopes[route.scope];
@@ -1764,7 +1543,7 @@ fn module_child_edges(
                 else {
                     continue;
                 };
-                push_module_child(root, relative, route, scope, &mut children);
+                push_module_child(root, relative, route, test_gated, scope, &mut children);
             }
             None => {
                 let Some(base) = scope.module_directory.as_ref() else {
@@ -1774,7 +1553,7 @@ fn module_child_edges(
                     base.join(&route.module_name).with_extension("rs"),
                     base.join(&route.module_name).join("mod.rs"),
                 ] {
-                    push_module_child(root, relative, route, scope, &mut children);
+                    push_module_child(root, relative, route, test_gated, scope, &mut children);
                 }
             }
         }
@@ -1788,6 +1567,7 @@ fn push_module_child(
     root: &Path,
     relative: PathBuf,
     route: &RustModuleRouteFact,
+    test_gated: bool,
     scope: &ResolvedModuleScope,
     children: &mut Vec<RustExternalModuleChild>,
 ) {
@@ -1800,7 +1580,7 @@ fn push_module_child(
         declaring_module: scope.declaring_module.clone(),
         visibility: route.visibility.clone(),
         imports_macros: route.imports_macros,
-        test_gated: route.test_gated,
+        test_gated,
         declaration_start_byte: route.declaration_start,
         visibility_start_byte: if route.imports_macros {
             route.declaration_end
@@ -1808,20 +1588,6 @@ fn push_module_child(
             usize::MAX
         },
     });
-}
-
-#[cfg(test)]
-fn rust_external_module_children(
-    file: &ProjectFile,
-    source: &str,
-    root_node: Node<'_>,
-    is_crate_root: bool,
-    passthrough_macros: &HashMap<String, Vec<RustVisibleItemMacroDefinition>>,
-) -> Vec<ProjectFile> {
-    rust_external_module_child_edges(file, source, root_node, is_crate_root, passthrough_macros)
-        .into_iter()
-        .map(|edge| edge.file)
-        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1835,91 +1601,9 @@ struct RustExternalModuleChild {
     visibility_start_byte: usize,
 }
 
-/// The pre-#1793 syntax walk, frozen as the reference the equivalence pin
-/// compares against.
-///
-/// This is what the Cargo-route build called for every analyzed file, with that
-/// file's hydrated tree. `extract_rust_module_route_facts` plus
-/// [`module_child_edges`] must reproduce it exactly, and
-/// `module_child_edges_reproduce_the_syntax_walk` is what holds that honest.
-/// It also still backs `build_from_disk`, whose fixtures have no store.
-#[cfg(test)]
-fn rust_external_module_child_edges(
-    file: &ProjectFile,
-    source: &str,
-    root_node: Node<'_>,
-    is_crate_root: bool,
-    passthrough_macros: &HashMap<String, Vec<RustVisibleItemMacroDefinition>>,
-) -> Vec<RustExternalModuleChild> {
-    let parent = file.rel_path().parent().unwrap_or(Path::new(""));
-    let stem = file
-        .rel_path()
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    let module_directory = if is_crate_root || stem == "mod" {
-        parent.to_path_buf()
-    } else {
-        parent.join(stem)
-    };
-    let mut children = Vec::new();
-    let mut pending_fragments = VecDeque::new();
-    collect_external_module_children(
-        file,
-        source,
-        root_node,
-        &module_directory,
-        parent,
-        passthrough_macros,
-        true,
-        0,
-        &rust_package_name(file),
-        &mut pending_fragments,
-        &mut children,
-    );
-    let mut parser = None;
-    while let Some(fragment) = pending_fragments.pop_front() {
-        if parser.is_none() {
-            let mut prepared_parser = Parser::new();
-            if prepared_parser
-                .set_language(&tree_sitter_rust::LANGUAGE.into())
-                .is_err()
-            {
-                break;
-            }
-            parser = Some(prepared_parser);
-        }
-        let Some(parser) = parser.as_mut() else {
-            break;
-        };
-        let Some(tree) = parser.parse(&fragment.source, None) else {
-            continue;
-        };
-        if tree.root_node().has_error() {
-            continue;
-        }
-        collect_external_module_children(
-            file,
-            &fragment.source,
-            tree.root_node(),
-            &fragment.module_directory,
-            &fragment.path_attribute_directory,
-            passthrough_macros,
-            fragment.imports_macros_to_file_scope,
-            fragment.source_base_byte,
-            &fragment.declaring_module,
-            &mut pending_fragments,
-            &mut children,
-        );
-    }
-    sort_and_merge_module_children(&mut children);
-    children
-}
-
 /// Collapse repeated declarations of the same file into one edge.
 ///
-/// Shared by the fact reader and the frozen syntax walk so the equivalence pin
-/// compares the derivations rather than two copies of this merge.
+/// Shared by every canonical module-route fact reader.
 fn sort_and_merge_module_children(children: &mut Vec<RustExternalModuleChild>) {
     children.sort_by(|left, right| {
         left.file
@@ -1954,175 +1638,10 @@ fn sort_and_merge_module_children(children: &mut Vec<RustExternalModuleChild>) {
     });
 }
 
-#[cfg(test)]
-struct RustPendingMacroFragment {
-    source: String,
-    source_base_byte: usize,
-    module_directory: PathBuf,
-    path_attribute_directory: PathBuf,
-    imports_macros_to_file_scope: bool,
-    declaring_module: String,
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn collect_external_module_children(
-    source_file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    module_directory: &Path,
-    path_attribute_directory: &Path,
-    passthrough_macros: &HashMap<String, Vec<RustVisibleItemMacroDefinition>>,
-    imports_macros_to_file_scope: bool,
-    source_base_byte: usize,
-    declaring_module: &str,
-    pending_fragments: &mut VecDeque<RustPendingMacroFragment>,
-    children: &mut Vec<RustExternalModuleChild>,
-) {
-    let mut pending_nodes = vec![(
-        node,
-        module_directory.to_path_buf(),
-        path_attribute_directory.to_path_buf(),
-        imports_macros_to_file_scope,
-        declaring_module.to_string(),
-    )];
-    while let Some((
-        node,
-        module_directory,
-        path_attribute_directory,
-        imports_macros_to_file_scope,
-        declaring_module,
-    )) = pending_nodes.pop()
-    {
-        let mut cursor = node.walk();
-        let mut named_children: Vec<_> = node.named_children(&mut cursor).collect();
-        named_children.reverse();
-        for child in named_children {
-            let child = unwrap_attributes(child);
-            if child.kind() == "macro_invocation" {
-                let invocation_start = source_base_byte.saturating_add(child.start_byte());
-                let is_passthrough = rust_unqualified_macro_invocation_name(child, source)
-                    .and_then(|name| passthrough_macros.get(name))
-                    .and_then(|definitions| {
-                        rust_latest_visible_item_macro(definitions, invocation_start)
-                    })
-                    .unwrap_or(false);
-                let Some(arguments) = is_passthrough
-                    .then(|| rust_macro_invocation_arguments(child))
-                    .flatten()
-                else {
-                    continue;
-                };
-                let Some(items) = rust_macro_argument_items(arguments, source) else {
-                    continue;
-                };
-                pending_fragments.push_back(RustPendingMacroFragment {
-                    source: items.to_string(),
-                    source_base_byte: source_base_byte
-                        .saturating_add(arguments.start_byte().saturating_add(1)),
-                    module_directory: module_directory.clone(),
-                    path_attribute_directory: path_attribute_directory.clone(),
-                    imports_macros_to_file_scope,
-                    declaring_module: declaring_module.clone(),
-                });
-                continue;
-            }
-            if child.kind() != "mod_item" {
-                continue;
-            }
-            let Some(name) = child.child_by_field_name("name") else {
-                continue;
-            };
-            let Some(name) = source.get(name.start_byte()..name.end_byte()) else {
-                continue;
-            };
-            let name = strip_raw_identifier_prefix(name);
-            if let Some(body) = child.child_by_field_name("body") {
-                let imports_macros = imports_macros_to_file_scope
-                    && item_has_path_attribute(child, source, "macro_use");
-                let inline_directory = match rust_path_attribute(child, source) {
-                    Some(path) => {
-                        let Some(relative) = workspace_relative_path(
-                            source_file.root(),
-                            &path_attribute_directory,
-                            &path,
-                        ) else {
-                            continue;
-                        };
-                        relative
-                    }
-                    None => module_directory.join(name),
-                };
-                pending_nodes.push((
-                    body,
-                    inline_directory.clone(),
-                    inline_directory,
-                    imports_macros,
-                    if declaring_module.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{declaring_module}.{name}")
-                    },
-                ));
-                continue;
-            }
-            if let Some(path) = rust_path_attribute(child, source) {
-                let Some(relative) =
-                    workspace_relative_path(source_file.root(), &path_attribute_directory, &path)
-                else {
-                    continue;
-                };
-                let candidate = source_file.with_rel_path(relative);
-                if candidate.exists() {
-                    let imports_macros = imports_macros_to_file_scope
-                        && item_has_path_attribute(child, source, "macro_use");
-                    children.push(RustExternalModuleChild {
-                        file: candidate,
-                        declaring_module: declaring_module.clone(),
-                        visibility: rust_item_visibility(child, source),
-                        imports_macros,
-                        test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
-                        declaration_start_byte: source_base_byte.saturating_add(child.start_byte()),
-                        visibility_start_byte: if imports_macros {
-                            source_base_byte.saturating_add(child.end_byte())
-                        } else {
-                            usize::MAX
-                        },
-                    });
-                }
-                continue;
-            }
-            for relative in [
-                module_directory.join(name).with_extension("rs"),
-                module_directory.join(name).join("mod.rs"),
-            ] {
-                let candidate = source_file.with_rel_path(relative);
-                if candidate.exists() {
-                    let imports_macros = imports_macros_to_file_scope
-                        && item_has_path_attribute(child, source, "macro_use");
-                    children.push(RustExternalModuleChild {
-                        file: candidate,
-                        declaring_module: declaring_module.clone(),
-                        visibility: rust_item_visibility(child, source),
-                        imports_macros,
-                        test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
-                        declaration_start_byte: source_base_byte.saturating_add(child.start_byte()),
-                        visibility_start_byte: if imports_macros {
-                            source_base_byte.saturating_add(child.end_byte())
-                        } else {
-                            usize::MAX
-                        },
-                    });
-                }
-            }
-        }
-    }
-}
-
 fn rust_latest_visible_item_macro(
     definitions: &[RustVisibleItemMacroDefinition],
     invocation_start: usize,
-) -> Option<bool> {
+) -> Option<Option<RustCfgCondition>> {
     let latest = definitions
         .iter()
         .filter(|definition| {
@@ -2138,72 +1657,10 @@ fn rust_latest_visible_item_macro(
             && definition.scope_start <= invocation_start
             && invocation_start < definition.scope_end
     });
-    let passthrough = matching.next()?.passthrough;
+    let decoration = matching.next()?.decoration.clone();
     matching
-        .all(|definition| definition.passthrough == passthrough)
-        .then_some(passthrough)
-}
-
-/// Whether the `mod x;` item at `module` is gated by a bare `#[cfg(test)]`.
-///
-/// This is the only place the test-gating of a module edge is decided, and it
-/// is deliberately conservative: **only** the bare `#[cfg(test)]` predicate
-/// counts. Any composition -- `all`, `any`, `not`, or a nested predicate such
-/// as `#[cfg(any(test, feature = "test-support"))]`, which is this repository's
-/// own pattern for fixtures shared with dependents -- can still evaluate true
-/// in a non-test build, so the declared file is reachable from production code
-/// and must not be classified as test-only. Getting that wrong hides real
-/// production files, which is far worse than leaving a test file visible.
-///
-/// The shape is read from the AST: `#[cfg(test)]` is an `attribute` whose path
-/// is the bare identifier `cfg` and whose `arguments` token tree holds exactly
-/// one named token, the identifier `test`. Every composition puts an operator
-/// identifier beside a nested `token_tree`, and `#[cfg(feature = "test")]`
-/// puts a `string_literal` beside `feature`, so both fail the single-identifier
-/// check without inspecting any text beyond those two identifiers.
-///
-/// Attributes are attached in the grammar's grouped `attributes` node, so read
-/// that explicit association instead of scanning an item's siblings.
-fn rust_declaration_is_bare_cfg_test_gated(module: Node<'_>, source: &str) -> bool {
-    crate::syntax::outer_attributes(module)
-        .any(|attribute_item| rust_attribute_is_bare_cfg_test(attribute_item, source))
-}
-
-fn rust_attribute_is_bare_cfg_test(attribute_item: Node<'_>, source: &str) -> bool {
-    let mut item_cursor = attribute_item.walk();
-    let Some(attribute) = attribute_item
-        .named_children(&mut item_cursor)
-        .find(|child| child.kind() == "attribute")
-    else {
-        return false;
-    };
-    let Some(path) = attribute.named_child(0) else {
-        return false;
-    };
-    if path.kind() != "identifier" || node_source_text(path, source) != Some("cfg") {
-        return false;
-    }
-    let Some(arguments) = attribute.child_by_field_name("arguments") else {
-        return false;
-    };
-    let mut argument_cursor = arguments.walk();
-    let mut tokens = arguments.named_children(&mut argument_cursor);
-    let Some(token) = tokens.next() else {
-        return false;
-    };
-    tokens.next().is_none()
-        && token.kind() == "identifier"
-        && node_source_text(token, source) == Some("test")
-}
-
-fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    source.get(node.start_byte()..node.end_byte())
-}
-
-fn rust_macro_argument_items<'a>(arguments: Node<'_>, source: &'a str) -> Option<&'a str> {
-    let start = arguments.start_byte().checked_add(1)?;
-    let end = arguments.end_byte().checked_sub(1)?;
-    (start <= end).then(|| source.get(start..end)).flatten()
+        .all(|definition| definition.decoration == decoration)
+        .then_some(decoration)
 }
 
 /// The decoded `#[path = "..."]` value written on `module`, if any.
@@ -2211,24 +1668,6 @@ fn rust_macro_argument_items<'a>(arguments: Node<'_>, source: &'a str) -> Option
 /// Kept as the decoded string rather than a `PathBuf` because this is what the
 /// `rust_module_scopes` / `rust_module_routes` rows carry: the attribute is a
 /// content fact, and turning it into a path is the reader's job.
-fn rust_path_attribute_value(module: Node<'_>, source: &str) -> Option<String> {
-    for attribute_item in crate::syntax::outer_attributes(module) {
-        let attribute = attribute_item.named_child(0)?;
-        let path = attribute.named_child(0)?;
-        let path = source.get(path.start_byte()..path.end_byte())?;
-        if path == "path" {
-            let value = attribute.child_by_field_name("value")?;
-            return rust_static_string_literal(value, source).filter(|path| !path.is_empty());
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-fn rust_path_attribute(module: Node<'_>, source: &str) -> Option<PathBuf> {
-    rust_path_attribute_value(module, source).map(PathBuf::from)
-}
-
 /// Decode a static Rust string literal from its tree-sitter node.
 ///
 /// `#[path]` and filesystem macros accept both cooked and raw strings. Decode
@@ -2401,7 +1840,10 @@ fn inferred_cargo_target_paths(table_name: &str, name: &str, package_name: &str)
             Path::new("examples").join(name).with_extension("rs"),
             Path::new("examples").join(name).join("main.rs"),
         ],
-        "test" => vec![Path::new("tests").join(name).with_extension("rs")],
+        "test" => vec![
+            Path::new("tests").join(name).with_extension("rs"),
+            Path::new("tests").join(name).join("main.rs"),
+        ],
         "bench" => vec![
             Path::new("benches").join(name).with_extension("rs"),
             Path::new("benches").join(name).join("main.rs"),
@@ -2421,7 +1863,35 @@ fn cargo_build_script_path(root: &Path, cargo_crate: &CargoCrate) -> Option<Path
     workspace_relative_path(root, &cargo_crate.directory, path)
 }
 
-fn cargo_auto_discovery_enabled(manifest: &toml::Value, key: &str, edition: &str) -> bool {
+/// A package's library is `src/lib.rs` in every edition, whatever else the
+/// manifest declares, unless `[lib]` names another path or `autolib = false`.
+///
+/// Measured against Cargo 1.96 rather than read from the documentation: a
+/// package with `edition = "2015"`, an explicit `[[bin]] path = "src/cli.rs"`,
+/// and both `src/lib.rs` and `src/main.rs` present reports targets
+/// `[legacy: lib (lib.rs), legacy-cli: bin (cli.rs)]` under
+/// `cargo metadata --no-deps`. The implicit `main.rs` binary is dropped by the
+/// legacy rule below; the library is not. Under 2021 all three appear.
+///
+/// Routing the library through [`cargo_auto_discovery_enabled`] therefore left
+/// every 2015 package that declares a binary with no library target at all.
+fn cargo_library_discovery_enabled(manifest: &RustCargoManifestDocument) -> bool {
+    manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("autolib"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Cargo's legacy rule: in edition 2015, declaring any target at all turns off
+/// automatic discovery of that kind. It covers binaries, examples, tests and
+/// benches. The library has its own rule, above.
+fn cargo_auto_discovery_enabled(
+    manifest: &RustCargoManifestDocument,
+    key: &str,
+    edition: &str,
+) -> bool {
     let package = manifest.get("package").and_then(toml::Value::as_table);
     if let Some(enabled) = package
         .and_then(|package| package.get(key))
@@ -2433,7 +1903,7 @@ fn cargo_auto_discovery_enabled(manifest: &toml::Value, key: &str, edition: &str
     edition != "2015" || !cargo_manifest_has_explicit_target(manifest)
 }
 
-fn cargo_manifest_has_explicit_target(manifest: &toml::Value) -> bool {
+fn cargo_manifest_has_explicit_target(manifest: &RustCargoManifestDocument) -> bool {
     manifest.get("lib").is_some()
         || ["bin", "example", "test", "bench"].iter().any(|name| {
             manifest
@@ -2443,7 +1913,7 @@ fn cargo_manifest_has_explicit_target(manifest: &toml::Value) -> bool {
         })
 }
 
-fn auto_cargo_target_kind(
+pub(crate) fn auto_cargo_target_kind(
     relative: &Path,
     bins: bool,
     examples: bool,
@@ -2480,6 +1950,7 @@ fn auto_cargo_target_kind(
             } else if *third == "main.rs" {
                 match first.to_str() {
                     Some("examples") if examples => Some(RustCargoTargetKind::Example),
+                    Some("tests") if tests => Some(RustCargoTargetKind::Test),
                     Some("benches") if benches => Some(RustCargoTargetKind::Bench),
                     _ => None,
                 }
@@ -2499,7 +1970,7 @@ fn auto_cargo_target_kind(
 }
 
 fn cargo_dependency_tables_with_kind(
-    manifest: &toml::Value,
+    manifest: &RustCargoManifestDocument,
 ) -> Vec<(
     RustCargoDependencyKind,
     Option<&str>,
@@ -2534,7 +2005,9 @@ fn cargo_dependency_tables_with_kind(
     tables
 }
 
-fn cargo_dependency_tables(manifest: &toml::Value) -> Vec<&toml::map::Map<String, toml::Value>> {
+fn cargo_dependency_tables(
+    manifest: &RustCargoManifestDocument,
+) -> Vec<&toml::map::Map<String, toml::Value>> {
     cargo_dependency_tables_with_kind(manifest)
         .into_iter()
         .map(|(_, _, table)| table)
@@ -2544,10 +2017,10 @@ fn cargo_dependency_tables(manifest: &toml::Value) -> Vec<&toml::map::Map<String
 fn effective_cargo_dependency<'a>(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &'a toml::Value,
+    manifest: &'a RustCargoManifestDocument,
     exposed_name: &str,
     dependency: &'a toml::Value,
-    manifests: &'a HashMap<PathBuf, toml::Value>,
+    manifests: &'a HashMap<PathBuf, RustCargoManifestDocument>,
 ) -> Option<(&'a toml::map::Map<String, toml::Value>, PathBuf)> {
     let dependency = dependency.as_table()?;
     if !dependency
@@ -2568,23 +2041,89 @@ fn effective_cargo_dependency<'a>(
     Some((dependency, workspace_directory))
 }
 
-fn cargo_patched_dependency_directory(
+pub(crate) fn cargo_dependency_directory(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &toml::Value,
+    manifest: &RustCargoManifestDocument,
     exposed_name: &str,
+    raw_dependency: &toml::Value,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
+) -> Option<PathBuf> {
+    cargo_dependency_directory_with(
+        root,
+        manifest_directory,
+        manifest,
+        exposed_name,
+        raw_dependency,
+        manifests,
+        &mut |base, path| workspace_relative_path(root, base, path),
+    )
+}
+
+pub(crate) fn cargo_dependency_directory_with(
+    root: &Path,
+    manifest_directory: &Path,
+    manifest: &RustCargoManifestDocument,
+    exposed_name: &str,
+    raw_dependency: &toml::Value,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
+    resolve_path: &mut impl FnMut(&Path, &Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let dependency = effective_cargo_dependency(
+        root,
+        manifest_directory,
+        manifest,
+        exposed_name,
+        raw_dependency,
+        manifests,
+    );
+    dependency
+        .as_ref()
+        .and_then(|(dependency, _)| dependency.get("path"))
+        .and_then(toml::Value::as_str)
+        .and_then(|path| {
+            resolve_path(
+                dependency
+                    .as_ref()
+                    .map(|(_, base)| base.as_path())
+                    .unwrap_or(manifest_directory),
+                Path::new(path),
+            )
+        })
+        .or_else(|| {
+            // `[patch]` lives on the workspace manifest and names the package,
+            // not the exposed alias. Resolve both here so the patch lookup
+            // below reads already-resolved inputs.
+            let dependency = dependency.as_ref().map(|(dependency, _)| *dependency);
+            let package_name = dependency
+                .and_then(|dependency| dependency.get("package"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or(exposed_name);
+            let workspace_directory =
+                cargo_workspace_manifest_directory(root, manifest_directory, manifest, manifests)?;
+            cargo_patched_dependency_directory(
+                root,
+                &workspace_directory,
+                package_name,
+                dependency,
+                raw_dependency,
+                manifests,
+                resolve_path,
+            )
+        })
+}
+
+fn cargo_patched_dependency_directory(
+    root: &Path,
+    workspace_directory: &Path,
+    package_name: &str,
     dependency: Option<&toml::map::Map<String, toml::Value>>,
     raw_dependency: &toml::Value,
-    manifests: &HashMap<PathBuf, toml::Value>,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
+    resolve_path: &mut impl FnMut(&Path, &Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let package_name = dependency
-        .and_then(|dependency| dependency.get("package"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or(exposed_name);
-    let workspace_directory =
-        cargo_workspace_manifest_directory(root, manifest_directory, manifest, manifests)?;
     let patch_sources = manifests
-        .get(&workspace_directory)?
+        .get(workspace_directory)?
         .get("patch")?
         .as_table()?;
     let source_name = cargo_dependency_patch_source(dependency, raw_dependency)?;
@@ -2606,7 +2145,7 @@ fn cargo_patched_dependency_directory(
         })
         .filter_map(|(_, patch)| {
             let path = patch.as_table()?.get("path")?.as_str().map(Path::new)?;
-            let directory = workspace_relative_path(root, &workspace_directory, path)?;
+            let directory = resolve_path(workspace_directory, path)?;
             let patched_manifest = manifests.get(&directory)?;
             let package = patched_manifest.get("package")?.as_table()?;
             if package.get("name")?.as_str()? != package_name {
@@ -2669,8 +2208,8 @@ fn cargo_dependency_version_requirement<'a>(
 fn cargo_package_edition(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &toml::Value,
-    manifests: &HashMap<PathBuf, toml::Value>,
+    manifest: &RustCargoManifestDocument,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
 ) -> String {
     let edition = manifest
         .get("package")
@@ -2699,8 +2238,8 @@ fn cargo_package_edition(
 fn cargo_package_string(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &toml::Value,
-    manifests: &HashMap<PathBuf, toml::Value>,
+    manifest: &RustCargoManifestDocument,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
     field: &str,
 ) -> Option<String> {
     let value = manifest.get("package")?.get(field)?;
@@ -2727,8 +2266,8 @@ fn cargo_package_string(
 fn cargo_workspace_manifest_directory(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &toml::Value,
-    manifests: &HashMap<PathBuf, toml::Value>,
+    manifest: &RustCargoManifestDocument,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
 ) -> Option<PathBuf> {
     let explicit_workspace = manifest
         .get("package")
@@ -2819,7 +2358,7 @@ fn discover_cargo_manifest_directories(
 fn cargo_patch_path_directories(
     root: &Path,
     manifest_directory: &Path,
-    manifest: &toml::Value,
+    manifest: &RustCargoManifestDocument,
 ) -> Vec<PathBuf> {
     manifest
         .get("patch")
@@ -2842,7 +2381,7 @@ fn cargo_patch_path_directories(
 fn cargo_workspace_member_directories(
     root: &Path,
     workspace_directory: &Path,
-    manifest: &toml::Value,
+    manifest: &RustCargoManifestDocument,
 ) -> Vec<PathBuf> {
     let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) else {
         return Vec::new();
@@ -2936,30 +2475,19 @@ fn canonical_workspace_relative_path(root: &Path, target: &Path) -> Option<PathB
         .map(Path::to_path_buf)
 }
 
-pub(super) fn normalize_crate_name(name: &str) -> String {
-    name.replace('-', "_")
-}
+pub(super) use crate::cargo_manifest::normalize_crate_name;
 
 /// `[package].name`, verbatim. Pure over parsed TOML, so `crate_naming` can
 /// share it without reaching the route index.
-pub(super) fn cargo_manifest_package_name(manifest: &toml::Value) -> Option<String> {
-    manifest
-        .get("package")?
-        .get("name")?
-        .as_str()
-        .map(str::to_owned)
+pub(super) fn cargo_manifest_package_name(manifest: &RustCargoManifestDocument) -> Option<String> {
+    manifest.package_name().map(str::to_owned)
 }
 
 /// Normalized `[lib].name`, when the manifest declares one. An implicit lib
 /// (`src/lib.rs` autodiscovery) is unnamed and inherits the package name, so
 /// `None` here does not mean "no lib target".
-pub(super) fn cargo_manifest_library_name(manifest: &toml::Value) -> Option<String> {
-    manifest
-        .get("lib")?
-        .as_table()?
-        .get("name")?
-        .as_str()
-        .map(normalize_crate_name)
+pub(super) fn cargo_manifest_library_name(manifest: &RustCargoManifestDocument) -> Option<String> {
+    manifest.normalized_library_name()
 }
 
 fn append_module_package(mut package: String, nested: Option<&str>) -> String {
@@ -2982,8 +2510,7 @@ fn append_module_package(mut package: String, nested: Option<&str>) -> String {
 /// whole workspace, and a gate-free file's module edges are resolved once
 /// instead of once per pass and target. Every one of those is an algebraic
 /// rewrite of the same derivation, so the guard has to be a direct comparison
-/// against what it replaced rather than a sample of its answers. This is the
-/// `#1793` idiom (`rust_external_module_child_edges`) one layer up.
+/// against what it replaced rather than a sample of its answers.
 ///
 /// Everything the rewrite did not touch is shared rather than copied:
 /// `discover_cargo_manifest_directories`, `cargo_crate`, `module_child_edges`,
@@ -3158,7 +2685,7 @@ mod frozen_orchestration {
                             visible_after,
                             scope_start,
                             scope_end,
-                            passthrough: definition.passthrough,
+                            decoration: definition.decoration.clone(),
                         });
                 }
             }
@@ -3216,7 +2743,7 @@ mod frozen_orchestration {
                     let before = child_bindings.values().map(Vec::len).sum::<usize>();
                     for (name, definitions) in &bindings {
                         keep_going().then_some(())?;
-                        let Some(passthrough) = rust_latest_visible_item_macro(
+                        let Some(decoration) = rust_latest_visible_item_macro(
                             definitions,
                             edge.declaration_start_byte,
                         ) else {
@@ -3226,7 +2753,7 @@ mod frozen_orchestration {
                             visible_after: 0,
                             scope_start: child_start,
                             scope_end: child_end,
-                            passthrough,
+                            decoration,
                         };
                         let definitions = child_bindings.entry(name.clone()).or_default();
                         if !definitions.contains(&inherited) {
@@ -3242,7 +2769,7 @@ mod frozen_orchestration {
                             visible_after: definition.visible_after,
                             scope_start: definition.scope_start,
                             scope_end: definition.scope_end,
-                            passthrough: definition.passthrough,
+                            decoration: definition.decoration.clone(),
                         };
                         let definitions =
                             child_bindings.entry(definition.name.clone()).or_default();
@@ -3393,32 +2920,15 @@ mod frozen_orchestration {
                         raw_dependency,
                         &manifests,
                     );
-                    let target = dependency
-                        .as_ref()
-                        .and_then(|(dependency, _)| dependency.get("path"))
-                        .and_then(toml::Value::as_str)
-                        .and_then(|path| {
-                            workspace_relative_path(
-                                root,
-                                dependency
-                                    .as_ref()
-                                    .map(|(_, base)| base.as_path())
-                                    .unwrap_or(&cargo_crate.directory),
-                                Path::new(path),
-                            )
-                        })
-                        .or_else(|| {
-                            cargo_patched_dependency_directory(
-                                root,
-                                &cargo_crate.directory,
-                                &cargo_crate.manifest,
-                                exposed_name,
-                                dependency.as_ref().map(|(dependency, _)| *dependency),
-                                raw_dependency,
-                                &manifests,
-                            )
-                        })
-                        .and_then(|directory| crate_by_directory.get(&directory).copied());
+                    let target = cargo_dependency_directory(
+                        root,
+                        &cargo_crate.directory,
+                        &cargo_crate.manifest,
+                        exposed_name,
+                        raw_dependency,
+                        &manifests,
+                    )
+                    .and_then(|directory| crate_by_directory.get(&directory).copied());
                     if let Some(target) = target {
                         let Some(target_library) = crates[target].library.as_ref() else {
                             continue;
@@ -3634,24 +3144,48 @@ mod frozen_orchestration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::declarations::rust_rules_item_macro_definitions;
+    use tree_sitter::Parser;
+
+    fn coordinated_route_facts(file: &ProjectFile, source: &str) -> RustModuleRouteFacts {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        assert!(
+            !tree.root_node().has_error(),
+            "fixture must parse: {source}"
+        );
+        crate::declarations::parse_rust_file(file, source, &tree)
+            .rust_usage_facts
+            .module_routes
+    }
+
+    fn build_from_coordinated_source(files: &[ProjectFile]) -> RustCargoRouteIndex {
+        let facts = route_facts_for(files);
+        RustCargoRouteIndex::build_while(files, &facts, &|| true)
+            .expect("coordinated Cargo route construction")
+    }
+
+    fn inline_fixture_file() -> ProjectFile {
+        ProjectFile::new(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("absolute fixture root"),
+            "bifrost-inline/src/lib.rs",
+        )
+    }
 
     /// Gating verdict for the single `mod_item` in `source`.
     fn module_is_test_gated(source: &str) -> bool {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("rust language");
-        let tree = parser.parse(source, None).expect("parse");
-        let root = tree.root_node();
-        assert!(!root.has_error(), "fixture must parse: {source}");
-        let mut cursor = root.walk();
-        let module = root
-            .named_children(&mut cursor)
-            .map(unwrap_attributes)
-            .find(|child| child.kind() == "mod_item")
-            .expect("fixture declares a module");
-        rust_declaration_is_bare_cfg_test_gated(module, source)
+        let file = inline_fixture_file();
+        let facts = coordinated_route_facts(&file, source);
+        facts
+            .routes
+            .iter()
+            .find(|route| route.module_name == "tests")
+            .map(|route| route.test_gated)
+            .expect("fixture declares a tests module")
     }
 
     /// Only the bare `#[cfg(test)]` gates a module edge. Every composition can
@@ -3717,8 +3251,7 @@ mod tests {
         let matcher = ProjectFile::new(root.clone(), "matcher/src/lib.rs");
         let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
         let renamed = ProjectFile::new(root.clone(), "renamed/src/lib.rs");
-        let routes =
-            RustCargoRouteIndex::build_from_disk(&[matcher, consumer.clone(), renamed.clone()]);
+        let routes = build_from_coordinated_source(&[matcher, consumer.clone(), renamed.clone()]);
 
         assert_eq!(
             routes.resolve_module_package(&consumer, "matcher_lib"),
@@ -3764,7 +3297,7 @@ mod tests {
         let options = ProjectFile::new(root.clone(), "src/options.rs");
         let binary = ProjectFile::new(root.clone(), "src/main.rs");
         let example = ProjectFile::new(root.clone(), "examples/example.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
+        let routes = build_from_coordinated_source(&[
             library.clone(),
             options,
             binary.clone(),
@@ -3819,7 +3352,7 @@ mod tests {
         write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
         let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
 
-        let routes = RustCargoRouteIndex::build_from_disk(std::slice::from_ref(&consumer));
+        let routes = build_from_coordinated_source(std::slice::from_ref(&consumer));
         for name in ["parent_escape", "absolute_escape"] {
             assert_eq!(routes.resolve_module_package(&consumer, name), None);
         }
@@ -3883,7 +3416,7 @@ git_shared = { package = "git-shared", git = "https://good.example/repository" }
         let future = ProjectFile::new(root.clone(), "future-v1/src/lib.rs");
         let wrong_git = ProjectFile::new(root.clone(), "git-wrong/src/lib.rs");
         let routes =
-            RustCargoRouteIndex::build_from_disk(&[app.clone(), shared.clone(), future, wrong_git]);
+            build_from_coordinated_source(&[app.clone(), shared.clone(), future, wrong_git]);
 
         assert_eq!(
             routes.resolve_crate_root_file(&app, "shared"),
@@ -3935,7 +3468,7 @@ patched = { path = "patched" }
 
         let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
         let patched = ProjectFile::new(root, "patched/src/lib.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[app.clone(), patched.clone()]);
+        let routes = build_from_coordinated_source(&[app.clone(), patched.clone()]);
 
         assert_eq!(
             routes.resolve_crate_root_file(&app, "patched"),
@@ -3973,7 +3506,7 @@ patched = { path = "patched" }
 
         let app = ProjectFile::new(root.clone(), "src/lib.rs");
         let patched = ProjectFile::new(root.clone(), "patched/src/lib.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[app.clone(), patched.clone()]);
+        let routes = build_from_coordinated_source(&[app.clone(), patched.clone()]);
 
         assert_eq!(
             routes.resolve_crate_root_file(&app, "patched"),
@@ -4034,7 +3567,7 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
             ProjectFile::new(root.clone(), "ambiguous-left/src/lib.rs"),
             ProjectFile::new(root, "ambiguous-right/src/lib.rs"),
         ];
-        let routes = RustCargoRouteIndex::build_from_disk(&files);
+        let routes = build_from_coordinated_source(&files);
 
         assert_eq!(
             routes.resolve_crate_root_file(&app, "shared"),
@@ -4127,7 +3660,7 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
         write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
         let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
 
-        let routes = RustCargoRouteIndex::build_from_disk(std::slice::from_ref(&consumer));
+        let routes = build_from_coordinated_source(std::slice::from_ref(&consumer));
         assert_eq!(routes.resolve_module_package(&consumer, "linked"), None);
 
         write(
@@ -4179,7 +3712,7 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
         let ordinary = ProjectFile::new(root.clone(), "src/relocated/ordinary.rs");
         let wrong_top = ProjectFile::new(root.clone(), "src/outer/top.rs");
         let wrong_mapped = ProjectFile::new(root.clone(), "src/outer/inline/mapped.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
+        let routes = build_from_coordinated_source(&[
             library.clone(),
             outer,
             top.clone(),
@@ -4230,8 +3763,7 @@ mod cooked;
         let library = ProjectFile::new(root.clone(), "src/lib.rs");
         let raw = ProjectFile::new(root.clone(), "src/nested/raw.rs");
         let cooked = ProjectFile::new(root.clone(), "src/nested/cooked.rs");
-        let routes =
-            RustCargoRouteIndex::build_from_disk(&[library.clone(), raw.clone(), cooked.clone()]);
+        let routes = build_from_coordinated_source(&[library.clone(), raw.clone(), cooked.clone()]);
 
         for expected in [raw, cooked] {
             assert_eq!(
@@ -4280,7 +3812,7 @@ mod cooked;
         let shared = ProjectFile::new(root.clone(), "shared/src/lib.rs");
         let model = ProjectFile::new(root.clone(), "shared/src/model.rs");
         let tool = ProjectFile::new(root.clone(), "shared/tool.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
+        let routes = build_from_coordinated_source(&[
             app.clone(),
             shared.clone(),
             model.clone(),
@@ -4375,7 +3907,7 @@ mod cooked;
             .into_iter()
             .map(|directory| ProjectFile::new(root.clone(), format!("{directory}/src/lib.rs"))),
         );
-        let routes = RustCargoRouteIndex::build_from_disk(&files);
+        let routes = build_from_coordinated_source(&files);
 
         let normal_root = ProjectFile::new(root.clone(), "normal/src/lib.rs");
         let development_root = ProjectFile::new(root.clone(), "development/src/lib.rs");
@@ -4491,11 +4023,8 @@ mod cooked;
         let dependency = ProjectFile::new(root.clone(), "dependency/src/lib.rs");
         let library = ProjectFile::new(root.clone(), "app/src/lib.rs");
         let test = ProjectFile::new(root.clone(), "app/tests/integration.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
-            dependency.clone(),
-            library.clone(),
-            test.clone(),
-        ]);
+        let routes =
+            build_from_coordinated_source(&[dependency.clone(), library.clone(), test.clone()]);
 
         assert_eq!(
             routes.resolve_crate_root_file(&library, "inherited_normal"),
@@ -4529,7 +4058,7 @@ mod cooked;
         let library = ProjectFile::new(root.clone(), "src/lib.rs");
         let main = ProjectFile::new(root.clone(), "src/main.rs");
         let example = ProjectFile::new(root.clone(), "examples/implicit.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
+        let routes = build_from_coordinated_source(&[
             manual.clone(),
             library.clone(),
             main.clone(),
@@ -4540,7 +4069,19 @@ mod cooked;
             routes.target_roots_for_file(&manual),
             std::slice::from_ref(&manual)
         );
-        for implicit in [library, main, example] {
+        // Corrected 2026-09-22, measured against Cargo 1.96 rather than read
+        // from the documentation. This package reports targets
+        // `[legacy: lib (lib.rs), legacy-cli: bin (cli.rs)]` under
+        // `cargo metadata --no-deps`: the legacy 2015 rule drops the implicit
+        // `src/main.rs` binary and the implicit example, and does not touch the
+        // library. `src/lib.rs` is the package's library in every edition unless
+        // `[lib]` names another path or `autolib = false`.
+        assert_eq!(
+            routes.target_roots_for_file(&library),
+            std::slice::from_ref(&library),
+            "the library is discovered whatever else a 2015 manifest declares"
+        );
+        for implicit in [main, example] {
             assert!(
                 routes.target_roots_for_file(&implicit).is_empty(),
                 "{} must not be auto-discovered for a legacy manifest with a manual target",
@@ -4575,11 +4116,8 @@ mod cooked;
         let dependency = ProjectFile::new(root.clone(), "dev-dep/src/lib.rs");
         let main = ProjectFile::new(root.clone(), "app/src/main.rs");
         let example = ProjectFile::new(root.clone(), "app/examples/implicit.rs");
-        let routes = RustCargoRouteIndex::build_from_disk(&[
-            dependency.clone(),
-            main.clone(),
-            example.clone(),
-        ]);
+        let routes =
+            build_from_coordinated_source(&[dependency.clone(), main.clone(), example.clone()]);
 
         assert_eq!(
             routes.target_roots_for_file(&example),
@@ -4629,8 +4167,7 @@ mod cooked;
         let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
         let left = ProjectFile::new(root.clone(), "left/src/lib.rs");
         let right = ProjectFile::new(root.clone(), "right/src/lib.rs");
-        let routes =
-            RustCargoRouteIndex::build_from_disk(&[app.clone(), left.clone(), right.clone()]);
+        let routes = build_from_coordinated_source(&[app.clone(), left.clone(), right.clone()]);
 
         assert_eq!(routes.resolve_crate_root_file(&app, "conflict"), None);
         assert_eq!(
@@ -4663,19 +4200,8 @@ mod cooked;
             "macro_rules! shared_macro { () => {}; }\n",
         );
         let library = ProjectFile::new(root, "src/lib.rs");
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        let tree = parser.parse(source, None).expect("parse Rust fixture");
-
-        let edges = rust_external_module_child_edges(
-            &library,
-            source,
-            tree.root_node(),
-            true,
-            &HashMap::default(),
-        );
+        let facts = coordinated_route_facts(&library, source);
+        let edges = module_child_edges(&library, &facts, true, &HashMap::default());
 
         assert_eq!(edges.len(), 1);
         assert!(edges[0].imports_macros);
@@ -4695,7 +4221,8 @@ mod cooked;
         std::fs::write(path, contents).expect("write fixture");
     }
 
-    /// Every module-declaration shape the syntax walk knows about, in one file:
+    /// Every module-declaration shape the coordinated producer knows about,
+    /// in one file:
     /// plain, directory-backed, `#[path]` on a declaration and on an inline
     /// module, `#[macro_use]`, `#[cfg(test)]`, nested inline scopes, duplicate
     /// declarations of one file, and both a replaying and a non-replaying item
@@ -4760,6 +4287,7 @@ replay! { replay! { mod doubly_replayed; } }
             "src/composed_gate.rs",
             "src/published.rs",
             "src/outer/inner/nested_child.rs",
+            "src/outer/elsewhere/deep_child.rs",
             "src/elsewhere/deep_child.rs",
             "src/shared.rs",
             "src/replayed.rs",
@@ -4775,79 +4303,247 @@ replay! { replay! { mod doubly_replayed; } }
         write(
             &root,
             "src/sub.rs",
-            "mod child;\n#[path = \"../shared.rs\"]\nmod escaped;\n",
+            "mod child;\n#[path = \"../shared.rs\"]\nmod escaped;\n#[path = \"sub/path_child.rs\"]\nmod path_child;\n",
         );
+        write(&root, "src/sub/path_child.rs", "pub struct Marker;\n");
         root
     }
 
-    fn parse_fixture(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust parser language");
-        parser.parse(source, None).expect("parse Rust fixture")
-    }
-
     fn visible_item_macros(
-        source: &str,
-        root_node: Node<'_>,
+        facts: &RustModuleRouteFacts,
     ) -> HashMap<String, Vec<RustVisibleItemMacroDefinition>> {
-        rust_rules_item_macro_definitions(root_node, source)
-            .into_iter()
+        facts
+            .item_macros
+            .iter()
             .fold(HashMap::default(), |mut bindings, definition| {
                 bindings
-                    .entry(definition.name)
+                    .entry(definition.name.clone())
                     .or_insert_with(Vec::new)
                     .push(RustVisibleItemMacroDefinition {
                         visible_after: definition.visible_after,
                         scope_start: definition.scope_start,
                         scope_end: definition.scope_end,
-                        passthrough: definition.passthrough,
+                        decoration: definition.decoration.clone(),
                     });
                 bindings
             })
     }
 
-    /// The equivalence pin for issue #1793.
-    ///
-    /// `extract_rust_module_route_facts` plus [`module_child_edges`] replaced
-    /// the syntax walk the Cargo-route build ran over every hydrated file, and
-    /// this requires the pair to reproduce it edge for edge -- including the
-    /// byte offsets, the `#[macro_use]` visibility point, the test gate, and
-    /// the merge of duplicate declarations. The walk is frozen at its pre-#1793
-    /// form for exactly this comparison.
-    ///
-    /// Both values of `is_crate_root` matter: it decides whether a file's
-    /// declarations search its own directory or its stem's, and the stored rows
-    /// deliberately do not know which of the two applies.
+    /// Route edges are resolved from the coordinated facts produced by
+    /// `parse_rust_file`. Exercise both file-root conventions and the
+    /// target-local item-macro visibility that the reader consumes.
     #[test]
-    fn module_child_edges_reproduce_the_frozen_syntax_walk() {
+    fn module_child_edges_use_coordinated_route_facts() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = module_route_fixture(&temp);
         for relative in ["src/lib.rs", "src/sub.rs"] {
             let file = ProjectFile::new(root.clone(), relative);
             let source = file.read_to_string().expect("read fixture");
-            let tree = parse_fixture(&source);
-            let item_macros = rust_rules_item_macro_definitions(tree.root_node(), &source);
-            let facts = extract_rust_module_route_facts(tree.root_node(), &source, &item_macros);
-            for passthrough in [
-                HashMap::default(),
-                visible_item_macros(&source, tree.root_node()),
-            ] {
+            let facts = coordinated_route_facts(&file, &source);
+            for visible in [false, true] {
+                let passthrough = if visible {
+                    visible_item_macros(&facts)
+                } else {
+                    HashMap::default()
+                };
                 for is_crate_root in [true, false] {
-                    let expected = rust_external_module_child_edges(
-                        &file,
-                        &source,
-                        tree.root_node(),
-                        is_crate_root,
-                        &passthrough,
-                    );
-                    let actual = module_child_edges(&file, &facts, is_crate_root, &passthrough);
+                    let mut actual = module_child_edges(&file, &facts, is_crate_root, &passthrough);
+                    let edge =
+                        |path: &str,
+                         declaring_module: &str,
+                         visibility: RustVisibility,
+                         imports_macros: bool,
+                         test_gated: bool,
+                         declaration: &str,
+                         visibility_declaration: Option<&str>| {
+                            let declaration_start =
+                                source.find(declaration).expect("fixture route");
+                            RustExternalModuleChild {
+                                file: ProjectFile::new(root.clone(), path),
+                                declaring_module: declaring_module.to_string(),
+                                visibility,
+                                imports_macros,
+                                test_gated,
+                                declaration_start_byte: declaration_start,
+                                visibility_start_byte: visibility_declaration
+                                    .map(|declaration| {
+                                        source.find(declaration).expect("fixture visibility route")
+                                            + declaration.len()
+                                    })
+                                    .unwrap_or(usize::MAX),
+                            }
+                        };
+                    let mut expected = match (relative, is_crate_root) {
+                        ("src/lib.rs", true) => vec![
+                            edge(
+                                "src/composed_gate.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod composed_gate;",
+                                None,
+                            ),
+                            edge(
+                                "src/directory_backed/mod.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod directory_backed;",
+                                None,
+                            ),
+                            edge(
+                                "src/gated.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                true,
+                                "mod gated;",
+                                None,
+                            ),
+                            edge(
+                                "src/macro_source.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                true,
+                                false,
+                                "mod macro_source;",
+                                Some("mod macro_source;"),
+                            ),
+                            edge(
+                                "src/outer/elsewhere/deep_child.rs",
+                                "routes.outer.relocated_scope",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod deep_child;",
+                                None,
+                            ),
+                            edge(
+                                "src/outer/inner/nested_child.rs",
+                                "routes.outer.inner",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod nested_child;",
+                                None,
+                            ),
+                            edge(
+                                "src/plain.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod plain;",
+                                None,
+                            ),
+                            edge(
+                                "src/published.rs",
+                                "routes",
+                                RustVisibility::Public,
+                                false,
+                                false,
+                                "pub mod published;",
+                                None,
+                            ),
+                            edge(
+                                "src/relocated/target.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod relocated_declaration;",
+                                None,
+                            ),
+                            edge(
+                                "src/shared.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                true,
+                                false,
+                                "mod first_alias;",
+                                Some("mod second_alias;"),
+                            ),
+                        ],
+                        ("src/lib.rs", false) => vec![
+                            edge(
+                                "src/relocated/target.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod relocated_declaration;",
+                                None,
+                            ),
+                            edge(
+                                "src/shared.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                true,
+                                false,
+                                "mod first_alias;",
+                                Some("mod second_alias;"),
+                            ),
+                        ],
+                        ("src/sub.rs", true) => vec![edge(
+                            "src/sub/path_child.rs",
+                            "routes.sub",
+                            RustVisibility::Private,
+                            false,
+                            false,
+                            "mod path_child;",
+                            None,
+                        )],
+                        ("src/sub.rs", false) => vec![
+                            edge(
+                                "src/sub/child.rs",
+                                "routes.sub",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod child;",
+                                None,
+                            ),
+                            edge(
+                                "src/sub/path_child.rs",
+                                "routes.sub",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod path_child;",
+                                None,
+                            ),
+                        ],
+                        _ => unreachable!("fixture file: {relative}"),
+                    };
+                    if relative == "src/lib.rs" && is_crate_root && visible {
+                        expected.extend([
+                            edge(
+                                "src/doubly_replayed.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod doubly_replayed;",
+                                None,
+                            ),
+                            edge(
+                                "src/replayed.rs",
+                                "routes",
+                                RustVisibility::Private,
+                                false,
+                                false,
+                                "mod replayed;",
+                                None,
+                            ),
+                        ]);
+                    }
+                    expected.sort_by(|left, right| left.file.cmp(&right.file));
+                    actual.sort_by(|left, right| left.file.cmp(&right.file));
                     assert_eq!(
-                        actual,
-                        expected,
-                        "{relative} (crate root {is_crate_root}, {} visible macros)",
-                        passthrough.len()
+                        actual, expected,
+                        "{relative}, root {is_crate_root}, visible {visible}"
                     );
                 }
             }
@@ -4856,9 +4552,9 @@ replay! { replay! { mod doubly_replayed; } }
 
     #[test]
     fn module_route_facts_canonicalize_raw_identifiers() {
+        let file = inline_fixture_file();
         let source = "mod r#struct;\nmod r#type { mod r#enum; }\n";
-        let tree = parse_fixture(source);
-        let facts = extract_rust_module_route_facts(tree.root_node(), source, &[]);
+        let facts = coordinated_route_facts(&file, source);
 
         assert!(
             facts
@@ -4889,9 +4585,7 @@ replay! { replay! { mod doubly_replayed; } }
         let root = module_route_fixture(&temp);
         let file = ProjectFile::new(root.clone(), "src/lib.rs");
         let source = file.read_to_string().expect("read fixture");
-        let tree = parse_fixture(&source);
-        let item_macros = rust_rules_item_macro_definitions(tree.root_node(), &source);
-        let facts = extract_rust_module_route_facts(tree.root_node(), &source, &item_macros);
+        let facts = coordinated_route_facts(&file, &source);
 
         assert!(
             facts
@@ -4943,7 +4637,7 @@ replay! { replay! { mod doubly_replayed; } }
 
         // The gates are what the reader filters on, so the two macros must
         // reach opposite verdicts through the real build.
-        let passthrough = visible_item_macros(&source, tree.root_node());
+        let passthrough = visible_item_macros(&facts);
         let edges = module_child_edges(&file, &facts, true, &passthrough);
         let named = |name: &str| {
             edges
@@ -4953,6 +4647,63 @@ replay! { replay! { mod doubly_replayed; } }
         assert!(named("src/replayed.rs"), "edges: {edges:?}");
         assert!(named("src/doubly_replayed.rs"), "edges: {edges:?}");
         assert!(!named("src/swallowed.rs"), "edges: {edges:?}");
+    }
+
+    /// The route index admits a `mod` route written inside item-macro
+    /// invocations only when the crate's module walk decides it: every
+    /// invocation's macro is a passthrough whose decoration is known. A
+    /// passthrough that decorates with `#[allow(..)]` used to be admitted here
+    /// while the crate left the route undecided (`UnsupportedMacroGeneratedModule`),
+    /// so the two disagreed about which file the crate compiles. A `cfg`
+    /// decoration is admitted, and a bare `cfg(test)` decoration gates the
+    /// edge as a bare `#[cfg(test)]` on the declaration does.
+    #[test]
+    fn module_child_edges_admit_only_invocations_the_crate_decides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = concat!(
+            "macro_rules! plain { ($($item:item)*) => { $($item)* }; }\n",
+            "macro_rules! unix_only { ($($item:item)*) => { $( #[cfg(unix)] $item )* }; }\n",
+            "macro_rules! testing { ($($item:item)*) => { $( #[cfg(test)] $item )* }; }\n",
+            "macro_rules! allowed { ($($item:item)*) => { $( #[allow(dead_code)] $item )* }; }\n",
+            "plain! { pub mod replayed; }\n",
+            "unix_only! { pub mod decorated; }\n",
+            "testing! { mod tested; }\n",
+            "allowed! { pub mod undecided; }\n",
+        );
+        write(&root, "src/lib.rs", source);
+        for relative in [
+            "src/replayed.rs",
+            "src/decorated.rs",
+            "src/tested.rs",
+            "src/undecided.rs",
+        ] {
+            write(&root, relative, "pub fn item() {}\n");
+        }
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        let facts = coordinated_route_facts(&file, source);
+        let edges = module_child_edges(&file, &facts, true, &visible_item_macros(&facts));
+        let edge = |name: &str| {
+            edges
+                .iter()
+                .find(|edge| edge.file.rel_path() == Path::new(name))
+        };
+        assert!(
+            edge("src/replayed.rs").is_some_and(|edge| !edge.test_gated),
+            "{edges:?}"
+        );
+        assert!(
+            edge("src/decorated.rs").is_some_and(|edge| !edge.test_gated),
+            "a cfg decoration is admitted for the crate's walk to evaluate: {edges:?}"
+        );
+        assert!(
+            edge("src/tested.rs").is_some_and(|edge| edge.test_gated),
+            "a bare cfg(test) decoration gates the edge: {edges:?}"
+        );
+        assert!(
+            edge("src/undecided.rs").is_none(),
+            "an undecided invocation admits no route: {edges:?}"
+        );
     }
 
     /// Every Rust file the fixture wrote, in the order an analyzed-file set
@@ -4975,19 +4726,13 @@ replay! { replay! { mod doubly_replayed; } }
         files
     }
 
-    /// The rows analysis would have written for each file, derived here by
-    /// parsing the fixture. `module_child_edges_reproduce_the_frozen_syntax_walk`
-    /// is what ties this to what the store actually holds.
+    /// The rows analysis would have written for each file, derived here by the
+    /// same coordinated producer used by production parsing.
     fn route_facts_for(files: &[ProjectFile]) -> HashMap<ProjectFile, RustModuleRouteFacts> {
         let mut facts = HashMap::default();
         for file in files {
             let source = file.read_to_string().expect("read fixture file");
-            let tree = parse_fixture(&source);
-            let item_macros = rust_rules_item_macro_definitions(tree.root_node(), &source);
-            facts.insert(
-                file.clone(),
-                extract_rust_module_route_facts(tree.root_node(), &source, &item_macros),
-            );
+            facts.insert(file.clone(), coordinated_route_facts(file, &source));
         }
         facts
     }
@@ -5121,8 +4866,9 @@ replay! { replay! { mod doubly_replayed; } }
         );
         write(&root, "legacy/src/cli.rs", "mod util;\nfn main() {}\n");
         write(&root, "legacy/src/util.rs", "pub fn util() {}\n");
-        // Auto discovery is off in this crate, so nothing reaches this file.
-        write(&root, "legacy/src/lib.rs", "pub struct Unreachable;\n");
+        // The 2015 explicit-target rule is off for binaries here, and on for
+        // the library: this file is the package's library target.
+        write(&root, "legacy/src/lib.rs", "pub struct Reachable;\n");
         root
     }
 
@@ -5291,11 +5037,13 @@ replay! { replay! { mod doubly_replayed; } }
             )),
             "the #[cfg(test)] subtree must stay test-only"
         );
-        assert!(
-            index
-                .target_roots_for_file(&ProjectFile::new(root.clone(), "legacy/src/lib.rs"))
-                .is_empty(),
-            "an explicit [[bin]] on a 2015 crate disables the auto library target"
+        // Corrected with the pin above: an explicit `[[bin]]` on a 2015 crate
+        // disables the implicit binary, example, test and bench targets, and
+        // leaves the library alone (Cargo 1.96, `cargo metadata --no-deps`).
+        assert_eq!(
+            index.target_roots_for_file(&ProjectFile::new(root.clone(), "legacy/src/lib.rs")),
+            [ProjectFile::new(root.clone(), "legacy/src/lib.rs")],
+            "an explicit [[bin]] on a 2015 crate leaves the auto library target"
         );
         let it = ProjectFile::new(root.clone(), "engine/tests/it.rs");
         let fixtures = ProjectFile::new(root.clone(), "engine/tests/fixtures.rs");
@@ -5380,6 +5128,7 @@ replay! { replay! { mod doubly_replayed; } }
             "benches/bench.rs",
             "src/bin/tool.rs",
             "examples/demo/main.rs",
+            "tests/integration/main.rs",
             "benches/bench/main.rs",
             "src/bin/tool/main.rs",
             "src/lib.rs",

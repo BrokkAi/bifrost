@@ -1,7 +1,7 @@
 use super::inverted::{
     CachedCallableAlternatives, ProjectTypes, is_package_level_type, same_overload_family,
 };
-use crate::scala::graph::syntax::{ScalaCallableRole, parenthesized_arity};
+use crate::scala::graph::syntax::ScalaCallableRole;
 use crate::scala::graph_support::ScalaSource;
 use crate::scala::wildcard_imports::scala_import_path;
 use brokk_bifrost_core::analyzer::model::Language;
@@ -77,12 +77,7 @@ impl TargetSpec {
 
         let owner = owner_of(types, target);
         let owner_name = owner.as_ref().map(scala_display_name);
-        let arity = target.signature().and_then(signature_arity).or_else(|| {
-            scala
-                .signatures(target)
-                .into_iter()
-                .find_map(|sig| signature_arity(&sig))
-        });
+        let arity = method_signature_arity(scala, target);
         let callable_alternatives = if !target.is_field() && target.is_function() {
             types.effective_callable_alternatives_for(scala, token, target)
         } else {
@@ -488,45 +483,51 @@ pub fn scala_extension_receiver_matches_resolved(
     scala_normalized_fq_name(&resolved) == scala_normalized_fq_name(receiver_owner)
 }
 
-pub fn extension_receiver_type(signature: &str) -> Option<String> {
-    let trimmed = signature.strip_prefix("extension ")?.trim_start();
-    let parameters = trimmed.strip_prefix('(')?.split_once(')')?.0;
-    let parameter = parameters.split(',').next()?.trim();
-    let (_, type_text) = parameter.split_once(':')?;
-    let receiver_type = type_text.trim();
-    (!receiver_type.is_empty()).then(|| receiver_type.to_string())
-}
-
 pub fn resolved_extension_receiver_type(
     scala: &dyn ScalaSource,
     token: QueryToken<'_>,
     unit: &CodeUnit,
-    signature: &str,
+    metadata: &brokk_bifrost_core::analyzer::model::SignatureMetadata,
 ) -> Option<String> {
-    extension_receiver_type(signature).map(|receiver_type| {
-        scala_resolve_declared_type(
-            scala,
-            token,
-            unit.source(),
-            unit.package_name(),
-            &receiver_type,
-        )
-        .unwrap_or(receiver_type)
-    })
+    let path = metadata
+        .extension_receiver_type_identity()
+        .and_then(|identity| identity.nominal_name())
+        .map(|name| name.path().to_vec())
+        .or_else(|| {
+            scala
+                .canonical_source_facts(unit.source())
+                .and_then(|bundle| {
+                    bundle
+                        .for_unit(unit)
+                        .filter_map(|fact| fact.callable.as_ref())
+                        .find_map(|callable| callable.extension_receiver_type_path.clone())
+                })
+        });
+    let Some(path) = path else {
+        // Keep unsupported receiver syntax as an unresolved comparison label;
+        // it is never parsed into a declaration identity.
+        return metadata.extension_receiver_type().map(str::to_string);
+    };
+    Some(
+        scala_resolve_declared_type_path(scala, token, unit.source(), unit.package_name(), &path)
+            .unwrap_or_else(|| path.join(".")),
+    )
 }
 
-pub fn scala_resolve_declared_type(
+fn scala_resolve_declared_type_path(
     scala: &dyn ScalaSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
     package_name: &str,
-    type_text: &str,
+    path: &[String],
 ) -> Option<String> {
-    if let Some(builtin) = scala_builtin_type_name(type_text) {
+    let simple = path.last()?.as_str();
+    if path.len() == 1
+        && let Some(builtin) = scala_builtin_type_name(simple)
+    {
         return Some(builtin.to_string());
     }
-    let base = scala_type_base(type_text)?;
-    let simple = scala_simple_type_name(base)?;
+    let base = path.join(".");
 
     for import in scala.import_info_of(token, file) {
         let Some(path) = scala_import_path(&import) else {
@@ -558,14 +559,14 @@ pub fn scala_resolve_declared_type(
     if let Some(fqn) = scala_declared_type_in_package(scala, package_name, simple) {
         return Some(fqn);
     }
-    if base.contains('.') {
-        for candidate in import_candidate_fq_names(base, package_name) {
+    if path.len() > 1 {
+        for candidate in import_candidate_fq_names(&base, package_name) {
             if let Some(fqn) = scala_declared_type_fqn(scala, &candidate) {
                 return Some(fqn);
             }
         }
     }
-    scala_declared_type_fqn(scala, base)
+    scala_declared_type_fqn(scala, &base)
 }
 
 fn scala_declared_type_in_package(
@@ -608,26 +609,6 @@ pub fn preferred_scala_type<'a>(
     first
 }
 
-fn scala_type_base(type_text: &str) -> Option<&str> {
-    type_text
-        .trim()
-        .split(['[', '(', '{', ' ', '<'])
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-}
-
-/// The terminal simple name of a (possibly generic/qualified) type text.
-///
-/// The qualifier boundary is read with the shared symbol-path segmentation
-/// rather than a local `rsplit('.')`, because a Scala identifier may be
-/// backtick-quoted and carry a literal `.` inside the quotes: the simple name
-/// of `` `zio.ZIO` `` is the whole quoted identifier, not `` ZIO` `` (#2219).
-///
-/// The shared splitter also treats `::` as a separator, which is right for a
-/// client-typed selector but not for Scala source, where `::` is an ordinary
-/// symbolic identifier (`x: ::[Int]`). A base made only of separator
-/// characters has no segment to report, and its own text is then the name.
 fn scala_simple_type_name(type_text: &str) -> Option<&str> {
     let base = type_text
         .trim()
@@ -656,12 +637,15 @@ pub fn method_arity_matches(
 }
 
 pub fn method_signature_arity(scala: &dyn ScalaSource, unit: &CodeUnit) -> Option<usize> {
-    unit.signature().and_then(signature_arity).or_else(|| {
-        scala
-            .signatures(unit)
-            .into_iter()
-            .find_map(|signature| signature_arity(&signature))
-    })
+    scala
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| {
+            metadata
+                .callable_arity()
+                .map(|arity| arity.total())
+                .or_else(|| metadata.extension_receiver_type().is_some().then_some(0))
+        })
 }
 
 fn owner_of(types: &ProjectTypes, target: &CodeUnit) -> Option<CodeUnit> {
@@ -703,18 +687,6 @@ pub fn import_candidate_owner_fq_names(path: &str, package_name: &str) -> HashSe
         }
     }
     owners
-}
-
-fn signature_arity(signature: &str) -> Option<usize> {
-    if let Some(extension_signature) = signature.strip_prefix("extension ") {
-        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
-        return after_receiver
-            .find('(')
-            .and_then(|open| parenthesized_arity(&after_receiver[open..]))
-            .or(Some(0));
-    }
-    let open = signature.find('(')?;
-    parenthesized_arity(&signature[open..])
 }
 
 pub fn package_name_of(scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {

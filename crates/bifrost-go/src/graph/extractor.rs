@@ -639,6 +639,10 @@ fn scan_direct_identifier(
     if ctx.spec.is_member() {
         return;
     }
+    let text = node_text(node, ctx.source);
+    if ctx.import_binding_names.contains(text) || !ctx.bindings.matches_direct_target(text) {
+        return;
+    }
     // A method receiver names its own type: `func (a AclResourceType) String()`
     // is a real occurrence of `AclResourceType` that an editor must navigate to
     // (gopls lists it), so it is recorded rather than swallowed by the
@@ -649,13 +653,6 @@ fn scan_direct_identifier(
     // from ExternalUsages.
     let receiver_type = is_method_receiver_type_name(node);
     if !receiver_type && is_definition_identifier(node, ctx.source) {
-        return;
-    }
-    let text = node_text(node, ctx.source);
-    if ctx.import_binding_names.contains(text) {
-        return;
-    }
-    if !ctx.bindings.matches_direct_target(text) {
         return;
     }
     if receiver_type {

@@ -1,3 +1,15 @@
+// jemalloc is the binary's global allocator wherever it builds (every target
+// except MSVC, which keeps the system allocator). Measured on the whole tract
+// usage graph (2026-09-25, lane a2, #2771): at matched host load, about 20
+// percent less wall and CPU than the system allocator, peak RSS unchanged
+// (1.27 to 1.28 GiB against 1.29 to 1.31 GiB). Replies were byte-equal on the
+// whole graph and the rooted generated-file graph, and equal on 800 point
+// requests apart from process-local SegmentId numbers in diagnostics.
+// Evidence: /mnt/optane/lane-receipts/bifrost-sg-a2/alloc/report.txt.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -8,7 +20,6 @@ use chrono::{Datelike, Utc};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
-use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_install::install_mcp_hosts;
 use brokk_bifrost::mcp_registry::{
@@ -38,6 +49,11 @@ use brokk_bifrost::{CancellationToken, ToolOutput};
 use code_query_repl::run_code_query_repl;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
+
+/// What `--lsp` and `--server lsp` now answer. The LSP server left this
+/// repository in #2771; an editor that still launches `bifrost --lsp` gets one
+/// plain sentence rather than a silent start.
+const LSP_SERVER_MOVED: &str = "the LSP server has moved out of this repository";
 
 enum CliRunResult {
     Complete,
@@ -104,12 +120,29 @@ enum PolicyColorMode {
 }
 
 fn main() -> ExitCode {
-    brokk_bifrost::ensure_global_rayon_pool();
-    if let Err(error) = brokk_bifrost::install_bifrost_semantic_model_packs() {
-        eprintln!("{error}");
-        return ExitCode::FAILURE;
-    }
-    match run(env::args().skip(1)) {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let result = if let Some(result) = run_portable_runtime_command(&args) {
+        result.map_err(|message| CliRunError {
+            message,
+            policy_invocation: false,
+        })
+    } else {
+        brokk_bifrost::ensure_global_rayon_pool();
+        if let Err(error) = brokk_bifrost::install_bifrost_semantic_model_packs() {
+            Err(CliRunError {
+                message: error,
+                policy_invocation: false,
+            })
+        } else {
+            run(args.into_iter())
+        }
+    };
+    // A one-shot run has no MCP request boundary to close, so this is the only
+    // place the reader seam's counts can be made complete. Both instruments do
+    // nothing unless their variable names an output file.
+    brokk_bifrost::seam_profile::write_totals();
+    brokk_bifrost::cache_db::sql_profile::flush();
+    match result {
         Ok(CliRunResult::Complete) => ExitCode::SUCCESS,
         Ok(CliRunResult::PolicyStatus(status)) => ExitCode::from(status),
         Err(err) => {
@@ -125,6 +158,12 @@ fn main() -> ExitCode {
 
 fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> {
     let args = args.collect::<Vec<_>>();
+    if let Some(result) = run_portable_runtime_command(&args) {
+        return result.map_err(|message| CliRunError {
+            message,
+            policy_invocation: false,
+        });
+    }
     // `scan` is a subcommand, recognized only in the first position so the
     // flag surface stays untouched: everywhere else the word remains an
     // unknown argument exactly as before the subcommand existed.
@@ -141,6 +180,78 @@ fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> 
         message,
         policy_invocation,
     })
+}
+
+fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, String>> {
+    let result = match args.first().map(String::as_str) {
+        Some("pack-engine-profile") => {
+            if args.len() != 1 {
+                Err("pack-engine-profile takes no arguments".to_owned())
+            } else {
+                println!("{}", brokk_bifrost::open_pack_engine_profile());
+                Ok(CliRunResult::Complete)
+            }
+        }
+        Some("install-semantic-packs") => {
+            if args.len() != 3 || args[1].is_empty() || args[2].is_empty() {
+                Err("usage: bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT".to_owned())
+            } else {
+                install_semantic_packs(Path::new(&args[1]), Path::new(&args[2]))
+            }
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn install_semantic_packs(bundle_dir: &Path, cache_root: &Path) -> Result<CliRunResult, String> {
+    use brokk_bifrost::analyzer::semantic_model::{
+        CATALOG_SCHEMA_VERSION, CatalogOpenMode, CatalogOptions, SemanticPackCatalog,
+    };
+
+    let cache_root = if cache_root.is_absolute() {
+        cache_root.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("cannot resolve the current directory: {error}"))?
+            .join(cache_root)
+    };
+    let catalog_root = cache_root.join(format!("semantic-pack-catalog.v{CATALOG_SCHEMA_VERSION}"));
+    let catalog = SemanticPackCatalog::open(
+        &catalog_root,
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "cannot open semantic-pack catalog `{}`: {error}",
+            catalog_root.display()
+        )
+    })?;
+    let installations =
+        brokk_bifrost::semantic_packs::release_bundle::install_release_bundle(bundle_dir, &catalog)
+            .map_err(|error| {
+                format!(
+                    "cannot install semantic-pack bundle `{}`: {error}",
+                    bundle_dir.display()
+                )
+            })?;
+    if installations.is_empty() {
+        return Err(format!(
+            "semantic-pack bundle `{}` installed no compatible packs",
+            bundle_dir.display()
+        ));
+    }
+    let output = json!({
+        "catalog_root": catalog_root,
+        "installed": installations.iter().map(|installation| json!({
+            "pack_id": installation.pack_id,
+            "pack_version": installation.pack_version,
+            "manifest_digest": installation.manifest_digest,
+        })).collect::<Vec<_>>(),
+    });
+    println!("{output}");
+    Ok(CliRunResult::Complete)
 }
 
 fn has_policy_syntax(args: &[String]) -> bool {
@@ -258,7 +369,6 @@ fn run_inner(
     let mut install = false;
     let mut named_workspaces = Vec::new();
     let mut mcp_mode: Option<String> = None;
-    let mut run_lsp = false;
     let mut run_repl = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
@@ -338,24 +448,24 @@ fn run_inner(
                 mcp_mode = Some(value);
             }
             "--lsp" => {
-                run_lsp = true;
+                return Err(LSP_SERVER_MOVED.to_string());
             }
             "--repl" => {
                 run_repl = true;
             }
-            // DEPRECATED: superseded by `--mcp <toolsets>` and `--lsp`. Kept as a
-            // backwards-compatible alias and intentionally undocumented in --help.
-            // `--server lsp` maps to `--lsp`; any other value maps to `--mcp <value>`.
+            // DEPRECATED: superseded by `--mcp <toolsets>`. Kept as a
+            // backwards-compatible alias and intentionally undocumented in
+            // --help. `--server <value>` maps to `--mcp <value>`; `--server lsp`
+            // fails, because the LSP server moved out of this repository.
             "--server" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--server requires a mode".to_string())?;
-                eprintln!("bifrost: --server is deprecated; use --mcp <toolsets> or --lsp");
+                eprintln!("bifrost: --server is deprecated; use --mcp <toolsets>");
                 if value == "lsp" {
-                    run_lsp = true;
-                } else {
-                    mcp_mode = Some(value);
+                    return Err(LSP_SERVER_MOVED.to_string());
                 }
+                mcp_mode = Some(value);
             }
             "--tool" => {
                 let value = args
@@ -649,7 +759,6 @@ fn run_inner(
         if query_file.is_some()
             || tool_name.is_some()
             || tool_args_seen
-            || run_lsp
             || run_repl
             || mcp_mode.is_some()
             || no_line_numbers_seen
@@ -658,7 +767,7 @@ fn run_inner(
             || install
         {
             return Err(
-                "policy options cannot be combined with --install, --query-file, --tool, --args, --mcp, --lsp, --repl, --no-line-numbers, --workspace-scaled-limits, or --diff-snapshot-object-dir"
+                "policy options cannot be combined with --install, --query-file, --tool, --args, --mcp, --repl, --no-line-numbers, --workspace-scaled-limits, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -858,7 +967,6 @@ fn run_inner(
         if root_explicit
             || !named_workspaces.is_empty()
             || mcp_mode.is_some()
-            || run_lsp
             || run_repl
             || tool_name.is_some()
             || tool_args_seen
@@ -877,13 +985,12 @@ fn run_inner(
     if let Some(query_file) = query_file {
         if tool_name.is_some()
             || tool_args_seen
-            || run_lsp
             || run_repl
             || mcp_mode.is_some()
             || diff_snapshot_object_dir.is_some()
         {
             return Err(
-                "--query-file cannot be combined with --tool, --args, --mcp, --lsp, --repl, or --diff-snapshot-object-dir"
+                "--query-file cannot be combined with --tool, --args, --mcp, --repl, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -907,8 +1014,8 @@ fn run_inner(
     }
 
     if let Some(tool_name) = tool_name {
-        if run_lsp || run_repl || mcp_mode.is_some() {
-            return Err("--tool cannot be combined with --mcp, --lsp, or --repl".to_string());
+        if run_repl || mcp_mode.is_some() {
+            return Err("--tool cannot be combined with --mcp or --repl".to_string());
         }
         let diff_snapshot_object_dir = diff_snapshot_object_dir
             .map(validate_diff_snapshot_object_dir)
@@ -929,12 +1036,8 @@ fn run_inner(
         return Err("--sources may only be used with --tool".to_string());
     }
 
-    if run_lsp && mcp_mode.is_some() {
-        return Err("--lsp cannot be combined with --mcp".to_string());
-    }
-
-    if run_repl && (run_lsp || mcp_mode.is_some()) {
-        return Err("--repl cannot be combined with --mcp or --lsp".to_string());
+    if run_repl && mcp_mode.is_some() {
+        return Err("--repl cannot be combined with --mcp".to_string());
     }
 
     if !root_explicit && mcp_mode.is_none() {
@@ -942,13 +1045,6 @@ fn run_inner(
             "bifrost: no --root supplied, using current directory: {}",
             escape_terminal_text(root.to_string_lossy().as_ref())
         );
-    }
-
-    if run_lsp {
-        if diff_snapshot_object_dir.is_some() {
-            return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --lsp".to_string());
-        }
-        return run_lsp_stdio_server(root).map(|()| CliRunResult::Complete);
     }
 
     if run_repl {
@@ -1014,6 +1110,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
     let mut fail_on = PolicyFailOn::Warning;
     let mut fail_on_seen = false;
     let mut evaluation_date = None;
+    let mut incremental = true;
     let mut output: Option<PathBuf> = None;
     let mut verbose = false;
     let mut color = PolicyColorMode::Auto;
@@ -1057,6 +1154,12 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
                 evaluation_date = Some(value.parse::<PolicyEvaluationDate>().map_err(|error| {
                     format!("Invalid --evaluation-date value: {value}. {error}.")
                 })?);
+            }
+            "--no-incremental" => {
+                if !incremental {
+                    return Err("--no-incremental may only be provided once".to_string());
+                }
+                incremental = false;
             }
             "--output" => {
                 let value = args
@@ -1107,6 +1210,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             || format_seen
             || fail_on_seen
             || evaluation_date.is_some()
+            || !incremental
             || output.is_some()
             || verbose
             || color_seen
@@ -1181,9 +1285,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             baseline: PolicyBaselineOptions::default(),
             accept_current: false,
             diff_base: None,
-            // The scan entry point has no --no-incremental flag; the incremental
-            // diff-base review is on by default, as on the policy path.
-            incremental: true,
+            incremental,
             policy_timings: false,
             output,
             verbose,
@@ -1263,6 +1365,7 @@ OPTIONS:
                            (default: warning; finding includes unrated findings)
     --evaluation-date YYYY-MM-DD
                            Evaluate suppression expiration on this UTC date (default: today)
+    --no-incremental       Evaluate in full without policy-unit cache access
     --output PATH          Atomically write the report to PATH instead of stdout
     --verbose              Include complete evidence and rule details in human output
     --color MODE           Human output color: auto, always, or never (default: auto)
@@ -1898,7 +2001,59 @@ fn spawn_orphan_watchdog(cancellation: CancellationToken) {
         .expect("spawn orphan watchdog");
 }
 
+/// Answer one tool call, on stdout, whatever happens to the analysis.
+///
+/// Analysis runs on threads this call does not own -- one build thread per
+/// language, a rayon pool under each of them -- and an assertion that fires on
+/// one of those workers unwinds all the way out of `main`. The process then
+/// exits with the panic's status and writes nothing to the channel the tool
+/// contract answers on, so a caller reading stdout sees an empty document with
+/// no statement of failure (issue #2771). Report the panic here instead: the
+/// message reaches stderr and a structured failure reaches stdout, and the
+/// exit status is the ordinary CLI failure. Nothing is hidden -- the process
+/// panic hook has already printed the original panic and its location, and the
+/// reported message repeats it.
+///
+/// Every dispatched tool call therefore writes exactly one JSON result:
+/// `isError: false` with the tool's structured content, or `isError: true`
+/// with the failure. Argument validation that happens before dispatch keeps
+/// reporting on stderr alone.
 fn run_tool(
+    root: PathBuf,
+    tool_name: &str,
+    tool_args: Value,
+    tool_sources: &[String],
+    render_options: McpRenderOptions,
+    diff_snapshot_object_dir: Option<PathBuf>,
+    workspace_scaled_limits: bool,
+) -> Result<(), String> {
+    let dispatched =
+        brokk_bifrost::panic_report::report_panics(format!("--tool {tool_name}"), || {
+            run_dispatched_tool(
+                root,
+                tool_name,
+                tool_args,
+                tool_sources,
+                render_options,
+                diff_snapshot_object_dir,
+                workspace_scaled_limits,
+            )
+        });
+    let failure = match dispatched {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(failure)) => failure,
+        Err(panic) => panic.to_string(),
+    };
+    let encoded = serde_json::to_string(&json!({
+        "isError": true,
+        "error": failure,
+    }))
+    .expect("an object of two strings serializes");
+    println!("{encoded}");
+    Err(failure)
+}
+
+fn run_dispatched_tool(
     root: PathBuf,
     tool_name: &str,
     tool_args: Value,
@@ -1989,11 +2144,13 @@ USAGE:
                                Run `bifrost scan --help` for the scan options.
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
-    bifrost --lsp              Run a Language Server (LSP) over stdio
     bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
     bifrost --install          Register brokk with installed coding hosts and exit
+    bifrost pack-engine-profile Print the portable pack-consumer profile as JSON
+    bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
+                               Verify and install a native semantic-pack bundle
     bifrost --policy           Evaluate the built-in policy packs on the project and exit
     bifrost --policy-file PATH Evaluate workspace or built-in static-analysis policies and exit
     bifrost --list-policies    Print the built-in policy catalog and exit
@@ -2066,10 +2223,10 @@ OPTIONS:
                            each finding as new or persisting against it, and fail only on new
                            findings. REV is any revision git rev-parse accepts; pass the pull
                            request's merge base in CI. An unresolvable base is unreliable (exit 2)
-    --no-incremental       Evaluate every policy in full instead of reusing per-unit results a
-                           previous run published in this repository's analyzer cache. Reuse is on
-                           by default and produces the same findings; this switch is for comparing
-                           against the full dual-snapshot evaluation when diagnosing a difference
+    --no-incremental       Evaluate every policy in full without reading or publishing policy
+                           units in this repository's analyzer cache. By default full scans publish
+                           complete units and diff scans reuse only verified units; this switch
+                           compares against full evaluation when diagnosing a difference
     --policy-timings       Include each policy's evaluation elapsed time in its report work metrics
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
@@ -2171,12 +2328,134 @@ EXAMPLES:
     bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 
     # Language server over stdio:
-    bifrost --root /path/to/project --lsp
 
 Servers speak their protocol over stdio (no network port). The workspace index is built
 in the background: the server is ready immediately and the first request waits for indexing.
 "#;
     print!("{bottom}");
+}
+
+#[cfg(test)]
+mod portable_runtime_cli_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tempfile::tempdir;
+
+    fn authored_release_bundle(root: &Path) -> PathBuf {
+        let mut authored: Value = serde_json::from_slice(include_bytes!(
+            "../../crates/bifrost-analysis/testdata/semantic-model-packs/declarations-v1.json"
+        ))
+        .expect("parse authored semantic-model fixture");
+        authored["compatibility"]["toolchains"][0]["requirement"] =
+            Value::String(">=17.0.0, <22.0.0".to_owned());
+        authored["shards"][0]["activation"][0]["package"]["version"] =
+            Value::String("=1.2.0".to_owned());
+        let authored = serde_json::to_vec(&authored).expect("serialize authored fixture");
+        let artifact_path = root.join("authored.json");
+        let spec_path = root.join("spec.json");
+        fs::write(&artifact_path, &authored).expect("write authored semantic-model fixture");
+        fs::write(root.join("NOTICE.txt"), "portable runtime fixture notice\n")
+            .expect("write fixture notice");
+
+        let activation = json!([{
+            "package": {
+                "name": "com.acme:widget",
+                "version": "=1.2.0"
+            },
+            "targets": ["jvm"],
+            "configurations": ["release"]
+        }]);
+        let compatibility = json!({
+            "bifrost": ">=0.8.0, <1.0.0",
+            "toolchains": [{ "name": "jdk", "requirement": ">=17.0.0, <22.0.0" }]
+        });
+        let provenance = json!({
+            "source": "https://repo.example/acme/widget-1.2.0.jar",
+            "revision": "sha256:example"
+        });
+        let safety = json!({
+            "generated_code_only": false,
+            "review_required": false
+        });
+        let digest = Sha256::digest(authored)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let spec = json!({
+            "schema_version": 1,
+            "pack_id": "acme.widget",
+            "pack_version": "1.2.0",
+            "ecosystem": "maven",
+            "kind": { "artifact_kind": "authored_semantic_model" },
+            "artifact": {
+                "file_name": "authored.json",
+                "sha256": digest,
+                "url": "https://repo.example/acme/authored.json",
+                "container": null
+            },
+            "compatibility": compatibility,
+            "activation": activation,
+            "provenance": provenance,
+            "license": "Apache-2.0",
+            "safety": safety,
+            "notices": ["NOTICE.txt"],
+            "measurement_activation": {
+                "package": {
+                    "name": "com.acme:widget",
+                    "version": "=1.2.0"
+                },
+                "toolchain": { "name": "jdk", "version": "=21.0.0" },
+                "targets": ["jvm"],
+                "configurations": ["release"]
+            },
+            "measurement_queries": [{
+                "kind": "type",
+                "name": "com.acme.Widget"
+            }]
+        });
+        fs::write(
+            &spec_path,
+            serde_json::to_vec_pretty(&spec).expect("serialize pinned spec"),
+        )
+        .expect("write pinned spec");
+
+        let bundle_root = root.join("bundle");
+        brokk_bifrost::semantic_packs::release_bundle::generate_release_bundle(
+            &bundle_root,
+            &[brokk_bifrost::semantic_packs::release_bundle::BundleInput {
+                spec_path,
+                artifact_path,
+            }],
+        )
+        .expect("generate native release bundle");
+        bundle_root
+    }
+
+    #[test]
+    fn pack_engine_profile_rejects_arguments() {
+        let result = run_portable_runtime_command(&[
+            "pack-engine-profile".to_owned(),
+            "unexpected".to_owned(),
+        ]);
+        assert!(
+            matches!(result, Some(Err(message)) if message == "pack-engine-profile takes no arguments")
+        );
+    }
+
+    #[test]
+    fn install_semantic_packs_installs_a_generated_authored_bundle() {
+        let fixture = tempdir().expect("temporary install fixture");
+        let bundle = authored_release_bundle(fixture.path());
+        let cache_root = fixture.path().join("cache");
+        let result = install_semantic_packs(&bundle, &cache_root).expect("install bundle");
+        assert!(matches!(result, CliRunResult::Complete));
+
+        let catalog_root = cache_root.join(format!(
+            "semantic-pack-catalog.v{}",
+            brokk_bifrost::analyzer::semantic_model::CATALOG_SCHEMA_VERSION
+        ));
+        assert!(catalog_root.is_dir(), "versioned catalog root exists");
+    }
 }
 
 /// Print `    <toolset>   name, name, ...`, wrapping the comma-separated names
@@ -3091,6 +3370,10 @@ mod scan_cli_tests {
             run_error(&["scan", "--format", "json", "--verbose"]).0,
             "--verbose and --color are only valid with --format human"
         );
+        assert_eq!(
+            run_error(&["scan", "--no-incremental", "--no-incremental"]).0,
+            "--no-incremental may only be provided once"
+        );
     }
 
     #[test]
@@ -3099,6 +3382,7 @@ mod scan_cli_tests {
             vec!["--list-builtin-policies", "some/path"],
             vec!["--list-builtin-policies", "--format", "json"],
             vec!["--list-builtin-policies", "--fail-on", "never"],
+            vec!["--list-builtin-policies", "--no-incremental"],
             vec!["--list-builtin-policies", "--output", "out.json"],
         ] {
             let mut args = vec!["scan"];

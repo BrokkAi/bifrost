@@ -1,8 +1,6 @@
 use super::*;
-use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::csharp::{graph_support, hierarchy};
 use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
-use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::applicability::{
     ApplicabilityOutcome, CandidateApplicability, arity_verdict,
 };
@@ -15,11 +13,13 @@ use crate::analyzer::usages::csharp_graph::{
     seed_csharp_bindings_before_in_session,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{CodeUnitIndex, ImportAnalysisProvider, ImportInfo};
 use crate::analyzer::{
     TypeHierarchyProvider, csharp_attribute_name_node, csharp_attribute_type_names,
-    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_source_identifier,
+    csharp_conditional_member_access, csharp_member_name, csharp_normalize_full_name,
+    csharp_source_identifier,
 };
+use brokk_bifrost_core::analyzer::model::ClassLikeKind;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
@@ -28,7 +28,7 @@ use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_stat
 use brokk_bifrost_csharp::graph::resolver::{
     CSharpCallArgumentOwners, call_argument_parameter_index,
     callable_parameter_type_fq_name_for_forward, callable_parameter_type_fq_name_in_session,
-    csharp_invocation_member, filter_call_argument_method_candidates_with_arities,
+    csharp_invocation_member, filter_call_argument_method_candidates_with_metadata,
 };
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
@@ -335,12 +335,11 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
-    fn import_statements(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
+    fn import_infos(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
         match self.session {
-            Some(session) => session.query_limited_rows(|limit| {
-                graph_support::import_statements_limited(self.csharp, token, file, limit)
-            }),
-            None => self.csharp.import_statements(file),
+            Some(session) => session
+                .query_limited_rows(|limit| self.csharp.import_info_of_limited(token, file, limit)),
+            None => self.csharp.import_info_of(token, file).to_vec(),
         }
     }
 
@@ -2217,7 +2216,8 @@ fn csharp_seed_symbol_for_type(
     }
 }
 
-pub(super) fn parse_csharp_tree(source: &str) -> Option<Tree> {
+#[cfg(test)]
+fn parse_csharp_tree(source: &str) -> Option<Tree> {
     brokk_bifrost_csharp::preprocessor::parse_csharp(source)
 }
 
@@ -2526,11 +2526,7 @@ fn resolve_csharp_constructor(
             applicable.extend(owner_applicable);
         } else if call_arity == 0
             && (owner_constructors.is_empty()
-                || csharp_uses_implicit_parameterless_value_constructor(
-                    analyzer,
-                    definitions,
-                    owner,
-                ))
+                || csharp_uses_implicit_parameterless_value_constructor(definitions, owner))
         {
             implicit_parameterless_owners.push(owner.clone());
         }
@@ -2572,29 +2568,14 @@ fn resolve_csharp_constructor(
 }
 
 fn csharp_uses_implicit_parameterless_value_constructor(
-    analyzer: &dyn IAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     owner: &CodeUnit,
 ) -> bool {
-    let Some(source) = definitions.query_optional(|| owner.source().read_to_string().ok()) else {
-        return false;
-    };
-    let Some(tree) = parse_csharp_tree(&source) else {
-        return false;
-    };
-    let ranges = definitions
-        .query(|| analyzer.ranges(owner).to_vec())
-        .unwrap_or_default();
-    let root = tree.root_node();
-    ranges.into_iter().any(|range| {
-        let Some(declaration) = node_for_exact_range(root, &range) else {
-            return false;
-        };
-        matches!(
-            declaration.kind(),
-            "struct_declaration" | "record_struct_declaration"
-        )
-    })
+    let metadata = definitions.signature_metadata(owner);
+    !metadata.is_empty()
+        && metadata
+            .iter()
+            .all(|metadata| metadata.class_like_kind() == Some(ClassLikeKind::Struct))
 }
 
 fn csharp_type_outcome(
@@ -3663,15 +3644,11 @@ fn csharp_forward_call_argument_method_candidates(
             if raw.is_empty() {
                 continue;
             }
-            candidates.extend(filter_call_argument_method_candidates_with_arities(
+            candidates.extend(filter_call_argument_method_candidates_with_metadata(
                 raw,
                 call_arity,
                 invocation.name.explicit_generic_arity,
-                |candidate| {
-                    definitions
-                        .query(|| csharp_callable_arity(analyzer, candidate))
-                        .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
-                },
+                |candidate| definitions.signature_metadata(candidate),
             ));
         }
     } else {
@@ -3689,15 +3666,11 @@ fn csharp_forward_call_argument_method_candidates(
             if raw.is_empty() {
                 continue;
             }
-            candidates = filter_call_argument_method_candidates_with_arities(
+            candidates = filter_call_argument_method_candidates_with_metadata(
                 raw,
                 call_arity,
                 invocation.name.explicit_generic_arity,
-                |candidate| {
-                    definitions
-                        .query(|| csharp_callable_arity(analyzer, candidate))
-                        .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
-                },
+                |candidate| definitions.signature_metadata(candidate),
             );
             break;
         }
@@ -4092,12 +4065,10 @@ fn csharp_nameof_invocation_for_operand(node: Node<'_>) -> Option<Node<'_>> {
 /// list at all. It is not admitted, exactly as before, and records `unknown`
 /// rather than a rejection nobody computed.
 ///
-/// A callable whose parameter list C# never recorded is compared against a
-/// defaulted zero arity, which is a language-side choice this factoring
-/// preserves rather than changes: the row states the refusal the resolver acted
-/// on. See the plan's Surprises entry.
+/// Missing or conflicting primary parameter metadata is unknown; it cannot
+/// prove a zero-argument callable or a parameter-count mismatch.
 fn csharp_candidate_applicability(
-    analyzer: &dyn IAnalyzer,
+    _analyzer: &dyn IAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     candidates: &[CodeUnit],
     arity: Option<usize>,
@@ -4117,10 +4088,10 @@ fn csharp_candidate_applicability(
             verdicts.push(CandidateApplicability::unknown(unit.clone()));
             continue;
         }
-        let declared = definitions
-            .query(|| csharp_callable_arity(analyzer, unit))
-            .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0));
-        let verdict = arity_verdict(unit, Some(&[declared]), expected);
+        let declared = brokk_bifrost_csharp::syntax::csharp_callable_arity_from_metadata(
+            &definitions.signature_metadata(unit),
+        );
+        let verdict = arity_verdict(unit, declared.as_ref().map(std::slice::from_ref), expected);
         if verdict.verdict != ApplicabilityVerdict::Inapplicable {
             winners.push(unit.clone());
         }
@@ -4159,7 +4130,20 @@ fn csharp_generic_arity_applicability(
             verdicts.push(CandidateApplicability::unknown(unit.clone()));
             continue;
         }
-        if unit.is_function() && csharp_method_generic_arity(unit.signature()) == expected {
+        let metadata = definitions.signature_metadata(unit);
+        if !definitions.observe_cancellation() {
+            verdicts.push(CandidateApplicability::unknown(unit.clone()));
+            continue;
+        }
+        if unit.is_function()
+            && (metadata.is_empty()
+                || metadata
+                    .iter()
+                    .any(|row| row.type_parameters().len() != metadata[0].type_parameters().len()))
+        {
+            winners.push(unit.clone());
+            verdicts.push(CandidateApplicability::unknown(unit.clone()));
+        } else if unit.is_function() && metadata[0].type_parameters().len() == expected {
             winners.push(unit.clone());
             verdicts.push(CandidateApplicability::applicable(unit.clone()));
         } else {
@@ -5450,16 +5434,11 @@ fn csharp_static_using_targets(
     file: &ProjectFile,
 ) -> impl Iterator<Item = String> {
     definitions
-        .import_statements(token, file)
+        .import_infos(token, file)
         .into_iter()
-        .filter_map(|raw| {
-            raw.trim()
-                .trim_start_matches("global ")
-                .trim_start_matches("using ")
-                .trim_end_matches(';')
-                .trim()
-                .strip_prefix("static ")
-                .map(|target| target.trim().to_string())
+        .filter_map(|import| {
+            brokk_bifrost_csharp::imports::csharp_static_using_from_import(&import)
+                .map(str::to_owned)
         })
 }
 

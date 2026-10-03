@@ -152,9 +152,9 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
         limit: usize,
     ) -> LimitedQueryRows<String>;
 
-    /// [`ImportAnalysisProvider::import_info_of`] under a budget: the import
-    /// records of `file`, whose `raw_snippet` still holds the `using` directive
-    /// verbatim for the C# spellings to parse. `limit` caps rows.
+    /// [`ImportAnalysisProvider::import_info_of`] under a budget: canonical
+    /// import records of `file`, including structured paths and global flags.
+    /// `limit` caps rows.
     fn import_info_of_limited(
         &self,
         token: QueryToken<'_>,
@@ -626,25 +626,6 @@ pub fn compute_namespace_of_file_limited(
     LimitedQueryRows::complete(vec![namespace], package.inspected)
 }
 
-pub fn import_statements_limited(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    limit: usize,
-) -> LimitedQueryRows<String> {
-    let imports = source.import_info_of_limited(token, file, limit);
-    let statements = imports
-        .rows
-        .into_iter()
-        .map(|import| import.raw_snippet)
-        .collect();
-    if imports.complete {
-        LimitedQueryRows::complete(statements, imports.inspected)
-    } else {
-        LimitedQueryRows::incomplete(statements, imports.inspected)
-    }
-}
-
 /// The uncached half of the analyzer's `using_namespaces_of`.
 pub fn compute_using_namespaces_of(
     source: &dyn CSharpSource,
@@ -1084,7 +1065,7 @@ pub fn compute_global_using_namespaces(
         .all_files()
         .into_iter()
         .flat_map(|file| source.import_info_of(token, &file).into_iter())
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_namespace(&import))
         .map(|namespace| {
             normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
@@ -1103,7 +1084,7 @@ pub fn compute_global_using_namespaces_limited(
     let namespaces: HashSet<_> = imports
         .rows
         .into_iter()
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_namespace(&import))
         .map(|namespace| {
             normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
@@ -1125,7 +1106,7 @@ pub fn compute_global_using_aliases(
         .all_files()
         .into_iter()
         .flat_map(|file| source.import_info_of(token, &file).into_iter())
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_alias_from_import(&import))
         .collect()
 }
@@ -1140,7 +1121,7 @@ pub fn compute_global_using_aliases_limited(
     let aliases: HashMap<_, _> = imports
         .rows
         .iter()
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(csharp_using_alias_from_import)
         .collect();
     if !imports.complete {
@@ -1159,7 +1140,7 @@ pub fn compute_global_static_using_type_names(
         .all_files()
         .into_iter()
         .flat_map(|file| source.import_info_of(token, &file).into_iter())
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(|import| {
             let target = csharp_static_using_from_import(&import)?;
             let target =
@@ -1181,7 +1162,7 @@ pub fn compute_global_static_using_type_names_limited(
     let mut type_names: Vec<_> = imports
         .rows
         .iter()
-        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter(|import| import.is_global)
         .filter_map(csharp_static_using_from_import)
         .map(|target| {
             normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target))
@@ -1207,7 +1188,7 @@ pub fn compute_global_static_using_types(
         for target in source
             .import_info_of(token, &file)
             .iter()
-            .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+            .filter(|import| import.is_global)
             .filter_map(csharp_static_using_from_import)
         {
             let target =
@@ -1233,7 +1214,7 @@ pub fn compute_usage_global_static_using_types(
         for target in source
             .import_info_of(token, &file)
             .iter()
-            .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+            .filter(|import| import.is_global)
             .filter_map(csharp_static_using_from_import)
         {
             let target =

@@ -157,22 +157,12 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
     fn prefetch_file_dependency_targets(
         &self,
         _files: &[ProjectFile],
-        imports: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _imports: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &CancellationToken,
     ) {
         if !cancellation.is_cancelled() {
             let _ = self.file_dependencies_by_namespace();
             let _ = self.compilation_index();
-            if let Some(imports) = imports {
-                let mut global_using_files = imports
-                    .iter()
-                    .filter(|(_, imports)| imports.iter().any(|import| import.is_global))
-                    .map(|(file, _)| file.clone())
-                    .collect::<Vec<_>>();
-                global_using_files.sort();
-                global_using_files.dedup();
-                let _ = self.memo_caches.global_using_files.set(global_using_files);
-            }
         }
     }
 
@@ -181,17 +171,23 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         files: &[ProjectFile],
         cancellation: &CancellationToken,
     ) -> Option<crate::analyzer::AdditionalFileDependencies> {
-        let global_using_files = self.memo_caches.global_using_files.get_or_init(|| {
-            let imports = self.inner.bulk_import_infos(files.iter().cloned());
-            let mut global_using_files = imports
-                .into_iter()
-                .filter(|(_, imports)| imports.iter().any(|import| import.is_global))
-                .map(|(file, _)| file)
-                .collect::<Vec<_>>();
-            global_using_files.sort();
-            global_using_files.dedup();
-            global_using_files
-        });
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        // Global usings belong to the compilation, including source files
+        // outside this dependency query's requested subset. Never memoize a
+        // partial publication as an authoritative global-using inventory.
+        let inventory = crate::analyzer::IAnalyzer::source_file_inventory(&self.inner);
+        let imports = self.inner.bulk_import_infos(inventory.rows.iter().cloned());
+        let imports_complete =
+            inventory.complete && inventory.rows.iter().all(|file| imports.contains_key(file));
+        let mut global_using_files = imports
+            .into_iter()
+            .filter(|(_, imports)| imports.iter().any(|import| import.is_global))
+            .map(|(file, _)| file)
+            .collect::<Vec<_>>();
+        global_using_files.sort();
+        global_using_files.dedup();
         if cancellation.is_cancelled() {
             return None;
         }
@@ -210,7 +206,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if cancellation.is_cancelled() {
             return None;
         }
-        Some(if compilation_index.is_complete() {
+        Some(if imports_complete && compilation_index.is_complete() {
             crate::analyzer::AdditionalFileDependencies::complete(dependencies)
         } else {
             crate::analyzer::AdditionalFileDependencies::incomplete(dependencies)
@@ -347,5 +343,82 @@ impl CSharpAnalyzer {
             || compute_implicit_reference_index(self, token, true),
             || compute_implicit_reference_index(self, token, false),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn global_using_dependencies_recover_after_missing_publication() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A/GlobalUsings.cs", "global using Shared;")
+            .file("A/App.cs", "namespace A; class App {}")
+            .build();
+        let project = fixture.project_dyn();
+        let context =
+            crate::analyzer::tree_sitter_analyzer::persistent_store_context_without_automatic_gc(
+                project.as_ref(),
+            )
+            .unwrap();
+        let mut analyzer = CSharpAnalyzer::new_with_config_store_context(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        analyzer.inner.clear_retained_file_states_for_test();
+        let app = fixture.file("A/App.cs");
+        let global = fixture.file("A/GlobalUsings.cs");
+        let cancellation = CancellationToken::new();
+        let conn = crate::cache_db::open_unified_connection(
+            analyzer
+                .inner
+                .analyzer_store()
+                .db_path()
+                .expect("persistent database"),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TEMP TABLE saved_source_manifests AS SELECT * FROM source_fact_manifests;
+             DROP TRIGGER source_fact_manifests_no_direct_delete;
+             DELETE FROM source_fact_manifests;",
+        )
+        .unwrap();
+        {
+            let _scope = AnalyzerQueryScope::new(&analyzer);
+            let partial = analyzer
+                .additional_direct_file_dependencies(std::slice::from_ref(&app), &cancellation)
+                .expect("not cancelled");
+            assert!(!partial.complete);
+            assert!(partial.dependencies.is_empty());
+        }
+        conn.execute_batch(
+            "UPDATE saved_source_manifests SET publication_state='building';
+             INSERT INTO source_fact_manifests SELECT * FROM saved_source_manifests;
+             UPDATE source_fact_manifests SET publication_state='complete';",
+        )
+        .unwrap();
+        analyzer.prefetch_file_dependency_targets(
+            std::slice::from_ref(&app),
+            Some(&HashMap::default()),
+            &cancellation,
+        );
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let result = analyzer
+            .additional_direct_file_dependencies(std::slice::from_ref(&app), &cancellation)
+            .expect("not cancelled after publication repair");
+        assert!(result.complete);
+        assert!(
+            result
+                .dependencies
+                .get(&app)
+                .is_some_and(|files| files.contains(&global))
+        );
     }
 }

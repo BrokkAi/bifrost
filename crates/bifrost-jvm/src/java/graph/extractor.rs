@@ -909,15 +909,26 @@ fn maybe_record_method_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut Scan
         let same_owner = outcome == ReceiverTargetMatch::Matched
             && method_receiver_object_is_same_owner(object, token, ctx);
         (outcome, same_owner)
-    } else if bare_method_context_matches_target(node, token, ctx) {
-        // An unqualified call resolving to the enclosing type is an implicit-this
-        // (or inherited) receiver on the current instance.
-        (ReceiverTargetMatch::Matched, true)
-    } else if has_proven_static_import(token, ctx) {
-        // A static import resolves to another type's static member, not the owner.
-        (ReceiverTargetMatch::Matched, false)
     } else {
-        (ReceiverTargetMatch::Unresolved, false)
+        match bare_method_context_matches_target(node, token, ctx) {
+            ReceiverTargetMatch::Matched => {
+                // An unqualified call resolving to the enclosing type is an
+                // implicit-this (or inherited) receiver on the current instance.
+                (ReceiverTargetMatch::Matched, true)
+            }
+            ReceiverTargetMatch::Incompatible | ReceiverTargetMatch::Unresolved => {
+                if has_proven_static_import(token, ctx) {
+                    // A static import resolves to another type's static member,
+                    // not the owner.
+                    (ReceiverTargetMatch::Matched, false)
+                } else {
+                    // Declaration matching does not prove call applicability.
+                    // Keep an incompatible bare call as conservative evidence
+                    // unless a static import gives a definite non-owner bind.
+                    (ReceiverTargetMatch::Unresolved, false)
+                }
+            }
+        }
     };
     match receiver_match {
         ReceiverTargetMatch::Matched if same_owner => hits::push_self_receiver_hit(name_node, ctx),
@@ -1206,11 +1217,19 @@ fn maybe_record_field_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanC
                 .is_shadowed_below_scope(*depth, ctx.spec.member_name.as_str())
         },
     );
-    if !shadowed
-        && (bare_field_context_matches_target(node, token, ctx)
-            || has_proven_static_import(token, ctx))
-    {
-        hits::push_hit(node, ctx);
+    if !shadowed {
+        match bare_field_context_matches_target(node, token, ctx) {
+            ReceiverTargetMatch::Matched => hits::push_hit(node, ctx),
+            ReceiverTargetMatch::Incompatible => {
+                if has_proven_static_import(token, ctx) {
+                    hits::push_hit(node, ctx);
+                }
+            }
+            ReceiverTargetMatch::Unresolved => {
+                // An unreadable lexical member scope may hide an import.
+                hits::push_unproven_hit(node, ctx);
+            }
+        }
     }
 }
 

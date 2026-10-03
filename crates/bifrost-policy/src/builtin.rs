@@ -17,10 +17,13 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
+use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 use serde::{Deserialize, Serialize};
 
 use super::locator::is_qualified_locator_code;
@@ -34,7 +37,8 @@ pub const CODE_SMELLS_PACK_ID: &str = "bifrost.code-smells";
 pub const CORRECTNESS_PACK_ID: &str = "bifrost.correctness";
 pub const SECURITY_PACK_ID: &str = "bifrost.security";
 pub const EFFECTS_PACK_ID: &str = "bifrost.effects";
-const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const OPEN_POLICY_PACK_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
 
 const CODE_SMELLS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.code-smells/manifest.json");
@@ -92,6 +96,12 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/python-absent-member.rqlp",
         include_str!("../policy-packs/bifrost.code-smells/policies/python-absent-member.rqlp"),
+    ),
+    (
+        "policies/python-absent-member-conditional.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.code-smells/policies/python-absent-member-conditional.rqlp"
+        ),
     ),
     (
         "policies/go-nil-dereference.rqlp",
@@ -708,8 +718,22 @@ pub struct BuiltInPolicyCatalog {
 }
 
 impl BuiltInPolicyCatalog {
-    /// Build the shipped catalog from the checked-in embedded packs.
+    /// Load the configured portable policy set, or the shipped embedded set.
     fn load() -> Result<Self, BuiltInPolicyError> {
+        if let Some(root) = std::env::var_os(OPEN_POLICY_PACK_ROOT_ENV) {
+            if root.is_empty() {
+                return Err(BuiltInPolicyError::new(format!(
+                    "{OPEN_POLICY_PACK_ROOT_ENV} must name a policy pack root"
+                )));
+            }
+            return load_external_policy_catalog(Path::new(&root));
+        }
+
+        Self::load_embedded()
+    }
+
+    /// Build the shipped catalog from the checked-in embedded packs.
+    fn load_embedded() -> Result<Self, BuiltInPolicyError> {
         let packs = EMBEDDED_POLICY_PACK_SOURCES
             .iter()
             .map(|(pack_id, manifest_source)| {
@@ -963,6 +987,182 @@ impl BuiltInPolicyCatalog {
     }
 }
 
+const MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES: usize = 4096;
+const MAX_EXTERNAL_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "cannot inspect configured policy pack root `{}`: {error}",
+            root.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BuiltInPolicyError::new(format!(
+            "configured policy pack root `{}` must be a real rules directory",
+            root.display()
+        )));
+    }
+    let root = root.canonicalize().map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "cannot resolve configured policy pack root `{}`: {error}",
+            root.display()
+        ))
+    })?;
+    let workspace_root = WorkspaceRoot::open(&root).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "cannot open configured policy pack root `{}`: {error}",
+            root.display()
+        ))
+    })?;
+
+    let mut directories = fs::read_dir(&root)
+        .map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot list configured policy pack root `{}`: {error}",
+                root.display()
+            ))
+        })?
+        .take(MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES + 1)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot read configured policy pack root `{}`: {error}",
+                root.display()
+            ))
+        })?;
+    if directories.len() > MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES {
+        return Err(BuiltInPolicyError::new(format!(
+            "configured policy pack root `{}` contains more than {MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES} entries",
+            root.display()
+        )));
+    }
+    directories.sort_by_key(|entry| entry.file_name());
+    if directories.is_empty() {
+        return Err(BuiltInPolicyError::new(format!(
+            "configured policy pack root `{}` contains no policy packs",
+            root.display()
+        )));
+    }
+
+    let mut packs = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let pack_id = directory.file_name().into_string().map_err(|_| {
+            BuiltInPolicyError::new(format!(
+                "configured policy pack directory `{}` has a non-UTF-8 name",
+                directory.path().display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(directory.path()).map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot inspect configured policy pack directory `{}`: {error}",
+                directory.path().display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BuiltInPolicyError::new(format!(
+                "configured policy pack root contains a non-directory or symlink `{}`",
+                directory.path().display()
+            )));
+        }
+
+        let manifest_path = PathBuf::from(&pack_id).join("manifest.json");
+        let manifest_source =
+            read_external_policy_document(&workspace_root, &manifest_path, "json")?;
+        let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(&manifest_source)
+            .map_err(|error| {
+                BuiltInPolicyError::new(format!(
+                    "invalid configured policy manifest `{}`: {error}",
+                    directory.path().join("manifest.json").display()
+                ))
+            })?;
+        validate_manifest_shape(&manifest)?;
+        if manifest.id != pack_id {
+            return Err(BuiltInPolicyError::new(format!(
+                "configured policy pack directory `{pack_id}` does not match manifest id `{}`",
+                manifest.id
+            )));
+        }
+
+        let mut pack = EmbeddedPolicyPack::new(manifest_source);
+        for policy in &manifest.policies {
+            validate_external_policy_path(&policy.path)?;
+            let source_path = PathBuf::from(&pack_id).join(&policy.path);
+            let policy_source =
+                read_external_policy_document(&workspace_root, &source_path, "rqlp")?;
+            pack = pack.with_source(policy.path.clone(), policy_source);
+        }
+        packs.push(pack);
+    }
+
+    BuiltInPolicyCatalog::from_embedded_packs(packs)
+}
+
+fn validate_external_policy_path(value: &str) -> Result<(), BuiltInPolicyError> {
+    if !value.starts_with("policies/")
+        || !value.ends_with(".rqlp")
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains('\0')
+    {
+        return Err(BuiltInPolicyError::new(format!(
+            "configured policy source path `{value}` must be a portable policies/*.rqlp path"
+        )));
+    }
+    Ok(())
+}
+
+fn read_external_policy_document(
+    root: &WorkspaceRoot,
+    relative_path: &Path,
+    extension: &str,
+) -> Result<String, BuiltInPolicyError> {
+    let parent = relative_path
+        .parent()
+        .expect("policy files have a parent directory");
+    let filename = relative_path
+        .file_name()
+        .expect("policy files have a filename");
+    let directory = root.open_directory(parent).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "invalid or unsafe configured policy path `{}`: {error}",
+            relative_path.display()
+        ))
+    })?;
+    let entries = directory
+        .entries_up_to(MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES)
+        .map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot inspect configured policy directory `{}`: {error}",
+                parent.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            BuiltInPolicyError::new(format!(
+                "configured policy directory `{}` has more than {MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES} entries",
+                parent.display()
+            ))
+        })?;
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.relative_path().file_name() == Some(filename))
+        .ok_or_else(|| {
+            BuiltInPolicyError::new(format!(
+                "configured policy source `{}` does not exist",
+                relative_path.display()
+            ))
+        })?;
+    let document = entry
+        .read_document(&[extension], MAX_EXTERNAL_POLICY_SOURCE_BYTES)
+        .map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot read configured policy source `{}`: {error}",
+                relative_path.display()
+            ))
+        })?;
+    Ok(document.source().to_owned())
+}
+
 /// The deterministic authored identity: close the policy with every qualified
 /// locator preserved, so the qualified name stays in the plan.
 fn authored_identity(
@@ -1145,7 +1345,7 @@ mod tests {
     use super::*;
     use crate::PolicyBudget;
     use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
-    use crate::inline_project::InlineTestProject;
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, Language};
 
     #[test]
@@ -1194,7 +1394,7 @@ mod tests {
                 .expect("code-smells pack")
                 .policies
                 .len(),
-            30
+            31
         );
         assert_eq!(
             catalog
@@ -1267,7 +1467,7 @@ mod tests {
                 })
                 .expect("select pack")
                 .len(),
-            30
+            31
         );
         let security = catalog
             .select(&BuiltInPolicySelection {
@@ -1500,6 +1700,7 @@ mod tests {
                 "bifrost.correctness.redundant-boolean-branches",
                 "bifrost.correctness.unsafe-deserialization",
                 "bifrost.correctness.python-absent-member",
+                "bifrost.correctness.python-absent-member-conditional",
                 "bifrost.correctness.go-data-race",
                 "bifrost.correctness.go-nil-dereference",
                 "bifrost.correctness.go-wrong-error-on-failure-path",
@@ -1635,6 +1836,98 @@ mod tests {
         );
     }
 
+    fn evaluate_go_data_race(project: &BuiltInlineTestProject) -> crate::PolicyRun {
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let selected = built_in_policy_catalog()
+            .expect("valid built-in catalog")
+            .select(&BuiltInPolicySelection {
+                policy_ids: vec!["bifrost.correctness.go-data-race".to_string()],
+                ..BuiltInPolicySelection::default()
+            })
+            .expect("select Go data-race policy");
+        let [selected] = selected.as_slice() else {
+            panic!("one Go data-race policy should be selected")
+        };
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        let policy = registry
+            .register_policy_bytes(selected.source_identity(), selected.source().as_bytes())
+            .expect("load Go data-race policy");
+        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+        let context = PolicyEvaluationContext {
+            analyzer: workspace.analyzer(),
+            workspace: Some(&workspace),
+            flow_state: &flow_state,
+            cancellation: None,
+            cvss_overlays: &[],
+            organizational_risk: &[],
+            incremental: None,
+        };
+        DefaultPolicyEvaluator::new()
+            .evaluate(policy, &context, &mut PolicyBudget::default())
+            .expect("evaluate Go data-race policy")
+    }
+
+    /// #3760: the root task's read is ordered before the writer's spawn, but
+    /// the first goroutine's read of the same site races the write. The two
+    /// task contexts share one conflict row, and the policy must report it.
+    #[test]
+    fn go_data_race_policy_reports_a_race_that_another_task_context_orders() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "fixture.go",
+                r#"package fixture
+
+type Pool struct{ stopped bool }
+
+func (p *Pool) Stopped() bool { return p.stopped }
+
+func Run() {
+	p := &Pool{}
+	_ = p.Stopped()
+	go func() {
+		_ = p.Stopped()
+	}()
+	go func() {
+		p.stopped = true
+	}()
+}
+"#,
+            )
+            .build();
+        let run = evaluate_go_data_race(&project);
+        let [finding] = run.findings() else {
+            panic!("the stopped flag has one race finding: {run:#?}")
+        };
+        let primary_line = finding
+            .primary()
+            .region()
+            .expect("race finding is source-backed")
+            .start_line();
+        assert_eq!(primary_line, 14, "{run:#?}");
+        let mut endpoint_lines = vec![primary_line];
+        endpoint_lines.extend(
+            finding
+                .related()
+                .iter()
+                .filter(|related| {
+                    related.relationship() == crate::PolicyLocationRelationship::Evidence
+                })
+                .filter_map(|related| {
+                    related
+                        .location()
+                        .region()
+                        .map(|region| region.start_line())
+                }),
+        );
+        endpoint_lines.sort_unstable();
+        endpoint_lines.dedup();
+        assert_eq!(endpoint_lines, [5, 14], "{run:#?}");
+    }
+
     #[test]
     fn go_data_race_policy_reports_exact_capture_and_context_cancellation_races() {
         let mut project = InlineTestProject::with_language(Language::Go);
@@ -1700,38 +1993,7 @@ func lookalikeDone(ctx localContext) (err error) {
 "#,
             )
             .build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let selected = built_in_policy_catalog()
-            .expect("valid built-in catalog")
-            .select(&BuiltInPolicySelection {
-                policy_ids: vec!["bifrost.correctness.go-data-race".to_string()],
-                ..BuiltInPolicySelection::default()
-            })
-            .expect("select Go data-race policy");
-        let [selected] = selected.as_slice() else {
-            panic!("one Go data-race policy should be selected")
-        };
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
-        let mut registry =
-            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
-        let policy = registry
-            .register_policy_bytes(selected.source_identity(), selected.source().as_bytes())
-            .expect("load Go data-race policy");
-        let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
-        let context = PolicyEvaluationContext {
-            analyzer: workspace.analyzer(),
-            workspace: Some(&workspace),
-            flow_state: &flow_state,
-            cancellation: None,
-            cvss_overlays: &[],
-            organizational_risk: &[],
-            incremental: None,
-        };
-        let run = DefaultPolicyEvaluator::new()
-            .evaluate(policy, &context, &mut PolicyBudget::default())
-            .expect("evaluate Go data-race policy");
+        let run = evaluate_go_data_race(&project);
         assert_eq!(run.findings().len(), 2, "{run:#?}");
         let mut primary_lines = run
             .findings()
@@ -1788,6 +2050,160 @@ func lookalikeDone(ctx localContext) (err error) {
         assert!(
             !endpoint_lines.contains(&31),
             "the post-done result read is ordered and must not be an endpoint: {run:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_policy_runtime_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::{TempDir, tempdir};
+
+    const PACK_ID: &str = CORRECTNESS_PACK_ID;
+    const CHILD_MARKER: &str = "BIFROST_TEST_EXTERNAL_POLICY_ROOT_CHILD";
+
+    fn write_embedded_pack(root: &Path) -> PathBuf {
+        let pack_root = root.join(PACK_ID);
+        let manifest = EMBEDDED_POLICY_PACK_SOURCES
+            .iter()
+            .find(|(id, _)| *id == PACK_ID)
+            .map(|(_, manifest)| *manifest)
+            .expect("the correctness pack has an embedded manifest");
+        let sources = EMBEDDED_POLICY_SOURCES
+            .iter()
+            .find(|(id, _)| *id == PACK_ID)
+            .map(|(_, sources)| *sources)
+            .expect("the correctness pack has embedded policy sources");
+
+        fs::create_dir_all(pack_root.join("policies")).expect("create policy directory");
+        fs::write(pack_root.join("manifest.json"), manifest).expect("write embedded manifest");
+        for (relative_path, source) in sources {
+            fs::write(pack_root.join(relative_path), source).expect("write embedded policy");
+        }
+        pack_root
+    }
+
+    fn external_fixture() -> (TempDir, PathBuf) {
+        let root = tempdir().expect("temporary rules root");
+        let pack_root = write_embedded_pack(root.path());
+        (root, pack_root)
+    }
+
+    #[test]
+    fn external_rules_root_loads_serialized_embedded_manifest_and_sources() {
+        let (root, _) = external_fixture();
+        let catalog = load_external_policy_catalog(root.path()).expect("external rules root");
+        assert_eq!(catalog.document().packs.len(), 1);
+        assert_eq!(catalog.document().packs[0].id, PACK_ID);
+        assert_eq!(catalog.document().packs[0].policies.len(), 1);
+    }
+
+    #[test]
+    fn external_rules_root_reports_a_missing_declared_source() {
+        let (root, pack_root) = external_fixture();
+        fs::remove_file(pack_root.join("policies/resource-lifecycle.rqlp"))
+            .expect("remove declared source");
+        let error = load_external_policy_catalog(root.path()).expect_err("missing source fails");
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn external_rules_root_rejects_a_corrupt_source() {
+        let (root, pack_root) = external_fixture();
+        fs::write(pack_root.join("policies/resource-lifecycle.rqlp"), [0xff])
+            .expect("corrupt serialized source");
+        let error = load_external_policy_catalog(root.path()).expect_err("corrupt source fails");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot read configured policy source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn external_rules_root_rejects_manifest_path_traversal() {
+        let (root, pack_root) = external_fixture();
+        let manifest_path = pack_root.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse embedded manifest");
+        manifest["policies"][0]["path"] =
+            serde_json::Value::String("policies/../../outside.rqlp".to_owned());
+        fs::write(
+            manifest_path,
+            serde_json::to_vec(&manifest).expect("serialize altered manifest"),
+        )
+        .expect("write altered manifest");
+        let error = load_external_policy_catalog(root.path()).expect_err("traversal fails");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid or unsafe configured policy path"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_rules_root_rejects_a_symlinked_policy_source() {
+        use std::os::unix::fs::symlink;
+
+        let (root, pack_root) = external_fixture();
+        let outside = tempdir().expect("temporary outside directory");
+        let outside_source = outside.path().join("source.rqlp");
+        fs::write(&outside_source, "not loaded through a symlink").expect("write outside source");
+        let source = pack_root.join("policies/resource-lifecycle.rqlp");
+        fs::remove_file(&source).expect("remove original source");
+        symlink(&outside_source, &source).expect("create source symlink");
+
+        let error = load_external_policy_catalog(root.path()).expect_err("source symlink fails");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot read configured policy source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn configured_empty_rules_root_fails_closed_in_a_subprocess() {
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let error = built_in_policy_catalog().expect_err("configured empty root must fail");
+            assert!(
+                error.to_string().contains("contains no policy packs"),
+                "{error}"
+            );
+            return;
+        }
+
+        let root = tempdir().expect("empty external rules root");
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "builtin::external_policy_runtime_tests::configured_empty_rules_root_fails_closed_in_a_subprocess",
+                "--nocapture",
+            ])
+            .env(OPEN_POLICY_PACK_ROOT_ENV, root.path())
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("run isolated environment test");
+        assert!(
+            output.status.success(),
+            "child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn configured_root_rejects_a_directory_with_no_policy_packs() {
+        let root = tempdir().expect("empty rules root");
+        let error = load_external_policy_catalog(root.path()).expect_err("empty root fails");
+        assert!(
+            error.to_string().contains("contains no policy packs"),
+            "{error}"
         );
     }
 }

@@ -1,110 +1,32 @@
 ---
 title: LSP Server
-description: Run Bifrost as a language server for editor code intelligence.
+description: The Bifrost language server has moved out of this repository.
 ---
 
-Bifrost can run as a Language Server Protocol server over stdio. Start it with an explicit workspace root:
+The Bifrost language server no longer ships from this repository. `bifrost --lsp`
+and `bifrost --server lsp` now fail with a message saying so, so an editor that
+still launches them reports a clear error instead of hanging on a server that
+never starts.
+
+Bifrost's code intelligence is available over MCP, which every supported agent
+host and several editors can call:
 
 ```bash
-bifrost --root /path/to/project --lsp
+bifrost --root /path/to/project --mcp searchtools
 ```
 
-The server does not open a network port. It speaks LSP over stdin and stdout, builds the workspace index in the background, and lets the first request wait for indexing when necessary.
+See [Claude Code](/claude-code/) and [opencode](/opencode/) for host setup, and
+[Capabilities](/capabilities/) for what the tools answer. For terminal checks
+and scripts, use [one-shot CLI tool mode](../cli/).
 
-## Semantic-pack activation
+An editor integration that needs the Language Server Protocol should follow the
+language server to its new home. This page stays as the pointer for links that
+still reach it.
 
-LSP shares the workspace semantic-pack contract used by the CLI and MCP hosts.
-Its background activation scheduler reads `.bifrost/packs.json`: an absent
-document selects compatible packs from ecosystems serving languages present in
-the workspace, a configured document selects its `ecosystems`, and an empty
-array explicitly disables dependency-pack activation. An omitted `catalog` is
-ephemeral; a configured catalog must be workspace-relative. Activation through
-the generic catalog contract does not download packs or dependencies, and
-compatibility plus `review_required` gates remain in force. The released
-`brokk-bifrost` facade separately opts into fetching the immutable matching
-public release bundle only for an exact generated production miss; set
-`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path. Policy-capable
-responses expose the activation mode and decisions so missing, incompatible,
-disabled, or incomplete packs cannot look like a clean negative.
-When required host evidence is absent, such as a JDK that cannot be found from
-`JAVA_HOME`, the server sends one deduplicated LSP warning explaining which
-semantic coverage is inactive and how to enable it. Because this is a
-workspace/toolchain problem rather than a source-code problem, the warning is
-not attached to an arbitrary source range.
-
-## Editor Integrations
-
-Install the packaged extension from the
-[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Brokk.bifrost-vscode)
-for [VS Code](/vscode/), or from
-[Open VSX](https://open-vsx.org/extension/brokk/bifrost-vscode) for
-[Cursor](/cursor/). Both editor integrations start Bifrost in LSP mode; the
-separate Cursor agent plugin starts an MCP server instead.
-
-Neovim, Vim, and Helix need no Bifrost-specific plugin; they start the same
-stdio server directly. Zed uses the Bifrost adapter extension. See the
-per-editor setup guides:
-
-- [Zed](/zed-lsp/)
-- [Neovim and Vim](/neovim/) (built-in client, nvim-lspconfig, vim-lsp, coc.nvim, ALE)
-- [Helix](/helix/)
-
-## Workspace Root
-
-`--root` is the fallback workspace root. During LSP initialization, clients may send `workspaceFolders`, `rootUri`, or `rootPath`; Bifrost uses those client-provided roots when available. Use `--root` to make the server process deterministic and to provide a fallback when the client does not send a usable workspace root.
-
-Each selected root honors root and nested `.bifrostignore` files. Matching files
-are excluded from code intelligence even when tracked by Git, while file-level
-tools can still inspect them. See [Workspace Scope](/workspace-scope/) for
-syntax, visibility, and live-refresh behavior.
-
-Clients can also pass Bifrost-specific `initializationOptions`:
-
-```json
-{
-  "roots": ["src", "tests"],
-  "exclude": ["target", "vendor/generated"],
-  "unrecognizedSymbolDiagnostics": false
-}
-```
-
-`roots` limits indexing to selected directories under the fallback root. `exclude` removes generated output, dependency caches, or other directories from workspace symbols and document-level lookups.
-
-## Runtime Configuration
-
-Bifrost supports the LSP 3.18 [`workspace/didChangeConfiguration`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/) notification. When the client advertises `workspace.configuration`, Bifrost requests the complete `bifrost` section with `workspace/configuration`. Clients without configuration-pull support can push the complete settings object directly or nest it under `bifrost`:
-
-```json
-{
-  "settings": {
-    "bifrost": {
-      "roots": ["src", "tests"],
-      "exclude": ["target"],
-      "formatterCommands": [],
-      "unrecognizedSymbolDiagnostics": false
-    }
-  }
-}
-```
-
-Each accepted runtime value is a full snapshot. It replaces the startup `initializationOptions` and the previous runtime value; omitted or empty `roots`, `exclude`, `formatterCommands`, and `unrecognizedSymbolDiagnostics` fields therefore reset those settings to their defaults. Unknown fields are ignored, while an invalid recognized field rejects the complete snapshot and leaves the last working configuration active.
-
-Changing only `formatterCommands` affects later formatting requests without rebuilding the analyzer. Changing `roots` or `exclude` rebuilds the workspace, preserves open editor buffers, cancels active formatter processes before swapping state, and clears published diagnostics for files that leave the workspace. Clearing `roots` restores the latest workspace folders reported by the editor.
-
-`unrecognizedSymbolDiagnostics` is an experimental opt-in lint. It is `false` by default because Bifrost's symbol resolver is not yet accurate enough to make those editor errors trustworthy. Set it to `true` to publish unrecognized symbol and member diagnostics; syntax diagnostics are always enabled. Ruby currently contributes only high-confidence project-local constant-path diagnostics. It intentionally does not diagnose unknown Ruby methods or members: `method_missing`, runtime patching, gems, autoloading, and framework conventions make their absence unsafe to claim. Kotlin currently contributes only high-confidence unresolved-type diagnostics: an unqualified type reference is reported only once it fails every tier of Kotlin's own resolution ladder — the file's imports, its own package, star imports, Kotlin's default imports, the wider JVM source realm (Java/Scala declarations in the same workspace), and the external (jar-backed) dependency index. A type reachable only through an unconfigured classpath stays silent, and it intentionally does not diagnose unknown members, functions, or properties. C++ uses an additional high-confidence gate: the workspace root must contain a valid `compile_commands.json` entry matching the file. Bifrost currently reports only simple unknown type references with fully proven project include context, and intentionally stays silent for system headers, macros or conditional preprocessing, templates, dependent names, members, and calls. When the compile database records more than one configuration for a file, Bifrost proves the include closure of each configuration separately and reports a missing type only where every configuration agrees that it is absent.
-
-## Protocol Surface
-
-Bifrost advertises LSP capabilities only after the matching handler exists. Unsupported requests return JSON-RPC `MethodNotFound`; unsupported notifications are ignored.
-
-Current support includes incremental and whole-document text synchronization, save notifications, diagnostics, definition/type-definition/implementation, hover, signature help, completion, references, rename, document highlights, document symbols, full-document semantic tokens, formatting, on-type formatting, folding ranges, workspace symbols, type and call hierarchy, workspace folder and runtime configuration changes, watched-file notifications, startup progress, formatting cancellation, and cooperative cancellation plus client-owned work-done progress for references requests.
-
-On-type formatting triggers on `)`, `]`, and newline. It answers only the in-process Bifrost S-expression languages (`bifrost-rql`, `bifrost-rql-policy`, `bifrost-rune-ir`) and replaces just the top-level form that encloses the trigger, so the edit stays local and the cursor stays put. Every other document, and every trigger inside a form the parser cannot finish, returns no edits. Configured formatter commands never run on type: they are reserved for explicit `textDocument/formatting` requests.
-
-Semantic tokens color analyzer-known declarations and structured references from the current overlay-aware document snapshot. Bifrost advertises a stable high-level legend to compatible clients and leaves ordinary syntax coloring to the editor; semantic-token range and delta requests are not currently advertised. To keep the serial LSP request loop responsive, documents larger than 1 MB or with more than 10,000 structured identifier candidates receive an empty semantic-token result. Go workspaces above 64 files or 2 MB of current source receive declaration tokens without the more expensive workspace-wide reference resolution.
-
-References progress is emitted only when the request supplies a `workDoneToken`; partial reference results are not streamed. Broader cancellation/progress support for workspace symbols, diagnostics, semantic tokens, and hierarchy remains an intentional follow-up area. Code actions, server-side execute commands, and pre-save hooks are not advertised until Bifrost has concrete safe edits or commands to expose.
-
-## CLI Tooling
-
-For terminal checks and scripts, use [one-shot CLI tool mode](../cli/) instead of starting an LSP session.
+The standalone server and VS Code extension live in
+[BrokkAi/bifrost-lsp](https://github.com/BrokkAi/bifrost-lsp). Open semantic
+packs and policy rules come from
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs), with release
+compatibility and qualification checked separately from the editor/server
+version. The extension's persistent storage provides the cache for verified
+content and offline reuse.

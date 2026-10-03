@@ -1063,6 +1063,15 @@ fn procedure_dispatch_call_at_relative_site(
 /// This digest is what says so, because every persisted fact such a unit read
 /// was derived under these epochs.
 pub fn analysis_epoch_digest() -> StableDigest {
+    analysis_epoch_digest_with_authority(crate::analyzer::languages::graph_authority_digest())
+}
+
+/// [`analysis_epoch_digest`] with the graph authority supplied.
+///
+/// The seam exists so a test can ask what the same grammars would produce
+/// under a different routing, which is the only way to observe that the epoch
+/// is sensitive to a flip without owning a second engine.
+fn analysis_epoch_digest_with_authority(graph_authority: StableDigest) -> StableDigest {
     let mut hasher = CanonicalHasher::new(ANALYSIS_EPOCH_DOMAIN);
     // `Language::ALL` is sorted by declaration and the fold is order-sensitive,
     // so the entry order is fixed by that constant rather than by any caller.
@@ -1077,11 +1086,17 @@ pub fn analysis_epoch_digest() -> StableDigest {
             crate::analyzer::store::epoch::epoch_for(language, &parser).as_bytes(),
         );
     }
+    // The fourth engine input beside the grammars, the configuration
+    // fingerprint and the model set: which implementation answers each
+    // language's reference, call and graph questions. A unit recorded against
+    // the legacy Rust resolver read answers this engine no longer derives, and
+    // without this field the two engines' epochs are equal.
+    hasher.field("graph_authority", graph_authority.as_bytes());
     StableDigest::from_array(hasher.finish())
 }
 
 /// Domain for [`analysis_epoch_digest`].
-const ANALYSIS_EPOCH_DOMAIN: &[u8] = b"bifrost-policy-unit:analysis-epoch:v1";
+const ANALYSIS_EPOCH_DOMAIN: &[u8] = b"bifrost-policy-unit:analysis-epoch:v2";
 
 /// The non-source inputs of the head evaluation, as the caller holds them.
 ///
@@ -1870,6 +1885,28 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_canonical_import_invalidates_both_module_keys() {
+        let base = workspace(
+            "import { value } from 'old_library';\nexport function alpha() { return value; }\n",
+        );
+        let head = workspace(
+            "import { value } from 'new_library';\nexport function alpha() { return value; }\n",
+        );
+        let changed = ChangedFacts::between(
+            &base.workspace_analyzer(AnalyzerConfig::default()),
+            &head.workspace_analyzer(AnalyzerConfig::default()),
+        );
+
+        assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+        for module in ["old_library", "new_library"] {
+            assert!(
+                changed.contains(IndexFamily::ImportPathSegment, module.as_bytes()),
+                "changed canonical import must invalidate module {module}"
+            );
+        }
+    }
+
+    #[test]
     fn a_rename_changes_the_names_of_both_the_old_and_the_new_blob() {
         let base = workspace(ORIGINAL);
         let head = workspace("export function renamed() {\n  return 1;\n}\n");
@@ -2003,6 +2040,32 @@ mod tests {
             (changed.reason.stable_label(), changed.key.stable_label()),
             ("input_content_changed", "path_absent"),
             "unexpected verdict {changed:#?}"
+        );
+    }
+
+    /// The engine epoch a recorded read set carries must move when a language's
+    /// graph authority flips.
+    ///
+    /// `LookupKind::Usages`, `Callers` and `Callees` replay through whichever
+    /// implementation the registry routes the language to, so a unit recorded
+    /// against the legacy Rust resolver carries answer digests this engine no
+    /// longer derives. Nothing detects that on its own: the recorded digests
+    /// simply disagree one lookup at a time, at replay cost, and a unit whose
+    /// Rust reads happened to agree is reused across two different engines.
+    /// Folding the authority into the epoch is what retires the whole
+    /// generation up front instead.
+    #[test]
+    fn the_analysis_epoch_moves_when_a_language_changes_graph_authority() {
+        let production = crate::analyzer::languages::graph_authority_digest();
+        assert_eq!(
+            analysis_epoch_digest(),
+            analysis_epoch_digest_with_authority(production),
+            "the production epoch is the epoch of the production authority"
+        );
+        assert_ne!(
+            analysis_epoch_digest(),
+            analysis_epoch_digest_with_authority(StableDigest::sha256(b"another-authority")),
+            "two routings of the same grammars are two engines"
         );
     }
 

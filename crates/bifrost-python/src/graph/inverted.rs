@@ -105,8 +105,9 @@ impl<'a> PythonEdgeScan<'a> {
         python: &dyn PythonUsageSource,
         file: &ProjectFile,
         input: &FileEdgeScanInput<'_>,
-    ) -> PerFileEdges {
+    ) -> Result<PerFileEdges, ProjectFile> {
         let source = input.source;
+        let canonical_imports = python.import_info_of(graph.token, file);
 
         // Per-file resolution context from the import binder. A namespace
         // binding's module_specifier is either the full fqn (for
@@ -185,15 +186,21 @@ impl<'a> PythonEdgeScan<'a> {
             .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
             .collect();
         let module_bindings = usage_module_binding_timeline(python, file, || {
-            super::extractor::collect_module_binding_timeline(input.root(), source)
+            super::extractor::collect_module_binding_timeline(
+                input.root(),
+                source,
+                &canonical_imports,
+            )
         });
 
         // Per-function receiver-type facts (typed params + `x = Foo()`),
         // computed by the same routine the forward scan uses, so a typed
         // `recv.method` resolves to the receiver's class fqn.
-        let scope_facts = usage_scope_facts(python, file, || {
+        let Some(scope_facts) = usage_scope_facts(python, file, || {
             collect_scope_facts_from_parsed_source(graph, python, file, source, input.root())
-        });
+        }) else {
+            return Err(file.clone());
+        };
 
         let mut ctx = PyScan {
             graph,
@@ -214,7 +221,7 @@ impl<'a> PythonEdgeScan<'a> {
         };
         scan_tree(input.root(), &mut ctx);
         ctx.resolve_pending();
-        ctx.edges
+        Ok(ctx.edges)
     }
 }
 

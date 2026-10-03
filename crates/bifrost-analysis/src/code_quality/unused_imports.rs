@@ -59,6 +59,7 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range, RustOverlayCrates
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_rust::structural::expression_name_node;
 use tree_sitter::Node;
 
 /// Whether this derivation reports findings for a language, and why not when
@@ -448,6 +449,7 @@ pub fn unused_imports_for_file(
             facts.source(),
             language,
             spec,
+            root,
             &environment.bindings,
             &mut findings,
         );
@@ -462,12 +464,14 @@ pub fn unused_imports_for_file(
 
 /// Refine the language-wide doubt only after resolving the actual import
 /// binder. A same-spelled declaration elsewhere is never negative evidence.
+#[allow(clippy::too_many_arguments)] // Keep the already-parsed AST alongside its source.
 fn refine_import_certainties(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     language: Language,
     spec: &dyn StructuralSpec,
+    root: Node<'_>,
     bindings: &[BindingRow],
     findings: &mut [UnusedImport],
 ) {
@@ -476,12 +480,15 @@ fn refine_import_certainties(
     }
     let requests = findings
         .iter()
-        .map(|finding| DefinitionLookupRequest {
-            file: file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(finding.range.start_byte),
-            end_byte: Some(finding.range.end_byte),
+        .map(|finding| {
+            let target = import_target_token(language, root, finding.range);
+            DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(target.start_byte()),
+                end_byte: Some(target.end_byte()),
+            }
         })
         .collect();
     let outcomes =
@@ -568,6 +575,36 @@ fn refine_import_certainties(
             finding.certainty = UnusedImportCertainty::Unreferenced;
         }
     }
+}
+
+/// The token whose resolution decides what an import binder names.
+///
+/// `use path::Thing as Local;` binds `Local`, and that token *declares* the
+/// local name: it references nothing, so the resolution route publishes no
+/// reference site for it and asking there answers `Unavailable` with
+/// `native_reference_missing`. Every aliased Rust import then kept the
+/// language-wide `RustTraitMethodScope` doubt, whatever its target was. The
+/// site that does reference the declaration is the last segment of the
+/// clause's path, which is what [`expression_name_node`] walks a Rust path
+/// down to. Every other import form spells the bound name with that segment
+/// itself, so the binder token is already the right question.
+fn import_target_token<'tree>(language: Language, root: Node<'tree>, binder: Range) -> Node<'tree> {
+    let token = root
+        .descendant_for_byte_range(binder.start_byte, binder.end_byte)
+        .expect("a binder range comes from this file's own syntax");
+    if language != Language::Rust {
+        return token;
+    }
+    let Some(clause) = token.parent() else {
+        return token;
+    };
+    if clause.kind() != "use_as_clause" || clause.child_by_field_name("alias") != Some(token) {
+        return token;
+    }
+    let Some(path) = clause.child_by_field_name("path") else {
+        return token;
+    };
+    expression_name_node(path).unwrap_or(token)
 }
 
 /// Whether the activated dependency packs prove that this Scala import names an

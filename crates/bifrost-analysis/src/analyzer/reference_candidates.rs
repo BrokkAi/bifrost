@@ -30,7 +30,7 @@ use brokk_bifrost_python::syntax::{
     python_keyword_argument_label as python_keyword_label,
 };
 use brokk_bifrost_rust::declarations::rust_node_text;
-use brokk_bifrost_rust::graph::ast::is_rust_declaration_name;
+use brokk_bifrost_rust::graph_support::is_rust_declaration_name;
 use brokk_bifrost_rust::lexical_scope::is_pattern_binding_identifier;
 use tree_sitter::Node;
 

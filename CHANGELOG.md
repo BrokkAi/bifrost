@@ -5,7 +5,71 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## Unreleased
+## [0.13.0] - 2026-10-02
+
+### Added
+
+- Correctness policy coverage now extends overwritten-unread-value checks to Go,
+  C#, and Kotlin, and extends unreachable-statement and non-repeating-loop checks
+  across Go, Rust, Kotlin, C#, and PHP while preserving explicit incomplete
+  boundaries.
+
+- Rust correctness policies now detect supported self-assignment, failed-swap,
+  and overwritten-unread cases. C# and Kotlin branch comparisons use lexical
+  binding evidence, with unsupported operators and scopes remaining incomplete.
+
+- Conditional absent-member queries now expose a conditional proof tier with
+  its remaining uncertainty reasons, and a built-in correctness policy can
+  report these supported conditional cases without treating them as proven
+  findings.
+
+- Go navigation resolves method expressions and discovers incoming references
+  through selected package routes. Java import and rename queries now preserve
+  nested static-import and binding identity.
+
+- C and C++ now have built-in branch checks for identical branches, repeated
+  conditions, and redundant Boolean returns, using lexical scope and binding
+  evidence while leaving unsupported cases inconclusive.
+
+- Python dependency summaries now bind to exact artifacts and callable
+  applicability under a declared filesystem-resolver environment; unsupported
+  launch behavior and incomplete applicability remain Unknown or Inconclusive.
+
+- Java annotation queries now expose source-declaration provenance when
+  structured type lookup is complete; ambiguous and unsupported paths remain
+  explicit, and framework identity is not inferred.
+
+### Changed
+
+- Warm structural queries with an explicit language and unrestricted scope now
+  verify only files selected by the existing index. They retain the full matcher
+  and result diagnostics while avoiding reads of unrelated files.
+
+- Native semantic-model schema 8 uses explicit reader schema admission while
+  preserving legacy engine-version ranges, toolchain and exact-artifact checks.
+  Catalog upgrades retain existing models and reject mixed compatibility shapes.
+
+- Open semantic-pack generation and publication move to
+  [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs), the home for open
+  semantic models and policy rules. Plugins cache verified releases selected
+  by supported schemas, RQL versions, and required semantic capabilities.
+  Engine release qualification retains pack tooling while content releases
+  advance independently.
+
+- Policy evaluation now retains independently proven taint findings and
+  per-policy evidence when selector discovery or a mixed policy batch is
+  incomplete, instead of discarding reliable results with the unresolved work.
+
+- Rust usage and reference queries now return already-proven partial results at
+  request budgets and preserve computed-receiver and shared-member evidence
+  across the bounded lookup paths.
+
+### Fixed
+
+- TypeScript declaration packs now preserve supported local default exports
+  and report unresolved or unsupported defaults and export-import aliases as
+  Partial; bounded diagnostics no longer drop a pack with a recoverable
+  unsupported shape.
 
 ## [0.12.0] - 2026-09-30
 
@@ -1029,6 +1093,10 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- A one-shot `--tool` call now reports a failure that arises on an analysis
+  worker thread: the process exits with the CLI's failure status, prints the
+  failure's message on standard error, and prints one `"isError": true` JSON
+  result on standard output instead of exiting with nothing to read there.
 - Diff tools no longer collect retained diff-revision facts at startup, so
   repeated analyses of the same base keep their caches, and `score_diff`
   now retains one immutable target revision and reuses its reference scan

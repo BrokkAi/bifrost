@@ -21,7 +21,7 @@ use crate::graph::resolver::{
 use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::{
     PythonImportBinding, PythonImportDetails, imported_module_assignment_at,
-    parse_python_import_bindings, python_import_details, python_import_infos_from_node,
+    python_import_bindings_from_imports, python_import_details, python_imports_by_statement,
     resolve_fqn_candidates, resolve_python_relative_module,
 };
 use crate::usage_index::{
@@ -29,6 +29,7 @@ use crate::usage_index::{
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
     usage_scope_facts,
 };
+use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
@@ -162,9 +163,9 @@ pub fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     cancellation: Option<&CancellationToken>,
-) -> ScanResult {
+) -> Result<ScanResult, HashSet<ProjectFile>> {
     let scan_target = PythonScanTarget::new(graph.index, target);
-    files
+    let results = files
         .par_iter()
         .map(|file| {
             scan_file_for_seeds(
@@ -177,11 +178,25 @@ pub fn scan_files_for_seeds(
                 cancellation,
             )
         })
-        .reduce(ScanResult::default, |mut collected, result| {
-            collected.hits.extend(result.hits);
-            collected.unproven_hits.extend(result.unproven_hits);
-            collected
-        })
+        .collect::<Vec<_>>();
+    let mut collected = ScanResult::default();
+    let mut missing = HashSet::default();
+    for result in results {
+        match result {
+            Ok(result) => {
+                collected.hits.extend(result.hits);
+                collected.unproven_hits.extend(result.unproven_hits);
+            }
+            Err(file) => {
+                missing.insert(file);
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(collected)
+    } else {
+        Err(missing)
+    }
 }
 
 /// Scan one file against one target. The owned result is suitable for replay
@@ -195,7 +210,7 @@ pub fn scan_file_for_seeds(
     scan_target: &PythonScanTarget<'_>,
     seeds: &BTreeSet<(ProjectFile, String)>,
     cancellation: Option<&CancellationToken>,
-) -> ScanResult {
+) -> Result<ScanResult, ProjectFile> {
     let parser_language = tree_sitter_python::LANGUAGE.into();
     let target = scan_target.target;
     let target_short = scan_target.target_short.as_str();
@@ -203,7 +218,7 @@ pub fn scan_file_for_seeds(
     let target_owner = scan_target.target_owner.as_ref();
 
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return ScanResult::default();
+        return Ok(ScanResult::default());
     }
     let owned_source: Option<Arc<String>>;
     let owned_tree: Option<Tree>;
@@ -213,17 +228,17 @@ pub fn scan_file_for_seeds(
             (parsed.source.as_str(), &parsed.tree)
         } else {
             let Ok(source) = file.read_to_string() else {
-                return ScanResult::default();
+                return Ok(ScanResult::default());
             };
             if source.is_empty() {
-                return ScanResult::default();
+                return Ok(ScanResult::default());
             }
             let mut parser = Parser::new();
             if parser.set_language(&parser_language).is_err() {
-                return ScanResult::default();
+                return Ok(ScanResult::default());
             }
             let Some(tree) = parser.parse(source.as_str(), None) else {
-                return ScanResult::default();
+                return Ok(ScanResult::default());
             };
             owned_source = Some(Arc::new(source));
             owned_tree = Some(tree);
@@ -234,7 +249,7 @@ pub fn scan_file_for_seeds(
         }
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return ScanResult::default();
+        return Ok(ScanResult::default());
     }
 
     let edges = {
@@ -257,17 +272,19 @@ pub fn scan_file_for_seeds(
         )
     };
     if !may_reference_target {
-        return ScanResult::default();
+        return Ok(ScanResult::default());
     }
+    let imports = python.import_info_of(graph.token, file);
     let raw_module_bindings = {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
         usage_module_binding_timeline(python, file, || {
-            collect_module_binding_timeline(tree_ref.root_node(), source_str)
+            collect_module_binding_timeline(tree_ref.root_node(), source_str, &imports)
         })
     };
     let module_bindings =
         classify_module_binding_timeline(python, file, raw_module_bindings.as_ref(), seeds, &edges);
-    let scoped_import_bindings = parse_python_import_bindings(source_str);
+    let scoped_import_bindings =
+        python_import_bindings_from_imports(&imports, tree_ref.root_node(), source_str.len());
     let target_self_file = file == target.source();
     let scope_facts = {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
@@ -280,6 +297,9 @@ pub fn scan_file_for_seeds(
                 tree_ref.root_node(),
             )
         })
+    };
+    let Some(scope_facts) = scope_facts else {
+        return Err(file.clone());
     };
     let scope_range_index = {
         let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_range_index");
@@ -320,10 +340,10 @@ pub fn scan_file_for_seeds(
         scan_node(tree_ref.root_node(), &mut scan_ctx);
     }
 
-    ScanResult {
+    Ok(ScanResult {
         hits: local_hits,
         unproven_hits: local_unproven_hits,
-    }
+    })
 }
 
 fn file_may_reference_target(
@@ -1537,8 +1557,13 @@ pub fn call_result_types(
             }
             let prepared = python.prepared_syntax(graph.token, file)?;
             let key = factory_function_key(graph, &callable);
-            collect_factory_return_types_from_root(prepared.tree().root_node(), prepared.source())
-                .remove(&key)
+            let facts = python.python_source_facts(graph.token, file, &|| true)?;
+            collect_factory_return_types_from_root(
+                prepared.tree().root_node(),
+                prepared.source(),
+                &facts,
+            )?
+            .remove(&key)
         });
         let Some(raw_type) = raw_type else {
             continue;
@@ -1994,8 +2019,13 @@ struct ClassifiedModuleBindingEvent {
     kind: ModuleBindingKind,
 }
 
-pub fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindingTimeline {
+pub fn collect_module_binding_timeline(
+    root: Node<'_>,
+    source: &str,
+    imports: &[ImportInfo],
+) -> ModuleBindingTimeline {
     let mut timeline = ModuleBindingTimeline::default();
+    let imports_by_statement = python_imports_by_statement(imports);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -2012,7 +2042,9 @@ pub fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBi
                 continue;
             }
             "import_statement" | "import_from_statement" => {
-                collect_import_binding_events(node, source, &mut timeline);
+                if let Some(statement_imports) = imports_by_statement.get(&node.start_byte()) {
+                    collect_import_binding_events(node, statement_imports, &mut timeline);
+                }
                 continue;
             }
             "assignment" | "augmented_assignment" | "named_expression" => {
@@ -2054,11 +2086,11 @@ pub fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBi
 
 fn collect_import_binding_events(
     node: Node<'_>,
-    source: &str,
+    imports: &[ImportInfo],
     timeline: &mut ModuleBindingTimeline,
 ) {
-    for import in python_import_infos_from_node(node, source) {
-        let Some(details) = python_import_details(&import) else {
+    for import in imports {
+        let Some(details) = python_import_details(import) else {
             continue;
         };
         match details {
@@ -2316,10 +2348,17 @@ pub fn collect_scope_facts_from_parsed_source(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-) -> PythonScopeFacts {
-    let mut factory_return_types = collect_factory_return_types_from_root(root, source);
+) -> Option<PythonScopeFacts> {
+    let facts = python.python_source_facts(graph.token, file, &|| true)?;
+    let mut factory_return_types = collect_factory_return_types_from_root(root, source, &facts)?;
     collect_imported_factory_return_types(graph, python, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(graph, file, source, &factory_return_types)
+    Some(collect_scope_facts_with_factory_returns(
+        graph,
+        file,
+        source,
+        root,
+        &factory_return_types,
+    ))
 }
 
 fn collect_imported_factory_return_types(
@@ -2395,71 +2434,62 @@ fn callable_return_type_name(
     python: &dyn PythonSource,
     callable: &CodeUnit,
 ) -> Option<String> {
-    // The analyzer's already-parsed whole-file tree when it has one. This runs
-    // once per imported class member, and the fallback below clones the entire
-    // file source and builds a fresh `Parser` per declaration range. Same
-    // prepared-syntax fast path C++ resolution uses for the same reason.
-    if let Some(prepared) = python.prepared_syntax(graph.token, callable.source()) {
-        #[cfg(any(test, feature = "test-support"))]
-        note_callable_return_type_lookup_for_test(true);
-        return callable_return_type_name_in_tree(
-            graph,
-            callable,
-            prepared.source(),
-            prepared.tree().root_node(),
-        );
-    }
+    let metadata = graph.index.signature_metadata(callable);
+    let first = metadata.first()?;
     #[cfg(any(test, feature = "test-support"))]
-    note_callable_return_type_lookup_for_test(false);
-    let source = graph.index.indexed_source(callable.source())?;
-    declaration_source_slices(graph, callable, &source)
-        .into_iter()
-        .find_map(|declaration_source| {
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_python::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(declaration_source, None)?;
-            let function = first_function_definition(tree.root_node())?;
-            factory_return_type(function, declaration_source)
-        })
+    note_callable_return_type_lookup_for_test(first.return_type_text().is_some());
+    if first.return_type_text().is_some() {
+        return first
+            .return_type_identity()?
+            .nominal_name()
+            .map(|name| name.path().join("."));
+    }
+    // An unannotated factory's return statements are executable body evidence.
+    // The source-owned declaration metadata above determines that this is an
+    // inference request, so a missing annotation fact cannot trigger reparsing.
+    let prepared = python.prepared_syntax(graph.token, callable.source())?;
+    callable_return_type_name_in_tree(
+        graph,
+        callable,
+        prepared.source(),
+        prepared.tree().root_node(),
+    )
 }
 
 /// How `callable_return_type_name` answered, counted per arm.
 ///
-/// Both arms are counted, not just the slow one: a test that asserted only
-/// "no reparses" would pass vacuously on a fixture that never reaches this
-/// function at all.
+/// Both canonical declarations and live body inference are counted so a test
+/// cannot pass without exercising the consumer.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CallableReturnTypeLookupCounts {
-    /// Answered from the analyzer's already-parsed whole-file tree.
-    pub prepared: usize,
-    /// Fell back to cloning the file source and building a fresh parser.
-    pub reparsed: usize,
+    /// Answered from primary declaration metadata.
+    pub canonical: usize,
+    /// Inferred from an unannotated executable body in prepared syntax.
+    pub body: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static CALLABLE_RETURN_TYPE_LOOKUPS_FOR_TEST: std::cell::Cell<CallableReturnTypeLookupCounts> =
-        const { std::cell::Cell::new(CallableReturnTypeLookupCounts { prepared: 0, reparsed: 0 }) };
+        const { std::cell::Cell::new(CallableReturnTypeLookupCounts { canonical: 0, body: 0 }) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn note_callable_return_type_lookup_for_test(from_prepared_syntax: bool) {
+fn note_callable_return_type_lookup_for_test(from_canonical_metadata: bool) {
     CALLABLE_RETURN_TYPE_LOOKUPS_FOR_TEST.with(|counts| {
         let mut observed = counts.get();
-        if from_prepared_syntax {
-            observed.prepared += 1;
+        if from_canonical_metadata {
+            observed.canonical += 1;
         } else {
-            observed.reparsed += 1;
+            observed.body += 1;
         }
         counts.set(observed);
     });
 }
 
 /// Runs `body` and reports which arm each `callable_return_type_name` call
-/// took. An analyzer that holds prepared syntax must report zero reparses.
+/// took. Annotated declarations must use canonical metadata.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_callable_return_type_lookup_counter_for_test<T>(
     body: impl FnOnce() -> T,
@@ -2473,11 +2503,7 @@ pub fn with_callable_return_type_lookup_counter_for_test<T>(
     })
 }
 
-/// The declaration walk both arms of [`callable_return_type_name`] share.
-///
-/// `source` and `root` must be the same snapshot: `factory_return_type` slices
-/// `source` at the node's byte offsets, so a whole-file tree needs whole-file
-/// source and a per-range reparse needs that range's slice.
+/// Locate executable bodies for unannotated callable inference in one snapshot.
 fn callable_return_type_name_in_tree(
     graph: &PythonGraphSource<'_>,
     callable: &CodeUnit,
@@ -2489,7 +2515,7 @@ fn callable_return_type_name_in_tree(
     ranges.into_iter().find_map(|range| {
         let declaration = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
         let function = first_function_definition(declaration)?;
-        factory_return_type(function, source)
+        inferred_factory_return_type(function, source, None, &HashMap::default())
     })
 }
 
@@ -2520,6 +2546,7 @@ fn collect_scope_facts_with_factory_returns(
     graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     factory_return_types: &HashMap<String, String>,
 ) -> PythonScopeFacts {
     let declarations = graph.index.declarations(file);
@@ -2529,11 +2556,11 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_class())
     {
-        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
-            continue;
-        };
-        let facts = collect_scope_facts_from_source(
-            &declaration_source,
+        let facts = collect_declaration_scope_facts(
+            graph,
+            declaration,
+            root,
+            source,
             ScopeFactTraversal::Class,
             true,
             Some(declaration.short_name()),
@@ -2550,9 +2577,6 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_function())
     {
-        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
-            continue;
-        };
         // fqname-M4: package-less short_name owner, matched below against
         // `class_facts_by_name` keys built from `short_name()`; `fq.parent()`
         // (`default_parent_fq_name`) would render the package-qualified owner,
@@ -2561,8 +2585,11 @@ fn collect_scope_facts_with_factory_returns(
             .short_name()
             .rsplit_once('.')
             .map(|(owner, _)| owner);
-        let mut facts = collect_scope_facts_from_source(
-            &declaration_source,
+        let mut facts = collect_declaration_scope_facts(
+            graph,
+            declaration,
+            root,
+            source,
             ScopeFactTraversal::Function,
             false,
             owner,
@@ -2581,11 +2608,11 @@ fn collect_scope_facts_with_factory_returns(
     // its bindings must be recorded too, otherwise constructed-local receivers
     // used at module scope resolve to no type.
     for declaration in declarations.iter().filter(|d| d.is_module()) {
-        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
-            continue;
-        };
-        let facts = collect_scope_facts_from_source(
-            &declaration_source,
+        let facts = collect_declaration_scope_facts(
+            graph,
+            declaration,
+            root,
+            source,
             ScopeFactTraversal::Module,
             false,
             None,
@@ -2596,36 +2623,25 @@ fn collect_scope_facts_with_factory_returns(
     scope_facts
 }
 
-fn declaration_source(
+#[allow(clippy::too_many_arguments)]
+fn collect_declaration_scope_facts(
     graph: &PythonGraphSource<'_>,
     declaration: &CodeUnit,
-    file_source: &str,
-) -> Option<String> {
-    let slices = declaration_source_slices(graph, declaration, file_source);
-    (!slices.is_empty()).then(|| slices.join("\n\n"))
-}
-
-fn declaration_source_slices<'a>(
-    graph: &PythonGraphSource<'_>,
-    declaration: &CodeUnit,
-    file_source: &'a str,
-) -> Vec<&'a str> {
-    let mut ranges = graph.index.ranges(declaration);
-    ranges.sort_by_key(|range| range.start_byte);
-    ranges
-        .into_iter()
-        .filter_map(|range| file_source.get(range.start_byte..range.end_byte))
-        .collect()
-}
-
-fn collect_scope_facts_from_source(
+    root: Node<'_>,
     source: &str,
     traversal: ScopeFactTraversal,
     allow_self_receivers: bool,
     current_class: Option<&str>,
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
-    let events = collect_scope_fact_events(source, traversal);
+    let mut events = Vec::new();
+    let mut ranges = graph.index.ranges(declaration);
+    ranges.sort_by_key(|range| range.start_byte);
+    for range in ranges {
+        if let Some(node) = root.descendant_for_byte_range(range.start_byte, range.end_byte) {
+            collect_scope_fact_events_from_node(node, source, traversal, &mut events);
+        }
+    }
     collect_scope_facts_from_events(
         &events,
         allow_self_receivers,
@@ -2914,27 +2930,6 @@ enum ScopeFactTraversal {
     Class,
 }
 
-fn collect_scope_fact_events(source: &str, traversal: ScopeFactTraversal) -> Vec<ScopeFactEvent> {
-    if source.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-
-    let mut events = Vec::new();
-    collect_scope_fact_events_from_node(tree.root_node(), source, traversal, &mut events);
-    events
-}
-
 fn collect_scope_fact_events_from_node(
     root: Node<'_>,
     source: &str,
@@ -3095,7 +3090,24 @@ fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashMap<String, String> {
+fn collect_factory_return_types_from_root(
+    root: Node<'_>,
+    source: &str,
+    source_facts: &crate::source_facts::PythonFileSourceFacts,
+) -> Option<HashMap<String, String>> {
+    let returns_by_range: HashMap<_, _> = source_facts
+        .facts
+        .callable_returns
+        .iter()
+        .map(|fact| {
+            let declaration = source_facts.occurrences.declaration(fact.declaration);
+            let range = source_facts
+                .occurrences
+                .occurrence(declaration.occurrence)
+                .range;
+            ((range.start_byte, range.end_byte), fact)
+        })
+        .collect();
     let mut returns = HashMap::default();
     let mut functions = Vec::new();
     let mut stack = vec![(root, None::<String>)];
@@ -3117,10 +3129,22 @@ fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashM
                         .as_ref()
                         .map(|class| format!("{class}.{name}"))
                         .unwrap_or(name);
-                    if let Some(return_type) = factory_return_type(node, source) {
+                    let declaration = node
+                        .parent()
+                        .filter(|parent| parent.kind() == "decorated_definition")
+                        .unwrap_or(node);
+                    let fact = *returns_by_range
+                        .get(&(declaration.start_byte(), declaration.end_byte()))?;
+                    if let Some(return_type) = factory_return_type_with_known(
+                        node,
+                        source,
+                        fact,
+                        None,
+                        &HashMap::default(),
+                    ) {
                         returns.insert(key.clone(), return_type);
                     }
-                    functions.push((key, class_name, node));
+                    functions.push((key, class_name, node, fact));
                 }
             }
             _ => push_factory_index_children(node, class_name, &mut stack),
@@ -3133,10 +3157,14 @@ fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashM
     // the conservative raw result instead of recursing.
     for _ in 0..functions.len() {
         let mut changed = false;
-        for (key, class_name, function) in &functions {
-            let Some(return_type) =
-                factory_return_type_with_known(*function, source, class_name.as_deref(), &returns)
-            else {
+        for (key, class_name, function, fact) in &functions {
+            let Some(return_type) = factory_return_type_with_known(
+                *function,
+                source,
+                fact,
+                class_name.as_deref(),
+                &returns,
+            ) else {
                 continue;
             };
             if returns.get(key) != Some(&return_type) {
@@ -3148,7 +3176,7 @@ fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashM
             break;
         }
     }
-    returns
+    Some(returns)
 }
 
 fn push_factory_index_children<'tree>(
@@ -3166,20 +3194,30 @@ fn push_factory_index_children<'tree>(
     );
 }
 
-fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
-    factory_return_type_with_known(function, source, None, &HashMap::default())
+fn factory_return_type_with_known(
+    function: Node<'_>,
+    source: &str,
+    fact: &brokk_bifrost_core::analyzer::python_facts::PythonCallableReturnFact,
+    current_class: Option<&str>,
+    known: &HashMap<String, String>,
+) -> Option<String> {
+    if fact.return_annotation.is_some() {
+        return fact
+            .runtime_type
+            .as_ref()?
+            .nominal_name()
+            .map(|name| name.path().join("."));
+    }
+
+    inferred_factory_return_type(function, source, current_class, known)
 }
 
-fn factory_return_type_with_known(
+fn inferred_factory_return_type(
     function: Node<'_>,
     source: &str,
     current_class: Option<&str>,
     known: &HashMap<String, String>,
 ) -> Option<String> {
-    if let Some(return_type) = function.child_by_field_name("return_type") {
-        return receiver_type_from_annotation_node(return_type, source);
-    }
-
     let body = function.child_by_field_name("body")?;
     let mut candidates = HashSet::default();
     let mut saw_return = false;
@@ -3231,86 +3269,6 @@ fn canonical_factory_return(
         current = next;
     }
     Some(current.to_string())
-}
-
-/// Return the runtime class named by a structured Python return annotation.
-///
-/// For `Manager[A, B]`, the constructed class is the subscript base `Manager`.
-/// `Optional[T]` is different: it denotes `T | None`, so retain the existing
-/// supported-wrapper behavior and inspect its structured type argument.
-fn receiver_type_from_annotation_node(annotation: Node<'_>, source: &str) -> Option<String> {
-    match annotation.kind() {
-        "type" => receiver_type_from_annotation_node(annotation.named_child(0)?, source),
-        "identifier" | "attribute" | "member_type" | "string" => {
-            normalized_receiver_type(slice(annotation, source).trim())
-        }
-        "generic_type" => {
-            let base = annotation.named_child(0)?;
-            if optional_annotation_wrapper(base, source) {
-                let parameter = annotation.named_child(1)?;
-                return receiver_type_from_annotation_node(parameter.named_child(0)?, source);
-            }
-            if runtime_type_annotation_wrapper(base, source) {
-                let parameter = annotation.named_child(1)?;
-                return receiver_type_from_annotation_node(
-                    parameter.named_child(0).unwrap_or(parameter),
-                    source,
-                );
-            }
-            receiver_type_from_annotation_node(base, source)
-        }
-        "subscript" => {
-            let value = annotation.child_by_field_name("value")?;
-            if optional_annotation_wrapper(value, source) {
-                let inner = annotation.child_by_field_name("subscript")?;
-                return receiver_type_from_annotation_node(inner, source);
-            }
-            if runtime_type_annotation_wrapper(value, source) {
-                let inner = annotation.child_by_field_name("subscript")?;
-                return receiver_type_from_annotation_node(inner, source);
-            }
-            normalized_receiver_type(slice(value, source).trim())
-        }
-        _ => None,
-    }
-}
-
-fn runtime_type_annotation_wrapper(node: Node<'_>, source: &str) -> bool {
-    match node.kind() {
-        "identifier" => matches!(slice(node, source), "type" | "Type"),
-        "attribute" => {
-            let (Some(object), Some(attribute)) = (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("attribute"),
-            ) else {
-                return false;
-            };
-            object.kind() == "identifier"
-                && attribute.kind() == "identifier"
-                && slice(object, source) == "typing"
-                && slice(attribute, source) == "Type"
-        }
-        _ => false,
-    }
-}
-
-fn optional_annotation_wrapper(node: Node<'_>, source: &str) -> bool {
-    match node.kind() {
-        "identifier" => slice(node, source) == "Optional",
-        "attribute" => {
-            let (Some(object), Some(attribute)) = (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("attribute"),
-            ) else {
-                return false;
-            };
-            object.kind() == "identifier"
-                && attribute.kind() == "identifier"
-                && slice(object, source) == "typing"
-                && slice(attribute, source) == "Optional"
-        }
-        _ => false,
-    }
 }
 
 fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {

@@ -8,6 +8,10 @@ standard libraries, frameworks, generated APIs, and binary artifacts whose
 bodies may be unavailable. Semantic-model packs add structured declarations and
 procedure behavior at that boundary.
 
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs) owns open semantic
+packs and policy rules, their generation recipes, and their independent release
+streams. The engine owns compilation, catalogs, activation, and interpretation.
+
 Model evidence retains its origin. Source-derived proof comes from analysis of
 the source itself.
 

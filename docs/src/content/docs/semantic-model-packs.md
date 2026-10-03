@@ -9,6 +9,11 @@ or generator behavior, and reviewed external procedure behavior. A producer
 can construct the public Rust model directly or load reviewed YAML or JSON.
 Both paths compile through the same validation and canonicalization pipeline.
 
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs) is the home for open
+semantic packs and policy rules, including authoring contributions, generation
+recipes, and independently versioned releases. The engine retains compilation,
+installation, and activation tooling.
+
 Compilation alone does not install, store, match, or activate a pack; those
 operations belong to the catalog and generation-scoped runtime described below.
 
@@ -29,6 +34,23 @@ unbounded evaluator inputs. Generator expressions are bounded trees of
 literals, declared scalar captures, ordered concatenation, and named ASCII case
 transforms. Procedure summaries are bounded typed records, not executable
 models or source-text matching rules.
+
+## Native format compatibility
+
+New native packs use schema `8`. Their `compatibility` object contains
+`toolchains` and omits `bifrost`; reader support for the native schema determines
+format admission. An engine-version field in a schema-8 pack is rejected.
+Producer versions still identify the generator and remain part of provenance.
+
+Historical native schemas `2` through `7` retain their required, valid
+`compatibility.bifrost` range and enforce it during selection and activation.
+Missing, malformed, null or mixed compatibility forms are rejected. Existing
+pack bytes and content digests are preserved when the catalog is upgraded.
+
+For every schema, toolchain requirements, artifact identity, selectors and
+integrity checks continue to apply. Reading the format does not establish
+complete model coverage or support for every semantic capability; partial
+results retain their completeness diagnostics.
 
 ## Workspace pack activation
 
@@ -51,14 +73,23 @@ with linked worktrees and relocated by the normal Bifrost cache environment
 overrides. An analyzer explicitly built with ephemeral storage instead uses a
 delete-on-drop catalog, so a scoped or test session does not create `.bifrost`
 inside the workspace. Supplying `catalog` or a cache environment override is an
-explicit opt-in to persistent reuse. Set `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to
-a writable machine-local directory when independent repositories should share
-the same content-addressed generated productions. A cold cache still generates
-each pack from the exact local artifact; later sessions reuse that verified
-production. The analysis catalog and activation APIs do not download packs or
-dependencies. The released `brokk-bifrost` facade separately opts into an
-exact-production acquisition provider; see [Released-facade generated-pack
-acquisition](#released-facade-generated-pack-acquisition). `ecosystems` names
+explicit opt-in to persistent reuse. Default persistent catalogs also reuse
+exact generated productions through the user's machine cache. Only the requested
+generated pack and its extraction accounting are copied into a workspace's
+catalog; workspace models and activation settings remain local. Host reuse
+refreshes retention, and publishing a new production runs bounded cleanup of
+generated packs unused for at least seven days. Active transfers hold leases.
+If the optional host cache cannot accept a publication, the verified local copy
+remains usable and a later hit retries publication. Set
+`BIFROST_SEMANTIC_PACK_CACHE_ROOT` to choose an explicitly shared catalog instead.
+A cold cache still generates each pack from the exact local artifact; later
+sessions reuse that verified production. Shard validation is cached by exact
+content, validator version and decode limits; every load still checks content
+integrity. On Unix, unchanged JDK source ZIPs also avoid rereading the archive
+using file identity and change timestamps. Other platforms retain exact reads.
+The analysis catalog and activation APIs do not download packs or dependencies.
+Hosts acquire compatible open content into their persistent cache; see
+[Cached and offline installation](#cached-and-offline-installation). `ecosystems` names
 the dependency ecosystems to discover, and may be an empty array to explicitly
 disable ambient dependency-pack activation.
 When the document is absent, the shared host path selects every ecosystem that
@@ -107,91 +138,78 @@ artifact coordinate and the reviewed predicates it requires. Only a declaration
 of the exact reviewed revision counts -- a range such as `>=22` or a moving
 label such as `lts/*` names no reviewed artifact.
 
-## Offline image-build installation
+## Cached and offline installation
 
-A release can provide a standalone semantic-pack installer for
-`x86_64-unknown-linux-gnu`. The release asset name is
-`bifrost-semantic-pack-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`, with a
-`.sha256` sidecar for that exact filename. The archive includes the installer
-and its license notices. Verify both release assets and the bundle
-before building an image-owned catalog:
+Open content is published by
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs) in separate
+`packs/vX.Y.Z` and `rules/vX.Y.Z` streams. Engine `vX.Y.Z` releases retain
+installer tooling but no longer generate or publish the semantic-pack bundle.
+Pack versions advance independently of the engine version.
+
+Each release's `pack-release.json` records its immutable source commit,
+required schemas and semantic capabilities, integrity and behavior evidence,
+and artifact sizes and SHA-256 hashes. Manifest schema 2 checks the consumer's
+supported RQL, policy, catalog, and native-model versions; engine versions are
+provenance and do not gate compatibility. Rules may pin an exact semantic-pack
+dependency; resolve it rather than selecting an unrelated latest bundle.
+Default selection requires verified integrity and behavior that has not failed.
+Pending or limited behavior remains visible in the receipt and does not establish
+complete coverage. Historical schema 1 releases retain their original engine
+bounds and qualification requirements.
+
+The packs repository provides `release-contract/discover.py` for online
+selection and `--offline` selection from verified cached manifests and
+artifacts. Supply a trusted engine profile containing the exact engine build,
+supported schemas and capabilities; do not infer them from a version label.
+Retain the selection receipt for the lifetime of the scan. Follow the
+[release contract](https://github.com/BrokkAi/bifrost-packs/tree/main/release-contract)
+for acquisition commands and profile requirements.
+
+After downloading, verifying, and safely extracting a native bundle, install
+it with the running engine's portable command:
 
 ```bash
-release_tag=v0.11.4
-installer_archive="bifrost-semantic-pack-${release_tag}-x86_64-unknown-linux-gnu.tar.gz"
-base_url="https://github.com/BrokkAi/bifrost/releases/download/${release_tag}"
-
-curl --fail --silent --show-error --location --remote-name \
-  "${base_url}/${installer_archive}" \
-  "${base_url}/${installer_archive}.sha256" \
-  "${base_url}/bifrost-semantic-packs-${release_tag}.tar.gz" \
-  "${base_url}/bifrost-semantic-packs-${release_tag}.tar.gz.sha256"
-sha256sum --check "${installer_archive}.sha256"
-sha256sum --check "bifrost-semantic-packs-${release_tag}.tar.gz.sha256"
-tar -xzf "$installer_archive"
-installer_dir="${installer_archive%.tar.gz}"
-chmod +x "$installer_dir/bifrost-semantic-pack"
-
-rm -rf "$release_tag-extracted"
-mkdir "$release_tag-extracted"
-tar -xzf "bifrost-semantic-packs-${release_tag}.tar.gz" -C "$release_tag-extracted"
-mkdir -p workspace/.bifrost/semantic-pack-catalog
-"./$installer_dir/bifrost-semantic-pack" install \
-  "$release_tag-extracted/bifrost-semantic-packs" \
-  workspace/.bifrost/semantic-pack-catalog
+bifrost install-semantic-packs /path/to/bifrost-semantic-packs /path/to/cache
 ```
 
-Then pin that explicit catalog in the image's workspace configuration:
+The command checks the native index, manifests, shards, and generation identity,
+and installs into the engine's versioned catalog under the cache root. Hosts
+can instead import the extracted bundle through the facade bootstrap:
 
-```json
-{
-  "schema_version": 1,
-  "catalog": ".bifrost/semantic-pack-catalog",
-  "ecosystems": ["jvm"]
-}
+```bash
+export BIFROST_SEMANTIC_PACK_CACHE_ROOT=/path/to/cache
+export BIFROST_OPEN_SEMANTIC_PACK_BUNDLE=/path/to/bifrost-semantic-packs
+export BIFROST_OPEN_POLICY_PACK_ROOT=/path/to/extracted-rules/rules
+bifrost --root /path/to/project --mcp 'symbol|extended'
 ```
 
-Set `BIFROST_SEMANTIC_PACK_DOWNLOAD=off` so a released facade cannot try to
-download generated productions at runtime. Use the ecosystems required by the
-image and explicit `enable` controls for packs marked as requiring review. An
-empty `ecosystems` list explicitly turns off dependency discovery and therefore
-does not activate an installed JDK pack.
+These directories belong to the host's persistent cache, as in SlopCop's
+image-owned pack installation. A configured malformed native bundle or policy
+catalog fails explicitly. Policy manifests and authored hashes are checked by
+the same catalog loader used for embedded policies. Runtime activation still
+requires the exact modeled dependency artifacts and workspace evidence;
+installation alone does not establish applicability or complete coverage.
 
-Installed, reviewed packs can activate only when the runtime discovers the
-exact coordinates and artifacts they model. Curated catalog entries do not
-relax that requirement. Generated-production reuse remains keyed to the exact
-artifact digest and producer identity; a Linux runtime cannot reuse a production
-made from a different operating-system or toolchain artifact merely because the
-pack id or ecosystem matches. Missing, corrupt, incompatible, unsupported, or
-version-mismatched pack state remains a typed incomplete result. It is not
-silently treated as clean or replaced by name-only activation.
+Use `.bifrost/packs.json` to control ecosystems and reviewed packs, as described
+above. Empty `ecosystems` disables dependency discovery. Generated-production
+reuse remains keyed to the exact artifact digest and producer identity; a
+Linux production cannot be reused for a different toolchain or operating-system
+artifact merely because its pack ID matches.
 
-## Released-facade generated-pack acquisition
+## Generated-pack acquisition
 
-Generic analysis, explicit catalog activation, direct consumers of
-`brokk-bifrost-semantic-packs`, and package dependency discovery remain
-network-free. The published `brokk-bifrost` facade registers a provider that
-runs only after the generated-production cache miss has been rechecked under
-its key-specific lock. It requests the immutable bundle for the running
-release from the public `BrokkAi/bifrost` `vX.Y.Z` release, together with its
-checksum sidecar; it does not use a mutable branch, package index, or
-third-party source.
-
-The provider verifies the archive SHA-256, safe extraction, release index, and
-inner manifest and shard checksums before installing anything. Installation is
-accepted only when the bundle contains the requested exact
-`GeneratedProductionKey`, which binds the input digest, producer name and
-version, semantic schema version, and generated-production cache version. An
-unavailable, invalid, or otherwise failed acquisition emits a warning and
-falls back to local generation. Set
-`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable this facade path; unset/default
-enables it.
+The facade no longer installs a network acquisition provider pointing at
+engine release assets. Plugins and image builders acquire open content from
+Bifrost-packs outside analysis and pass a verified cached selection to the
+server. Local generation remains available for exact dependency artifacts
+missing from the catalog. Generic analysis and catalog activation remain
+network-free.
 
 Policy reports expose whether dependency activation was `default`,
 `configured`, or `disabled`, together with the selected, missing,
-incompatible, version-mismatched, rejected, or otherwise incomplete decisions
-that explain the result. Activation failures and incomplete runtime state stay
-typed and attributable; they are not converted into a clean negative.
+incompatible, version-mismatched, rejected, or otherwise incomplete decisions.
+Activation failures and incomplete runtime state remain typed and attributable;
+they do not become a clean negative.
 
 ## Authoring and review tools
 

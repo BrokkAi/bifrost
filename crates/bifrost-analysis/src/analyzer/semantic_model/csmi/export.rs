@@ -331,6 +331,27 @@ fn export_semantic_document<'a>(
                 members: shard_members,
                 relations: shard_relations,
             } => {
+                if let Some(fact) = shard_types
+                    .iter()
+                    .find(|fact| fact.callable_surface_complete)
+                {
+                    return Err(CsmiExportError::Unsupported {
+                        path: format!("types.{}.callable_surface_complete", fact.id),
+                        semantic:
+                            "declared callable-surface coverage has no supported CSMI contract"
+                                .to_owned(),
+                    });
+                }
+                if let Some(fact) = shard_members
+                    .iter()
+                    .find(|fact| fact.non_overridable.is_some())
+                {
+                    return Err(CsmiExportError::Unsupported {
+                        path: format!("members.{}.non_overridable", fact.id),
+                        semantic: "selected declaration non-overridability has no CSMI contract"
+                            .to_owned(),
+                    });
+                }
                 type_names_by_id.extend(
                     shard_types
                         .iter()
@@ -736,6 +757,7 @@ fn export_semantic_document<'a>(
         }
         if !summary.effects.is_empty()
             || !summary.concurrency_effects.is_empty()
+            || summary.no_concurrency_effects
             || !summary.declared_effects.is_empty()
             || summary.preconditions.is_some()
             || !summary.result_contracts.is_empty()

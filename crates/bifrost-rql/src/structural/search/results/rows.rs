@@ -235,6 +235,7 @@ pub enum CodeQueryStableOwnerDerivation {
 pub enum CodeQueryRowScalarType {
     StableId,
     String,
+    StringList,
     Integer,
     Boolean,
     ConstrainedEnum,
@@ -247,6 +248,7 @@ impl CodeQueryRowScalarType {
         match self {
             Self::StableId => "stable_id",
             Self::String => "string",
+            Self::StringList => "string_list",
             Self::Integer => "integer",
             Self::Boolean => "boolean",
             Self::ConstrainedEnum => "constrained_enum",
@@ -387,7 +389,9 @@ impl CodeQueryRowField {
 /// beside that site and re-exported here rather than restated.
 mod value_domain {
     use super::super::super::decorator_binding;
-    use super::{NormalizedKind, ReceiverQueryOperation, UsageHitKind};
+    use super::{
+        CodeQueryResultSubjectOutcome, NormalizedKind, ReceiverQueryOperation, UsageHitKind,
+    };
     use crate::analyzer::CodeUnitType;
     use crate::analyzer::semantic::CandidateCoverage;
     use crate::analyzer::semantic::capabilities::SemanticCapability;
@@ -437,7 +441,7 @@ mod value_domain {
         RewriteDomainKind, RewriteOutcomeKind,
     };
     use brokk_bifrost_core::analyzer::structural::routes::SegmentResolutionStatus;
-    use brokk_bifrost_flow::type_flow::ClassSetStatus;
+    use brokk_bifrost_flow::type_flow::{AbsentMemberProof, ClassSetStatus};
 
     pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
     pub(super) const LANGUAGE_DIALECT: &[&str] = LanguageDialect::STABLE_LABELS;
@@ -593,6 +597,7 @@ mod value_domain {
         "obligation_unavailable",
         "obligation_conflict",
     ];
+    pub(super) const RESULT_SUBJECT_OUTCOME: &[&str] = CodeQueryResultSubjectOutcome::LABELS;
     pub(super) const RESULT_CONTRACT_USE_KIND: &[&str] = &[
         "dereference",
         "field",
@@ -634,6 +639,7 @@ mod value_domain {
     pub(super) const CONCURRENT_PROOF: &[&str] = &["proven", "open"];
     pub(super) const CONCURRENT_COVERAGE: &[&str] = &["exhaustive", "open"];
     pub(super) const CLASS_SET_STATUS: &[&str] = ClassSetStatus::LABELS;
+    pub(super) const ABSENT_MEMBER_PROOF: &[&str] = AbsentMemberProof::LABELS;
     pub(super) const ABSENT_MEMBER_WITNESS_STATUS: &[&str] =
         &["available", "truncated", "unavailable"];
     pub(super) const SWITCH_PROOF: &[&str] = &["exact", "unknown"];
@@ -761,6 +767,7 @@ mod value_domain {
         "do",
         "for",
         "enhanced_for",
+        "for_in",
         "switch",
         "try",
         "try_with_resources",
@@ -768,6 +775,19 @@ mod value_domain {
         "labeled",
         "assert",
         "empty",
+        "with",
+        "delete",
+        "import",
+        "debugger",
+        "goto",
+        "using",
+        "lock",
+        "fixed",
+        "checked",
+        "unsafe",
+        "fallthrough",
+        "defer",
+        "go",
     ];
     pub(super) const STATEMENT_VERDICT: &[&str] = &["reachable", "unreachable", "open"];
     pub(super) const BRANCH_REASON: &[&str] = &[
@@ -864,6 +884,7 @@ macro_rules! code_query_row_fields {
 pub enum CodeQueryRowScalarRef<'a> {
     StableId(&'a str),
     String(&'a str),
+    StringList(&'a [String]),
     Integer(u64),
     Boolean(bool),
     ConstrainedEnum(&'a str),
@@ -875,6 +896,7 @@ impl CodeQueryRowScalarRef<'_> {
         match self {
             Self::StableId(_) => CodeQueryRowScalarType::StableId,
             Self::String(_) => CodeQueryRowScalarType::String,
+            Self::StringList(_) => CodeQueryRowScalarType::StringList,
             Self::Integer(_) => CodeQueryRowScalarType::Integer,
             Self::Boolean(_) => CodeQueryRowScalarType::Boolean,
             Self::ConstrainedEnum(_) => CodeQueryRowScalarType::ConstrainedEnum,
@@ -1308,6 +1330,9 @@ detailed_row_domains! {
                     CodeQueryRowField::required("class", Scalar::String),
                     CodeQueryRowField::required("caller", Scalar::String),
                     CodeQueryRowField::required("witness_steps", Scalar::Integer),
+                    CodeQueryRowField::required_enum("proof", value_domain::ABSENT_MEMBER_PROOF),
+                    CodeQueryRowField::optional("condition", Scalar::String),
+                    CodeQueryRowField::required("also_fails_at", Scalar::StringList),
         ],
     },
     AbsentMemberWitness => "absent_member_witness" {
@@ -1764,6 +1789,27 @@ detailed_row_domains! {
             CodeQueryRowField::required("terminal", Scalar::Boolean),
         ],
     },
+    ResultSubjectUse => "result_subject_use" {
+        display_range: |value| value.receiver_range,
+        identities: None,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::optional("origin_id", Scalar::StableId),
+            CodeQueryRowField::optional("subject_id", Scalar::StableId),
+            CodeQueryRowField::optional("artifact_id", Scalar::StableId),
+            CodeQueryRowField::optional("procedure_id", Scalar::StableId),
+            CodeQueryRowField::optional("receiver_call_id", Scalar::StableId),
+            CodeQueryRowField::optional("receiver_site_id", Scalar::StableId),
+            CodeQueryRowField::optional("receiver_site_ast_id", Scalar::StableId),
+            CodeQueryRowField::optional("receiver_point_id", Scalar::StableId),
+            CodeQueryRowField::required("path", Scalar::String),
+            CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+            CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+            CodeQueryRowField::required_enum("completeness", value_domain::EVIDENCE_COMPLETENESS),
+            CodeQueryRowField::required_enum("outcome", value_domain::RESULT_SUBJECT_OUTCOME),
+            CodeQueryRowField::optional_open_enum("reason", "normal-result subject outcome reasons"),
+        ],
+    },
     ResultContractUse => "result_contract_use" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -2040,6 +2086,8 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("parameter_ordinal", Scalar::Integer),
                     CodeQueryRowField::optional("port_id", Scalar::StableId),
                     CodeQueryRowField::required("decorator_name", Scalar::String),
+                    CodeQueryRowField::optional("annotation_type_id", Scalar::StableId),
+                    CodeQueryRowField::optional("annotation_type_name", Scalar::String),
                     CodeQueryRowField::optional("local_name", Scalar::String),
                     CodeQueryRowField::optional("imported_name", Scalar::String),
                     CodeQueryRowField::optional("module", Scalar::String),
@@ -3047,6 +3095,15 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::AbsentMemberFinding { value }, "witness_steps") => {
             Some(Scalar::Integer(value.witness_steps as u64))
         }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "condition") => {
+            value.condition.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::AbsentMemberFinding { value }, "also_fails_at") => {
+            Some(Scalar::StringList(&value.also_fails_at))
+        }
         (CodeQueryResultValue::AbsentMemberWitness { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -3546,6 +3603,15 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::DecoratedParameter { value }, "decorator_name") => {
             Some(Scalar::String(&value.decorator_name))
         }
+        (CodeQueryResultValue::DecoratedParameter { value }, "annotation_type_id") => value
+            .annotation_type
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref())
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::DecoratedParameter { value }, "annotation_type_name") => value
+            .annotation_type
+            .as_ref()
+            .map(|declaration| Scalar::String(&declaration.fq_name)),
         (CodeQueryResultValue::DecoratedParameter { value }, "local_name") => {
             value.local_name.as_deref().map(Scalar::String)
         }
@@ -3959,6 +4025,52 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallResultObligation { value }, "terminal") => {
             Some(Scalar::Boolean(value.terminal))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "origin_id") => value
+            .origin
+            .as_ref()
+            .map(|origin| Scalar::StableId(&origin.id)),
+        (CodeQueryResultValue::ResultSubjectUse { value }, "subject_id") => {
+            value.subject_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "artifact_id") => {
+            value.artifact_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "procedure_id") => {
+            value.procedure_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "receiver_call_id") => {
+            value.receiver_call_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "receiver_site_id") => {
+            value.receiver_site_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "receiver_site_ast_id") => {
+            value.receiver_site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "receiver_point_id") => {
+            value.receiver_point_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome.label()))
+        }
+        (CodeQueryResultValue::ResultSubjectUse { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::ResultContractUse { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -5360,6 +5472,9 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    ResultSubjectUse {
+        id: String,
+    },
     ResultContractUse {
         id: String,
         acquisition_id: String,
@@ -5748,6 +5863,12 @@ fn detailed_semantic_identity(
                 site_id: value.site_id.clone(),
             },
         )),
+        CodeQueryResultValue::ResultSubjectUse { value } => Some((
+            DetailedCodeQueryDomain::ResultSubjectUse,
+            DetailedCodeQueryKey::ResultSubjectUse {
+                id: value.id.clone(),
+            },
+        )),
         CodeQueryResultValue::ResultContractUse { value } => Some((
             DetailedCodeQueryDomain::ResultContractUse,
             DetailedCodeQueryKey::ResultContractUse {
@@ -5960,6 +6081,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ProgramPoint { id, .. }
         | DetailedCodeQueryKey::ControlEdge { id, .. }
         | DetailedCodeQueryKey::CallResult { id, .. }
+        | DetailedCodeQueryKey::ResultSubjectUse { id }
         | DetailedCodeQueryKey::TypestateFinding { id }
         | DetailedCodeQueryKey::TypestateWitness { id, .. }
         | DetailedCodeQueryKey::FlowEndpoint { id }

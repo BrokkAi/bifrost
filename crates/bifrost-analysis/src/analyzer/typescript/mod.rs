@@ -30,10 +30,9 @@ use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use brokk_bifrost_js_ts::identifiers::collect_js_ts_identifiers;
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
-use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name, node_text};
+use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
-use brokk_bifrost_js_ts::type_text::ts_clean_type_text;
 use brokk_bifrost_js_ts::typescript::*;
 
 mod semantic;
@@ -42,6 +41,22 @@ mod semantic;
 pub struct TypescriptAdapter;
 
 impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn js_ts_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::TypeScript
     }
@@ -194,6 +209,18 @@ impl TypescriptAnalyzer {
 }
 
 impl JsTsSource for TypescriptAnalyzer {
+    fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        crate::analyzer::IAnalyzer::source_file_inventory(&self.inner)
+    }
+
+    fn source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>> {
+        self.inner
+            .canonical_js_ts_source_facts(file, &self.memo_caches.source_facts)
+    }
+
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
@@ -226,40 +253,6 @@ impl JsTsSource for TypescriptAnalyzer {
         self.inner.signatures_vec_of(code_unit)
     }
 
-    fn type_alias_value_text(&self, code_unit: &CodeUnit) -> Option<String> {
-        if !self.inner.is_type_alias(code_unit) {
-            return None;
-        }
-        let scope = AnalyzerQueryScope::new(self);
-        let prepared = self
-            .inner
-            .prepared_syntax(scope.token(), code_unit.source())?;
-        let node = prepared.declaration_node(code_unit)?;
-        let declaration = if node.kind() == "export_statement" {
-            node.child_by_field_name("declaration")?
-        } else {
-            node
-        };
-        if declaration.kind() != "type_alias_declaration" {
-            return None;
-        }
-        let value = declaration.child_by_field_name("value")?;
-        Some(node_text(value, prepared.source()).trim().to_string())
-    }
-
-    fn member_type_annotation_text(&self, code_unit: &CodeUnit) -> Option<String> {
-        let scope = AnalyzerQueryScope::new(self);
-        let prepared = self
-            .inner
-            .prepared_syntax(scope.token(), code_unit.source())?;
-        let node = prepared.declaration_node(code_unit)?;
-        if node.kind() != "property_signature" && node.kind() != "index_signature" {
-            return None;
-        }
-        let annotation = node.child_by_field_name("type")?;
-        Some(ts_clean_type_text(node_text(annotation, prepared.source())))
-    }
-
     fn with_usage_definitions(
         &self,
         _token: QueryToken<'_>,
@@ -274,7 +267,7 @@ impl JsTsSource for TypescriptAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<Arc<JsTsUsageIndex>> {
         cancellation.map_or_else(
-            || Some(providers::jsts_usage_index(self)),
+            || providers::jsts_usage_index(self),
             |token| providers::jsts_usage_index_with_cancellation(self, token),
         )
     }

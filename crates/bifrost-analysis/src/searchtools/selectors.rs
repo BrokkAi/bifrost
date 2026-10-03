@@ -358,6 +358,10 @@ pub(super) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
         DeclarationKind::ImportAlias => "type",
         DeclarationKind::StatementLabel => "statement_label",
         DeclarationKind::LambdaParameter => "lambda_parameter",
+        // A block-local item is an item, not a variable: naming it
+        // local_variable would misreport a nested `fn` or `struct`.
+        DeclarationKind::BlockLocalItem => "block_local_item",
+        DeclarationKind::Field => "field",
         DeclarationKind::LocalVariable
         | DeclarationKind::CatchParameter
         | DeclarationKind::EnhancedForVariable
@@ -368,7 +372,8 @@ pub(super) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
 
 #[derive(Default)]
 pub(super) struct CppIdentityRenderCache {
-    cpp_classifiers: HashMap<ProjectFile, Option<crate::analyzer::CppOccurrenceClassifier>>,
+    cpp_occurrences:
+        HashMap<CodeUnit, Option<Vec<crate::analyzer::languages::DeclarationNavigationOccurrence>>>,
     canonical_selectors: HashMap<CodeUnit, String>,
     loaded_fqns: HashSet<String>,
 }
@@ -398,19 +403,15 @@ impl CppIdentityRenderCache {
             .or_else(|| Some(file_anchored_definition_selector(unit)))
     }
 
-    fn classifier(
+    fn occurrences(
         &mut self,
         analyzer: &dyn IAnalyzer,
-        source: &ProjectFile,
-    ) -> Option<&crate::analyzer::CppOccurrenceClassifier> {
-        self.cpp_classifiers
-            .entry(source.clone())
-            .or_insert_with(|| {
-                analyzer
-                    .indexed_source(source)
-                    .and_then(|content| crate::analyzer::CppOccurrenceClassifier::new(&content))
-            })
-            .as_ref()
+        unit: &CodeUnit,
+    ) -> Option<&[crate::analyzer::languages::DeclarationNavigationOccurrence]> {
+        self.cpp_occurrences
+            .entry(unit.clone())
+            .or_insert_with(|| declaration_navigation_occurrences(analyzer, unit))
+            .as_deref()
     }
 
     pub(super) fn primary_range(
@@ -418,17 +419,18 @@ impl CppIdentityRenderCache {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Option<Range> {
-        // A class with a forward declaration and a definition has one physical
-        // occurrence per site; the definition is the primary one, the same way
-        // it is for a callable with a prototype (#1650, #3297).
-        let classifier = if language_for_target(unit) == Language::Cpp
+        let ranges = analyzer.ranges(unit);
+        if ranges.len() < 2 {
+            return ranges.into_iter().next();
+        }
+        let occurrences = if language_for_target(unit) == Language::Cpp
             && (unit.is_callable() || unit.is_class())
         {
-            self.classifier(analyzer, unit.source())
+            Some(self.occurrences(analyzer, unit)?)
         } else {
             None
         };
-        primary_range_with_cpp_classifier(analyzer, unit, classifier)
+        primary_range_from_ranges(ranges, occurrences)
     }
 
     pub(super) fn primary_range_from_projected_pair(
@@ -438,39 +440,8 @@ impl CppIdentityRenderCache {
         primary: Range,
         secondary: Range,
     ) -> Option<Range> {
-        let content = analyzer.indexed_source(unit.source())?;
-        let start = primary.start_byte.min(secondary.start_byte);
-        let end = primary.end_byte.max(secondary.end_byte);
-        let slice = content.get(start..end)?;
-        let prefix = "namespace bifrost_search_range {\n";
-        let local_source = format!("{prefix}{slice}\n}}");
-        let classifier = crate::analyzer::CppOccurrenceClassifier::new(&local_source)?;
-        let adjusted = |range: Range| -> Option<Range> {
-            Some(Range {
-                start_byte: prefix
-                    .len()
-                    .checked_add(range.start_byte.checked_sub(start)?)?,
-                end_byte: prefix
-                    .len()
-                    .checked_add(range.end_byte.checked_sub(start)?)?,
-                start_line: range.start_line,
-                end_line: range.end_line,
-            })
-        };
-        let mut definitions = [primary, secondary].into_iter().filter(|range| {
-            adjusted(*range).is_some_and(|adjusted| {
-                classifier.classify(unit, &adjusted)
-                    == crate::analyzer::CppOccurrenceRole::Definition
-            })
-        });
-        let selected = definitions.next()?;
-        Some(definitions.fold(selected, |earliest, range| {
-            if (range.start_line, range.start_byte) < (earliest.start_line, earliest.start_byte) {
-                range
-            } else {
-                earliest
-            }
-        }))
+        let occurrences = self.occurrences(analyzer, unit)?;
+        primary_range_from_ranges(vec![primary, secondary], Some(occurrences))
     }
 
     /// The physical declaration ranges to render for `unit`. A C++ class with
@@ -487,14 +458,18 @@ impl CppIdentityRenderCache {
         if language_for_target(unit) != Language::Cpp || !unit.is_class() || ranges.len() < 2 {
             return ranges;
         }
-        let Some(classifier) = self.classifier(analyzer, unit.source()) else {
+        let Some(occurrences) = self.occurrences(analyzer, unit) else {
             return ranges;
         };
         let definitions = ranges
             .iter()
             .copied()
             .filter(|range| {
-                classifier.classify(unit, range) == crate::analyzer::CppOccurrenceRole::Definition
+                occurrences.iter().any(|occurrence| {
+                    occurrence.range == *range
+                        && occurrence.role
+                            == crate::analyzer::languages::DeclarationNavigationRole::Definition
+                })
             })
             .collect::<Vec<_>>();
         if definitions.is_empty() {
@@ -513,8 +488,10 @@ impl CppIdentityRenderCache {
         if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
             return None;
         }
-        self.classifier(analyzer, unit.source())
-            .and_then(|classifier| classifier.classify(unit, range).api_label())
+        self.occurrences(analyzer, unit)?
+            .iter()
+            .find(|occurrence| occurrence.range == *range)
+            .and_then(|occurrence| occurrence.role.api_label())
             .map(str::to_string)
     }
 }
@@ -2226,6 +2203,7 @@ mod tests {
         let analyzer = CppAnalyzer::from_project(fixture.project().clone());
         let scope = AnalyzerQueryScope::new(&analyzer);
         let complete = DefinitionLookupOutcome {
+            modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
             reference: None,
             definitions: Vec::new(),

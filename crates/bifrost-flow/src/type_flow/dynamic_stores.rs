@@ -28,7 +28,8 @@ pub(super) struct PendingDynamicWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicWriteEvidence {
     pub site: SourceSite,
-    /// None means the receiver set is bounded. Some names the open boundary.
+    /// Why receiver identity is incomplete. A separate scope bit determines
+    /// whether that uncertainty is global or constrained by `bounds`.
     pub reason: Option<UnknownReason>,
 }
 
@@ -54,7 +55,12 @@ impl DynamicWriteEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScopedDynamicWrite {
+    /// Receiver classes observed exactly at a write site.
     pub classes: Vec<ClassIdentity>,
+    /// Structural upper bounds for unknown receiver alternatives.
+    pub bounds: Vec<ClassIdentity>,
+    /// An unbounded receiver alternative can affect any class.
+    pub global: bool,
     pub evidence: DynamicWriteEvidence,
 }
 
@@ -62,6 +68,8 @@ impl ScopedDynamicWrite {
     pub fn open(site: SourceSite, reason: UnknownReason) -> Self {
         Self {
             classes: Vec::new(),
+            bounds: Vec::new(),
+            global: true,
             evidence: DynamicWriteEvidence {
                 site,
                 reason: Some(reason),
@@ -69,8 +77,16 @@ impl ScopedDynamicWrite {
         }
     }
 
-    pub fn affects(&self, class: &ClassIdentity) -> bool {
-        self.evidence.reason.is_some() || self.classes.contains(class)
+    pub fn affects(
+        &self,
+        class: &ClassIdentity,
+        hierarchy: &crate::analyzer::semantic::ClassHierarchy,
+    ) -> bool {
+        self.global
+            || self.classes.contains(class)
+            || self.bounds.iter().any(|bound| {
+                bound == class || hierarchy.unresolved_base || hierarchy.ancestors.contains(bound)
+            })
     }
 }
 
@@ -161,6 +177,8 @@ pub(super) fn survey(
         .iter()
         .map(|write| ScopedDynamicWrite {
             classes: Vec::new(),
+            bounds: Vec::new(),
+            global: false,
             evidence: DynamicWriteEvidence {
                 site: write.site.clone(),
                 reason: None,
@@ -255,11 +273,10 @@ pub(super) fn survey(
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
         }
-        // Every write is already open; no further root can narrow one.
-        if effects
-            .iter()
-            .all(|effect| effect.evidence.reason.is_some())
-        {
+        // A globally open write cannot be narrowed by another root. A
+        // bounded uncertainty still benefits from collecting its other
+        // observed receiver classes and bounds.
+        if effects.iter().all(|effect| effect.global) {
             break;
         }
         let plan = match TypeFlowDiscovery::new(
@@ -285,9 +302,12 @@ pub(super) fn survey(
             }
             // Open effects cannot narrow again. Only pending writes can make
             // this root's class seeds or solve contribute further evidence.
-            if discovered.excludes_procedures(writes.iter().zip(&effects).filter_map(
-                |(write, effect)| effect.evidence.reason.is_none().then_some(&write.procedure),
-            )) {
+            if discovered.excludes_procedures(
+                writes
+                    .iter()
+                    .zip(&effects)
+                    .filter_map(|(write, effect)| (!effect.global).then_some(&write.procedure)),
+            ) {
                 return Ok(None);
             }
             discovered
@@ -359,7 +379,7 @@ pub(super) fn survey(
         let mut queried = HashSet::default();
         for ((write, observation), effect) in writes.iter().zip(&observations).zip(&effects) {
             if plan.value_flow().has_snapshot(&write.procedure)
-                && effect.evidence.reason.is_none()
+                && !effect.global
                 && let Some(observation) = observation
             {
                 queried.insert(observation.point().clone());
@@ -375,8 +395,7 @@ pub(super) fn survey(
             }
         };
         for (index, (write, effect)) in writes.iter().zip(&mut effects).enumerate() {
-            if !plan.value_flow().has_snapshot(&write.procedure) || effect.evidence.reason.is_some()
-            {
+            if !plan.value_flow().has_snapshot(&write.procedure) || effect.global {
                 continue;
             }
             let Some(observation) = &observations[index] else {
@@ -422,7 +441,13 @@ pub(super) fn survey(
                     return Err(TypeFlowPlanError::Cancelled);
                 }
                 Err(CorrelationError::Budget(_)) => {
-                    effect.evidence.reason = Some(UnknownReason::SemanticBudget);
+                    open_or_bound(
+                        workspace,
+                        adapter,
+                        effect,
+                        structural_receiver_classes[index].as_ref(),
+                        UnknownReason::SemanticBudget,
+                    );
                     continue;
                 }
             };
@@ -432,15 +457,31 @@ pub(super) fn survey(
                     continue;
                 }
                 identity_observed = true;
+                let atom = plan.atom(source);
                 if uncertain {
                     effect.evidence.reason = Some(UnknownReason::UncertainFlow);
+                    let source_is_bounded = match atom {
+                        ClassAtom::Class(_) => {
+                            matches!(
+                                plan.source_site(source).kind,
+                                SourceSiteKind::DeclaredParameter | SourceSiteKind::RootReceiver
+                            )
+                        }
+                        ClassAtom::Unknown(UnknownReason::SelfReceiver)
+                        | ClassAtom::Unknown(UnknownReason::OpenTypeBound) => true,
+                        ClassAtom::Unknown(_) => false,
+                    };
+                    effect.global |= !source_is_bounded;
                 }
-                match plan.atom(source) {
+                match atom {
                     ClassAtom::Class(class) => {
                         if !effect.classes.contains(class) {
                             effect.classes.push(class.clone());
                         }
-                        if plan.source_site(source).kind == SourceSiteKind::DeclaredParameter {
+                        if matches!(
+                            plan.source_site(source).kind,
+                            SourceSiteKind::DeclaredParameter | SourceSiteKind::RootReceiver
+                        ) {
                             add_bound(workspace, adapter, effect, class);
                         }
                     }
@@ -455,7 +496,7 @@ pub(super) fn survey(
                         if let Some(class) = adapter.enclosing_class(workspace, source_procedure) {
                             add_bound(workspace, adapter, effect, &class);
                         } else {
-                            effect.evidence.reason = Some(UnknownReason::SelfReceiver);
+                            open_global(effect, UnknownReason::SelfReceiver);
                         }
                     }
                     // The identity comes from an actual argument at some
@@ -482,10 +523,10 @@ pub(super) fn survey(
                             }
                         }
                         if !bounded {
-                            effect.evidence.reason = Some(UnknownReason::OpenTypeBound);
+                            open_global(effect, UnknownReason::OpenTypeBound);
                         }
                     }
-                    ClassAtom::Unknown(reason) => effect.evidence.reason = Some(reason.clone()),
+                    ClassAtom::Unknown(reason) => open_global(effect, reason.clone()),
                 }
             }
             if !identity_observed {
@@ -501,9 +542,7 @@ pub(super) fn survey(
     }
     if let Some(reason) = survey_failure {
         for (index, effect) in effects.iter_mut().enumerate() {
-            if effect.evidence.reason.is_none()
-                && (effect.classes.is_empty() || caller_dependent[index])
-            {
+            if !effect.global && (effect.classes.is_empty() || caller_dependent[index]) {
                 open_or_bound(
                     workspace,
                     adapter,
@@ -516,6 +555,8 @@ pub(super) fn survey(
     }
     for effect in &mut effects {
         effect.classes.sort_by(super::field_slots::class_order);
+        effect.bounds.sort_by(super::field_slots::class_order);
+        effect.bounds.dedup();
     }
     Ok(effects)
 }
@@ -547,7 +588,7 @@ fn open_or_bound(
 ) {
     match structural_class {
         Some(class) => add_bound(workspace, adapter, effect, class),
-        None => effect.evidence.reason = Some(reason),
+        None => open_global(effect, reason),
     }
 }
 
@@ -557,17 +598,17 @@ fn add_bound(
     effect: &mut ScopedDynamicWrite,
     class: &ClassIdentity,
 ) {
-    if !effect.classes.contains(class) {
-        effect.classes.push(class.clone());
+    let hierarchy = adapter.class_hierarchy(workspace, class);
+    if matches!(class, ClassIdentity::External { .. }) || hierarchy.unresolved_base {
+        open_global(effect, UnknownReason::OpenTypeBound);
+        return;
     }
-    match adapter.class_hierarchy(workspace, class).descendants {
-        Some(descendants) => {
-            for descendant in descendants {
-                if !effect.classes.contains(&descendant) {
-                    effect.classes.push(descendant);
-                }
-            }
-        }
-        None => effect.evidence.reason = Some(UnknownReason::OpenTypeBound),
+    if !effect.bounds.contains(class) {
+        effect.bounds.push(class.clone());
     }
+}
+
+fn open_global(effect: &mut ScopedDynamicWrite, reason: UnknownReason) {
+    effect.global = true;
+    effect.evidence.reason = Some(reason);
 }

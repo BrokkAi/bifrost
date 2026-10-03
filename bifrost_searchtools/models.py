@@ -25,6 +25,9 @@ BlastRadiusCallableChangeValue = Literal[
     "edited", "introduced", "deleted", "moved", "signature_changed"
 ]
 BlastRadiusScopeKindValue = Literal["file", "directory"]
+MissingTestsModeValue = Literal[
+    "file_imports_then_exact_usages", "file_graph_narrowed_binding_reachability"
+]
 MissingTestsIncompleteReasonValue = Literal[
     "target_graph_cancelled",
     "compilation_scope_unresolved",
@@ -43,6 +46,12 @@ MissingTestsIncompleteReasonValue = Literal[
     "usage_analysis_incomplete",
     "unproven_references",
     "usage_site_without_enclosing_declaration",
+    "unresolved_changed_target",
+    "open_binding_frontier",
+    "unsupported_binding_boundary",
+    "unproven_binding_edge",
+    "reference_graph_cancelled",
+    "reference_graph_stale",
 ]
 CyclomaticComplexityChangeValue = Literal["introduced", "edited"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
@@ -55,6 +64,7 @@ _BLAST_RADIUS_BASE_RECOVERIES = get_args(BlastRadiusBaseRecoveryValue)
 _BLAST_RADIUS_INCOMPLETE_REASONS = get_args(BlastRadiusIncompleteReasonValue)
 _BLAST_RADIUS_CALLABLE_CHANGES = get_args(BlastRadiusCallableChangeValue)
 _BLAST_RADIUS_SCOPE_KINDS = get_args(BlastRadiusScopeKindValue)
+_MISSING_TESTS_MODES = get_args(MissingTestsModeValue)
 _MISSING_TESTS_INCOMPLETE_REASONS = get_args(MissingTestsIncompleteReasonValue)
 _CYCLOMATIC_COMPLEXITY_CHANGES = get_args(CyclomaticComplexityChangeValue)
 _MISSING = object()
@@ -8658,7 +8668,7 @@ class BlastRadiusResult:
 
 @dataclass(frozen=True)
 class MissingTestsAnalysis:
-    mode: Literal["file_imports_then_exact_usages"]
+    mode: MissingTestsModeValue
     file_graph_completion: FileGraphCompletionValue
     exact_usage_completion: FileGraphCompletionValue
     candidate_function_count: int
@@ -8671,9 +8681,7 @@ class MissingTestsAnalysis:
 
     @classmethod
     def from_dict(cls, data: dict) -> MissingTestsAnalysis:
-        mode = _closed_value(
-            data["mode"], ("file_imports_then_exact_usages",), "mode"
-        )
+        mode = _closed_value(data["mode"], _MISSING_TESTS_MODES, "mode")
         file_graph_completion = _closed_value(
             data["file_graph_completion"],
             _FILE_GRAPH_COMPLETIONS,
@@ -8693,7 +8701,7 @@ class MissingTestsAnalysis:
             for value in _strict_string_list(data, "incomplete_reasons")
         ]
         result = cls(
-            mode=cast(Literal["file_imports_then_exact_usages"], mode),
+            mode=cast(MissingTestsModeValue, mode),
             file_graph_completion=cast(
                 FileGraphCompletionValue, file_graph_completion
             ),
@@ -8807,10 +8815,21 @@ class MissingTestsResult:
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
+        if self.analysis.mode == "file_graph_narrowed_binding_reachability":
+            heading = "Missing-test candidates (canonical binding reachability)"
+            description = (
+                "The file graph schedules the search; proven canonical binding edges "
+                "determine reachability. This is not runtime coverage."
+            )
+        else:
+            heading = "Missing-test candidates (bounded structured usage evidence)"
+            description = (
+                "The file graph narrows the search; exact static usage paths determine "
+                "reachability. This is not runtime coverage."
+            )
         lines = [
-            "Missing-test candidates (bounded structured usage evidence)",
-            "The file graph narrows the search; exact static usage paths determine "
-            "reachability. This is not runtime coverage.",
+            heading,
+            description,
             f"Endpoints: {self.endpoints.base} -> {self.endpoints.target}",
             "Candidates: "
             f"{self.analysis.candidate_function_count} "

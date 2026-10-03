@@ -1,12 +1,12 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::model::{ImportInfo, TestAssertionSmell, TestAssertionWeights};
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
 
-use crate::declarations::{collect_go_import_infos, go_node_text};
+use crate::declarations::go_node_text;
 
 const TESTIFY_ASSERT_PATH: &str = "github.com/stretchr/testify/assert";
 const TESTIFY_REQUIRE_PATH: &str = "github.com/stretchr/testify/require";
@@ -54,9 +54,10 @@ struct GoAssertionSignal {
 pub fn detect_go_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
+    imports: &[ImportInfo],
     weights: &TestAssertionWeights,
 ) -> Vec<TestAssertionSmell> {
-    let testify_assertions = collect_testify_assertions(source);
+    let testify_assertions = collect_testify_assertions(source, imports);
     let mut findings = Vec::new();
     for captures in GO_TEST_FUNC_RE.captures_iter(source) {
         let Some(name_match) = captures.name("name") else {
@@ -320,13 +321,13 @@ fn collect_go_assertions(
     assertions
 }
 
-fn collect_testify_assertions(source: &str) -> Vec<GoAssertionSignal> {
+fn collect_testify_assertions(source: &str, imports: &[ImportInfo]) -> Vec<GoAssertionSignal> {
     let Some(tree) = crate::parse::parse_go(source) else {
         return Vec::new();
     };
     let root = tree.root_node();
-    let testify_bindings = collect_go_import_infos(root, source)
-        .into_iter()
+    let testify_bindings = imports
+        .iter()
         .filter(|import| {
             import.path.as_ref().is_some_and(|path| {
                 matches!(

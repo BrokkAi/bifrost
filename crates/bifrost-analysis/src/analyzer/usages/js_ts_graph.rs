@@ -27,9 +27,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::receiver_analysi
     JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
 };
 pub(crate) use brokk_bifrost_js_ts::graph::resolver::JsTsUsageIndex;
-pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::resolver::{
-    browser_global_property_shape, unbound_browser_global_property,
-};
+pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::resolver::browser_global_property_shape;
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 
 use crate::analyzer::js_ts::providers::{jsts_usage_index_for_parallel_scan, resolve_js_ts_source};
@@ -97,7 +95,7 @@ where
     let mut cached_indices = Vec::new();
     for language in JS_TS_LANGUAGES {
         if let Some(index) =
-            resolve_js_ts_source(analyzer, language).map(jsts_usage_index_for_parallel_scan)
+            resolve_js_ts_source(analyzer, language).and_then(jsts_usage_index_for_parallel_scan)
         {
             cached_indices.push(index);
         }
@@ -230,7 +228,7 @@ fn plan_js_ts_usage_candidates(
         let host = resolve_js_ts_source(analyzer, language)?;
         let index = host.usage_index(Some(cancellation))?;
         candidate_files.extend(js_ts_target_candidate_files(
-            analyzer, &index, target, language,
+            host, analyzer, &index, target, language,
         ));
     }
     Some(PreparedJsTsUsageQuery { candidate_files })
@@ -267,16 +265,20 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 );
             }
             if !hosts.iter().any(|(dialect, _, _)| *dialect == language) {
-                let resolved = resolve_js_ts_source(analyzer, language)
-                    .and_then(|host| host.usage_index(cancellation).map(|index| (host, index)));
-                let Some((host, index)) = resolved else {
+                let Some(host) = resolve_js_ts_source(analyzer, language) else {
+                    return Err(GraphFailureReason::MissingAnalyzerCapability(
+                        "analyzer does not expose a JS/TS analyzer",
+                    )
+                    .diagnostic(target.fq_name(), JS_TS_STRATEGY));
+                };
+                let Some(index) = host.usage_index(cancellation) else {
                     if cancellation.is_some_and(CancellationToken::is_cancelled) {
                         // The scan stopped mid-flight; the group keeps whatever
                         // the candidates scanned before the token tripped.
                         return Ok(CandidateUsageHits::default());
                     }
-                    return Err(GraphFailureReason::MissingAnalyzerCapability(
-                        "analyzer does not expose a JS/TS analyzer",
+                    return Err(GraphFailureReason::UnavailableCanonicalFacts(
+                        "JS/TS usage index requires complete canonical source publications",
                     )
                     .diagnostic(target.fq_name(), JS_TS_STRATEGY));
                 };
@@ -320,7 +322,7 @@ where
     let mut cached_indices = Vec::new();
     for language in JS_TS_LANGUAGES {
         if let Some(index) =
-            resolve_js_ts_source(analyzer, language).map(jsts_usage_index_for_parallel_scan)
+            resolve_js_ts_source(analyzer, language).and_then(jsts_usage_index_for_parallel_scan)
         {
             cached_indices.push(index);
         }

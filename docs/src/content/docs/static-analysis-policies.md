@@ -9,6 +9,12 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
+Open policy rules and semantic models are maintained in
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). Submit shared open
+content there; parser, evaluation, catalog, and reporting changes belong in
+the engine repository. Pack releases have independent versions and compatibility
+metadata.
+
 > **Current execution boundary:** Bifrost executes match-, taint-, typestate-,
 > assertion-, and flow-analysis policies. Taint and flow resolve typed endpoint
 > bindings, compiles compatible demand, runs bounded set-oriented propagation,
@@ -100,14 +106,16 @@ close identities, as the Java landing fixture under
 
 ### Built-in security pack
 
-The installed binary also embeds `bifrost.security`. Version 1.0 contains one
-high-precision Java rule: a Servlet request parameter reaching the exact `sql`
-operand of `Statement.execute(String)`. The rule uses semantic declaration and
-actual-to-formal identity plus value-flow reachability. It does not treat
-PreparedStatement value binding or unrelated same-named methods as SQL-text
-sinks, and unresolved or incomplete dispatch remains inconclusive instead of
-clean. The built-in catalog groups the code-smell and security manifests in
-stable pack order and permits selection by pack, category, or policy ID.
+The installed binary also embeds `bifrost.security`. Its Servlet parameter rule
+reports a request parameter reaching the exact `sql` operand of
+`Statement.execute(String)` or `Statement.executeQuery(String)`.
+The rule uses semantic declaration and actual-to-formal identity plus value-flow
+reachability. It does not treat PreparedStatement value binding or unrelated
+same-named methods as SQL-text sinks. A witnessed flow through an open dispatch
+retains possible, unproven, partial evidence; unresolved binding remains
+inconclusive instead of clean. The built-in catalog groups the code-smell and
+security manifests in stable pack order and permits selection by pack, category,
+or policy ID.
 
 Pack version 1.2 adds the **declared-storage family**: two independently
 selectable obligations per supported source language, each an opt-in policy

@@ -37,5 +37,6 @@ mod contracts;
 mod details;
 mod execution;
 mod index_access;
+mod selected_edges;
 mod unit_partition_properties;
 mod units;

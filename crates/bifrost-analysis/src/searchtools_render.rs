@@ -419,20 +419,27 @@ impl RenderText for MostRelevantFilesResult {
             lines.push(String::new());
             let reason = match self.incomplete_reason {
                 Some(MostRelevantFilesIncompleteReason::TimeBudget) => {
-                    "the usage-graph ranking exceeded its time budget"
+                    "the request exceeded its time budget before a complete result could be \
+                     published"
                 }
                 Some(MostRelevantFilesIncompleteReason::Cancelled) => {
-                    "the usage-graph ranking was cancelled"
+                    "the request was cancelled before a complete result could be published"
+                }
+                Some(MostRelevantFilesIncompleteReason::UsageGraphIncomplete) => {
+                    "the usage graph could not certify a complete edge inventory"
                 }
                 Some(MostRelevantFilesIncompleteReason::HistoryUnavailable) => {
-                    "this repository does not store recent commit history locally, \
-                     so ranking used imports only"
+                    "this repository could not supply recent commit history locally"
+                }
+                Some(
+                    MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
+                ) => {
+                    "the usage graph could not certify a complete edge inventory and this \
+                     repository could not supply recent commit history locally"
                 }
                 None => "the requested ranking did not complete",
             };
-            lines.push(format!(
-                "Incomplete: {reason}; returned deterministic history/import ranking instead."
-            ));
+            lines.push(format!("Incomplete: {reason}."));
         }
         lines.join("\n")
     }
@@ -1191,6 +1198,27 @@ fn escape_markdown_table_cell(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn most_relevant_files_renders_both_independent_incomplete_reasons() {
+        let result = MostRelevantFilesResult {
+            session_subset: None,
+            files: Vec::new(),
+            not_found: Vec::new(),
+            ambiguous_paths: Vec::new(),
+            duplicates: Vec::new(),
+            complete: false,
+            ranking_mode_used: crate::searchtools::MostRelevantFilesRankingMode::UsageGraphExact,
+            incomplete_reason: Some(
+                MostRelevantFilesIncompleteReason::UsageGraphIncompleteAndHistoryUnavailable,
+            ),
+        };
+
+        let text = result.render_text(RenderOptions::default());
+
+        assert!(text.contains("complete edge inventory"), "{text}");
+        assert!(text.contains("recent commit history"), "{text}");
+    }
 
     #[test]
     fn search_symbols_renders_markdown_with_structured_fields() {

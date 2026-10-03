@@ -917,7 +917,8 @@ fn whole_assertion_run(
                             RewritePathIncompleteReason::Cancelled => {
                                 PolicyIncompleteReason::Cancelled
                             }
-                            RewritePathIncompleteReason::NoDomainAnalyzer(_)
+                            RewritePathIncompleteReason::CanonicalFactsUnavailable
+                            | RewritePathIncompleteReason::NoDomainAnalyzer(_)
                             | RewritePathIncompleteReason::NoIndexedSource => {
                                 PolicyIncompleteReason::CapabilityIncomplete
                             }
@@ -2000,6 +2001,24 @@ fn evaluate_assert_file(
         }
     }
 
+    // Several subject rows can carry one finding identity: a call under three
+    // nested loops matches a two-loop selector once per pair of enclosing
+    // loops, and every match anchors on the same call. They state one
+    // finding. Keep the match whose subject starts first and spans furthest,
+    // the outermost one, so the choice does not depend on row order.
+    file_findings.sort_by(|left, right| {
+        let span = |finding: &PolicyFinding| {
+            finding
+                .primary()
+                .byte_span()
+                .map(|span| (span.start(), std::cmp::Reverse(span.end())))
+        };
+        left.id()
+            .cmp(&right.id())
+            .then_with(|| span(left).cmp(&span(right)))
+    });
+    file_findings.dedup_by(|later, kept| later.id() == kept.id());
+
     // Soundness rule 3 again, stated as the product's shape: a file whose
     // asserts could not conclude reports no findings at all, so the two
     // halves of the product are never both populated.
@@ -2625,6 +2644,34 @@ fn relational_run(
             };
             Some(vec![endpoint("first")?, endpoint("second")?])
         };
+    let row_also_fails_at_locations =
+        |row: &RelationalViolationRow| -> Option<Vec<PolicySourceLocation>> {
+            let index = *binding_index_by_name.get(&row.binding)?;
+            let item = executed[index].items.get(row.row)?;
+            if item.domain != DetailedCodeQueryDomain::AbsentMemberFinding {
+                return Some(Vec::new());
+            }
+            let Some(UnitRowItemTerminal::AbsentMemberFinding { also_fails_at }) = &item.terminal
+            else {
+                return None;
+            };
+            also_fails_at
+                .iter()
+                .map(|location| {
+                    let path = WorkspaceRelativePath::new(location.path.as_ref()).ok()?;
+                    let byte_span =
+                        PolicyByteSpan::new(location.start_byte, location.end_byte).ok()?;
+                    let region = PolicyDisplayRegion::new(
+                        u64::try_from(location.range.start_line).ok()?,
+                        u64::try_from(location.range.start_column).ok()?,
+                        u64::try_from(location.range.end_line).ok()?,
+                        u64::try_from(location.range.end_column).ok()?,
+                    )
+                    .ok()?;
+                    Some(PolicySourceLocation::span(path, byte_span, region))
+                })
+                .collect()
+        };
 
     let mut findings = Vec::new();
     for violation in &evaluation.violations {
@@ -2740,6 +2787,43 @@ fn relational_run(
                             findings,
                             PolicyFailureReason::InternalInvariant,
                             "a concurrent access endpoint could not be retained as finding evidence",
+                            work,
+                            budget,
+                        );
+                    };
+                    related.push(entry);
+                }
+                let Some(additional_locations) = row_also_fails_at_locations(row) else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "an absent-member row could not project its masked access locations",
+                        work,
+                        budget,
+                    );
+                };
+                for location in additional_locations {
+                    if related.iter().any(|entry| entry.location() == &location) {
+                        continue;
+                    }
+                    if related.len() == budget.max_related_locations_per_finding() {
+                        related_truncated = true;
+                        omitted_related = omitted_related.saturating_add(1);
+                        continue;
+                    }
+                    let Ok(entry) = RelatedPolicyLocation::try_new(
+                        PolicyLocationRelationship::AlsoFailsAt,
+                        location,
+                        Vec::new(),
+                    ) else {
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "a masked absent-member access could not be retained as related evidence",
                             work,
                             budget,
                         );
@@ -2898,7 +2982,9 @@ fn row_text<'a>(item: &'a UnitRowItem, field: &str) -> Option<&'a str> {
         | CodeQueryRowScalarRef::String(value)
         | CodeQueryRowScalarRef::ConstrainedEnum(value)
         | CodeQueryRowScalarRef::DeclarationIdentity(value) => Some(value),
-        CodeQueryRowScalarRef::Integer(_) | CodeQueryRowScalarRef::Boolean(_) => None,
+        CodeQueryRowScalarRef::StringList(_)
+        | CodeQueryRowScalarRef::Integer(_)
+        | CodeQueryRowScalarRef::Boolean(_) => None,
     }
 }
 
@@ -2907,6 +2993,7 @@ fn row_boolean(item: &UnitRowItem, field: &str) -> Option<bool> {
     match item.field(field).ok()?? {
         CodeQueryRowScalarRef::Boolean(value) => Some(value),
         CodeQueryRowScalarRef::Integer(_)
+        | CodeQueryRowScalarRef::StringList(_)
         | CodeQueryRowScalarRef::StableId(_)
         | CodeQueryRowScalarRef::String(_)
         | CodeQueryRowScalarRef::ConstrainedEnum(_)
@@ -2919,6 +3006,7 @@ fn row_number(item: &UnitRowItem, field: &str) -> Option<u64> {
     match item.field(field).ok()?? {
         CodeQueryRowScalarRef::Integer(value) => Some(value),
         CodeQueryRowScalarRef::StableId(_)
+        | CodeQueryRowScalarRef::StringList(_)
         | CodeQueryRowScalarRef::String(_)
         | CodeQueryRowScalarRef::ConstrainedEnum(_)
         | CodeQueryRowScalarRef::DeclarationIdentity(_)
@@ -3184,6 +3272,7 @@ fn render_relational_key(key: &[Option<super::super::assertion_policy::RowScalar
             | Some(RowScalar::DeclarationIdentity(value)) => value.clone(),
             Some(RowScalar::Integer(value)) => value.to_string(),
             Some(RowScalar::Boolean(value)) => value.to_string(),
+            Some(RowScalar::StringList(values)) => format!("{values:?}"),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -3453,6 +3542,9 @@ struct EdgeAssertContext<'a> {
     cancellation: Option<&'a CancellationToken>,
     inverse: HashMap<CodeUnit, Arc<EdgeDerivationResult>>,
     forward: HashMap<ProjectFile, Option<Arc<EdgeDerivationResult>>>,
+    /// The selected inverse index of every language that registers one, built
+    /// at most once per language per run.
+    selected: SelectedInverseEdgeCache,
 }
 
 impl<'a> EdgeAssertContext<'a> {
@@ -3462,6 +3554,7 @@ impl<'a> EdgeAssertContext<'a> {
             cancellation,
             inverse: HashMap::new(),
             forward: HashMap::new(),
+            selected: SelectedInverseEdgeCache::default(),
         }
     }
 
@@ -3473,11 +3566,21 @@ impl<'a> EdgeAssertContext<'a> {
         if let Some(cached) = self.inverse.get(declaration) {
             return Arc::clone(cached);
         }
-        let derived = Arc::new(inverse_edges_for_declaration(
-            self.analyzer,
-            declaration,
-            self.cancellation,
-        ));
+        // A language that registers a selected inverse provider answers from
+        // its own whole-workspace index, including when that index refuses to
+        // build: an edge assert must read that refusal as an incomplete axis,
+        // not as an absent reference.
+        let derived = match self
+            .selected
+            .inverse_for(self.analyzer, declaration, self.cancellation)
+        {
+            Some(selected) => Arc::new(selected),
+            None => Arc::new(inverse_edges_for_declaration(
+                self.analyzer,
+                declaration,
+                self.cancellation,
+            )),
+        };
         self.inverse
             .insert(declaration.clone(), Arc::clone(&derived));
         derived
@@ -3549,7 +3652,17 @@ fn forward_usage_kind_is_classified(row: &ReferenceEdgeRow) -> bool {
 
 /// The explicit field-for-field comparison. Returns the labels of the fields
 /// that disagree; empty means parity.
-fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Vec<String> {
+/// The compared fields the two producers disagree on, or `None` when a
+/// compared field is `unknown` on one side and classified on the other.
+///
+/// `OwnerRelation::Unknown` states that the classifier could not relate the
+/// site's owner to the target's owner, and that relation's contract is
+/// explicit that an assertion over an unknown relation is inconclusive rather
+/// than clean. Reporting it as a disagreement would turn one producer's
+/// abstention into a finding against the other producer's classification --
+/// the same reading `assert-edge-class` already refuses through
+/// `EdgeClassVerdict::Undecidable`.
+fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Option<Vec<String>> {
     let mut mismatches = Vec::new();
     if left.reference_kind != right.reference_kind {
         mismatches.push(format!(
@@ -3583,13 +3696,18 @@ fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> V
         ));
     }
     if left.owner_relation != right.owner_relation {
+        if left.owner_relation == OwnerRelation::Unknown
+            || right.owner_relation == OwnerRelation::Unknown
+        {
+            return None;
+        }
         mismatches.push(format!(
             "owner_relation {} != {}",
             left.owner_relation.label(),
             right.owner_relation.label()
         ));
     }
-    mismatches
+    Some(mismatches)
 }
 
 fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
@@ -3739,7 +3857,10 @@ fn evaluate_edge_parity_assert<'rows>(
                         locations.extend(derivation_file_location(&edge.site.file));
                     }
                     Some(counterpart) => {
-                        let mismatches = edge_field_mismatches(counterpart, edge);
+                        let Some(mismatches) = edge_field_mismatches(counterpart, edge) else {
+                            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                            return None;
+                        };
                         if !mismatches.is_empty() {
                             count += 1;
                             unmatched.push(format!(
@@ -3792,7 +3913,10 @@ fn evaluate_edge_parity_assert<'rows>(
                         locations.extend(derivation_file_location(edge.target.source()));
                     }
                     Some(counterpart) => {
-                        let mismatches = edge_field_mismatches(&edge, counterpart);
+                        let Some(mismatches) = edge_field_mismatches(&edge, counterpart) else {
+                            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                            return None;
+                        };
                         if !mismatches.is_empty() {
                             count += 1;
                             unmatched.push(format!(

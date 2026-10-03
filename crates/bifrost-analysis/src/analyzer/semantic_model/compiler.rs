@@ -512,6 +512,7 @@ fn compile_procedure_summary(
         },
         completeness: summary.completeness,
         ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
+        no_concurrency_effects: summary.no_concurrency_effects,
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,

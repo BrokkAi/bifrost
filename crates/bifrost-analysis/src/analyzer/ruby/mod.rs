@@ -12,6 +12,9 @@ mod mixins;
 mod rbs_artifact;
 mod semantic;
 mod source_artifact;
+mod source_facts;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 pub(crate) mod structural;
 mod tests;
 mod type_flow;
@@ -85,6 +88,7 @@ pub struct RubyAnalyzer {
     direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
+    source_readiness: Arc<OnceLock<()>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
     zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
     zeitwerk_consumer_files: Arc<OnceLock<HashSet<ProjectFile>>>,
@@ -102,9 +106,7 @@ crate::analyzer::impl_forward_query_provider!(RubyAnalyzer);
 
 impl RubyAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut clone = self.clone();
-        clone.inner = clone.inner.clone_with_project(project);
-        clone
+        Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {
@@ -144,6 +146,7 @@ impl RubyAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),
+            source_readiness: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),
             zeitwerk_autoload_files: Arc::new(OnceLock::new()),
             zeitwerk_consumer_files: Arc::new(OnceLock::new()),
@@ -890,6 +893,13 @@ impl DeadCodeBulkProof for RubyDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        if resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .is_none_or(|ruby| !ruby.canonical_sources_ready())
+        {
+            return DeadCodeBulkPreflight::Unavailable(
+                "canonical Ruby source facts are unavailable",
+            );
+        }
         DeadCodeBulkPreflight::Ready {
             label: "Ruby",
             files: analyzable_file_count(analyzer, Language::Ruby),

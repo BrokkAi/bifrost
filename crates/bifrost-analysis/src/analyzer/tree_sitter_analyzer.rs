@@ -22,6 +22,7 @@ pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
 };
 
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::store::WorkspaceConfigurationInput;
 use arc_swap::ArcSwapOption;
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -41,12 +42,21 @@ use crate::analyzer::store::liveness::{
     FileStatStamp, LivePathEntry, LivePathMap, LiveSnapshot, Liveness,
 };
 use crate::analyzer::store::query::QueryResolver;
+use crate::analyzer::store::resolution_publication::{
+    ResolutionContentInput, ResolutionContentPublicationOutcome,
+    SelectedResolutionOverlayInputsOutcome,
+};
+use crate::analyzer::store::resolution_selection::{
+    SelectedResolutionContentMountRequest, SelectedResolutionOverlayMask,
+    SelectedResolutionUnavailable,
+};
 use crate::analyzer::store::{
-    ActiveSearchBlob, AnalyzerStore, GenerationId, HierarchyStorageKey, HydratedCandidateRow,
-    HydratedDefinitionOrderCandidateRow,
+    ActiveSearchBlob, AnalyzerStore, CompleteAnalysisBlobRequest, GenerationId,
+    HierarchyStorageKey, HydratedCandidateRow, HydratedDefinitionOrderCandidateRow,
     HydratedMountedCandidatePrimaryRangeRow as MountedCandidatePrimaryRangeRow,
-    HydratedMountedCandidateRow as MountedCandidateRow, LimitedQueryRows, PathSymbolRow,
-    PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, RelationalStoreOutcome,
+    HydratedMountedCandidateRow as MountedCandidateRow, LimitedQueryRows,
+    MissingCompleteAnalysisBlob, PathSymbolRow, PersistBatchStats, PersistBatchTargets,
+    PreparedParsedBlob, PreparedParsedBlobPreparation, RelationalStoreOutcome,
     RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest, StoreError, WorkspaceAnchorRow,
     WorkspaceContentPackageFact, WorkspaceFileRow, WorkspacePackageEdgeRow,
     WorkspacePackageFileRow, WorkspaceSnapshots,
@@ -215,6 +225,46 @@ const COMPLETE_FILE_PARSE_BUDGET: Duration = Duration::from_secs(10);
 /// the C++ parse phase while fifteen workers idle. Without the file's name a
 /// reader sees only a slow build and reaches for the persistence knobs.
 const SLOW_FILE_ANALYSIS_NOTE_NANOS: usize = 5_000_000_000;
+
+/// The process-wide parse pool for `language` with `threads` workers (#3751).
+///
+/// Building a rayon pool per parse batch spawned and joined `threads` OS
+/// threads on every call, which an interactive one-file update paid in full.
+/// The pools live for the process, one per language and thread count, so the
+/// map is bounded by the languages the process builds and never grows with
+/// the workspace. Languages keep separate pools because a workspace build
+/// parses its languages concurrently: on a shared one-worker pool, one
+/// language's slow or blocked file would stall every other language.
+///
+/// This is deliberately not the dedicated index-build pool. A background
+/// catch-up occupies a worker of that pool while its parse producer, which
+/// runs on a scoped thread outside every pool, waits for parse workers. With
+/// one worker, parsing on the dedicated pool would queue the producer behind
+/// the catch-up that waits for it. Builds of one language that share a parse
+/// pool only serialize: a producer blocks on its own consumer, which holds no
+/// pool worker and no lock while it waits for results. Progress callbacks and
+/// project reads run on a parse worker, so they must not wait for another
+/// thread's build of the same language: at one worker that build's parse would
+/// queue behind them.
+fn parse_pool(language: Language, threads: usize) -> &'static rayon::ThreadPool {
+    static POOLS: OnceLock<Mutex<HashMap<(Language, usize), &'static rayon::ThreadPool>>> =
+        OnceLock::new();
+    let _scope = profiling::scope("TreeSitterAnalyzer::parse_pool");
+    // A failed pool build panics before inserting, so a poisoned map is still
+    // consistent and the next build can retry.
+    let mut pools = POOLS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pools.entry((language, threads)).or_insert_with(|| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("bifrost-parse-{index}"))
+            .build()
+            .expect("failed to build analyzer parse pool");
+        Box::leak(Box::new(pool))
+    })
+}
 
 enum BoundedParse {
     Complete(Tree),
@@ -393,6 +443,32 @@ fn projection_value_for_unit<'a, T>(
     })
 }
 
+/// The full rebuilds `update_all` ran per project root, so a test can tell an
+/// incremental update from one that escalated. Keyed by root because a
+/// workspace updates its delegates on pool threads and tests share a process.
+#[cfg(test)]
+static FULL_UPDATES: Mutex<Option<HashMap<std::path::PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn count_full_update_for_test(root: &std::path::Path) {
+    *FULL_UPDATES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::default)
+        .entry(root.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn full_update_count_for_test(root: &std::path::Path) -> usize {
+    FULL_UPDATES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|counts| counts.get(root).copied())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(test)]
@@ -427,16 +503,20 @@ static BLOCKING_ANALYSIS_READY: (Mutex<bool>, std::sync::Condvar) =
 /// re-raised as soon as the fan-out joins.
 #[derive(Debug, Default)]
 pub(crate) struct BuildAbort {
-    aborted: std::sync::atomic::AtomicBool,
+    cancellation: CancellationToken,
 }
 
 impl BuildAbort {
     pub(crate) fn abort(&self) {
-        self.aborted.store(true, Ordering::Release);
+        self.cancellation.cancel();
     }
 
     pub(crate) fn is_aborted(&self) -> bool {
-        self.aborted.load(Ordering::Acquire)
+        self.cancellation.is_cancelled()
+    }
+
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
     }
 }
 
@@ -1143,6 +1223,15 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn workspace_package_identity_input(&self, _file: &ProjectFile) -> bool {
         false
     }
+    /// The digest of what one package-identity input's `source` contributes
+    /// to declaration identities. Two versions with the same digest qualify
+    /// every declaration identically, so an edit between them is an ordinary
+    /// incremental update rather than a full rebuild. `None` means this
+    /// language does not know which parts of the input matter, and any change
+    /// to it rebuilds the workspace.
+    fn workspace_package_identity_digest(&self, _source: &[u8]) -> Option<[u8; 32]> {
+        None
+    }
     /// Additional import spellings for one canonical workspace package.
     ///
     /// The canonical row remains authoritative declaration identity. Aliases
@@ -1211,6 +1300,16 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
+    /// Storage keys this particular primary file can additionally publish from
+    /// the same structured parse. This is a direction-aware capability, not
+    /// the adapter's full key inventory: callers use it to decide whether an
+    /// existing optional projection belongs to this primary's atomic analysis.
+    fn possible_additional_storage_language_keys_for_file(
+        &self,
+        _file: &ProjectFile,
+    ) -> &'static [&'static str] {
+        &[]
+    }
     /// Every reading of this blob: the file's own, plus any extra row-sets it
     /// contributes under storage language keys other than
     /// [`LanguageAdapter::storage_language_key_for_file`]'s answer.
@@ -1253,6 +1352,77 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// [`crate::analyzer::structural::StructuralFactProvider`].
     fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
         crate::analyzer::structural_spec_for(self.language())
+    }
+
+    /// Whether this adapter's primary analysis publishes canonical source
+    /// occurrences and structural projections together. Migrated adapters
+    /// must not silently substitute a second structural parser on a miss.
+    fn produces_canonical_source_facts(&self) -> bool {
+        false
+    }
+
+    /// The language-specific side-fact tables this language's parse can fill.
+    /// Publication asserts the parse stays inside them and hydration reads only
+    /// them; see [`crate::analyzer::store::SideFactFamilies`].
+    fn side_fact_families(&self) -> crate::analyzer::store::SideFactFamilies {
+        crate::analyzer::store::SideFactFamilies::EVERY
+    }
+
+    /// Every source-backed metadata projection has an exact declaration bridge.
+    /// Older source producers may retain their established sparse-link contract.
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        false
+    }
+
+    /// Required declaration-visibility publication for each parsed storage
+    /// projection. Absence denotes an unmigrated producer, not an empty file.
+    fn declaration_visibility_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    /// Expected Java type-construction metadata contract, distinct from an
+    /// absent constructor shape in a legacy or non-Java publication.
+    fn java_type_constructor_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    /// Language-owned accounting and insertion for this adapter's canonical family.
+    /// The prepared blob retains this capability so admission and publication use
+    /// the same implementation; the store owns transactions and common sealing.
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        None
+    }
+
+    fn cpp_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn php_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn go_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn ruby_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn python_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn java_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn scala_source_facts_version(&self) -> Option<i64> {
+        None
+    }
+
+    fn js_ts_source_facts_version(&self) -> Option<i64> {
+        None
     }
 }
 
@@ -1337,11 +1507,28 @@ pub struct FileState {
     /// a materialized `FileState`, so hydrating them here would be dead weight
     /// on every cache hit. Same rule as `parse_errors` below.
     pub(crate) rust_usage_facts: brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts,
+    /// Immutable file-local resolution inputs produced by the adapter's parse.
+    /// Store hydration leaves this empty until the fact family is persisted;
+    /// request-time consumers must not reconstruct it by parsing source.
+    pub(crate) resolution_facts:
+        brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
+    /// Write-side canonical source rows. Hydration intentionally does not
+    /// materialize these: bounded consumers read selected persisted rows.
+    pub(crate) source_facts: Option<brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
+    pub(crate) source_declaration_units: Vec<(
+        brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+        CodeUnit,
+    )>,
+    pub(crate) source_declaration_metadata:
+        Vec<brokk_bifrost_core::analyzer::parsed_file::SourceDeclarationMetadataLink>,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
     pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
     pub(crate) signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    /// Captured display-label ordinal for each metadata ordinal, including
+    /// synthetic units that have no written source-declaration identity.
+    pub(crate) signature_metadata_signature_ordinals: HashMap<CodeUnit, Vec<usize>>,
     pub(crate) cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
     pub(crate) ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
@@ -1388,7 +1575,7 @@ impl FileState {
     /// Rust cannot report heap allocation sizes. This accounts for owned
     /// buffers and map slots, then charges a fixed allocator allowance. The
     /// value is a cache budget estimate, not an RSS measurement.
-    fn estimated_retained_bytes(&self) -> usize {
+    pub(crate) fn estimated_retained_bytes(&self) -> usize {
         const ALLOCATION_ALLOWANCE_NUMERATOR: usize = 3;
         const ALLOCATION_ALLOWANCE_DENOMINATOR: usize = 2;
 
@@ -1465,6 +1652,21 @@ impl FileState {
                     .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<SignatureMetadata>)>()),
             )
             .saturating_add(
+                self.signature_metadata_signature_ordinals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<usize>)>())
+                    .saturating_add(
+                        self.signature_metadata_signature_ordinals
+                            .values()
+                            .map(|ordinals| {
+                                ordinals
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<usize>())
+                            })
+                            .fold(0usize, usize::saturating_add),
+                    ),
+            )
+            .saturating_add(
                 self.cpp_template_metadata
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(CodeUnit, CppTemplateMetadata)>()),
@@ -1518,6 +1720,23 @@ impl FileState {
             .saturating_add(self.source.capacity())
             .saturating_add(self.package_name.capacity())
             .saturating_add(self.content_qualifier.capacity())
+            .saturating_add(self.resolution_facts.estimated_retained_bytes())
+            .saturating_add(
+                self.source_facts
+                    .as_ref()
+                    .map_or(0, |facts| facts.estimated_retained_bytes()),
+            )
+            .saturating_add(self.source_declaration_units.capacity().saturating_mul(
+                std::mem::size_of::<(
+                    brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId,
+                    CodeUnit,
+                )>(),
+            ))
+            .saturating_add(self.source_declaration_metadata.capacity().saturating_mul(
+                std::mem::size_of::<
+                    brokk_bifrost_core::analyzer::parsed_file::SourceDeclarationMetadataLink,
+                >(),
+            ))
             .saturating_add(strings)
             .saturating_add(collection_slots);
         direct
@@ -1595,6 +1814,45 @@ pub(crate) struct HierarchyDeclarationFacts {
     storage_key: Option<HierarchyStorageKey>,
 }
 
+/// One exact source identity selected without hydration or publication retry.
+/// Language-owned projections decide how their bounded caches admit its values.
+pub(crate) struct CanonicalSourceRead<'a, A: LanguageAdapter> {
+    analyzer: &'a TreeSitterAnalyzer<A>,
+    file: &'a ProjectFile,
+    generation: GenerationId,
+    oid: Oid,
+}
+
+impl<A: LanguageAdapter> CanonicalSourceRead<'_, A> {
+    pub(crate) fn cache_key(&self) -> (GenerationId, Oid, ProjectFile) {
+        (self.generation, self.oid, self.file.clone())
+    }
+
+    pub(crate) fn retained_primary(&self) -> Option<Arc<FileState>> {
+        let key = TreeSitterAnalyzer::<A>::transient_cache_key(self.oid, self.file);
+        self.analyzer
+            .retained_file_state(self.file, &key)
+            .filter(|state| state.source_facts.is_some())
+    }
+
+    pub(crate) fn read<T>(
+        &self,
+        action: &str,
+        read: impl FnOnce(&AnalyzerStore, Oid, GenerationId, &A) -> Result<T, StoreError>,
+    ) -> Option<T> {
+        self.analyzer.store_query_or_record(
+            |sink| sink.push(self.analyzer.file_read_key(self.file, self.oid)),
+            read(
+                self.analyzer.store_context.store.as_ref(),
+                self.oid,
+                self.generation,
+                self.analyzer.adapter.as_ref(),
+            ),
+            format!("{action} for {:?} ({})", self.file, self.oid),
+        )
+    }
+}
+
 pub(crate) struct ImportFileFacts {
     pub(crate) package_name: String,
     pub(crate) imports: Vec<ImportInfo>,
@@ -1609,7 +1867,7 @@ enum DirtyFileStateStatus {
 }
 
 fn dirty_file_state_status(error: &StoreError) -> DirtyFileStateStatus {
-    if error.is_stale_generation() {
+    if error.is_stale_generation() || error.is_stale_resolution() {
         DirtyFileStateStatus::TerminalStale
     } else if error.is_resource_bound() {
         DirtyFileStateStatus::TerminalResourceBound
@@ -1621,11 +1879,33 @@ fn dirty_file_state_status(error: &StoreError) -> DirtyFileStateStatus {
 #[derive(Debug, Clone)]
 struct DirtyFileState {
     state: Arc<FileState>,
-    generation: GenerationId,
+    generations: Arc<HashMap<String, GenerationId>>,
+    required_existing_additional_storage_languages: Arc<[String]>,
     attempts: usize,
     next_retry_at: Instant,
     status: DirtyFileStateStatus,
     _last_error: String,
+}
+
+/// One package-identity input as a generation saw it on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackageIdentityInputDigest {
+    /// The byte digest. Request overlays are authoritative only when their
+    /// digest agrees with this exact baseline, and it keys content-derived
+    /// caches.
+    content: [u8; 32],
+    /// [`LanguageAdapter::workspace_package_identity_digest`]: an edit that
+    /// keeps it needs no full rebuild.
+    identity: Option<[u8; 32]>,
+}
+
+impl PackageIdentityInputDigest {
+    fn new<A: LanguageAdapter + ?Sized>(adapter: &A, source: &[u8]) -> Self {
+        Self {
+            content: crate::analyzer::canonical_hash::sha256_bytes(source),
+            identity: adapter.workspace_package_identity_digest(source),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1637,10 +1917,17 @@ struct AnalyzerRuntimeState {
     /// Positive package rows remain usable when false; only absence loses
     /// authority. Incremental generations may clear but never restore it.
     workspace_package_inventory_complete: bool,
-    /// Content identities of the non-source inputs that qualified this
-    /// generation's workspace declarations. Request overlays are authoritative
-    /// only when their digest agrees with this exact baseline.
-    workspace_package_identity_input_digests: HashMap<ProjectFile, [u8; 32]>,
+    /// Digests of the non-source inputs that qualified this generation's
+    /// workspace declarations.
+    workspace_package_identity_input_digests: HashMap<ProjectFile, PackageIdentityInputDigest>,
+    /// Canonical disk configuration identity; exact historical bytes live in SQL.
+    workspace_configuration_digest: Option<StableDigest>,
+    /// A build can finish with useful source/package rows while failing to
+    /// capture the configuration bytes that qualify those rows. Keep that
+    /// failure with the generation: construction happens before a query
+    /// context exists, so `begin_query` delivers it at the normal query
+    /// failure boundary instead of dropping it.
+    workspace_package_inventory_error: Option<StoreError>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     persistence_stats: PersistBatchStats,
     /// Include-driven claim relation for this generation (#1837): analyzed file
@@ -1703,6 +1990,8 @@ impl AnalyzerRuntimeState {
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             workspace_package_inventory_complete,
             workspace_package_identity_input_digests: HashMap::default(),
+            workspace_configuration_digest: None,
+            workspace_package_inventory_error: None,
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
             claim_edges: HashMap::default(),
@@ -1721,6 +2010,8 @@ impl AnalyzerRuntimeState {
             dirty_path_symbol_rows,
             workspace_package_inventory_complete,
             workspace_package_identity_input_digests,
+            workspace_configuration_digest: _,
+            workspace_package_inventory_error,
             seeded_file_states,
             persistence_stats,
             claim_edges,
@@ -1745,6 +2036,9 @@ impl AnalyzerRuntimeState {
         self.workspace_package_inventory_complete &= workspace_package_inventory_complete;
         self.workspace_package_identity_input_digests
             .extend(workspace_package_identity_input_digests);
+        if self.workspace_package_inventory_error.is_none() {
+            self.workspace_package_inventory_error = workspace_package_inventory_error;
+        }
         self.seeded_file_states.extend(seeded_file_states);
         self.seeded_file_states
             .truncate(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
@@ -1757,6 +2051,13 @@ impl AnalyzerRuntimeState {
 
     fn mark_workspace_package_inventory_incomplete(&mut self) {
         self.workspace_package_inventory_complete = false;
+    }
+
+    fn record_workspace_package_inventory_error(&mut self, error: StoreError) {
+        self.mark_workspace_package_inventory_incomplete();
+        if self.workspace_package_inventory_error.is_none() {
+            self.workspace_package_inventory_error = Some(error);
+        }
     }
 
     fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
@@ -1829,13 +2130,24 @@ enum PreparedAnalysis {
     Ready {
         file: ProjectFile,
         prepared: Box<PreparedParsedBlob>,
+        required_existing_additional_storage_languages: Vec<String>,
     },
     PreparationFailed {
         file: ProjectFile,
         state: Arc<FileState>,
+        required_existing_additional_storage_languages: Vec<String>,
         error: String,
     },
     Unparseable(ProjectFile),
+}
+
+struct PreparedAnalysisTarget {
+    file: ProjectFile,
+    oid: Oid,
+    storage_language: String,
+    generation: GenerationId,
+    required_existing_additional_storage_languages: Vec<String>,
+    independently_owned_additional_storage_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1867,7 +2179,7 @@ impl PreparedInFlight {
     }
 }
 
-type PreparedPersistenceOutcome = Option<(Arc<FileState>, Option<StoreError>)>;
+type PreparedPersistenceOutcome = Option<(Arc<FileState>, Vec<String>, Option<StoreError>)>;
 type PreparedOutcomeHandler<'a> = dyn FnMut(ProjectFile, PreparedPersistenceOutcome) + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2104,7 +2416,23 @@ type PreparedSyntaxStore = ByteBoundedStore<PreparedSyntaxCacheKey, Arc<Prepared
 /// Per-file import infos retained across requests (#1451). The warm Rust usage
 /// scan asked for the same file's imports tens of thousands of times per
 /// request, every one a SQLite hydration.
-type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, Arc<[ImportInfo]>>;
+#[derive(Debug, Clone)]
+struct RetainedImportInfos {
+    imports: Arc<[ImportInfo]>,
+    /// A legacy hydration can legitimately populate the ordinary cache even
+    /// when the canonical source manifest is absent. Keep that entry useful
+    /// for the legacy reader, but never let the checked reader mistake it for
+    /// a witnessed canonical publication.
+    canonical: bool,
+}
+
+impl ByteBounded for RetainedImportInfos {
+    fn estimated_bytes(&self) -> usize {
+        self.imports.estimated_bytes()
+    }
+}
+
+type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, RetainedImportInfos>;
 type TypeAliasStore = ByteBoundedStore<FileStateCacheKey, Arc<[CodeUnit]>>;
 type EnclosingCodeUnitStore = ByteBoundedStore<FileStateCacheKey, Arc<EnclosingCodeUnitIndex>>;
 
@@ -2198,9 +2526,10 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K
 /// workspaces; it is a bound rather than a target.
 const SOURCE_BLOB_OID_MEMO_ENTRIES: u64 = 32_768;
 
-/// The blob oid of the exact source string last hashed for one file, with the
+/// The blob oid of the decoded source string last hashed for one file, with the
 /// cheap identity (length and FxHash) that lets a later call recognize the
-/// same bytes without re-running SHA-1.
+/// same text without re-running SHA-1. Raw disk identity is deliberately not
+/// retained here: distinct invalid-byte blobs can decode to the same text.
 #[derive(Clone, Copy)]
 struct SourceBlobIdentity {
     len: usize,
@@ -2208,7 +2537,7 @@ struct SourceBlobIdentity {
     oid: Oid,
 }
 
-/// Per-file memo of "the blob oid of these exact source bytes" (#2917).
+/// Per-file memo of "the blob oid of this exact decoded source text" (#2917).
 ///
 /// Every query path that persists or looks up facts under a file's content key
 /// used to recompute that key with libgit2's collision-detecting SHA-1 over the
@@ -2223,6 +2552,9 @@ struct SourceBlobOidMemo {
     /// SHA-1 computations performed, for the #2917 cost pin.
     #[cfg(any(test, feature = "test-support"))]
     hashes: AtomicUsize,
+    /// Whole-text hashes performed to validate the memo.
+    #[cfg(test)]
+    text_hashes: AtomicUsize,
 }
 
 impl Default for SourceBlobOidMemo {
@@ -2233,28 +2565,28 @@ impl Default for SourceBlobOidMemo {
                 .build(),
             #[cfg(any(test, feature = "test-support"))]
             hashes: AtomicUsize::new(0),
+            #[cfg(test)]
+            text_hashes: AtomicUsize::new(0),
         }
     }
 }
 
 impl SourceBlobOidMemo {
-    /// The identity of `file`'s exact `source`, derived by `identify` the
-    /// first time these bytes are asked about. `identify` runs once per
-    /// (file, bytes), which is what the #2917 hash count pins.
-    fn oid_of(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        identify: impl FnOnce() -> Option<Oid>,
-    ) -> Option<Oid> {
+    /// The identity of `source`, computed once per (file, decoded text).
+    /// Keeping only this text hash avoids conflating distinct raw snapshots
+    /// that lossily decode to the same parser input.
+    fn oid_of(&self, file: &ProjectFile, source: &str) -> Oid {
+        #[cfg(test)]
+        self.text_hashes.fetch_add(1, Ordering::Relaxed);
         let source_hash = crate::analyzer::structural::provider::hash_source(source);
         if let Some(known) = self.entries.get(file)
             && known.len == source.len()
             && known.source_hash == source_hash
         {
-            return Some(known.oid);
+            return known.oid;
         }
-        let oid = identify()?;
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+            .expect("hashing in-memory source bytes as a blob cannot fail");
         #[cfg(any(test, feature = "test-support"))]
         self.hashes.fetch_add(1, Ordering::Relaxed);
         self.entries.insert(
@@ -2265,8 +2597,15 @@ impl SourceBlobOidMemo {
                 oid,
             },
         );
-        Some(oid)
+        oid
     }
+}
+
+/// A file's working-tree text and the content identity it hydrates under.
+#[derive(Debug, Clone)]
+struct CurrentSource {
+    text: Arc<str>,
+    oid: Oid,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2636,7 +2975,12 @@ struct QueryReadCache {
     /// of another.
     analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
     live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
-    current_sources: Arc<RwLock<HashMap<ProjectFile, Option<String>>>>,
+    /// The working-tree text of a file and its content identity, read and
+    /// hashed at most once per request. Declaration-location reads ask for a
+    /// file's current state once per declaration; cloning and hashing the
+    /// whole text on each ask made a location lookup in an 850 KB generated
+    /// file copy and hash 850 KB for each of its 8,494 declarations.
+    current_sources: Arc<RwLock<HashMap<ProjectFile, Option<CurrentSource>>>>,
     prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
     file_states: Arc<RwLock<QueryFileStateCache>>,
     prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
@@ -3117,9 +3461,10 @@ pub struct TreeSitterAnalyzer<A> {
     /// blob identity of the exact source the digest was taken from, so an
     /// entry is a pure function of content and can never go stale.
     semantic_source_digests: crate::analyzer::semantic::service::SourceContentIdentityMemo,
-    /// Blob oids already derived for a file's exact source bytes, so a query
-    /// path that keys facts by content does not re-hash an unchanged file.
-    /// See [`Self::content_oid_of`].
+    /// Decoded-text blob oids already derived for a file, so a query path that
+    /// keys facts by content does not re-hash unchanged text. Raw snapshot
+    /// identity is selected separately on each request. See
+    /// [`Self::content_oid_of`].
     blob_oids: Arc<SourceBlobOidMemo>,
     store_context: AnalyzerStoreContext,
     /// Immutable path-to-blob identities for the source generation that built
@@ -3402,6 +3747,12 @@ where
         store_context: Option<AnalyzerStoreContext>,
     ) -> std::result::Result<Self, StoreError> {
         let adapter = Arc::new(adapter);
+        // A supplied store can still belong to a directly constructed analyzer.
+        // Only a workspace build snapshot delegates crate publication to the
+        // WorkspaceAnalyzer boundary after its language workers finish.
+        let standalone = store_context
+            .as_ref()
+            .is_none_or(|context| context.workspace_snapshot.is_none());
         let mut store_context = match store_context {
             Some(store_context) => store_context,
             None => ephemeral_store_context(project.as_ref())?,
@@ -3421,6 +3772,12 @@ where
             .store
             .ensure_language_epoch_values(&epochs)
             .map_err(|error| error.context("publishing analyzer epochs"))?;
+        for (storage_language, _) in &epochs {
+            store_context
+                .store
+                .ensure_resolution_producer_epoch(storage_language, adapter.language())
+                .map_err(|error| error.context("publishing resolution producer epochs"))?;
+        }
         store_context.generations = Arc::new(generations);
         let state = {
             let _scope = profiling::scope(format!(
@@ -3473,6 +3830,20 @@ where
                 )
                 .map_err(|error| error.context("capturing relational workspace identities"))?,
         );
+        // WorkspaceAnalyzer reconciles after all delegates have published.
+        // A directly constructed Rust analyzer owns that build boundary itself.
+        if standalone
+            && adapter.language() == Language::Rust
+            && let Some(snapshot) = relational_workspace_snapshots.get("rust")
+        {
+            store_context
+                .store
+                .reconcile_rust_crates_unless_current(snapshot)?;
+        }
+        store_context
+            .store
+            .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
+            .map_err(|error| error.context("reconciling JVM package contexts"))?;
         let indexed_live_snapshot = store_context.live_paths.snapshot();
         Ok(Self {
             project,
@@ -3633,19 +4004,31 @@ where
             .state
             .workspace_package_identity_input_digests
             .iter()
-            .map(|(file, digest)| (crate::path_utils::rel_path_string(file), *digest))
+            .map(|(file, digest)| (crate::path_utils::rel_path_string(file), digest.content))
             .collect::<BTreeMap<_, _>>();
         if let Some(overlays) = overlays.as_deref() {
             for (file, digest) in overlays.entries() {
                 if crate::analyzer::common::language_for_file(file) == language
                     || self.adapter.workspace_package_identity_input(file)
+                    || Self::workspace_configuration_input(self.adapter.as_ref(), file)
                 {
                     overlay_paths.insert(crate::path_utils::rel_path_string(file), *digest);
                 }
             }
         }
-        crate::analyzer::content_identity::language_content_identity(
+        let base = self.state.workspace_configuration_digest.map_or(
             self.content_identity_base,
+            |digest| {
+                let mut base = crate::analyzer::canonical_hash::CanonicalHasher::new(
+                    b"bifrost-workspace-content:selected-configuration:v1",
+                );
+                base.field("language", self.content_identity_base.as_bytes());
+                base.field("configuration", digest.as_bytes());
+                StableDigest::from_array(base.finish())
+            },
+        );
+        crate::analyzer::content_identity::language_content_identity(
+            base,
             self.indexed_live_snapshot
                 .content_digest(overlays.as_deref()),
             overlay_paths
@@ -3738,37 +4121,28 @@ where
     /// This is the one place a query path turns a source string into the
     /// store's content key (#2917). The identity is a property of the content,
     /// not of the snapshot: a concurrent disk or overlay change hands the
-    /// caller different text and so a different oid, never a stale one. The
-    /// SHA-1 runs once per (file, bytes) and is memoized against the source's
-    /// length and FxHash, so a repeat query over an unchanged file pays a
-    /// hash-map probe and one FxHash pass instead of libgit2's
-    /// collision-detecting SHA-1 over the whole file.
+    /// caller different text and so a different text oid, never a stale one.
+    /// The decoded-text SHA-1 runs once per (file, text) and is memoized against
+    /// the source's length and FxHash, so a repeat query over unchanged text
+    /// pays a hash-map probe and one FxHash pass instead of libgit2's
+    /// collision-detecting SHA-1 over the whole source.
     ///
-    /// The text is usually the content, so hashing it is the content's oid.
-    /// Not always: `Project::read_source` admits legacy non-UTF-8 bytes
-    /// lossily (`decode_source_bytes`), and lossy admission is exactly the
-    /// case where the text re-encodes to bytes no file holds. Hashing it there
-    /// minted a second identity for one file -- an oid liveness never records
-    /// and no `workspace_file_versions` row names -- which a demand parse then
-    /// wrote declarations into the store under (#3106). Replacement characters
-    /// are the only thing a lossy decode introduces, so text without one is
-    /// byte-identical to what was read and text with one sends this to the
-    /// bytes themselves. Facts stay content-addressed either way, because the
-    /// admitted text is a deterministic function of those bytes.
-    ///
-    /// `None` when `file` has no content to name: it decoded lossily and is
-    /// now gone from disk.
+    /// The memo stores only the hash of the decoded text. Raw identity is
+    /// selected after the memo lookup from the live or prepared snapshot, on
+    /// every request: distinct invalid-byte blobs can decode to the same text,
+    /// so retaining their raw OIDs in the text memo would conflate snapshots
+    /// (#3106).
     pub(crate) fn content_oid_of(&self, file: &ProjectFile, source: &str) -> Option<Oid> {
-        self.blob_oids.oid_of(file, source, || {
-            if self.project.has_overlay(file) || !source.contains(char::REPLACEMENT_CHARACTER) {
-                Some(
-                    Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                        .expect("hashing in-memory bytes as a blob cannot fail"),
-                )
-            } else {
-                Oid::hash_file(ObjectType::Blob, file.abs_path()).ok()
-            }
-        })
+        let text_oid = self.blob_oids.oid_of(file, source);
+        if self.live_snapshot().oid_for_path(file) == Some(text_oid) {
+            return Some(text_oid);
+        }
+        if let Ok(Some(snapshot)) = self.resolve_prepared_source(file, None)
+            && snapshot.snapshot.source() == source
+        {
+            return Some(snapshot.oid);
+        }
+        Some(text_oid)
     }
 
     /// SHA-1 blob hashes [`Self::content_oid_of`] computed since the last reset.
@@ -3806,39 +4180,97 @@ where
         })
     }
 
-    /// Whether facts keyed by content can also be persisted. An ephemeral
-    /// store owns no durable rows, so its facts live in the memo alone.
-    pub(crate) fn persists_structural_facts(&self) -> bool {
-        !self.store_context.store.is_ephemeral()
+    /// Resolve a persistence identity for the exact source string being
+    /// normalized, retaining the raw identity of decoded disk text.
+    pub(crate) fn structural_snapshot_key(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<StructuralSnapshotKey> {
+        let oid = self.content_oid_of(file, source)?;
+        self.structural_facts_key(file, oid)
     }
 
-    pub(crate) fn load_structural_facts_rows(
+    pub(crate) fn load_structural_facts_rows_limited(
         &self,
         key: &StructuralSnapshotKey,
         facts_version: i64,
-    ) -> Result<Option<crate::analyzer::structural::facts::PersistedStructuralFacts>, StoreError>
-    {
-        self.store_context.store.load_structural_facts_rows(
+        max_work_items: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<crate::analyzer::store::StructuralFactRowsRead, StoreError> {
+        self.store_context.store.load_structural_facts_rows_limited(
             key.oid,
             key.lang,
             key.generation,
             facts_version,
+            max_work_items,
+            cancellation,
         )
     }
 
-    pub(crate) fn persist_structural_facts_rows(
+    fn cached_file_state_for_exact_source(
         &self,
-        key: &StructuralSnapshotKey,
-        facts_version: i64,
-        facts: crate::analyzer::structural::facts::PersistedStructuralFacts,
-    ) -> Result<bool, StoreError> {
-        self.store_context.store.upsert_structural_facts_rows(
-            key.oid,
-            key.lang,
-            key.generation,
-            facts_version,
-            facts,
-        )
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<Arc<FileState>> {
+        let oid = self.content_oid_of(file, source)?;
+        let key = Self::transient_cache_key(oid, file);
+        let state = self
+            .state
+            .dirty_file_state(&key)
+            .or_else(|| self.source_snapshot_file_states.get(&key).cloned())
+            .or_else(|| self.query_file_state_snapshot(&key));
+        let state = state.or_else(|| {
+            let file_states = self.active_query_cache_handle(|cache| &cache.file_states)?;
+            file_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .get(&key)
+        });
+        let state = state.or_else(|| {
+            self.transient_file_states
+                .lock()
+                .expect("transient file-state cache mutex poisoned")
+                .get(&key)
+        });
+        state.filter(|state| state.source == source)
+    }
+
+    /// Return an exact cached file state carrying canonical facts without
+    /// cloning the source-facts arena. Callers use this to check a work-item
+    /// budget before materializing those rows.
+    pub(crate) fn cached_canonical_source_state(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<Arc<FileState>> {
+        let state = self.cached_file_state_for_exact_source(file, source)?;
+        state.source_facts.as_ref()?;
+        Some(state)
+    }
+
+    /// Prepare canonical source facts through the normal analyzer parse/store
+    /// path when no exact in-memory preparation is available. Bounded callers
+    /// must not invoke this method because it may parse and publish a file.
+    pub(crate) fn prepare_canonical_source_facts(
+        &self,
+        file: &ProjectFile,
+        source: String,
+    ) -> Option<brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts> {
+        let oid = self.content_oid_of(file, &source)?;
+        self.parse_and_store_transient(file, oid, source)
+            .and_then(|state| state.source_facts)
+    }
+
+    /// Capture the exact query source for canonical structural hydration
+    /// without hydrating a complete persisted `FileState` first.
+    pub(crate) fn source_snapshot_for_structural_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<String> {
+        self.resolve_prepared_source(file, None)
+            .expect("an unbounded structural source read cannot exceed its limit")
+            .map(|source| source.snapshot.into_source().to_string())
     }
 
     pub fn project(&self) -> &dyn Project {
@@ -3878,7 +4310,34 @@ where
                     .state
                     .workspace_package_identity_input_digests
                     .get(file)
+                    .map(|baseline| &baseline.content)
                     == Some(digest)
+        })
+    }
+
+    /// Whether every source overlay belongs to the parsed inventory. Unlike
+    /// package-absence proof, graph construction may consume an indexed overlay.
+    /// Package-identity configuration readiness is a separate caller obligation.
+    pub(crate) fn indexed_source_inventory_complete(&self) -> bool {
+        if !self.state.workspace_package_inventory_complete {
+            return false;
+        }
+        let Some(overlays) = self.project.overlay_content() else {
+            return true;
+        };
+        let snapshot = self.live_snapshot();
+        overlays.entries().iter().all(|(file, _)| {
+            crate::analyzer::common::language_for_file(file) != self.adapter.language()
+                || self.project.read_source(file).ok().is_some_and(|source| {
+                    // Compare against publication, not a request's live OID:
+                    // merely reading an overlay does not establish membership.
+                    Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                        .ok()
+                        .is_some_and(|oid| {
+                            snapshot.validated_oid_for_path(file) == Some(oid)
+                                && CodeUnitIndex::is_analyzed(self, file)
+                        })
+                })
         })
     }
 
@@ -3906,6 +4365,7 @@ where
                             .state
                             .workspace_package_identity_input_digests
                             .get(file)
+                            .map(|baseline| &baseline.content)
                             == Some(digest)
                 })
             })
@@ -4121,6 +4581,37 @@ where
             collect_parse_errors(tree.root_node(), &mut errors);
             Some(errors)
         };
+        let primary_storage_key = adapter.storage_language_key_for_file(file);
+        let possible_additional = adapter.possible_additional_storage_language_keys_for_file(file);
+        let adapter_storage_keys = (!projections.is_empty()).then(|| {
+            adapter
+                .storage_language_keys()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<HashSet<_>>()
+        });
+        let mut actual_additional = HashSet::default();
+        for (storage_key, _) in &projections {
+            assert_ne!(
+                *storage_key, primary_storage_key,
+                "an additional projection must differ from the primary storage key"
+            );
+            assert!(
+                actual_additional.insert(*storage_key),
+                "an adapter must emit each additional storage projection once"
+            );
+            assert!(
+                adapter_storage_keys
+                    .as_ref()
+                    .expect("nonempty projections build their key inventory")
+                    .contains(*storage_key),
+                "an additional projection must use an adapter-owned storage key"
+            );
+            assert!(
+                possible_additional.contains(storage_key),
+                "an emitted projection must be declared possible for this file"
+            );
+        }
         let additional_projections = projections
             .into_iter()
             .map(|(storage_key, mut projection)| {
@@ -4155,7 +4646,7 @@ where
     /// Shared with the bounded-parse timeout path above, which produces a
     /// file-scope-only `ParsedFile` rather than reaching the walk at all, and
     /// must still hand back a `FileState` of exactly the same shape.
-    fn file_state_from_parsed(
+    pub(crate) fn file_state_from_parsed(
         source: String,
         mut parsed: ParsedFile,
         contains_tests: bool,
@@ -4174,11 +4665,16 @@ where
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
             rust_usage_facts: parsed.rust_usage_facts,
+            resolution_facts: parsed.resolution_facts,
+            source_facts: parsed.source_facts,
+            source_declaration_units: parsed.source_declaration_units,
+            source_declaration_metadata: parsed.source_declaration_metadata,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
             signature_metadata: parsed.signature_metadata,
+            signature_metadata_signature_ordinals: parsed.signature_metadata_signature_ordinals,
             cpp_template_metadata: parsed.cpp_template_metadata,
             ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
             ranges: parsed.ranges,
@@ -4270,10 +4766,7 @@ where
         let total = files.len();
         let language = adapter.parser_language();
         let completed = AtomicUsize::new(0);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.parallelism())
-            .build()
-            .expect("failed to build analyzer thread pool");
+        let pool = parse_pool(adapter.language(), config.parallelism());
 
         let states = pool.install(|| {
             files
@@ -4308,7 +4801,7 @@ where
         adapter: &A,
         project: &dyn Project,
         config: &AnalyzerConfig,
-        targets: Vec<(ProjectFile, Oid, String, GenerationId)>,
+        targets: Vec<PreparedAnalysisTarget>,
         progress: Option<BuildProgress>,
         store_context: &AnalyzerStoreContext,
         mut on_outcome: impl FnMut(ProjectFile, PreparedPersistenceOutcome),
@@ -4322,10 +4815,7 @@ where
         let language = adapter.parser_language();
         let completed = AtomicUsize::new(0);
         let started = AtomicUsize::new(0);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.parallelism())
-            .build()
-            .expect("failed to build analyzer thread pool");
+        let pool = parse_pool(adapter.language(), config.parallelism());
         let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(PREPARED_CHANNEL_CAPACITY);
         let producer_progress = progress.clone();
         let in_flight = Arc::new(Mutex::new(PreparedInFlight::default()));
@@ -4335,7 +4825,7 @@ where
         let mut prepared_channel_recvs = 0usize;
         let blob_persistence_elapsed = Cell::new(Duration::ZERO);
         let blob_persistence_batches = Cell::new(0usize);
-        let limits = PersistBatchLimits::PRODUCTION;
+        let limits = PersistBatchTargets::PRODUCTION;
         stats.configured_max_in_flight_items = config
             .parallelism()
             .saturating_add(PREPARED_CHANNEL_CAPACITY)
@@ -4373,7 +4863,17 @@ where
                     pool.install(|| {
                         targets.into_par_iter().for_each_init(
                             || Self::build_parser(language.clone()),
-                            |parser, (file, oid, storage_key, generation)| {
+                            |parser, target| {
+                                let PreparedAnalysisTarget {
+                                    file,
+                                    oid,
+                                    storage_language: storage_key,
+                                    generation,
+                                    required_existing_additional_storage_languages:
+                                        required_projections,
+                                    independently_owned_additional_storage_languages:
+                                        independent_projections,
+                                } = target;
                                 let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
                                 if current_started == total {
                                     producer_tx
@@ -4390,11 +4890,60 @@ where
                                 }
                                 Self::block_until_build_abort_for_test(&file, store_context);
                                 Self::panic_during_analysis_for_test(&file);
+                                Self::panic_during_analysis_from_environment(&file);
                                 store_context
                                     .build_tier_access
                                     .record_tier_access(InformationTier::Syntax);
                                 let analyze_start = std::time::Instant::now();
-                                let analyzed = Self::analyze_file(parser, adapter, project, &file);
+                                // Parse exactly the bytes belonging to the
+                                // captured blob. A prior inventory/catch-up
+                                // check cannot protect this later source read
+                                // from an intervening edit.
+                                let source = match project.read_source_snapshot(&file) {
+                                    Ok(source) => Some(source),
+                                    Err(error) => {
+                                        profiling::note(format!(
+                                            "cannot read {file:?} for blob {oid}: {error}; leaving the captured blob unpublished"
+                                        ));
+                                        None
+                                    }
+                                };
+                                let analyzed = source
+                                    .filter(|source| {
+                                        let actual = source.oid();
+                                        if actual != oid {
+                                            profiling::note(format!(
+                                                "source changed before blob preparation for {file:?}: expected {oid}, read {actual}; leaving the captured blob unpublished"
+                                            ));
+                                        }
+                                        actual == oid
+                                    })
+                                    .and_then(|source| {
+                                        let source_bytes = source.source().len();
+                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                            Self::analyze_source(parser, adapter, &file, source.source().to_owned())
+                                        })).unwrap_or_else(|payload| {
+                                            let message = payload.downcast_ref::<String>().map(String::as_str)
+                                                .or_else(|| payload.downcast_ref::<&str>().copied())
+                                                .unwrap_or("non-string panic payload");
+                                            panic!("producer panicked for {file:?}, source bytes 0..{source_bytes}: {message}");
+                                        })
+                                    })
+                                    .map(|mut state| {
+                                        assert!(required_projections.iter().all(|required| {
+                                            !independent_projections.contains(required)
+                                        }));
+                                        state.additional_projections.retain(
+                                            |(projection, _)| {
+                                                !independent_projections
+                                                    .iter()
+                                                    .any(|independent| {
+                                                        independent.as_str() == *projection
+                                                    })
+                                            },
+                                        );
+                                        state
+                                    });
                                 let analyze_elapsed = analyze_start.elapsed().as_nanos() as usize;
                                 if analyze_elapsed >= SLOW_FILE_ANALYSIS_NOTE_NANOS {
                                     profiling::note(format!(
@@ -4411,29 +4960,47 @@ where
                                             PreparedAnalysis::PreparationFailed {
                                                 file,
                                                 state,
+                                                required_existing_additional_storage_languages:
+                                                    required_projections,
                                                 error: "injected preparation failure".to_string(),
                                             }
                                         } else {
-                                            match AnalyzerStore::prepare_parsed_blob(
+                                            assert_eq!(
+                                                store_context.generations[&storage_key],
+                                                generation,
+                                                "parse target generation must equal the captured language authority"
+                                            );
+                                            match AnalyzerStore::prepare_parsed_blob_at_generations(
                                                 oid,
                                                 &storage_key,
-                                                generation,
+                                                store_context.generations.as_ref(),
                                                 adapter,
                                                 Arc::clone(&state),
+                                                &required_projections,
+                                                store_context.build_abort.cancellation(),
                                             ) {
-                                                Ok(mut prepared) => {
+                                                Ok(PreparedParsedBlobPreparation::Prepared(
+                                                    mut prepared,
+                                                )) => {
                                                     Self::inject_prepared_failure_for_test(
                                                         &file,
                                                         &mut prepared,
                                                     );
                                                     PreparedAnalysis::Ready {
                                                         file,
-                                                        prepared: Box::new(prepared),
+                                                        prepared,
+                                                        required_existing_additional_storage_languages:
+                                                            required_projections,
                                                     }
+                                                }
+                                                Ok(PreparedParsedBlobPreparation::Cancelled) => {
+                                                    return;
                                                 }
                                                 Err(error) => PreparedAnalysis::PreparationFailed {
                                                     file,
                                                     state,
+                                                    required_existing_additional_storage_languages:
+                                                        required_projections,
                                                     error: error.to_string(),
                                                 },
                                             }
@@ -4463,7 +5030,7 @@ where
                                     producer_in_flight
                                         .lock()
                                         .expect("prepared in-flight mutex poisoned")
-                                        .add(prepared.payload_bytes());
+                                        .add(prepared.mutation_payload_bytes());
                                 }
                                 let send_start = std::time::Instant::now();
                                 producer_tx
@@ -4495,7 +5062,7 @@ where
             let mut persist_completed = 0usize;
             let mut tail_mode = false;
             let flush = |pending: &mut Vec<PreparedParsedBlob>,
-                         pending_files: &mut HashMap<(Oid, String), ProjectFile>,
+                         pending_files: &mut HashMap<(Oid, String), (ProjectFile, Vec<String>)>,
                          pending_rows: &mut usize,
                          pending_bytes: &mut usize,
                          stats: &mut PersistBatchStats,
@@ -4508,8 +5075,13 @@ where
                 *pending_rows = 0;
                 *pending_bytes = 0;
                 let persist_start = std::time::Instant::now();
-                let (outcomes, batch_stats) =
-                    store_context.store.persist_prepared_blobs(prepared, limits);
+                let (outcomes, batch_stats) = store_context
+                    .store
+                    .persist_prepared_blobs_with_cancellation(
+                        prepared,
+                        store_context.build_abort.cancellation(),
+                        limits,
+                    );
                 // One clock feeds both reports: the phase split below and the
                 // profiling line's per-batch persistence total.
                 let persist_elapsed = persist_start.elapsed();
@@ -4539,54 +5111,68 @@ where
                     in_flight
                         .lock()
                         .expect("prepared in-flight mutex poisoned")
-                        .remove(outcome.prepared.payload_bytes());
+                        .remove(outcome.prepared.mutation_payload_bytes());
                     let key = (outcome.prepared.oid(), outcome.prepared.lang().to_string());
-                    let file = pending_files
+                    let (file, required_existing_additional_storage_languages) = pending_files
                         .remove(&key)
                         .expect("prepared outcome must retain its file envelope");
+                    if let Some(error) = &outcome.error {
+                        profiling::note_with(|| {
+                            format!("parsed blob publication failed for {file:?}: {error:?}")
+                        });
+                    }
                     on_outcome(
                         file,
-                        Some((Arc::clone(outcome.prepared.state()), outcome.error)),
+                        Some((
+                            Arc::clone(outcome.prepared.state()),
+                            required_existing_additional_storage_languages,
+                            outcome.error,
+                        )),
                     );
                 }
             };
 
-            let add_ready = |file: ProjectFile,
-                             prepared: Box<PreparedParsedBlob>,
-                             pending: &mut Vec<PreparedParsedBlob>,
-                             pending_files: &mut HashMap<(Oid, String), ProjectFile>,
-                             pending_rows: &mut usize,
-                             pending_bytes: &mut usize| {
-                let key = (prepared.oid(), prepared.lang().to_string());
-                if pending_files.insert(key, file).is_some() {
-                    panic!("duplicate prepared blob key in reconcile batch");
-                }
-                let rows = prepared.logical_rows();
-                let bytes = prepared.payload_bytes();
-                pending.push(*prepared);
-                *pending_rows = pending_rows.saturating_add(rows);
-                *pending_bytes = pending_bytes.saturating_add(bytes);
-                // The totals only stay correct while every drain resets
-                // them, so debug builds pay for the fold this replaced and
-                // compare, rather than trusting the invariant silently.
-                debug_assert_eq!(
-                    *pending_rows,
-                    pending.iter().fold(0usize, |total, blob| {
-                        total.saturating_add(blob.logical_rows())
-                    }),
-                    "pending row total drifted from the pending batch"
-                );
-                debug_assert_eq!(
-                    *pending_bytes,
-                    pending.iter().fold(0usize, |total, blob| {
-                        total.saturating_add(blob.payload_bytes())
-                    }),
-                    "pending payload byte total drifted from the pending batch"
-                );
-                pending.len() >= limits.max_blobs
-                    || *pending_rows >= limits.max_rows
-                    || *pending_bytes >= limits.max_payload_bytes
-            };
+            let add_ready =
+                |file: ProjectFile,
+                 prepared: Box<PreparedParsedBlob>,
+                 required_existing_additional_storage_languages: Vec<String>,
+                 pending: &mut Vec<PreparedParsedBlob>,
+                 pending_files: &mut HashMap<(Oid, String), (ProjectFile, Vec<String>)>,
+                 pending_rows: &mut usize,
+                 pending_bytes: &mut usize| {
+                    let key = (prepared.oid(), prepared.lang().to_string());
+                    if pending_files
+                        .insert(key, (file, required_existing_additional_storage_languages))
+                        .is_some()
+                    {
+                        panic!("duplicate prepared blob key in reconcile batch");
+                    }
+                    let rows = prepared.logical_rows();
+                    let bytes = prepared.payload_bytes();
+                    pending.push(*prepared);
+                    *pending_rows = pending_rows.saturating_add(rows);
+                    *pending_bytes = pending_bytes.saturating_add(bytes);
+                    // The totals only stay correct while every drain resets
+                    // them, so debug builds pay for the fold this replaced and
+                    // compare, rather than trusting the invariant silently.
+                    debug_assert_eq!(
+                        *pending_rows,
+                        pending.iter().fold(0usize, |total, blob| {
+                            total.saturating_add(blob.logical_rows())
+                        }),
+                        "pending row total drifted from the pending batch"
+                    );
+                    debug_assert_eq!(
+                        *pending_bytes,
+                        pending.iter().fold(0usize, |total, blob| {
+                            total.saturating_add(blob.payload_bytes())
+                        }),
+                        "pending payload byte total drifted from the pending batch"
+                    );
+                    pending.len() >= limits.max_blobs
+                        || *pending_rows >= limits.max_rows
+                        || *pending_bytes >= limits.max_payload_bytes
+                };
 
             let mut deferred = None;
             loop {
@@ -4617,10 +5203,15 @@ where
                         );
                         tail_mode = true;
                     }
-                    Ok(PreparedAnalysis::Ready { file, prepared }) => {
+                    Ok(PreparedAnalysis::Ready {
+                        file,
+                        prepared,
+                        required_existing_additional_storage_languages,
+                    }) => {
                         if add_ready(
                             file,
                             prepared,
+                            required_existing_additional_storage_languages,
                             &mut pending,
                             &mut pending_files,
                             &mut pending_rows,
@@ -4639,10 +5230,15 @@ where
                         if tail_mode {
                             loop {
                                 match prepared_rx.try_recv() {
-                                    Ok(PreparedAnalysis::Ready { file, prepared }) => {
+                                    Ok(PreparedAnalysis::Ready {
+                                        file,
+                                        prepared,
+                                        required_existing_additional_storage_languages,
+                                    }) => {
                                         if add_ready(
                                             file,
                                             prepared,
+                                            required_existing_additional_storage_languages,
                                             &mut pending,
                                             &mut pending_files,
                                             &mut pending_rows,
@@ -4678,8 +5274,28 @@ where
                             );
                         }
                     }
-                    Ok(PreparedAnalysis::PreparationFailed { file, state, error }) => {
+                    Ok(PreparedAnalysis::PreparationFailed {
+                        file,
+                        state,
+                        required_existing_additional_storage_languages,
+                        error,
+                    }) => {
                         stats.failed_blobs = stats.failed_blobs.saturating_add(1);
+                        let mut projection_languages = HashSet::default();
+                        for (storage_language, _) in &state.additional_projections {
+                            assert!(
+                                projection_languages.insert(*storage_language),
+                                "one failed preparation must retain each actual projection once"
+                            );
+                        }
+                        projection_languages.extend(
+                            required_existing_additional_storage_languages
+                                .iter()
+                                .map(String::as_str),
+                        );
+                        stats.failed_fragments = stats
+                            .failed_fragments
+                            .saturating_add(1usize.saturating_add(projection_languages.len()));
                         persist_completed = persist_completed.saturating_add(1);
                         if let Some(progress) = progress.as_ref() {
                             progress(BuildProgressEvent::new(
@@ -4690,7 +5306,14 @@ where
                                 None,
                             ));
                         }
-                        on_outcome(file, Some((state, Some(StoreError::new(error)))));
+                        on_outcome(
+                            file,
+                            Some((
+                                state,
+                                required_existing_additional_storage_languages,
+                                Some(StoreError::new(error)),
+                            )),
+                        );
                     }
                     Ok(PreparedAnalysis::Unparseable(file)) => {
                         persist_completed = persist_completed.saturating_add(1);
@@ -4744,15 +5367,18 @@ where
                 blob_persistence_elapsed.get(),
             );
             profiling::note(format!(
-                "language={language} prepared_channel_recvs={prepared_channel_recvs} blob_persistence_batches={} persist_transactions={} failed_attempts={} committed_blobs={} failed_blobs={} logical_rows={} prepared_bytes={} peak_batch_blobs={} peak_batch_rows={} peak_batch_bytes={} peak_in_flight_items={} peak_in_flight_bytes={} configured_max_in_flight_items={}",
+                "language={language} prepared_channel_recvs={prepared_channel_recvs} blob_persistence_batches={} persist_transactions={} failed_attempts={} committed_blobs={} failed_blobs={} committed_fragments={} failed_fragments={} logical_rows={} prepared_bytes={} peak_batch_blobs={} peak_batch_fragments={} peak_batch_rows={} peak_batch_bytes={} peak_in_flight_items={} peak_in_flight_bytes={} configured_max_in_flight_items={}",
                 blob_persistence_batches.get(),
                 stats.transactions,
                 stats.failed_transaction_attempts,
                 stats.committed_blobs,
                 stats.failed_blobs,
+                stats.committed_fragments,
+                stats.failed_fragments,
                 stats.logical_rows,
                 stats.payload_bytes,
                 stats.peak_batch_blobs,
+                stats.peak_batch_fragments,
                 stats.peak_batch_rows,
                 stats.peak_batch_payload_bytes,
                 stats.peak_in_flight_items,
@@ -4831,6 +5457,32 @@ where
             }
         }
         #[cfg(not(test))]
+        let _ = file;
+    }
+
+    /// The same injected frontend panic, for a test that runs Bifrost as a
+    /// process: `BIFROST_PANIC_DURING_ANALYSIS_PATH` names the workspace
+    /// -relative file whose analysis panics (issue #2771).
+    ///
+    /// The hook above is compiled only into this crate's own test binary, so it
+    /// cannot reach a spawned CLI. This one rides the `test-support` feature
+    /// that the root package's dev-dependency turns on for its integration
+    /// suites, and is absent from every shipped build, so it is not a switch a
+    /// user can reach. The panic has to originate here, on an analysis worker,
+    /// because the worker-to-caller propagation is what the test certifies.
+    fn panic_during_analysis_from_environment(file: &ProjectFile) {
+        #[cfg(feature = "test-support")]
+        {
+            static INJECTED_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> =
+                std::sync::OnceLock::new();
+            let injected = INJECTED_PATH.get_or_init(|| {
+                std::env::var_os("BIFROST_PANIC_DURING_ANALYSIS_PATH").map(std::path::PathBuf::from)
+            });
+            if injected.as_deref() == Some(file.rel_path()) {
+                panic!("injected analysis panic for {}", file.rel_path().display());
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
         let _ = file;
     }
 
@@ -5113,13 +5765,27 @@ where
             "a full build cannot drop a retained claim"
         );
         indexed_files.extend(claim_delta.added);
+        let configuration =
+            match Self::workspace_configuration_inputs(project, adapter, workspace_snapshot) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    state.record_workspace_package_inventory_error(StoreError::new(format!(
+                        "cannot capture workspace configuration inputs: {error}"
+                    )));
+                    return state;
+                }
+            };
         {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
                 adapter.language()
             ));
-            let (dirty, package_inventory_complete) =
-                Self::sync_path_symbol_units(adapter, &indexed_files, store_context);
+            let (dirty, package_inventory_complete) = Self::sync_path_symbol_units(
+                adapter,
+                &indexed_files,
+                &configuration,
+                store_context,
+            );
             state
                 .dirty_path_symbol_rows
                 .lock()
@@ -5140,8 +5806,32 @@ where
                 None,
             ));
         }
-        state.workspace_package_identity_input_digests =
-            Self::workspace_package_identity_input_digests(project, adapter, workspace_snapshot);
+        if Self::captures_workspace_configuration(adapter.language()) {
+            let mut ordered = configuration.iter().collect::<Vec<_>>();
+            ordered.sort_by_key(|input| input.relative_path());
+            state.workspace_configuration_digest =
+                Some(crate::analyzer::store::configuration_digest(
+                    ordered
+                        .into_iter()
+                        .map(|input| (input.relative_path(), input.content_oid())),
+                ));
+        }
+        state.workspace_package_identity_input_digests = if adapter.language() == Language::Rust {
+            configuration
+                .iter()
+                .map(|input| {
+                    (
+                        ProjectFile::new(
+                            project.root(),
+                            std::path::PathBuf::from(input.relative_path()),
+                        ),
+                        PackageIdentityInputDigest::new(adapter, input.source_bytes()),
+                    )
+                })
+                .collect()
+        } else {
+            Self::workspace_package_identity_input_digests(project, adapter, workspace_snapshot)
+        };
         store_context
             .gc
             .schedule(project.root(), Arc::clone(&store_context.store));
@@ -5156,7 +5846,7 @@ where
         project: &dyn Project,
         adapter: &A,
         workspace_snapshot: Option<&WorkspaceBuildSnapshot>,
-    ) -> HashMap<ProjectFile, [u8; 32]> {
+    ) -> HashMap<ProjectFile, PackageIdentityInputDigest> {
         let files = match workspace_snapshot {
             Some(snapshot) => Cow::Borrowed(snapshot.files()),
             None => match project.all_files_shared() {
@@ -5171,11 +5861,77 @@ where
                 std::fs::read(file.abs_path()).ok().map(|source| {
                     (
                         file.clone(),
-                        crate::analyzer::canonical_hash::sha256_bytes(&source),
+                        PackageIdentityInputDigest::new(adapter, &source),
                     )
                 })
             })
             .collect()
+    }
+
+    /// Languages whose builds retain their configuration inputs' exact bytes.
+    /// Each such build records the inputs' digest, which keys content
+    /// identity and lets an incremental update republish one input in place.
+    fn captures_workspace_configuration(language: Language) -> bool {
+        matches!(
+            language,
+            Language::Rust | Language::Go | Language::Java | Language::Kotlin | Language::Scala
+        )
+    }
+
+    fn workspace_configuration_input(adapter: &A, file: &ProjectFile) -> bool {
+        (adapter.language() == Language::Rust && adapter.workspace_package_identity_input(file))
+            || WorkspaceConfigurationInput::is_native_input(adapter.language(), file.rel_path())
+    }
+
+    /// Capture filesystem configuration once for the persisted revision. Request
+    /// overlays remain transient and cannot replace this input authority.
+    fn workspace_configuration_inputs(
+        project: &dyn Project,
+        adapter: &A,
+        workspace_snapshot: Option<&WorkspaceBuildSnapshot>,
+    ) -> std::io::Result<Vec<WorkspaceConfigurationInput>> {
+        if !Self::captures_workspace_configuration(adapter.language()) {
+            return Ok(Vec::new());
+        }
+        let files = match workspace_snapshot {
+            Some(snapshot) => Cow::Borrowed(snapshot.files()),
+            None => Cow::Owned((*project.all_files_shared()?).clone()),
+        };
+        let mut inputs = files
+            .iter()
+            .filter(|file| Self::workspace_configuration_input(adapter, file))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        WorkspaceConfigurationInput::include_native_metadata_paths(
+            project.root(),
+            adapter.language(),
+            &mut inputs,
+        )?;
+        inputs
+            .iter()
+            .map(|file| {
+                match std::fs::read(file.abs_path()) {
+                    Ok(bytes) => Ok(Some(WorkspaceConfigurationInput::new(
+                        crate::path_utils::rel_path_string(file),
+                        bytes.into_boxed_slice(),
+                    ))),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && project.has_overlay(file) =>
+                    {
+                        // An unsaved configuration file has no filesystem
+                        // identity to publish. The request's transient
+                        // selection handles its overlay separately.
+                        Ok(None)
+                    }
+                    Err(error) => Err(std::io::Error::new(
+                        error.kind(),
+                        format!("reading {}: {error}", file.rel_path().display()),
+                    )),
+                }
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .map(|inputs| inputs.into_iter().flatten().collect())
     }
 
     /// Every workspace file whose extension no language claims: the universe
@@ -5597,6 +6353,7 @@ where
     fn sync_path_symbol_units(
         adapter: &A,
         files: &[ProjectFile],
+        configuration: &[WorkspaceConfigurationInput],
         store_context: &AnalyzerStoreContext,
     ) -> (HashMap<ProjectFile, (String, PathSymbolRow)>, bool) {
         let snapshot = store_context.live_paths.snapshot();
@@ -5621,6 +6378,22 @@ where
                 .entry(adapter.storage_language_key_for_file(file).to_string())
                 .or_default()
                 .push((file.clone(), workspace_file, path_symbol));
+        }
+        // This sync owns, in each storage language, the files whose own
+        // storage language it is. A file of another storage language can
+        // still be mounted here by the analyzer's content-reading publication
+        // (the C reading of a C++ header under `cpp:c`); that row is the
+        // publication's, so it is named foreign and left alone (#3763).
+        let mut foreign_source_paths: HashMap<String, Vec<String>> = rows_by_language
+            .keys()
+            .map(|lang| (lang.clone(), Vec::new()))
+            .collect();
+        for (lang, entries) in &rows_by_language {
+            for (other, foreign) in &mut foreign_source_paths {
+                if other != lang {
+                    foreign.extend(entries.iter().map(|(_, row, _)| row.rel_path.clone()));
+                }
+            }
         }
         let mut dirty = HashMap::default();
         let mut package_inventory_complete = true;
@@ -5649,7 +6422,7 @@ where
                 for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
                     if store_context
                         .store
-                        .sync_workspace_snapshot_for_workspace(
+                        .sync_workspace_inputs_for_workspace(
                             &store_context.workspace_id,
                             &lang,
                             store_context.generations[&lang],
@@ -5659,6 +6432,8 @@ where
                             &package_files,
                             &package_edges,
                             &anchors,
+                            configuration,
+                            &foreign_source_paths[&lang],
                         )
                         .is_ok()
                     {
@@ -5682,15 +6457,21 @@ where
         (dirty, package_inventory_complete)
     }
 
-    /// Replace one storage language's complete workspace membership, including
-    /// natural files and any additional content readings owned by this analyzer.
+    /// Publish the content readings in one storage language's workspace
+    /// membership: the files of `files` whose own storage language is another
+    /// one.
+    ///
+    /// `files` may include natural files, but every natural file's row
+    /// belongs to the ordinary workspace sync, which also
+    /// publishes their path symbols and packages. They are passed to the store
+    /// as foreign and left as that sync wrote them; rewriting them here, and
+    /// that sync then dropping the readings, advanced the revision twice on
+    /// every warm start (#3763).
     ///
     /// A content reading is not a path-derived symbol mount and does not
     /// contribute package or anchor rows. Its definitions already carry
     /// content-stable structured names. C++ uses this for the distinct C
-    /// reading of headers compiled by C translation units. The supplied set
-    /// also includes ordinary `.c` files because snapshot replacement is
-    /// atomic and complete. The ordinary
+    /// reading of headers compiled by C translation units. The ordinary
     /// `workspace_files` key naturally admits the same path once under `cpp`
     /// and once under `cpp:c`, so no parallel liveness relation is needed.
     pub(crate) fn sync_content_reading_workspace_files(
@@ -5708,8 +6489,24 @@ where
                     "analyzer does not own content-reading storage language {storage_lang}"
                 ))
             })?;
+        let natural =
+            |file: &ProjectFile| self.adapter.storage_language_key_for_file(file) == storage_lang;
+        let readings = files
+            .iter()
+            .filter(|file| !natural(file))
+            .collect::<Vec<_>>();
         let snapshot = self.store_context.live_paths.snapshot();
-        let rows = files
+        // The same files the ordinary sync publishes: a natural file with no
+        // validated content is not its row either, and is closed here.
+        let natural_paths = self
+            .store_context
+            .live_paths
+            .files()
+            .iter()
+            .filter(|file| natural(file) && snapshot.validated_oid_for_path(file).is_some())
+            .map(crate::path_utils::rel_path_string)
+            .collect::<Vec<_>>();
+        let rows = readings
             .iter()
             .filter_map(|file| {
                 snapshot
@@ -5726,7 +6523,7 @@ where
             match self
                 .store_context
                 .store
-                .sync_workspace_snapshot_for_workspace(
+                .sync_workspace_inputs_for_workspace(
                     &self.store_context.workspace_id,
                     storage_lang,
                     generation,
@@ -5736,6 +6533,8 @@ where
                     &[],
                     &[],
                     &[],
+                    &[],
+                    &natural_paths,
                 ) {
                 Ok(snapshot) => {
                     let mut snapshots = self.selected_workspace_snapshots().as_ref().clone();
@@ -5744,12 +6543,7 @@ where
                         .store(Arc::new(snapshots));
                     self.store_context.live_paths.replace_additional_mounts(
                         storage_lang,
-                        files
-                            .iter()
-                            .filter(|file| {
-                                self.adapter.storage_language_key_for_file(file) != storage_lang
-                            })
-                            .cloned(),
+                        readings.iter().map(|file| (*file).clone()),
                     );
                     return Ok(());
                 }
@@ -5888,23 +6682,92 @@ where
         match oid_plan {
             Ok(file_oids) => {
                 workspace_package_inventory_complete &= file_oids.len() == files.len();
-                let all_blob_keys: Vec<_> = files
+                let mut candidate_order = Vec::new();
+                let mut candidates_by_blob_key = HashMap::default();
+                for file in &files {
+                    let Some(oid) = file_oids.get(file).copied() else {
+                        continue;
+                    };
+                    let key = (oid, adapter.storage_language_key_for_file(file).to_owned());
+                    let mut possible_additional = adapter
+                        .possible_additional_storage_language_keys_for_file(file)
+                        .iter()
+                        .map(|key| (*key).to_owned())
+                        .collect::<Vec<_>>();
+                    possible_additional.sort();
+                    possible_additional.dedup();
+                    assert!(
+                        possible_additional.iter().all(|additional| {
+                            additional != &key.1 && served_keys.contains(additional)
+                        }),
+                        "possible projections must be distinct adapter-owned storage keys"
+                    );
+                    if !candidates_by_blob_key.contains_key(&key) {
+                        candidate_order.push(key.clone());
+                    }
+                    candidates_by_blob_key
+                        .entry(key)
+                        .or_insert_with(Vec::new)
+                        .push((file.clone(), possible_additional));
+                }
+                let mut representative_by_blob_key = HashMap::default();
+                let mut analysis_requests = Vec::with_capacity(candidate_order.len());
+                for key in candidate_order {
+                    let mut candidates = candidates_by_blob_key
+                        .remove(&key)
+                        .expect("ordered blob key must retain candidates");
+                    candidates.sort_by(
+                        |(left_file, left_additional), (right_file, right_additional)| {
+                            right_additional
+                                .len()
+                                .cmp(&left_additional.len())
+                                .then_with(|| left_additional.cmp(right_additional))
+                                .then_with(|| left_file.rel_path().cmp(right_file.rel_path()))
+                        },
+                    );
+                    let required_additional = candidates
+                        .iter()
+                        .flat_map(|(_, additional)| additional.iter().cloned())
+                        .collect::<HashSet<_>>();
+                    let (representative, possible_additional) = candidates
+                        .into_iter()
+                        .next()
+                        .expect("one resolved blob key has a representative");
+                    assert!(
+                        required_additional
+                            .iter()
+                            .all(|required| possible_additional.contains(required)),
+                        "one deterministic representative must cover every possible projection for its blob key"
+                    );
+                    representative_by_blob_key.insert(key.clone(), representative);
+                    analysis_requests.push(CompleteAnalysisBlobRequest::new(
+                        key.0,
+                        key.1,
+                        possible_additional,
+                    ));
+                }
+                let all_blob_keys = analysis_requests
                     .iter()
-                    .filter_map(|file| {
-                        file_oids.get(file).map(|oid| {
-                            (
-                                *oid,
-                                adapter.storage_language_key_for_file(file).to_string(),
-                            )
-                        })
+                    .map(|request| (request.oid(), request.storage_language().to_owned()))
+                    .collect::<Vec<_>>();
+                let independent_primary_keys =
+                    all_blob_keys.iter().cloned().collect::<HashSet<_>>();
+                let possible_additional_by_blob_key = analysis_requests
+                    .iter()
+                    .map(|request| {
+                        (
+                            (request.oid(), request.storage_language().to_owned()),
+                            request.possible_additional_storage_languages().to_vec(),
+                        )
                     })
-                    .collect();
+                    .collect::<HashMap<_, _>>();
                 let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
                 let missing_result = store_context
                     .store
-                    .missing_published_parsed_blob_keys_at_generations(
-                        &all_blob_keys,
+                    .missing_published_complete_analysis_blob_keys_at_generations(
+                        &analysis_requests,
                         store_context.generations.as_ref(),
+                        adapter.language(),
                     );
                 let missing = match missing_result {
                     Ok(missing) => missing,
@@ -5913,10 +6776,16 @@ where
                         all_blob_keys
                             .into_iter()
                             .filter(|key| seen.insert(key.clone()))
+                            .map(|(oid, storage_language)| {
+                                MissingCompleteAnalysisBlob::primary_only(oid, storage_language)
+                            })
                             .collect()
                     }
                 };
-                let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
+                let missing_blob_keys: HashSet<(Oid, String)> = missing
+                    .iter()
+                    .map(|missing| (missing.oid(), missing.storage_language().to_owned()))
+                    .collect();
                 drop(_missing_scope);
 
                 if let Some(progress) = progress.as_ref() {
@@ -5929,27 +6798,36 @@ where
                     ));
                 }
 
-                let mut representative_by_blob_key = HashMap::default();
-                for file in &files {
-                    let Some(oid) = file_oids.get(file).copied() else {
-                        continue;
-                    };
-                    let storage_key = adapter.storage_language_key_for_file(file);
-                    if missing_blob_keys.contains(&(oid, storage_key.to_string())) {
-                        representative_by_blob_key
-                            .entry((oid, storage_key.to_string()))
-                            .or_insert_with(|| file.clone());
-                    }
-                }
                 let parse_targets: Vec<_> = missing
                     .iter()
-                    .map(|(oid, storage_key)| {
+                    .map(|missing| {
+                        let oid = missing.oid();
+                        let storage_key = missing.storage_language();
                         let file = representative_by_blob_key
-                            .get(&(*oid, storage_key.clone()))
+                            .get(&(oid, storage_key.to_owned()))
                             .expect("every missing blob key must have a representative")
                             .clone();
                         let generation = store_context.generations[storage_key];
-                        (file, *oid, storage_key.clone(), generation)
+                        let independently_owned_additional_storage_languages =
+                            possible_additional_by_blob_key
+                                .get(&(oid, storage_key.to_owned()))
+                                .expect("every missing blob key retains its projection capability")
+                                .iter()
+                                .filter(|projection| {
+                                    independent_primary_keys.contains(&(oid, (*projection).clone()))
+                                })
+                                .cloned()
+                                .collect();
+                        PreparedAnalysisTarget {
+                            file,
+                            oid,
+                            storage_language: storage_key.to_owned(),
+                            generation,
+                            required_existing_additional_storage_languages: missing
+                                .required_existing_additional_storage_languages()
+                                .to_vec(),
+                            independently_owned_additional_storage_languages,
+                        }
                     })
                     .collect();
                 let mut representative_blob_outcomes = HashMap::default();
@@ -5967,7 +6845,11 @@ where
                         };
                         let storage_key = adapter.storage_language_key_for_file(&file);
                         match outcome {
-                            Some((state, error)) => {
+                            Some((
+                                state,
+                                required_existing_additional_storage_languages,
+                                error,
+                            )) => {
                                 workspace_package_inventory_complete &=
                                     error.is_none() && state.parse_complete;
                                 let blob_outcome = if error.is_some() {
@@ -5985,7 +6867,8 @@ where
                                             key.clone(),
                                             Self::dirty_file_state(
                                                 Arc::clone(&state),
-                                                store_context.generations[storage_key],
+                                                Arc::clone(&store_context.generations),
+                                                required_existing_additional_storage_languages,
                                                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
                                                 error.to_string(),
                                                 status,
@@ -6203,7 +7086,7 @@ where
         if let Some(state) = self.retry_dirty_file_state(&key, storage_key) {
             return Some(state.source.clone());
         }
-        if let Some(state) = self.retained_file_state(&key) {
+        if let Some(state) = self.retained_file_state(file, &key) {
             return Some(state.source.clone());
         }
         self.source_for_oid(file, oid)
@@ -6223,6 +7106,53 @@ where
             .and_then(|snapshot| snapshot.get(key).cloned())
     }
 
+    /// Reuse already-owned projections without starting hydration, parser
+    /// catch-up, or a dirty-state persistence retry.
+    fn retained_file_state(
+        &self,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+    ) -> Option<Arc<FileState>> {
+        if let Some(state) = self
+            .state
+            .dirty_file_state(key)
+            .or_else(|| self.source_snapshot_file_states.get(key).cloned())
+        {
+            return Some(state);
+        }
+        let streaming = STREAMING_FILE_READS.with(|reads| {
+            reads
+                .borrow()
+                .get(&self.streaming_file_read_id())
+                .filter(|active| active.file == *file)
+                .and_then(|active| active.state.clone())
+        });
+        if let Some(state) = streaming.or_else(|| self.query_file_state_snapshot(key)) {
+            return Some(state);
+        }
+        let file_states = self.active_query_cache_handle(|cache| &cache.file_states);
+        if let Some(states) = file_states.as_ref()
+            && let Some(state) = states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .get(key)
+        {
+            return Some(state);
+        }
+        let state = self
+            .transient_file_states
+            .lock()
+            .expect("transient file-state cache mutex poisoned")
+            .get(key)?;
+        if let Some(file_states) = file_states {
+            file_states
+                .write()
+                .expect("query file-state cache write lock poisoned")
+                .retain(key.clone(), Arc::clone(&state));
+        }
+        Some(state)
+    }
+
     fn dirty_retry_delay(attempts: usize) -> Duration {
         let exponent = attempts.saturating_sub(1).min(7) as u32;
         let factor = 1u32 << exponent;
@@ -6233,14 +7163,17 @@ where
 
     fn dirty_file_state(
         state: Arc<FileState>,
-        generation: GenerationId,
+        generations: Arc<HashMap<String, GenerationId>>,
+        required_existing_additional_storage_languages: Vec<String>,
         attempts: usize,
         last_error: String,
         status: DirtyFileStateStatus,
     ) -> DirtyFileState {
         DirtyFileState {
             state,
-            generation,
+            generations,
+            required_existing_additional_storage_languages:
+                required_existing_additional_storage_languages.into(),
             attempts,
             next_retry_at: Instant::now() + Self::dirty_retry_delay(attempts),
             status,
@@ -6256,21 +7189,47 @@ where
         generation: GenerationId,
         state: &FileState,
     ) -> std::result::Result<usize, StoreError> {
+        assert_eq!(
+            store_context.generations[storage_key], generation,
+            "store write generation must equal the captured language authority"
+        );
         let mut last_error = None;
         for attempt in 1..=STORE_WRITE_IMMEDIATE_RETRIES + 1 {
-            match store_context.store.write_parsed_blob_at_generation(
+            let prepared = AnalyzerStore::prepare_parsed_blob_at_generations(
                 oid,
                 storage_key,
-                generation,
+                store_context.generations.as_ref(),
                 adapter,
-                state,
-            ) {
+                Arc::new(state.clone()),
+                &[],
+                store_context.build_abort.cancellation(),
+            );
+            let result = prepared.and_then(|prepared| match prepared {
+                PreparedParsedBlobPreparation::Prepared(prepared) => {
+                    let (mut outcomes, _) = store_context
+                        .store
+                        .persist_prepared_blobs_with_cancellation(
+                            vec![*prepared],
+                            store_context.build_abort.cancellation(),
+                            PersistBatchTargets::PRODUCTION,
+                        );
+                    outcomes
+                        .pop()
+                        .expect("one prepared blob has one persistence outcome")
+                        .error
+                        .map_or(Ok(()), Err)
+                }
+                PreparedParsedBlobPreparation::Cancelled => {
+                    Err(StoreError::new("parsed blob preparation was cancelled"))
+                }
+            });
+            match result {
                 Ok(()) => return Ok(attempt),
                 Err(err) => {
-                    let stale = err.is_stale_generation();
+                    let stale = err.is_stale_generation() || err.is_stale_resolution();
                     let resource_bound = err.is_resource_bound();
                     last_error = Some(err);
-                    if stale || resource_bound {
+                    if stale || resource_bound || store_context.build_abort.is_aborted() {
                         break;
                     }
                     if attempt <= STORE_WRITE_IMMEDIATE_RETRIES {
@@ -6311,7 +7270,8 @@ where
                     key,
                     Self::dirty_file_state(
                         Arc::new(state.clone()),
-                        generation,
+                        Arc::clone(&store_context.generations),
+                        Vec::new(),
                         STORE_WRITE_IMMEDIATE_RETRIES + 1,
                         err.to_string(),
                         status,
@@ -6334,7 +7294,7 @@ where
         key: &FileStateCacheKey,
         storage_key: &str,
     ) -> Option<Arc<FileState>> {
-        let (state, generation) = {
+        let (state, generations, required_existing_additional_storage_languages) = {
             let dirty_file_states = self
                 .state
                 .dirty_file_states
@@ -6346,7 +7306,11 @@ where
             {
                 return Some(Arc::clone(&dirty.state));
             }
-            (Arc::clone(&dirty.state), dirty.generation)
+            (
+                Arc::clone(&dirty.state),
+                Arc::clone(&dirty.generations),
+                Arc::clone(&dirty.required_existing_additional_storage_languages),
+            )
         };
 
         // A bounded parse timeout intentionally retains a conservative state
@@ -6356,15 +7320,23 @@ where
         if !state.parse_complete {
             return Some(state);
         }
-
-        let repair = AnalyzerStore::prepare_parsed_blob(
+        let repair = AnalyzerStore::prepare_parsed_blob_at_generations(
             key.oid,
             storage_key,
-            generation,
+            generations.as_ref(),
             self.adapter.as_ref(),
             Arc::clone(&state),
+            required_existing_additional_storage_languages.as_ref(),
+            self.store_context.build_abort.cancellation(),
         )
-        .and_then(|prepared| self.store_context.store.repair_prepared_blob(prepared));
+        .and_then(|prepared| match prepared {
+            PreparedParsedBlobPreparation::Prepared(prepared) => {
+                self.store_context.store.repair_prepared_blob(*prepared)
+            }
+            PreparedParsedBlobPreparation::Cancelled => Err(StoreError::new(
+                "dirty parsed blob preparation was cancelled",
+            )),
+        });
         match repair {
             Ok(()) => {
                 self.state
@@ -6390,11 +7362,7 @@ where
                     .lock()
                     .expect("dirty file-state mutex poisoned");
                 if let Some(dirty) = dirty_file_states.get_mut(key) {
-                    if err.is_stale_generation() {
-                        dirty.status = DirtyFileStateStatus::TerminalStale;
-                    } else if err.is_resource_bound() {
-                        dirty.status = DirtyFileStateStatus::TerminalResourceBound;
-                    }
+                    dirty.status = dirty_file_state_status(&err);
                     dirty.attempts = dirty.attempts.saturating_add(1);
                     dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
                     dirty._last_error = err.to_string();
@@ -6411,6 +7379,10 @@ where
             .into_iter()
             .map(|(key, _)| key)
             .collect()
+    }
+
+    pub(crate) fn owns_file(&self, file: &ProjectFile) -> bool {
+        self.owns_storage_language_key(self.adapter.storage_language_key_for_file(file))
     }
 
     fn owns_storage_language_key(&self, storage_key: &str) -> bool {
@@ -6554,7 +7526,20 @@ where
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
-        self.fetch_file_state_for_key(file, &key)
+        let state = self.fetch_file_state_for_key(file, &key)?;
+        if self.project.has_overlay(file) {
+            // A cache or persisted-blob hit is still preparation of this
+            // buffer. Publishing overlay provenance only on the parse path
+            // loses identical-to-disk buffers and revisited buffer contents.
+            self.store_context
+                .live_paths
+                .refresh([LivePathEntry::overlay(file.clone(), oid)]);
+            self.transient_file_states
+                .lock()
+                .expect("transient file-state cache mutex poisoned")
+                .insert(key, Arc::clone(&state));
+        }
+        Some(state)
     }
 
     /// The second reading of `file`'s blob stored under `storage_key`, when
@@ -6594,7 +7579,7 @@ where
         .map(Arc::new)
     }
 
-    fn current_source(&self, file: &ProjectFile) -> Option<String> {
+    fn current_source(&self, file: &ProjectFile) -> Option<CurrentSource> {
         let sources = self.active_query_cache_handle(|cache| &cache.current_sources);
         if let Some(sources) = sources.as_ref()
             && let Some(source) = sources
@@ -6605,7 +7590,13 @@ where
         {
             return source;
         }
-        let source = self.project.read_source(file).ok();
+        let source = self.project.read_source(file).ok().and_then(|text| {
+            let oid = self.content_oid_of(file, &text)?;
+            Some(CurrentSource {
+                text: Arc::from(text),
+                oid,
+            })
+        });
         if let Some(sources) = sources {
             sources
                 .write()
@@ -6622,22 +7613,21 @@ where
         let Some(source) = self.current_source(file) else {
             return indexed.or_else(|| self.fetch_file_state_from_current_source(file));
         };
-        self.fetch_file_state_from_source(file, source).or(indexed)
+        self.fetch_file_state_from_source(file, &source).or(indexed)
     }
 
     fn fetch_file_state_from_source(
         &self,
         file: &ProjectFile,
-        source: String,
+        source: &CurrentSource,
     ) -> Option<Arc<FileState>> {
-        let oid = self.content_oid_of(file, &source)?;
-        let key = Self::transient_cache_key(oid, file);
-        self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
+        let key = Self::transient_cache_key(source.oid, file);
+        self.fetch_file_state_for_key_with_source(file, &key, Some(&source.text))
     }
 
     fn fetch_file_state_from_current_source(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         self.current_source(file)
-            .and_then(|source| self.fetch_file_state_from_source(file, source))
+            .and_then(|source| self.fetch_file_state_from_source(file, &source))
     }
 
     /// The declaration-materialization provenance recorded for `file` by its
@@ -6658,36 +7648,6 @@ where
         key: &FileStateCacheKey,
     ) -> Option<Arc<FileState>> {
         self.fetch_file_state_for_key_with_source(file, key, None)
-    }
-
-    /// `key`'s already-materialized state, from the query snapshot, the query
-    /// read cache, or the transient cache. `None` means answering would cost a
-    /// full hydration.
-    fn retained_file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
-        if let Some(state) = self.query_file_state_snapshot(key) {
-            return Some(state);
-        }
-        let file_states = self.active_query_cache_handle(|cache| &cache.file_states);
-        if let Some(file_states) = file_states.as_ref()
-            && let Some(state) = file_states
-                .read()
-                .expect("query file-state cache read lock poisoned")
-                .get(key)
-        {
-            return Some(state);
-        }
-        let state = self
-            .transient_file_states
-            .lock()
-            .expect("transient file-state cache mutex poisoned")
-            .get(key)?;
-        if let Some(file_states) = file_states.as_ref() {
-            let mut file_states = file_states
-                .write()
-                .expect("query file-state cache write lock poisoned");
-            file_states.retain(key.clone(), Arc::clone(&state));
-        }
-        Some(state)
     }
 
     fn fetch_file_state_for_key_with_source(
@@ -6713,10 +7673,17 @@ where
         if let Some(state) = self.retry_dirty_file_state(key, storage_key) {
             return Some(state);
         }
+        // An identical-to-disk overlay can reuse the exact producer snapshot.
+        // SQL hydration below supplies display rows, not native source facts.
+        if self.project.has_overlay(file)
+            && let Some(state) = self.source_snapshot_file_states.get(key)
+        {
+            return Some(Arc::clone(state));
+        }
         if exact_source.is_none() && self.streaming_file_read_active(file) {
             return self.streaming_file_state(file);
         }
-        if let Some(state) = self.retained_file_state(key) {
+        if let Some(state) = self.retained_file_state(file, key) {
             return Some(state);
         }
 
@@ -7473,11 +8440,18 @@ where
         if entries.is_empty() {
             return HashMap::default();
         }
+        let canonical = self.adapter.produces_canonical_source_facts();
         let mut out = HashMap::default();
         let mut clean_entries = Vec::new();
         for (file, oid, storage_key) in entries {
             let key = Self::transient_cache_key(oid, &file);
-            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+            let retained = if canonical {
+                self.retained_file_state(&file, &key)
+                    .filter(|state| state.source_facts.is_some())
+            } else {
+                self.retry_dirty_file_state(&key, &storage_key)
+            };
+            if let Some(state) = retained {
                 out.insert(
                     file,
                     ImportFileFacts {
@@ -7494,6 +8468,21 @@ where
         if entries.is_empty() {
             return out;
         }
+        let hydrated = if canonical {
+            self.store_context
+                .store
+                .hydrate_canonical_import_facts_by_key(
+                    &entries,
+                    self.store_context.generations.as_ref(),
+                    self.adapter.as_ref(),
+                )
+        } else {
+            self.store_context.store.hydrate_import_facts_by_key(
+                &entries,
+                self.store_context.generations.as_ref(),
+                self.adapter.as_ref(),
+            )
+        };
         let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
             .store_query_or_record(
                 |sink| {
@@ -7501,11 +8490,7 @@ where
                         sink.push(self.file_read_key(file, *oid));
                     }
                 },
-                self.store_context.store.hydrate_import_facts_by_key(
-                    &entries,
-                    self.store_context.generations.as_ref(),
-                    self.adapter.as_ref(),
-                ),
+                hydrated,
                 "hydrating import facts",
             )
             .unwrap_or_default()
@@ -7524,7 +8509,8 @@ where
         self.bulk_hydration_count
             .fetch_add(facts.len(), Ordering::Relaxed);
         for (file, oid, _) in entries {
-            if !facts.contains_key(&file)
+            if !canonical
+                && !facts.contains_key(&file)
                 && let Some(source) = self.source_for_oid(&file, oid)
                 && let Some(state) = self.parse_and_store_transient(&file, oid, source)
             {
@@ -7541,10 +8527,13 @@ where
             // `out` above -- so these facts are keyed by the same content
             // identity `import_info_of` reads, and warm its per-file path.
             if let Some(facts) = facts.get(&file) {
-                self.import_info_store_retain(
-                    Self::transient_cache_key(oid, &file),
-                    Arc::from(facts.imports.clone()),
-                );
+                let key = Self::transient_cache_key(oid, &file);
+                let imports = Arc::from(facts.imports.clone());
+                if canonical {
+                    self.import_info_store_retain_canonical(key, imports);
+                } else {
+                    self.import_info_store_retain(key, imports);
+                }
             }
         }
         out.extend(facts);
@@ -7789,11 +8778,13 @@ where
             }
             None => self.project.read_source_snapshot(file).ok(),
         };
-        let resolved = snapshot.and_then(|snapshot| {
-            Some(ResolvedPreparedSource {
-                oid: self.content_oid_of(file, snapshot.source())?,
-                snapshot,
-            })
+        // The snapshot carries the raw disk identity alongside its decoded
+        // parser text. Retaining that identity keeps lossy source publication
+        // mounted to the blob the live path map names; overlays already carry
+        // the UTF-8 identity of their admitted text.
+        let resolved = snapshot.map(|snapshot| ResolvedPreparedSource {
+            oid: snapshot.oid(),
+            snapshot,
         });
 
         if let Some(prepared_sources) = prepared_sources.as_ref() {
@@ -7835,10 +8826,11 @@ where
                 .or_default() += 1;
         }
         let source = if self.project.has_overlay(file) {
-            let source = self.project.read_source(file).ok()?;
-            Some(ResolvedLiveSource {
-                oid: self.content_oid_of(file, &source)?,
-            })
+            // Keep identity and text from one admitted snapshot. Resolving an
+            // OID from separately read text would capture the overlay twice.
+            self.resolve_prepared_source(file, None)
+                .expect("an unbounded source read cannot exceed its limit")
+                .map(|source| ResolvedLiveSource { oid: source.oid })
         } else if let Some(oid) = self
             .store_context
             .live_paths
@@ -7898,10 +8890,10 @@ where
     }
 
     fn source_for_oid(&self, file: &ProjectFile, oid: Oid) -> Option<String> {
-        if let Ok(source) = self.project.read_source(file)
-            && self.content_oid_of(file, &source) == Some(oid)
+        if let Ok(snapshot) = self.project.read_source_snapshot(file)
+            && snapshot.oid() == oid
         {
-            return Some(source);
+            return Some(snapshot.source().to_owned());
         }
         if let Some(source) = self.source_from_git_blob(oid) {
             return Some(source);
@@ -7912,7 +8904,7 @@ where
     fn source_from_git_blob(&self, oid: Oid) -> Option<String> {
         let repo = gitblob::discover(self.project.root())?;
         let bytes = gitblob::read_blob(&repo, &oid.to_string()).ok()?;
-        String::from_utf8(bytes).ok()
+        crate::analyzer::project::decode_source_bytes(bytes).ok()
     }
 
     fn parse_and_store_transient(
@@ -7965,12 +8957,16 @@ where
                         key,
                         Self::dirty_file_state(
                             Arc::new(state.clone()),
-                            generation,
+                            Arc::clone(&self.store_context.generations),
+                            Vec::new(),
                             STORE_WRITE_IMMEDIATE_RETRIES + 1,
                             err.to_string(),
                             status,
                         ),
                     );
+                self.record_store_error(
+                    err.context(format!("persisting primary source facts of {file:?}")),
+                );
             }
         }
         self.store_context
@@ -8061,6 +9057,32 @@ where
         if targets.is_empty() {
             return;
         }
+        let independent_primary_keys = targets
+            .iter()
+            .map(|(_, oid, storage_language, _)| (*oid, storage_language.clone()))
+            .collect::<HashSet<_>>();
+        let targets = targets
+            .into_iter()
+            .map(|(file, oid, storage_language, generation)| {
+                let independently_owned_additional_storage_languages = self
+                    .adapter
+                    .possible_additional_storage_language_keys_for_file(&file)
+                    .iter()
+                    .filter(|projection| {
+                        independent_primary_keys.contains(&(oid, (**projection).to_owned()))
+                    })
+                    .map(|projection| (**projection).to_owned())
+                    .collect();
+                PreparedAnalysisTarget {
+                    file,
+                    oid,
+                    storage_language,
+                    generation,
+                    required_existing_additional_storage_languages: Vec::new(),
+                    independently_owned_additional_storage_languages,
+                }
+            })
+            .collect();
         Self::analyze_prepare_and_persist_files(
             self.adapter.as_ref(),
             self.project.as_ref(),
@@ -8082,6 +9104,10 @@ where
         &self.store_context.store
     }
 
+    pub(crate) fn workspace_id(&self) -> &crate::analyzer::store::WorkspaceId {
+        &self.store_context.workspace_id
+    }
+
     /// The analysis generation `lang`'s persisted rows belong to. Cache keys
     /// that mention it are invalidated for free when the generation moves.
     pub(crate) fn language_generation(&self, lang: &str) -> Option<GenerationId> {
@@ -8097,6 +9123,32 @@ where
     /// store-backed query works in a plain directory too.
     pub(crate) fn live_path_snapshot(&self) -> Arc<LiveSnapshot> {
         self.live_snapshot()
+    }
+
+    /// Frozen live mounts, without filtering out missing parsed publications.
+    /// Readiness probes must not use `analyzed_files`: that query intentionally
+    /// excludes incomplete persisted blobs, precisely the files a repair owes.
+    pub(crate) fn live_file_mounts_for_fact_publication_while(
+        &self,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Vec<(ProjectFile, Oid)>> {
+        keep_going().then_some(())?;
+        let snapshot = self.live_snapshot();
+        let mut mounts = Vec::new();
+        for file in snapshot.all_paths() {
+            keep_going().then_some(())?;
+            let Some(rebased) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if !self.adapter_owns_file(&rebased, &snapshot) {
+                continue;
+            }
+            let oid = snapshot
+                .oid_for_path(file)
+                .expect("a live snapshot path has a content identity");
+            mounts.push((rebased, oid));
+        }
+        Some(mounts)
     }
 
     /// Whether this adapter analyzes `file`.
@@ -8828,6 +9880,13 @@ where
     }
 
     fn dirty_file_states_for_queries(&self) -> Vec<Arc<FileState>> {
+        self.dirty_file_states_with_paths_for_queries()
+            .into_iter()
+            .map(|(_, state)| state)
+            .collect()
+    }
+
+    fn dirty_file_states_with_paths_for_queries(&self) -> Vec<(ProjectFile, Arc<FileState>)> {
         let snapshot = self.live_snapshot();
         let dirty = self.state.dirty_snapshot();
         let mut states = Vec::new();
@@ -8841,7 +9900,7 @@ where
             }
             let storage_key = self.adapter.storage_language_key_for_file(&file);
             if let Some(state) = self.retry_dirty_file_state(&key, storage_key) {
-                states.push(state);
+                states.push((file, state));
             }
         }
         states
@@ -8872,6 +9931,25 @@ where
     /// `FileState` -- which is why a warm analyzer answered `scan_usages` more
     /// slowly than a cold one (#2883).
     fn authoritative_file_states_for_queries(&self) -> (Vec<Arc<FileState>>, HashSet<ProjectFile>) {
+        if !self.hydrate_overlay_file_states() {
+            return (Vec::new(), HashSet::default());
+        }
+        self.authoritative_file_states_already_owned()
+    }
+
+    /// Materialize the file state of every explicitly registered overlay
+    /// buffer, and report whether any overlay-authoritative state can exist.
+    ///
+    /// A buffer that has never been fetched is in no cache, so a caller that
+    /// reads only the already-owned states sees the persisted disk row instead
+    /// of the buffer's own facts. Relational reads call this once per lookup
+    /// and a usage scan issues thousands of lookups per request, so the `false`
+    /// answer is the cheap exit: overlay-authoritative states can only come
+    /// from overlay-backed paths or dirty (unpersisted) states, and with
+    /// neither present the caller's walk provably contributes nothing. The
+    /// project overlay registry is checked alongside the frozen snapshot's
+    /// overlay flags because either side can observe an overlay first.
+    fn hydrate_overlay_file_states(&self) -> bool {
         let overlay_files = self
             .project
             .overlay_content()
@@ -8883,36 +9961,33 @@ where
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        // Relational reads call this once per lookup, and a usage scan issues
-        // thousands of lookups per request. Overlay-authoritative states can
-        // only come from overlay-backed paths or dirty (unpersisted) states;
-        // with neither present the walks below provably contribute nothing,
-        // so skip the per-lookup cache iteration that rebuilt a `ProjectFile`
-        // for every retained file-state entry just to discard it. The project
-        // overlay registry is checked alongside the frozen snapshot's overlay
-        // flags because either side can observe an overlay first.
         if overlay_files.is_empty()
             && !self.state.has_dirty_file_states()
             && !self.live_snapshot().has_overlay_paths()
         {
-            return (Vec::new(), HashSet::default());
+            return false;
         }
         for file in &overlay_files {
             let _ = self.fetch_file_state(file);
         }
+        true
+    }
+
+    fn authoritative_file_states_already_owned(
+        &self,
+    ) -> (Vec<Arc<FileState>>, HashSet<ProjectFile>) {
+        let (states, paths) = self.authoritative_file_states_with_paths_already_owned();
+        (states.into_iter().map(|(_, state)| state).collect(), paths)
+    }
+
+    fn authoritative_file_states_with_paths_already_owned(
+        &self,
+    ) -> (Vec<(ProjectFile, Arc<FileState>)>, HashSet<ProjectFile>) {
         let snapshot = self.live_snapshot();
         let mut states: HashMap<ProjectFile, Arc<FileState>> = HashMap::default();
 
-        for state in self.dirty_file_states_for_queries() {
-            if let Some(file) = state
-                .declarations
-                .iter()
-                .next()
-                .or_else(|| state.definition_lookup_units.iter().next())
-                .map(|unit| unit.source().clone())
-            {
-                states.insert(file, state);
-            }
+        for (file, state) in self.dirty_file_states_with_paths_for_queries() {
+            states.insert(file, state);
         }
 
         for file in snapshot.overlay_files() {
@@ -8932,7 +10007,7 @@ where
         self.authoritative_file_state_reads
             .fetch_add(states.len(), Ordering::Relaxed);
         let paths = states.keys().cloned().collect();
-        (states.into_values().collect(), paths)
+        (states.into_iter().collect(), paths)
     }
 
     /// `key`'s already-materialized state in the two caches a request overlay
@@ -9086,6 +10161,25 @@ where
         let mut rows: BTreeSet<_> = resolved.rows.into_iter().collect();
         rows.extend(dirty.rows);
         LimitedQueryRows::complete(rows.into_iter().collect(), inspected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_retained_file_states_for_test(&mut self) {
+        assert!(
+            self.state.dirty_snapshot().is_empty(),
+            "cold fixture must be published"
+        );
+        self.source_snapshot_file_states = Arc::new(HashMap::default());
+        self.query_file_state_snapshot.store(None);
+        self.transient_file_states
+            .lock()
+            .expect("transient cache lock")
+            .clear();
+        self.query_read_cache_lock()
+            .file_states
+            .write()
+            .expect("query cache lock")
+            .clear();
     }
 
     #[doc(hidden)]
@@ -9589,8 +10683,302 @@ where
         Ok(true)
     }
 
-    fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
+    pub(crate) fn install_python_runtime_snapshot(
+        &self,
+        base: &crate::analyzer::store::WorkspaceSnapshotId,
+        published: crate::analyzer::store::WorkspaceSnapshotId,
+    ) -> std::result::Result<(), StoreError> {
+        assert_eq!(base.lang, "python");
+        assert_eq!(published.lang, "python");
+        let current = self.relational_workspace_snapshots.load_full();
+        if current.get("python") != Some(base) {
+            return Err(StoreError::stale_resolution(
+                "Python snapshot moved during provider publication",
+            ));
+        }
+        let mut next = current.as_ref().clone();
+        next.insert("python".into(), published);
+        let previous = self
+            .relational_workspace_snapshots
+            .compare_and_swap(&current, Arc::new(next));
+        if !Arc::ptr_eq(&current, &previous) {
+            return Err(StoreError::stale_resolution(
+                "Python snapshot moved while installing provider publication",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
         self.relational_workspace_snapshots.load_full()
+    }
+
+    /// Check supplied point-query text against admitted live content without
+    /// producing new native facts. Selected-operation revalidation still owns
+    /// the final snapshot/generation check.
+    pub(crate) fn source_matches_selected_native_content(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> bool {
+        let Some(oid) = self.content_oid_of(file, source) else {
+            return false;
+        };
+        self.live_snapshot().validated_oid_for_path(file) == Some(oid)
+    }
+
+    pub(crate) fn selected_rust_resolution_overlay_inputs(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
+        assert_eq!(
+            self.adapter.language(),
+            Language::Rust,
+            "Rust selected overlays require the Rust adapter"
+        );
+        self.selected_resolution_overlay_inputs(snapshots, cancellation)
+    }
+
+    pub(crate) fn selected_rust_resolution_overlay_inputs_excluding(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        overridden_paths: &HashSet<&ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
+        assert_eq!(
+            self.adapter.language(),
+            Language::Rust,
+            "Rust selected overlays require the Rust adapter"
+        );
+        self.selected_resolution_overlay_inputs_excluding(snapshots, overridden_paths, cancellation)
+    }
+
+    /// Publish exact live content for the row-backed source frontends. Package
+    /// and import authority must still be composed for the selected contents;
+    /// publishing an overlay does not authorize its disk predecessor's context.
+    pub(crate) fn selected_resolution_overlay_inputs(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
+        self.selected_resolution_overlay_inputs_excluding(
+            snapshots,
+            &HashSet::default(),
+            cancellation,
+        )
+    }
+
+    fn selected_resolution_overlay_inputs_excluding(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        overridden_paths: &HashSet<&ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
+        let language = self.adapter.language();
+        assert!(
+            matches!(language, Language::Rust | Language::Java | Language::Go),
+            "selected native overlays require an admitted row-backed frontend: {language:?}"
+        );
+        let storage_language = language.config_label();
+        if cancellation.is_cancelled() {
+            return Ok(SelectedResolutionOverlayInputsOutcome::Cancelled);
+        }
+        let Some(owner) = snapshots.get(storage_language) else {
+            return Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingWorkspaceSnapshot {
+                    storage_language: storage_language.to_owned(),
+                },
+            ));
+        };
+        self.hydrate_overlay_file_states();
+        let live = self.live_snapshot();
+        let (states, _) = self.authoritative_file_states_with_paths_already_owned();
+        let mut content_mounts = Vec::new();
+        for (file, state) in states {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedResolutionOverlayInputsOutcome::Cancelled);
+            }
+            if overridden_paths.contains(&file) {
+                continue;
+            }
+            if self.adapter.storage_language_key_for_file(&file) != storage_language {
+                continue;
+            }
+            let Some(oid) = live.validated_oid_for_path(&file) else {
+                continue;
+            };
+            let path = crate::path_utils::rel_path_string(&file);
+            let cached = self.store_context.store.admit_cached_selected_content(
+                owner,
+                &path,
+                oid,
+                &ResolutionContentInput::Parsed {
+                    content_oid: oid,
+                    semantic_language: language,
+                },
+                cancellation,
+            )?;
+            let outcome = match cached {
+                ResolutionContentPublicationOutcome::Unavailable(
+                    SelectedResolutionUnavailable::MissingBlob { .. }
+                    | SelectedResolutionUnavailable::MissingInterior { .. }
+                    | SelectedResolutionUnavailable::IncompleteInterior { .. }
+                    | SelectedResolutionUnavailable::IncompleteParsedBlob { .. },
+                ) if state.source_facts.is_some() => self.publish_selected_native_file_state(
+                    owner,
+                    &file,
+                    oid,
+                    Arc::clone(&state),
+                    cancellation,
+                )?,
+                outcome => outcome,
+            };
+            let witness = match outcome {
+                ResolutionContentPublicationOutcome::Ready(content) => content.into_parts().0,
+                ResolutionContentPublicationOutcome::Cancelled => {
+                    return Ok(SelectedResolutionOverlayInputsOutcome::Cancelled);
+                }
+                ResolutionContentPublicationOutcome::Stale(stale) => {
+                    return Ok(SelectedResolutionOverlayInputsOutcome::Stale(stale));
+                }
+                ResolutionContentPublicationOutcome::Unavailable(unavailable) => {
+                    return Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(
+                        unavailable,
+                    ));
+                }
+            };
+            let mut mount = SelectedResolutionContentMountRequest::new(
+                witness,
+                WorkspaceFileRow {
+                    rel_path: path,
+                    blob_oid: oid,
+                },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            if live.is_overlay_path(&file) {
+                mount = mount.with_live_overlay_content_digest(
+                    crate::analyzer::canonical_hash::sha256_bytes(state.source.as_bytes()),
+                );
+            }
+            content_mounts.push(mount);
+        }
+        content_mounts.sort_by(|left, right| {
+            left.persisted_relative_path()
+                .cmp(right.persisted_relative_path())
+        });
+        let masks = content_mounts
+            .iter()
+            .map(|mount| {
+                SelectedResolutionOverlayMask::replacement(
+                    storage_language,
+                    mount.persisted_relative_path(),
+                )
+            })
+            .collect();
+        Ok(SelectedResolutionOverlayInputsOutcome::Ready {
+            masks,
+            content_mounts,
+        })
+    }
+
+    fn publish_selected_native_file_state(
+        &self,
+        owner: &crate::analyzer::store::WorkspaceSnapshotId,
+        file: &ProjectFile,
+        oid: Oid,
+        state: Arc<FileState>,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<ResolutionContentPublicationOutcome> {
+        let path = crate::path_utils::rel_path_string(file);
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        if !state.parse_complete {
+            return Ok(ResolutionContentPublicationOutcome::Unavailable(
+                SelectedResolutionUnavailable::IncompleteParsedBlob {
+                    storage_language: owner.lang.clone(),
+                    persisted_relative_path: path,
+                },
+            ));
+        }
+        let generations = HashMap::from_iter([(owner.lang.clone(), owner.generation)]);
+        let prepared = match AnalyzerStore::prepare_parsed_blob_at_generations(
+            oid,
+            &owner.lang,
+            &generations,
+            self.adapter.as_ref(),
+            state,
+            &[],
+            cancellation,
+        )? {
+            PreparedParsedBlobPreparation::Prepared(prepared) => *prepared,
+            PreparedParsedBlobPreparation::Cancelled => {
+                return Ok(ResolutionContentPublicationOutcome::Cancelled);
+            }
+        };
+        self.store_context.store.publish_selected_parsed_content(
+            owner,
+            &path,
+            prepared,
+            cancellation,
+        )
+    }
+
+    /// Publish caller-supplied hypothetical source under the captured owner.
+    /// The caller retains original-source proof; no live file version is changed.
+    pub(crate) fn selected_rust_counterfactual_publication(
+        &self,
+        owner: &crate::analyzer::store::WorkspaceSnapshotId,
+        file: &ProjectFile,
+        source: String,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::store::Result<ResolutionContentPublicationOutcome> {
+        assert_eq!(
+            self.adapter.language(),
+            Language::Rust,
+            "Rust counterfactual publication requires the Rust adapter"
+        );
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).map_err(|error| {
+            StoreError::new(format!("hash counterfactual Rust content: {error}"))
+        })?;
+        let path = crate::path_utils::rel_path_string(file);
+        let cached = self.store_context.store.admit_cached_selected_content(
+            owner,
+            &path,
+            oid,
+            &ResolutionContentInput::Parsed {
+                content_oid: oid,
+                semantic_language: Language::Rust,
+            },
+            cancellation,
+        )?;
+        match cached {
+            ResolutionContentPublicationOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingBlob { .. }
+                | SelectedResolutionUnavailable::MissingInterior { .. }
+                | SelectedResolutionUnavailable::IncompleteInterior { .. }
+                | SelectedResolutionUnavailable::IncompleteParsedBlob { .. },
+            ) => {}
+            outcome => return Ok(outcome),
+        }
+        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let Some(state) = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)
+        else {
+            return Ok(ResolutionContentPublicationOutcome::Unavailable(
+                SelectedResolutionUnavailable::IncompleteParsedBlob {
+                    storage_language: owner.lang.clone(),
+                    persisted_relative_path: path,
+                },
+            ));
+        };
+        self.publish_selected_native_file_state(owner, file, oid, Arc::new(state), cancellation)
     }
 
     fn capture_relational_workspace_snapshots(&self) -> (Arc<WorkspaceSnapshots>, bool) {
@@ -10606,57 +11994,6 @@ where
         grouped
     }
 
-    /// The file-scoped form of [`Self::lookup_declarations_by_identifier`].
-    /// The persisted seek is narrowed by the live blob; the existing dirty and
-    /// non-persisted merges retain the workspace lookup's membership rules.
-    pub(crate) fn lookup_declarations_by_identifier_in_file(
-        &self,
-        file: &ProjectFile,
-        identifier: &str,
-    ) -> BTreeSet<CodeUnit> {
-        if !self.workspace_declaration_identities_authoritative() {
-            return BTreeSet::new();
-        }
-        let Some((storage_key, _generation)) = self.storage_key_and_generation(file) else {
-            return BTreeSet::new();
-        };
-        let Some(blob_oid) = self.resolve_live_oid_for_file(file) else {
-            return BTreeSet::new();
-        };
-        let rows = self
-            .store_query_or_record(
-                |sink| {
-                    sink.push(self.file_read_key(file, blob_oid));
-                    sink.push(ReadKey::index(
-                        IndexFamily::DefinitionIdentifier,
-                        identifier,
-                    ));
-                },
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_identifier_for_blob(
-                        &storage_key,
-                        self.store_context.generations.as_ref(),
-                        blob_oid,
-                        identifier,
-                    ),
-                format!("querying file-scoped declarations by identifier `{identifier}`"),
-            )
-            .unwrap_or_default();
-        let mut matches = self
-            .resolve_candidate_rows(rows)
-            .into_iter()
-            .filter(|unit| unit.source() == file)
-            .collect::<BTreeSet<_>>();
-        let keep = |unit: &CodeUnit| unit.source() == file && unit.identifier() == identifier;
-        matches.extend(self.dirty_units_matching(true, keep));
-        matches.extend(
-            self.sql_nonpersisted_workspace_declarations_vec_matching(keep)
-                .unwrap_or_default(),
-        );
-        matches
-    }
-
     pub(crate) fn lookup_declarations_by_identifier_limited(
         &self,
         identifier: &str,
@@ -10694,80 +12031,6 @@ where
             |unit| unit.identifier() == identifier,
             continue_query,
         )
-    }
-
-    pub(crate) fn lookup_declarations_by_identifier_in_file_limited(
-        &self,
-        file: &ProjectFile,
-        identifier: &str,
-        limit: usize,
-        mut continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        if !self.workspace_declaration_identities_authoritative() {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        }
-        if limit == 0 || !continue_query() {
-            return LimitedQueryRows::incomplete(Vec::new(), 0);
-        }
-        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        };
-        let Some(blob_oid) = self.resolve_live_oid_for_file(file) else {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        };
-        let generations = HashMap::from_iter([(storage_key.clone(), generation)]);
-        let persisted = self
-            .store_query_or_record(
-                |sink| {
-                    sink.push(self.file_read_key(file, blob_oid));
-                    sink.push(ReadKey::index(
-                        IndexFamily::DefinitionIdentifier,
-                        identifier,
-                    ));
-                },
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_identifier_for_blob_limited(
-                        &storage_key,
-                        &generations,
-                        blob_oid,
-                        identifier,
-                        limit,
-                    ),
-                format!("querying bounded file-scoped declarations by identifier `{identifier}`"),
-            )
-            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
-        let mut inspected = persisted.inspected;
-        if !persisted.complete || inspected >= limit || !continue_query() {
-            return LimitedQueryRows::incomplete(Vec::new(), inspected);
-        }
-
-        let resolved = self.resolve_candidate_rows_limited(
-            persisted.rows,
-            limit - inspected,
-            &mut continue_query,
-        );
-        inspected = inspected.saturating_add(resolved.inspected);
-        if !resolved.complete || inspected >= limit {
-            return LimitedQueryRows::incomplete(Vec::new(), inspected);
-        }
-        let mut matches = resolved
-            .rows
-            .into_iter()
-            .filter(|unit| unit.source() == file)
-            .collect::<BTreeSet<_>>();
-        let dirty = self.dirty_units_matching_limited(
-            true,
-            limit - inspected,
-            |unit| unit.source() == file && unit.identifier() == identifier,
-            &mut continue_query,
-        );
-        inspected = inspected.saturating_add(dirty.inspected);
-        if !dirty.complete {
-            return LimitedQueryRows::incomplete(Vec::new(), inspected);
-        }
-        matches.extend(dirty.rows);
-        LimitedQueryRows::complete(matches.into_iter().collect(), inspected)
     }
 
     pub(crate) fn lookup_non_module_declarations_by_identifier_limited(
@@ -11896,18 +13159,432 @@ where
         retained.to_vec()
     }
 
+    /// Return a complete source-owned import set, preserving the distinction
+    /// between a witnessed import-free file and unavailable canonical facts.
+    /// This path deliberately stops at the indexed store: the legacy reader's
+    /// source/fetch reparsing fallback would turn an unavailable publication
+    /// into an apparent empty set.
+    pub(crate) fn import_info_of_checked(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        if !self.adapter.produces_canonical_source_facts() {
+            return None;
+        }
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return state.source_facts.as_ref().map(|_| state.imports.clone());
+        }
+        if let Some(retained) = self.import_info_store_get_checked(&key) {
+            return Some(retained.to_vec());
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.record_file_tier_access(InformationTier::Imports, file);
+        let facts = self
+            .store_query_or_record(
+                |sink| sink.push(self.file_read_key(file, oid)),
+                self.store_context
+                    .store
+                    .hydrate_canonical_import_facts_by_key(
+                        &[(file.clone(), oid, storage_key.to_string())],
+                        self.store_context.generations.as_ref(),
+                        self.adapter.as_ref(),
+                    ),
+                format!("hydrating canonical imports for `{file}`"),
+            )
+            .and_then(|mut facts| facts.remove(file))?;
+        let retained: Arc<[ImportInfo]> = Arc::from(facts.imports);
+        self.import_info_store_retain_canonical(key, Arc::clone(&retained));
+        Some(retained.to_vec())
+    }
+
+    pub(crate) fn canonical_source_read<'a>(
+        &'a self,
+        file: &'a ProjectFile,
+        storage_language: &str,
+    ) -> Option<CanonicalSourceRead<'a, A>> {
+        let generation = self.language_generation(storage_language)?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        Some(CanonicalSourceRead {
+            analyzer: self,
+            file,
+            generation,
+            oid,
+        })
+    }
+
+    pub(crate) fn canonical_php_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
+        >,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>> {
+        if !keep_going() {
+            return None;
+        }
+        let generation = self.language_generation("php")?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_read_key(self.file_read_key(file, oid));
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.retained_file_state(file, &key)
+            && let Some(source) = state.source_facts.as_ref()
+        {
+            let facts = source.php.as_ref()?;
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in &state.source_declaration_units {
+                if !keep_going() {
+                    return None;
+                }
+                declaration_units
+                    .entry(*declaration)
+                    .or_default()
+                    .push(unit.clone());
+            }
+            let facts = Arc::new(brokk_bifrost_php::source_facts::PhpFileSourceFacts {
+                source: source.occurrences.clone(),
+                imports: source.imports.clone(),
+                facts: facts.clone(),
+                declaration_units,
+            });
+            return keep_going().then_some(facts);
+        }
+        let cache_key = (generation, oid, file.clone());
+        if let Some(facts) = cache.get(&cache_key) {
+            return keep_going().then_some(facts);
+        }
+        let facts = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context.store.php_source_facts(
+                oid,
+                generation,
+                self.adapter.as_ref(),
+                file,
+                keep_going,
+            ),
+            format!("reading canonical PHP declaration facts for {file:?} ({oid})"),
+        )??;
+        let facts = Arc::new(facts);
+        if !keep_going() {
+            return None;
+        }
+        cache.insert(cache_key, Arc::clone(&facts));
+        Some(facts)
+    }
+
+    pub(crate) fn canonical_go_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>,
+        >,
+    ) -> Option<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>> {
+        let generation = self.language_generation("go")?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_read_key(self.file_read_key(file, oid));
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.retained_file_state(file, &key)
+            && let Some(source) = state.source_facts.as_ref()
+        {
+            let facts = source.go.as_ref()?;
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in &state.source_declaration_units {
+                declaration_units
+                    .entry(*declaration)
+                    .or_default()
+                    .push(unit.clone());
+            }
+            return Some(Arc::new(
+                brokk_bifrost_go::source_facts::GoFileSourceFacts {
+                    source: source.occurrences.clone(),
+                    facts: facts.clone(),
+                    declaration_units,
+                },
+            ));
+        }
+        let cache_key = (generation, oid, file.clone());
+        if let Some(facts) = cache.get(&cache_key) {
+            return Some(facts);
+        }
+        let facts = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context.store.go_source_facts(
+                oid,
+                generation,
+                self.adapter.as_ref(),
+                file,
+                &|| true,
+            ),
+            format!("reading canonical Go declaration facts for {file:?} ({oid})"),
+        )??;
+        let facts = Arc::new(facts);
+        cache.insert(cache_key, Arc::clone(&facts));
+        Some(facts)
+    }
+
+    pub(crate) fn canonical_cpp_source_facts(
+        &self,
+        file: &ProjectFile,
+        lang: &str,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile, String),
+            Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
+        >,
+    ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>> {
+        let generation = self.language_generation(lang)?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_read_key(self.file_read_key(file, oid));
+        let key = Self::transient_cache_key(oid, file);
+        // Ordinary store hydration deliberately omits canonical source families.
+        // Only a retained primary parse owns an in-memory source inventory.
+        if let Some(primary) = self.retained_file_state(file, &key)
+            && primary.source_facts.is_some()
+        {
+            let selected = if lang == self.adapter.storage_language_key_for_file(file) {
+                Some(&primary)
+            } else {
+                primary
+                    .additional_projections
+                    .iter()
+                    .find(|(key, _)| *key == lang)
+                    .map(|(_, state)| state)
+            };
+            // The primary retained parse owns its complete projection inventory.
+            let state = selected?;
+            let Some((source, facts)) = state
+                .source_facts
+                .as_ref()
+                .and_then(|source| source.cpp.as_ref().map(|facts| (source, facts)))
+            else {
+                self.record_store_error(StoreError::new(format!(
+                    "required retained C/C++ source facts unavailable for {file:?} ({oid}, {lang})"
+                )));
+                return None;
+            };
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in &state.source_declaration_units {
+                declaration_units
+                    .entry(*declaration)
+                    .or_default()
+                    .push(unit.clone());
+            }
+            return Some(Arc::new(
+                brokk_bifrost_cpp::source_facts::CppFileSourceFacts::new(
+                    source.occurrences.clone(),
+                    facts.clone(),
+                    declaration_units,
+                ),
+            ));
+        }
+        let cache_key = (generation, oid, file.clone(), lang.to_owned());
+        if let Some(facts) = cache.get(&cache_key) {
+            return Some(facts);
+        }
+        let facts = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context.store.cpp_source_facts(
+                oid,
+                generation,
+                lang,
+                self.adapter.as_ref(),
+                file,
+                &|| true,
+            ),
+            format!("reading canonical C/C++ declaration facts for {file:?} ({oid}, {lang})"),
+        )?;
+        let Some(facts) = facts else {
+            if lang != self.adapter.storage_language_key_for_file(file)
+                && !self.store_query_or_record(
+                    |sink| sink.push(self.file_read_key(file, oid)),
+                    self.store_context.store.contains_blob(oid, lang),
+                    format!(
+                        "checking C/C++ source projection ownership for {file:?} ({oid}, {lang})"
+                    ),
+                )?
+            {
+                // An optional dialect with no blob registration was never produced.
+                return None;
+            }
+            self.record_store_error(StoreError::new(format!(
+                "required C/C++ source publication unavailable for {file:?} ({oid}, {lang})"
+            )));
+            return None;
+        };
+        let facts = Arc::new(facts);
+        cache.insert(cache_key, Arc::clone(&facts));
+        Some(facts)
+    }
+
+    pub(crate) fn canonical_js_ts_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,
+        >,
+    ) -> Option<Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>> {
+        let language = self.adapter.storage_language_key_for_file(file);
+        let generation = self.language_generation(language)?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_read_key(self.file_read_key(file, oid));
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.retained_file_state(file, &key)
+            && let Some(source) = state.source_facts.as_ref()
+        {
+            let facts = source.js_ts.as_ref()?;
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in &state.source_declaration_units {
+                declaration_units
+                    .entry(*declaration)
+                    .or_default()
+                    .push(unit.clone());
+            }
+            return Some(Arc::new(
+                brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts {
+                    source: source.occurrences.clone(),
+                    imports: source.imports.clone(),
+                    facts: facts.clone(),
+                    declaration_units,
+                },
+            ));
+        }
+        let cache_key = (generation, oid, file.clone());
+        if let Some(facts) = cache.get(&cache_key) {
+            return Some(facts);
+        }
+        let facts = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context.store.js_ts_source_facts(
+                oid,
+                generation,
+                self.adapter.as_ref(),
+                file,
+                &|| true,
+            ),
+            format!("reading canonical JS/TS source facts for {file:?} ({oid})"),
+        )??;
+        let facts = Arc::new(facts);
+        cache.insert(cache_key, Arc::clone(&facts));
+        Some(facts)
+    }
+
+    pub(crate) fn canonical_python_source_facts(
+        &self,
+        file: &ProjectFile,
+        cache: &moka::sync::Cache<
+            (GenerationId, Oid, ProjectFile),
+            Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>,
+        >,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>> {
+        if !keep_going() {
+            return None;
+        }
+        let generation = self.language_generation("python")?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_read_key(self.file_read_key(file, oid));
+        let key = Self::transient_cache_key(oid, file);
+        let cache_key = (generation, oid, file.clone());
+        if let Some(state) = self.retained_file_state(file, &key)
+            && let Some(source) = state.source_facts.as_ref()
+        {
+            if !keep_going() {
+                return None;
+            }
+            let facts = source.python.as_ref()?;
+            if !keep_going() {
+                return None;
+            }
+            if let Some(facts) = cache.get(&cache_key) {
+                return keep_going().then_some(facts);
+            }
+            let mounted = Arc::new(brokk_bifrost_python::source_facts::PythonFileSourceFacts {
+                occurrences: source.occurrences.clone(),
+                facts: facts.clone(),
+            });
+            if !keep_going() {
+                return None;
+            }
+            cache.insert(cache_key, Arc::clone(&mounted));
+            return Some(mounted);
+        }
+        if !keep_going() {
+            return None;
+        }
+        if let Some(facts) = cache.get(&cache_key) {
+            if !keep_going() {
+                return None;
+            }
+            return Some(facts);
+        }
+        let facts = self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context
+                .store
+                .python_source_facts(oid, generation, file, keep_going),
+            format!("reading canonical Python declaration facts for {file:?} ({oid})"),
+        )??;
+        if !keep_going() {
+            return None;
+        }
+        let facts = Arc::new(facts);
+        cache.insert(cache_key, Arc::clone(&facts));
+        if !keep_going() {
+            return None;
+        }
+        Some(facts)
+    }
+
     fn import_info_store_get(&self, key: &FileStateCacheKey) -> Option<Arc<[ImportInfo]>> {
         self.import_info_store
             .lock()
             .expect("import info store mutex poisoned")
             .get(key)
+            .map(|entry| entry.imports)
+    }
+
+    fn import_info_store_get_checked(&self, key: &FileStateCacheKey) -> Option<Arc<[ImportInfo]>> {
+        self.import_info_store
+            .lock()
+            .expect("import info store mutex poisoned")
+            .get(key)
+            .filter(|entry| entry.canonical)
+            .map(|entry| entry.imports)
     }
 
     fn import_info_store_retain(&self, key: FileStateCacheKey, imports: Arc<[ImportInfo]>) {
         self.import_info_store
             .lock()
             .expect("import info store mutex poisoned")
-            .retain(key, imports);
+            .retain(
+                key,
+                RetainedImportInfos {
+                    imports,
+                    canonical: false,
+                },
+            );
+    }
+
+    fn import_info_store_retain_canonical(
+        &self,
+        key: FileStateCacheKey,
+        imports: Arc<[ImportInfo]>,
+    ) {
+        self.import_info_store
+            .lock()
+            .expect("import info store mutex poisoned")
+            .retain(
+                key,
+                RetainedImportInfos {
+                    imports,
+                    canonical: true,
+                },
+            );
     }
 
     fn import_info_for_oid_limited(
@@ -12587,9 +14264,32 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return Vec::new();
         }
-        self.fetch_file_state(code_unit.source())
-            .and_then(|state| state.signature_metadata.get(code_unit).cloned())
-            .unwrap_or_default()
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return Vec::new();
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.retained_file_state(file, &key) {
+            return projection_rows_for_unit(&state.signature_metadata, code_unit)
+                .unwrap_or_default()
+                .to_vec();
+        }
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return Vec::new();
+        };
+        // This Vec API has no truncation witness. Do not route through the
+        // bounded reader: its byte budget can truncate even with usize::MAX.
+        self.store_query_or_record(
+            |sink| sink.push(self.file_read_key(file, oid)),
+            self.store_context.store.signature_metadata_for_unit(
+                oid,
+                &storage_key,
+                generation,
+                code_unit,
+            ),
+            format!("querying signature metadata for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_default()
     }
 
     pub(crate) fn signature_metadata_limited(
@@ -12636,19 +14336,7 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
         let key = Self::transient_cache_key(oid, file);
-        if let Some(state) = self.state.dirty_file_state(&key) {
-            return limited_projection_rows(
-                projection_rows_for_unit(&state.signature_metadata, code_unit),
-                limit,
-            );
-        }
-        if let Some(state) = self.source_snapshot_file_state(file) {
-            return limited_projection_rows(
-                projection_rows_for_unit(&state.signature_metadata, code_unit),
-                limit,
-            );
-        }
-        if let Some(state) = self.query_file_state_snapshot(&key) {
+        if let Some(state) = self.retained_file_state(file, &key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.signature_metadata, code_unit),
                 limit,
@@ -13024,24 +14712,45 @@ fn merge_dirty_relational_value<A: LanguageAdapter>(
                     .chain(&state.definition_lookup_units)
                     .filter(|unit| unit_matches_relational_request(adapter, unit, request))
                 {
-                    let signatures = state.signatures.get(unit);
-                    let metadata = state.signature_metadata.get(unit);
-                    let count = signatures
-                        .map_or(0, Vec::len)
-                        .max(metadata.map_or(0, Vec::len));
-                    for ordinal in 0..count {
-                        let signature = signatures
-                            .and_then(|values| values.get(ordinal))
-                            .cloned()
-                            .or_else(|| unit.signature().map(str::to_string));
-                        let Some(signature) = signature else {
-                            continue;
-                        };
+                    let signatures = state
+                        .signatures
+                        .get(unit)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let metadata = state
+                        .signature_metadata
+                        .get(unit)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let signature_ordinals = state
+                        .signature_metadata_signature_ordinals
+                        .get(unit)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    assert_eq!(
+                        metadata.len(),
+                        signature_ordinals.len(),
+                        "newly constructed metadata must have every captured signature coordinate"
+                    );
+                    let mut paired = vec![false; signatures.len()];
+                    for (metadata, &signature_ordinal) in metadata.iter().zip(signature_ordinals) {
+                        paired[signature_ordinal] = true;
                         facts.push(RelationalCallableFact {
                             declaration: unit.clone(),
-                            signature_ordinal: ordinal,
-                            signature,
-                            metadata: metadata.and_then(|values| values.get(ordinal)).cloned(),
+                            signature_ordinal,
+                            signature: signatures[signature_ordinal].clone(),
+                            metadata: Some(metadata.clone()),
+                        });
+                    }
+                    for (signature_ordinal, signature) in signatures.iter().enumerate() {
+                        if paired[signature_ordinal] {
+                            continue;
+                        }
+                        facts.push(RelationalCallableFact {
+                            declaration: unit.clone(),
+                            signature_ordinal,
+                            signature: signature.clone(),
+                            metadata: None,
                         });
                     }
                 }
@@ -13587,6 +15296,37 @@ where
             .unwrap_or_default()
     }
 
+    /// [`Self::declarations`] as a membership test: the same file state and
+    /// the same filter, without cloning and sorting every declaration of the
+    /// file. The Rust hierarchy asks it once per owner-relation check, and a
+    /// generated file with tens of thousands of declarations made that copy
+    /// most of a whole-graph request's time.
+    fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
+        self.workspace_declaration_identities_authoritative()
+            && !unit.is_file_scope()
+            && self
+                .fetch_file_state(file)
+                .or_else(|| self.fetch_file_state_from_current_source(file))
+                .is_some_and(|state| state.declarations.contains(unit))
+    }
+
+    fn declarations_named(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
+        self.fetch_file_state(file)
+            .or_else(|| self.fetch_file_state_from_current_source(file))
+            .map(|state| {
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope() && unit.identifier() == identifier)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// One bulk hydration per `BULK_FILE_STATE_QUERY_LIMIT` files instead of
     /// one per file, over the same file states `Self::declarations` reads.
     ///
@@ -13889,6 +15629,26 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        let mut inventory = crate::analyzer::i_analyzer::project_source_file_inventory(self);
+        let live = self.live_snapshot();
+        for file in live.all_paths() {
+            inventory.inspected = inventory.inspected.saturating_add(1);
+            let Some(file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if self.adapter_owns_file(&file, &live)
+                && (!inventory.complete || crate::analyzer::common::has_unclaimed_extension(&file))
+                && (file.exists() || self.project.has_overlay(&file))
+            {
+                inventory.rows.push(file);
+            }
+        }
+        inventory.rows.sort();
+        inventory.rows.dedup();
+        inventory
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -13998,6 +15758,9 @@ where
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        if let Some(error) = self.state.workspace_package_inventory_error.clone() {
+            context.record_store_error(error);
+        }
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
         let registered = cache.begin(context);
@@ -14118,12 +15881,54 @@ where
         if changed_files.is_empty() {
             return self.clone();
         }
-        if changed_files
-            .iter()
-            .any(|file| self.adapter.workspace_package_identity_input(file))
-        {
-            return self.update_all();
+        // A changed package-identity input rekeys declarations in files it did
+        // not change, which only a full rebuild reaches. An edit that keeps its
+        // identity digest rekeys nothing; it only moves the byte baseline and,
+        // when the input is also selected configuration, publishes its new
+        // bytes at the next revision. Created, deleted and unreadable inputs
+        // change which files an input governs, so they rebuild too, as does any
+        // other configuration input. Like the build, this reads the disk
+        // generation, not a request overlay.
+        let mut identity_inputs = Vec::new();
+        let mut configuration_inputs = Vec::new();
+        for file in changed_files {
+            let configuration = Self::workspace_configuration_input(self.adapter.as_ref(), file);
+            if !self.adapter.workspace_package_identity_input(file) {
+                if configuration {
+                    return self.update_all();
+                }
+                continue;
+            }
+            let Ok(source) = std::fs::read(file.abs_path()) else {
+                return self.update_all();
+            };
+            let digest = PackageIdentityInputDigest::new(self.adapter.as_ref(), &source);
+            let previous = self
+                .state
+                .workspace_package_identity_input_digests
+                .get(file);
+            if digest.identity.is_none()
+                || previous.is_none_or(|previous| previous.identity != digest.identity)
+            {
+                return self.update_all();
+            }
+            identity_inputs.push((file.clone(), digest));
+            if configuration {
+                // A generation that failed to capture configuration has no
+                // baseline row to replace.
+                if self.state.workspace_configuration_digest.is_none() {
+                    return self.update_all();
+                }
+                configuration_inputs.push(WorkspaceConfigurationInput::new(
+                    crate::path_utils::rel_path_string(file),
+                    source.into_boxed_slice(),
+                ));
+            }
         }
+        let unchanged_meaning = identity_inputs
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<BTreeSet<_>>();
 
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(
@@ -14194,8 +15999,14 @@ where
         );
         state.workspace_package_inventory_complete &=
             self.state.workspace_package_inventory_complete;
+        state.workspace_package_inventory_error =
+            self.state.workspace_package_inventory_error.clone();
         state.workspace_package_identity_input_digests =
             self.state.workspace_package_identity_input_digests.clone();
+        state.workspace_configuration_digest = self.state.workspace_configuration_digest;
+        state
+            .workspace_package_identity_input_digests
+            .extend(identity_inputs);
         if new_claimable_file_appeared {
             claim_roots.extend(
                 live.all_paths()
@@ -14235,9 +16046,77 @@ where
             .dirty_path_symbol_rows
             .lock()
             .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
+        for input in configuration_inputs {
+            let storage_languages = self
+                .adapter
+                .storage_language_keys()
+                .into_iter()
+                .map(|(lang, _)| lang)
+                .collect::<Vec<_>>();
+            let generations = storage_languages
+                .iter()
+                .map(|lang| (lang.clone(), store_context.generations[lang]))
+                .collect::<HashMap<_, _>>();
+            let path = input.relative_path().to_owned();
+            match store_context.store.replace_configuration_input(
+                &store_context.workspace_id,
+                &relational_workspace_snapshots,
+                &storage_languages,
+                &generations,
+                input,
+            ) {
+                Ok((snapshots, digest)) => {
+                    relational_workspace_snapshots.extend(snapshots);
+                    state.workspace_configuration_digest = Some(digest);
+                }
+                Err(error) => {
+                    state.record_workspace_package_inventory_error(
+                        error.context(format!("configuration input {path:?} after update")),
+                    );
+                }
+            }
+        }
         store_context
             .gc
             .schedule(self.project.root(), Arc::clone(&store_context.store));
+        // An incremental update knows which paths moved, and the crate rows
+        // know which crates place them, so this reconcile derives those and
+        // their surface-changed dependents instead of every crate in the
+        // workspace. The full pass still runs when the change can move crate
+        // membership itself.
+        if let Some(snapshot) = relational_workspace_snapshots.get("rust")
+            && self.adapter.language() == Language::Rust
+        {
+            // A manifest whose meaning did not change places no crate
+            // differently, so it does not send the reconcile to every crate.
+            let changed_paths = workspace_paths_to_refresh
+                .iter()
+                .filter(|file| !unchanged_meaning.contains(*file))
+                .map(crate::path_utils::rel_path_string)
+                .collect::<Vec<_>>();
+            let previous = self.selected_workspace_snapshots();
+            let reconciled = match previous.get("rust") {
+                Some(previous) => store_context.store.reconcile_rust_crates_after_changes(
+                    previous,
+                    snapshot,
+                    &changed_paths,
+                ),
+                // No crate rows were reconciled for this workspace before.
+                None => store_context.store.reconcile_rust_crates(snapshot),
+            };
+            if let Err(error) = reconciled {
+                state.mark_workspace_package_inventory_incomplete();
+                eprintln!("Rust crate reconciliation failed after update: {error}");
+            }
+        }
+        if let Err(error) = store_context
+            .store
+            .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
+        {
+            state.record_workspace_package_inventory_error(
+                error.context("JVM context reconciliation after update"),
+            );
+        }
         let relational_workspace_snapshots = Arc::new(relational_workspace_snapshots);
         Self::from_state(
             Arc::clone(&self.project),
@@ -14255,6 +16134,8 @@ where
     }
 
     fn update_all(&self) -> Self {
+        #[cfg(test)]
+        count_full_update_for_test(self.project.root());
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(
             self.store_context
@@ -14279,6 +16160,21 @@ where
             self.capture_relational_workspace_snapshots();
         if !snapshots_complete {
             state.mark_workspace_package_inventory_incomplete();
+        }
+        if let Some(snapshot) = relational_workspace_snapshots.get("rust")
+            && self.adapter.language() == Language::Rust
+            && let Err(error) = store_context.store.reconcile_rust_crates(snapshot)
+        {
+            state.mark_workspace_package_inventory_incomplete();
+            eprintln!("Rust crate reconciliation failed after full update: {error}");
+        }
+        if let Err(error) = store_context
+            .store
+            .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
+        {
+            state.record_workspace_package_inventory_error(
+                error.context("JVM context reconciliation after full update"),
+            );
         }
         Self::from_state(
             Arc::clone(&self.project),
@@ -14727,9 +16623,9 @@ pub(crate) fn enclosing_code_unit_from_declaration_ranges(
 
 /// The producer side of the read ledger's per-file keys for this language.
 ///
-/// Every key here is produced by the same code the publish path runs, never by
-/// a second interpretation of a name: `PreparedParsedBlob::index_keys` reads
-/// the rows `write_prepared_blob_rows_tx` writes, the supertype keys are the
+/// Every key here follows the structures the publish path uses, never a second
+/// interpretation of a name: `file_state_index_keys` uses the writer's unit
+/// selection and canonical import projections, the supertype keys are the
 /// declarations the file state actually recorded supertypes for,
 /// `path_symbol_row` mints the path-symbol row the workspace projection
 /// persists, and the package names come from `workspace_snapshot_relations`
@@ -14823,21 +16719,23 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
     ) -> Option<Vec<(crate::analyzer::read_ledger::IndexFamily, Box<[u8]>)>> {
         use crate::analyzer::read_ledger::IndexFamily;
 
+        if self.store_context.build_abort.cancellation().is_cancelled()
+            || !state.parse_complete
+            || state
+                .additional_projections
+                .iter()
+                .any(|(_, projection)| !projection.parse_complete)
+        {
+            return None;
+        }
         let storage_key = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(storage_key).copied()?;
-        let prepared = crate::analyzer::store::AnalyzerStore::prepare_parsed_blob(
-            blob,
-            storage_key,
-            generation,
-            self.adapter.as_ref(),
-            Arc::clone(&state),
-        )
-        .ok()?;
-
         let mut keys = Vec::new();
-        prepared.index_keys(self.adapter.as_ref(), &mut |family, key| {
-            keys.push((family, Box::from(key)))
-        });
+        crate::analyzer::store::file_state_index_keys(
+            self.adapter.as_ref(),
+            &state,
+            &mut |family, key| keys.push((family, Box::from(key))),
+        );
         for unit in state.raw_supertypes.keys() {
             keys.push((IndexFamily::Supertype, Box::from(unit.fq_name().as_bytes())));
         }
@@ -14891,6 +16789,10 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
 }
 
 #[cfg(test)]
+#[path = "tree_sitter_resolution_producer_tests.rs"]
+mod resolution_producer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitType;
@@ -14918,6 +16820,15 @@ mod tests {
             oid: Oid::zero(),
             rel_path: PathBuf::from(name),
         }
+    }
+
+    fn singleton_generation_map(
+        language: &str,
+        generation: GenerationId,
+    ) -> Arc<HashMap<String, GenerationId>> {
+        let mut generations = HashMap::default();
+        generations.insert(language.to_owned(), generation);
+        Arc::new(generations)
     }
 
     #[test]
@@ -15332,6 +17243,136 @@ mod tests {
     }
 
     #[test]
+    fn relational_callable_pairs_preserve_shared_labels_and_synthetic_metadata() {
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+        let source = "interface Dual { void run() {} }\nclass Dual { void run() {} Object make() { return new Object() { void inside() {} }; } }\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Dual.java", source)
+            .build();
+        let file = fixture.file("Dual.java");
+        let mut parser = Parser::new();
+        parser.set_language(&JavaAdapter.parser_language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let parsed = JavaAdapter.parse_file(&file, source, &tree);
+        let state = TreeSitterAnalyzer::<JavaAdapter>::file_state_from_parsed(
+            source.to_owned(),
+            parsed,
+            false,
+            None,
+            true,
+        );
+        let run = state
+            .signature_metadata
+            .keys()
+            .find(|unit| unit.is_function() && unit.identifier() == "run")
+            .unwrap()
+            .clone();
+        assert_eq!(state.signature_metadata[&run].len(), 2);
+        assert_eq!(state.signatures[&run].len(), 1);
+        assert_eq!(
+            state.signature_metadata_signature_ordinals[&run],
+            vec![0, 0]
+        );
+        let synthetic = state
+            .signature_metadata
+            .keys()
+            .find(|unit| unit.is_synthetic() && unit.is_class())
+            .unwrap()
+            .clone();
+        assert!(
+            state
+                .source_declaration_metadata
+                .iter()
+                .all(|link| link.unit != synthetic)
+        );
+
+        let state = Arc::new(state);
+        let requests = [run.clone(), synthetic.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, unit)| RelationalDefinitionRequest {
+                ordinal,
+                language_scope: DefinitionLanguageScope::Language(Language::Java),
+                name: RelationalName::stable(unit.fq().clone()),
+                query: RelationalDefinitionQuery::CallableFacts,
+            })
+            .collect::<Vec<_>>();
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        let outcome = analyzer.batch(&requests, &CancellationToken::new());
+        let RelationalBatchOutcome::Complete(results) = outcome else {
+            panic!("paired callable query must complete: {outcome:?}");
+        };
+        for (request, result) in requests.iter().zip(&results) {
+            let mut dirty = RelationalDefinitionValue::CallableFacts(Vec::new());
+            merge_dirty_relational_value(
+                &JavaAdapter,
+                request,
+                std::slice::from_ref(&state),
+                &HashSet::from_iter([file.clone()]),
+                &mut dirty,
+            );
+            assert_eq!(
+                result.value, dirty,
+                "persisted and producer-owned callable pairs must agree"
+            );
+        }
+        let RelationalDefinitionValue::CallableFacts(run_facts) = &results[0].value else {
+            panic!("run must return callable facts");
+        };
+        assert_eq!(run_facts.len(), 2);
+        assert!(
+            run_facts
+                .iter()
+                .all(|fact| fact.signature_ordinal == 0 && fact.metadata.is_some())
+        );
+        let RelationalDefinitionValue::CallableFacts(synthetic_facts) = &results[1].value else {
+            panic!("synthetic class must retain its metadata");
+        };
+        assert_eq!(synthetic_facts.len(), 1);
+        assert_eq!(synthetic_facts[0].declaration, synthetic);
+        assert!(synthetic_facts[0].metadata.is_some());
+
+        let mut divergent = Arc::into_inner(state).expect("test owns its only state handle");
+        divergent
+            .signatures
+            .get_mut(&run)
+            .unwrap()
+            .insert(0, "plain signature".to_owned());
+        for ordinal in divergent
+            .signature_metadata_signature_ordinals
+            .get_mut(&run)
+            .unwrap()
+        {
+            *ordinal += 1;
+        }
+        let expected_metadata = divergent.signature_metadata[&run].clone();
+        let mut dirty = RelationalDefinitionValue::CallableFacts(Vec::new());
+        merge_dirty_relational_value(
+            &JavaAdapter,
+            &requests[0],
+            &[Arc::new(divergent)],
+            &HashSet::from_iter([file]),
+            &mut dirty,
+        );
+        let RelationalDefinitionValue::CallableFacts(facts) = dirty else {
+            panic!("dirty callable query must retain its shape");
+        };
+        assert_eq!(facts.len(), 3);
+        assert_eq!(facts[0].signature_ordinal, 0);
+        assert_eq!(facts[0].signature, "plain signature");
+        assert!(facts[0].metadata.is_none());
+        for (fact, expected) in facts[1..].iter().zip(expected_metadata) {
+            assert_eq!(fact.signature_ordinal, 1);
+            assert_eq!(fact.signature, "void run()");
+            assert_eq!(fact.metadata, Some(expected));
+        }
+    }
+
+    #[test]
     fn relational_batch_executes_every_supported_view_shape() {
         use brokk_bifrost_core::analyzer::{
             DefinitionLanguageScope, PackageRelationKind, PackageRelationValue,
@@ -15674,16 +17715,22 @@ mod tests {
     #[derive(Clone)]
     struct CountingOverlayProject {
         delegate: TestProject,
+        listing_failed: Arc<std::sync::atomic::AtomicBool>,
         source: Arc<RwLock<(String, u64)>>,
         reads: Arc<AtomicUsize>,
+        replacement: Arc<RwLock<Option<String>>>,
+        reads_after_arm: Arc<AtomicUsize>,
     }
 
     impl CountingOverlayProject {
         fn new(root: impl Into<std::path::PathBuf>, source: impl Into<String>) -> Self {
             Self {
                 delegate: TestProject::new(root, Language::Rust),
+                listing_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 source: Arc::new(RwLock::new((source.into(), 1))),
                 reads: Arc::new(AtomicUsize::new(0)),
+                replacement: Arc::new(RwLock::new(None)),
+                reads_after_arm: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -15703,6 +17750,14 @@ mod tests {
         fn read_count(&self) -> usize {
             self.reads.load(Ordering::Relaxed)
         }
+
+        fn arm_source_swap(&self, replacement: impl Into<String>) {
+            *self
+                .replacement
+                .write()
+                .expect("replacement source lock poisoned") = Some(replacement.into());
+            self.reads_after_arm.store(0, Ordering::Release);
+        }
     }
 
     impl Project for CountingOverlayProject {
@@ -15715,6 +17770,11 @@ mod tests {
         }
 
         fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            if self.listing_failed.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other(
+                    "injected source inventory listing failure",
+                ));
+            }
             self.delegate.all_files()
         }
 
@@ -15728,6 +17788,15 @@ mod tests {
 
         fn read_source(&self, _file: &ProjectFile) -> std::io::Result<String> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(replacement) = self
+                .replacement
+                .read()
+                .expect("replacement source lock poisoned")
+                .as_ref()
+                && self.reads_after_arm.fetch_add(1, Ordering::AcqRel) > 0
+            {
+                return Ok(replacement.clone());
+            }
             Ok(self.source.read().expect("source lock poisoned").0.clone())
         }
 
@@ -15736,6 +17805,18 @@ mod tests {
             _file: &ProjectFile,
         ) -> std::io::Result<ProjectSourceSnapshot> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(replacement) = self
+                .replacement
+                .read()
+                .expect("replacement source lock poisoned")
+                .as_ref()
+                && self.reads_after_arm.fetch_add(1, Ordering::AcqRel) > 0
+            {
+                return Ok(ProjectSourceSnapshot::overlay(
+                    replacement.clone(),
+                    OverlayRevision::from_monotonic_counter(2),
+                ));
+            }
             let current = self.source.read().expect("source lock poisoned");
             Ok(ProjectSourceSnapshot::overlay(
                 current.0.clone(),
@@ -15745,6 +17826,73 @@ mod tests {
 
         fn has_overlay(&self, _file: &ProjectFile) -> bool {
             true
+        }
+    }
+
+    /// Keeps the workspace listing stable while removing a configuration file
+    /// immediately before a generation's source reconciliation. This models a
+    /// manifest disappearing after the immutable inventory was captured,
+    /// without depending on platform-specific permission behavior.
+    #[derive(Clone)]
+    struct ConfigurationCaptureFailureProject {
+        delegate: TestProject,
+        files: BTreeSet<ProjectFile>,
+        manifest: ProjectFile,
+        fail_next_capture: Arc<AtomicBool>,
+    }
+
+    impl ConfigurationCaptureFailureProject {
+        fn new(delegate: TestProject, manifest: ProjectFile) -> Self {
+            let files = delegate
+                .all_files()
+                .expect("configuration fixture workspace listing");
+            Self {
+                delegate,
+                files,
+                manifest,
+                fail_next_capture: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_capture(&self) {
+            assert!(
+                !self.fail_next_capture.swap(true, Ordering::AcqRel),
+                "only one configuration capture failure may be armed"
+            );
+        }
+    }
+
+    impl Project for ConfigurationCaptureFailureProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            Ok(self.files.clone())
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files_from(&self.files, language)
+        }
+
+        fn analyzable_files_from(
+            &self,
+            files: &BTreeSet<ProjectFile>,
+            language: Language,
+        ) -> std::io::Result<BTreeSet<ProjectFile>> {
+            if self.fail_next_capture.swap(false, Ordering::AcqRel) {
+                std::fs::remove_file(self.manifest.abs_path())
+                    .expect("armed configuration capture failure should remove manifest");
+            }
+            self.delegate.analyzable_files_from(files, language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
         }
     }
 
@@ -16157,7 +18305,16 @@ mod tests {
         file.write(indexed).expect("indexed Java source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
-        assert!(analyzer.indexed_source_matches(&file, indexed));
+        analyzer.blob_oids.entries.invalidate(&file);
+        analyzer.reset_blob_hash_count_for_test();
+        for _ in 0..16 {
+            assert!(analyzer.indexed_source_matches(&file, indexed));
+        }
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            1,
+            "repeated checks of unchanged indexed source should hash its blob once"
+        );
         let indexed_identity = analyzer.language_content_identity();
 
         file.write(later).expect("later Java source");
@@ -16175,6 +18332,15 @@ mod tests {
         assert!(
             !analyzer.indexed_source_matches(&file, later),
             "a refreshed live projection must not redefine what this generation indexed"
+        );
+        let hashes_after_edit = analyzer.blob_hash_count_for_test();
+        for _ in 0..16 {
+            assert!(!analyzer.indexed_source_matches(&file, later));
+        }
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            hashes_after_edit,
+            "repeated checks must reuse the changed source identity too"
         );
         assert_eq!(
             analyzer.language_content_identity(),
@@ -16469,19 +18635,32 @@ mod tests {
 
     #[test]
     fn preparation_failure_reaches_terminal_persist_progress_and_dirty_fallback() {
+        const SHARED_SOURCE: &str = "int shared;\n";
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
-        for name in ["GoodA", "Bad", "GoodB"] {
-            let file = temp_file(&root, &format!("src/{name}.java"));
-            file.write(format!("package demo; class {name} {{}}\n"))
-                .expect("Java source");
+        let bad = temp_file(&root, "src/Bad.h");
+        bad.write(SHARED_SOURCE).expect("C++ header");
+        let seed = temp_file(&root, "src/Seed.c");
+        seed.write(SHARED_SOURCE).expect("C source");
+        let seed_project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Cpp));
+        let seed_analyzer = TreeSitterAnalyzer::new(seed_project, CppAdapter);
+        let store = Arc::clone(&seed_analyzer.store_context.store);
+        let shared_oid = Oid::hash_object(ObjectType::Blob, SHARED_SOURCE.as_bytes()).unwrap();
+        assert!(store.contains_parsed_blob(shared_oid, "cpp").unwrap());
+        assert!(store.contains_parsed_blob(shared_oid, "cpp:c").unwrap());
+
+        std::fs::remove_file(seed.abs_path()).expect("remove independent C owner");
+        for name in ["GoodA", "GoodB"] {
+            let file = temp_file(&root, &format!("src/{name}.h"));
+            file.write(format!("int {name};\n")).expect("C++ header");
         }
-        let bad = ProjectFile::new(root.clone(), "src/Bad.java");
+        store
+            .ensure_language_epoch_value("cpp:c", "stale-optional-preparation-failure")
+            .expect("advance the optional projection generation");
         *PREPARATION_FAILURE_PATH
             .lock()
             .expect("preparation failure path mutex poisoned") = Some(bad.abs_path().to_path_buf());
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
-        let store_context = ephemeral_store_context(project.as_ref()).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Cpp));
         let events = Arc::new(Mutex::new(Vec::new()));
         let progress_events = Arc::clone(&events);
         let progress: BuildProgress = Arc::new(move |event| {
@@ -16493,12 +18672,12 @@ mod tests {
 
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
-            JavaAdapter,
+            CppAdapter,
             AnalyzerConfig {
                 parallelism: Some(1),
                 ..AnalyzerConfig::default()
             },
-            store_context,
+            seed_analyzer.store_context.clone(),
             Some(progress),
         )
         .expect("analyzer epochs should initialize");
@@ -16508,9 +18687,19 @@ mod tests {
 
         assert_eq!(analyzer.state.persistence_stats.committed_blobs, 2);
         assert_eq!(analyzer.state.persistence_stats.failed_blobs, 1);
+        assert_eq!(analyzer.state.persistence_stats.committed_fragments, 2);
+        assert_eq!(analyzer.state.persistence_stats.failed_fragments, 2);
         let dirty = analyzer.state.dirty_snapshot();
         assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty.keys().next().unwrap().rel_path, bad.rel_path());
+        let (dirty_key, dirty_state) = dirty.iter().next().unwrap();
+        assert_eq!(dirty_key.rel_path, bad.rel_path());
+        assert!(dirty_state.state.additional_projections.is_empty());
+        assert_eq!(
+            dirty_state
+                .required_existing_additional_storage_languages
+                .as_ref(),
+            &["cpp:c".to_owned()]
+        );
         let events = events.lock().expect("progress event mutex poisoned");
         let final_persist = events
             .iter()
@@ -16519,6 +18708,44 @@ mod tests {
             .expect("persist progress event");
         assert_eq!(final_persist.completed, 3);
         assert_eq!(final_persist.total, 3);
+        drop(events);
+
+        let request = [CompleteAnalysisBlobRequest::new(
+            shared_oid,
+            "cpp",
+            ["cpp:c".to_owned()],
+        )];
+        let dirty_key = dirty_key.clone();
+        analyzer
+            .state
+            .dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .get_mut(&dirty_key)
+            .expect("failed preparation must remain dirty")
+            .next_retry_at = Instant::now();
+        let starts = store.parsed_blob_transaction_starts_for_test();
+
+        let retried = analyzer
+            .retry_dirty_file_state(&dirty_key, "cpp")
+            .expect("dirty state remains available during retry");
+
+        assert!(retried.additional_projections.is_empty());
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), starts + 1);
+        assert!(analyzer.state.dirty_snapshot().is_empty());
+        assert!(store.contains_parsed_blob(shared_oid, "cpp").unwrap());
+        assert!(store.contains_parsed_blob(shared_oid, "cpp:c").unwrap());
+        assert!(
+            store
+                .missing_published_complete_analysis_blob_keys_at_generations(
+                    &request,
+                    analyzer.store_context.generations.as_ref(),
+                    Language::Cpp,
+                )
+                .unwrap()
+                .is_empty(),
+            "retry must make the current primary and required optional projection warm"
+        );
     }
 
     /// Issue #2359. On microsoft/PowerToys a Cpp build worker panicked within
@@ -16674,11 +18901,16 @@ mod tests {
             imports: Vec::new(),
             scala_exports: HashMap::default(),
             rust_usage_facts: Default::default(),
+            resolution_facts: Default::default(),
+            source_facts: None,
+            source_declaration_units: Vec::new(),
+            source_declaration_metadata: Vec::new(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
             signatures: HashMap::default(),
             signature_metadata: HashMap::default(),
+            signature_metadata_signature_ordinals: HashMap::default(),
             cpp_template_metadata: HashMap::default(),
             ruby_method_dispatch_modes: HashMap::default(),
             ranges: HashMap::default(),
@@ -16692,6 +18924,34 @@ mod tests {
             parse_complete: true,
             additional_projections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parsed_resolution_facts_survive_file_state_assembly() {
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            FileResolutionFacts, ResolutionNameFact, ResolutionNameId,
+        };
+
+        let expected = FileResolutionFacts {
+            names: vec![ResolutionNameFact {
+                id: ResolutionNameId::new(0),
+                spelling: "Widget".to_string(),
+            }],
+            ..FileResolutionFacts::default()
+        };
+        let mut parsed = ParsedFile::new(String::new());
+        parsed.resolution_facts = expected.clone();
+
+        let state = TreeSitterAnalyzer::<JavaAdapter>::file_state_from_parsed(
+            String::new(),
+            parsed,
+            false,
+            None,
+            true,
+        );
+
+        assert_eq!(state.resolution_facts, expected);
+        assert!(state.estimated_retained_bytes() >= std::mem::size_of::<FileState>());
     }
 
     fn temp_file(root: &Path, rel_path: &str) -> ProjectFile {
@@ -17136,153 +19396,64 @@ mod tests {
     }
 
     #[test]
-    fn oversized_persistence_produces_queryable_resource_bound_dirty_state() {
+    fn prepared_source_above_batch_targets_publishes_queryable_facts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("pkg")).unwrap();
-        let source = "class Dirty:\n    pass\n".to_string();
-        std::fs::write(root.join("pkg/dirty.py"), &source).unwrap();
-        let file = ProjectFile::new(root.clone(), "pkg/dirty.py");
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
-
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
-        let adapter = Arc::new(PythonAdapter);
+        let source = "class Published:\n    pass\n".to_string();
+        let file = ProjectFile::new(root, "published.py");
+        let adapter = PythonAdapter;
         let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
             adapter.parser_language_for_file(&file),
         );
-        let mut parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
-            &mut parser,
-            &*adapter,
-            &file,
-            source,
-        )
-        .expect("python file parses");
-        // Keep this fixture small in source form while still exercising the
-        // production writer's actual row-cap admission check. These are
-        // structured reference identifiers, so preparation and persistence
-        // account for them exactly like identifiers produced by the parser.
-        for index in 0..=PersistBatchLimits::PRODUCTION.max_rows {
-            parsed.type_identifiers.insert(format!("synthetic_{index}"));
-        }
-        let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
-
-        let live_paths = Arc::new(LivePathMap::default());
-        live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
-        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
-        let store_context = AnalyzerStoreContext {
-            store: Arc::clone(&store),
-            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
-            _projection_lease: None,
-            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
-            liveness: None,
-            workspace_snapshot: None,
-            workspace_listing_complete: true,
-            revision_blobs: None,
-            live_paths,
-            generations: Arc::new(HashMap::from_iter([(
-                "python".to_string(),
-                GenerationId::BOOTSTRAP,
-            )])),
-            build_abort: Arc::new(BuildAbort::default()),
-            build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
-            structural_facts: Arc::new(OnceLock::new()),
-            cancellation: crate::CancellationToken::default(),
-        };
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let parsed = Arc::new(
+            TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+                &mut parser,
+                &adapter,
+                &file,
+                source,
+            )
+            .expect("python file parses"),
+        );
         let prepared = AnalyzerStore::prepare_parsed_blob(
             oid,
             "python",
             GenerationId::BOOTSTRAP,
-            &*adapter,
-            Arc::new(parsed.clone()),
+            &adapter,
+            Arc::clone(&parsed),
         )
-        .expect("oversized fixture must prepare");
-        assert!(prepared.logical_rows() > PersistBatchLimits::PRODUCTION.max_rows);
-        let mut dirty = HashMap::default();
-        TreeSitterAnalyzer::<PythonAdapter>::persist_or_mark_dirty(
-            &mut dirty,
-            &store_context,
-            &*adapter,
-            &file,
-            oid,
-            "python",
-            GenerationId::BOOTSTRAP,
-            &parsed,
-        );
-        let dirty_state = dirty.get(&key).expect("resource-bound state is retained");
-        assert_eq!(
-            dirty_state.status,
-            DirtyFileStateStatus::TerminalResourceBound
-        );
-        let config = AnalyzerConfig::default();
-        let analyzer = TreeSitterAnalyzer::from_state(
-            project,
-            adapter,
-            config.clone(),
-            AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
-            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
-                &config,
-                &store_context,
-            )),
-            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
-            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
-                &config,
-            )),
-            TreeSitterAnalyzer::build_content_identity_base(&config, &PythonAdapter),
-            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
-                config.memo_cache_budget_bytes() / 8,
-            ),
-            store_context,
-            Arc::new(HashMap::default()),
+        .unwrap();
+        let expected_rows = prepared.mutation_logical_rows();
+        let expected_bytes = prepared.mutation_payload_bytes();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            vec![prepared],
+            PersistBatchTargets {
+                max_blobs: 1,
+                max_rows: 1,
+                max_payload_bytes: 1,
+            },
         );
 
-        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
-        assert!(
-            analyzer
-                .declarations(&file)
-                .iter()
-                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty")
-        );
-        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        analyzer.begin_query(&context);
-        let starts = store.parsed_blob_transaction_starts_for_test();
-        assert_eq!(analyzer.get_definitions("pkg.dirty.Dirty").len(), 1);
-        assert!(
-            context.store_error().is_none(),
-            "a resource-bound dirty state must not become request-fatal"
-        );
-        assert_eq!(store.parsed_blob_transaction_starts_for_test(), starts);
-        analyzer.end_query(&context);
-        assert!(
-            analyzer
-                .lookup_declarations_by_identifier("Dirty")
-                .iter()
-                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
-            "exact identifier candidates must include dirty declarations"
-        );
-        assert!(
-            analyzer
-                .lookup_declarations_by_identifier("dirty")
-                .iter()
-                .any(|unit| unit.is_module() && unit.fq_name() == "pkg.dirty"),
-            "exact identifier candidates must retain non-persisted path modules"
-        );
-
-        let exhausted =
-            analyzer.lookup_non_module_declarations_by_identifier_limited("Dirty", 1, || true);
-        assert!(
-            !exhausted.complete && exhausted.rows.is_empty(),
-            "the dirty-state entry itself must consume bounded provider work before declarations"
-        );
-        let bounded =
-            analyzer.lookup_non_module_declarations_by_identifier_limited("Dirty", 64, || true);
-        assert!(bounded.complete);
-        assert!(
-            bounded
-                .rows
-                .iter()
-                .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
-            "a sufficient bounded lookup must retain dirty declarations"
-        );
+        assert!(outcomes[0].error.is_none());
+        assert_eq!(stats.transactions, 1);
+        assert_eq!(stats.peak_batch_rows, expected_rows);
+        assert_eq!(stats.peak_batch_payload_bytes, expected_bytes);
+        assert!(store.contains_parsed_blob(oid, "python").unwrap());
+        let hydrated = store
+            .hydrate_file_state_with_source(
+                oid,
+                "python",
+                GenerationId::BOOTSTRAP,
+                &adapter,
+                &file,
+                &parsed.source,
+            )
+            .unwrap()
+            .expect("publication must be readable from the store");
+        assert_eq!(hydrated.declarations, parsed.declarations);
+        assert_eq!(hydrated.type_identifiers, parsed.type_identifiers);
     }
 
     /// A Python workspace whose files each declare one distinctly named class,
@@ -17865,7 +20036,8 @@ mod tests {
             key.clone(),
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
-                generation,
+                singleton_generation_map("python", generation),
+                Vec::new(),
                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
                 "stale generation".to_string(),
                 DirtyFileStateStatus::TerminalStale,
@@ -18007,7 +20179,8 @@ mod tests {
             key,
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
-                GenerationId::BOOTSTRAP,
+                singleton_generation_map("python", GenerationId::BOOTSTRAP),
+                Vec::new(),
                 32,
                 "forced test persistence failure".to_string(),
                 DirtyFileStateStatus::Retryable,
@@ -18585,6 +20758,20 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
         let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let dirty = analyzer.state.dirty_snapshot();
+        assert!(
+            dirty.is_empty(),
+            "interval-cache fixture requires a healthy C++ publication: {dirty:?}"
+        );
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        assert!(
+            analyzer
+                .store_context
+                .store
+                .contains_parsed_blob(oid, "cpp")
+                .unwrap(),
+            "interval-cache fixture must have a complete persisted C++ blob"
+        );
         let methods = analyzer
             .get_all_declarations()
             .into_iter()
@@ -18711,7 +20898,11 @@ mod tests {
             .collect();
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
-        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        let mut analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        // Construction seeds the source snapshot index with the first 1,024
+        // file states. Clear it so every file goes through the query read
+        // cache that this test is about.
+        analyzer.clear_retained_file_states_for_test();
         analyzer.reset_full_hydration_count_for_test();
 
         let outer = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
@@ -18728,7 +20919,8 @@ mod tests {
 
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
-            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1
+            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1,
+            "the nested query must reuse the outer query's file states"
         );
 
         analyzer.end_query(&outer);
@@ -18894,6 +21086,689 @@ mod tests {
             0,
             "a later query must not re-stat the updated filesystem generation"
         );
+    }
+
+    #[test]
+    fn canonical_bulk_import_facts_distinguish_empty_and_missing_without_reparse() {
+        let source = "pub fn sample() {}\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/main.rs", source)
+            .build();
+        let file = fixture.file("src/main.rs");
+        let project = Arc::new(CountingOverlayProject::new(fixture.root(), source));
+        let db = fixture.root().join("bulk-imports.db");
+        let store = AnalyzerStore::open_persistent(&db).expect("persistent store");
+        let store_context = store_context_from_store(project.as_ref(), store, false);
+        let mut analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter,
+            AnalyzerConfig::default(),
+            store_context,
+            None,
+        )
+        .expect("canonical analyzer");
+        assert!(analyzer.state.dirty_snapshot().is_empty());
+        analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
+        analyzer.query_file_state_snapshot.store(None);
+        analyzer
+            .transient_file_states
+            .lock()
+            .expect("transient cache")
+            .clear();
+        analyzer
+            .query_read_cache_lock()
+            .file_states
+            .write()
+            .expect("query cache")
+            .clear();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let oid = analyzer
+            .resolve_live_oid_for_file(&file)
+            .expect("live overlay identity");
+        let key = TreeSitterAnalyzer::<RustAdapter>::transient_cache_key(oid, &file);
+        assert!(analyzer.retained_file_state(&file, &key).is_none());
+        project.reset_reads();
+        analyzer.reset_full_hydration_count_for_test();
+
+        let empty = analyzer.bulk_file_dependency_facts([file.clone()]);
+        let facts = empty.get(&file).expect("witnessed import-free file");
+        assert!(facts.imports.is_empty());
+        assert_eq!(facts.contains_tests, Some(false));
+        assert_eq!(project.read_count(), 0, "bulk facts do not fetch source");
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+
+        let conn = crate::cache_db::open_unified_connection(&db).expect("corruption connection");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER source_fact_manifests_no_direct_delete;
+             DELETE FROM source_fact_manifests;",
+        )
+        .expect("remove the common publication witness");
+        assert!(
+            analyzer
+                .bulk_file_dependency_facts([file.clone()])
+                .is_empty(),
+            "a missing canonical publication is not a known-empty import set"
+        );
+        assert_eq!(
+            project.read_count(),
+            0,
+            "missing facts do not read or reparse source"
+        );
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        assert!(
+            analyzer.retained_file_state(&file, &key).is_none(),
+            "missing bulk facts must not create a parsed transient state"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM source_fact_manifests", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0,
+            "bulk lookup must not repair the missing publication"
+        );
+        drop(scope);
+    }
+
+    #[test]
+    fn coarse_graph_keeps_missing_canonical_publication_in_source_inventory() {
+        use crate::analyzer::usages::file_usage_graph::{
+            WorkspaceFileUsageGraphBuildOutcome, build_workspace_file_usage_graph_with_cancellation,
+        };
+        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+
+        let source = "package example; class Factory {}";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Factory.java", source)
+            .build();
+        let file = fixture.file("Factory.java");
+        let mut counted = CountingOverlayProject::new(fixture.root(), source);
+        counted.delegate = TestProject::new(fixture.root(), Language::Java);
+        let project = Arc::new(counted);
+        let db = fixture.root().join("coarse-inventory.db");
+        let store = Arc::new(AnalyzerStore::open_persistent(&db).expect("persistent store"));
+        let producer = JavaAnalyzer::new_with_config_store_context(
+            Arc::clone(&project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+            store_context_from_shared_store(project.as_ref(), Arc::clone(&store), false),
+            None,
+        )
+        .expect("primary publication");
+        drop(producer);
+        let analyzer = JavaAnalyzer::new_with_config_store_context(
+            Arc::clone(&project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+            store_context_from_shared_store(project.as_ref(), store, false),
+            None,
+        )
+        .expect("reopened analyzer");
+        assert!(analyzer.inner().source_snapshot_file_states.is_empty());
+        let cancellation = CancellationToken::new();
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let oid = analyzer.inner().resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<JavaAdapter>::transient_cache_key(oid, &file);
+        assert!(analyzer.inner().retained_file_state(&file, &key).is_none());
+        project.reset_reads();
+        let empty = build_workspace_file_usage_graph_with_cancellation(
+            &analyzer,
+            scope.token(),
+            &selected,
+            &cancellation,
+        );
+        let WorkspaceFileUsageGraphBuildOutcome::Complete(empty) = empty else {
+            panic!("a witnessed import-free Java file has a complete coarse graph");
+        };
+        assert_eq!(empty.nodes.len(), 1);
+        assert_eq!(project.read_count(), 0);
+        drop(scope);
+
+        project.listing_failed.store(true, Ordering::Relaxed);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        analyzer.inner().resolve_live_oid_for_file(&file).unwrap();
+        project.reset_reads();
+        let unlisted = build_workspace_file_usage_graph_with_cancellation(
+            &analyzer,
+            scope.token(),
+            &selected,
+            &cancellation,
+        );
+        let WorkspaceFileUsageGraphBuildOutcome::Incomplete(unlisted) = unlisted else {
+            panic!("listing failure cannot publish a complete coarse graph");
+        };
+        assert_eq!(
+            unlisted.nodes.len(),
+            1,
+            "retain the selected live source identity"
+        );
+        assert_eq!(unlisted.nodes[0].primary_file, file);
+        assert_eq!(project.read_count(), 0);
+        drop(scope);
+        project.listing_failed.store(false, Ordering::Relaxed);
+
+        let conn = crate::cache_db::open_unified_connection(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER source_fact_manifests_no_direct_delete;
+             DELETE FROM source_fact_manifests;",
+        )
+        .unwrap();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(
+            analyzer.analyzed_files().is_empty(),
+            "parse readiness hides the missing file"
+        );
+        assert!(analyzer.inner().retained_file_state(&file, &key).is_none());
+        project.reset_reads();
+        analyzer.inner().reset_full_hydration_count_for_test();
+        let missing = build_workspace_file_usage_graph_with_cancellation(
+            &analyzer,
+            scope.token(),
+            &selected,
+            &cancellation,
+        );
+        let WorkspaceFileUsageGraphBuildOutcome::Incomplete(missing) = missing else {
+            panic!("a missing publication remains visible as an incomplete coarse graph");
+        };
+        assert_eq!(missing.nodes.len(), 1);
+        assert_eq!(missing.nodes[0].primary_file, file);
+        assert!(missing.nodes[0].incomplete);
+        assert_eq!(missing.nodes[0].contains_tests, None);
+        assert_eq!(
+            project.read_count(),
+            0,
+            "inventory and missing facts do not read source"
+        );
+        assert_eq!(analyzer.inner().full_hydration_count_for_test(), 0);
+        assert!(analyzer.inner().retained_file_state(&file, &key).is_none());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM source_fact_manifests", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn canonical_bulk_import_facts_reuse_updated_overlay_primary_state() {
+        let initial = "use crate::OldThing;\npub fn sample() {}\n";
+        let changed = "use crate::NewThing;\n#[test] fn sample() {}\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/main.rs", initial)
+            .build();
+        let file = fixture.file("src/main.rs");
+        let project = Arc::new(CountingOverlayProject::new(fixture.root(), initial));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        project.set_source(changed);
+        let updated = analyzer.update(&BTreeSet::from([file.clone()]));
+        let scope = AnalyzerQueryScope::new(&updated);
+        let oid = updated
+            .resolve_live_oid_for_file(&file)
+            .expect("updated overlay identity");
+        let key = TreeSitterAnalyzer::<RustAdapter>::transient_cache_key(oid, &file);
+        let retained = updated
+            .retained_file_state(&file, &key)
+            .expect("retained overlay primary state");
+        assert!(retained.source_facts.is_some());
+        assert_eq!(retained.source, changed);
+        let expected_imports = retained.imports.clone();
+        updated
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "rust");
+        project.reset_reads();
+        updated.reset_full_hydration_count_for_test();
+
+        let facts = updated.bulk_file_dependency_facts([file.clone()]);
+        let facts = facts
+            .get(&file)
+            .expect("exact retained primary facts remain available");
+        assert_eq!(facts.imports, expected_imports);
+        assert_eq!(facts.contains_tests, Some(true));
+        assert_eq!(project.read_count(), 0);
+        assert_eq!(updated.full_hydration_count_for_test(), 0);
+        drop(scope);
+    }
+
+    #[test]
+    fn cpp_missing_alias_publication_records_failure_and_retries_same_cache() {
+        let source = "struct Base {}; using Alias = Base; struct Derived : Alias {};";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("aliases.cpp", source)
+            .build();
+        let file = fixture.file("aliases.cpp");
+        let mut analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), CppAdapter);
+        let mut parser =
+            TreeSitterAnalyzer::<CppAdapter>::build_parser(CppAdapter.parser_language());
+        let state = TreeSitterAnalyzer::<CppAdapter>::analyze_source(
+            &mut parser,
+            &CppAdapter,
+            &file,
+            source.to_owned(),
+        )
+        .expect("primary C++ publication fixture");
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        assert!(analyzer.state.dirty_snapshot().is_empty());
+        analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
+        analyzer.query_file_state_snapshot.store(None);
+        analyzer.transient_file_states.lock().unwrap().clear();
+        analyzer
+            .query_read_cache_lock()
+            .file_states
+            .write()
+            .unwrap()
+            .clear();
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "cpp");
+        let cache = moka::sync::Cache::new(1);
+        analyzer.reset_full_hydration_count_for_test();
+        {
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            assert!(
+                analyzer
+                    .canonical_cpp_source_facts(&file, "cpp", &cache)
+                    .is_none()
+            );
+            assert!(
+                scope
+                    .store_error()
+                    .expect("missing publication must reach the query failure boundary")
+                    .to_string()
+                    .contains("required C/C++ source publication unavailable")
+            );
+        }
+        analyzer
+            .store_context
+            .store
+            .write_parsed_blob(oid, "cpp", &CppAdapter, &state)
+            .unwrap();
+        {
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            let facts = analyzer
+                .canonical_cpp_source_facts(&file, "cpp", &cache)
+                .expect("repair must retry through the same analyzer and canonical cache");
+            assert!(facts.facts.declarations.iter().any(|fact| {
+                fact.file_scope_alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.name == "Alias" && alias.target == "Base")
+            }));
+            assert!(scope.store_error().is_none());
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "failure and repair must not hydrate or reparse the donor file"
+        );
+    }
+
+    #[test]
+    fn java_source_facts_reuse_retained_primary_state_without_publication_retry() {
+        let source = "class Factory { Factory make() { return this; } }";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Factory.java", source)
+            .build();
+        let file = fixture.file("Factory.java");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        let mut parser =
+            TreeSitterAnalyzer::<JavaAdapter>::build_parser(JavaAdapter.parser_language());
+        let retained = TreeSitterAnalyzer::<JavaAdapter>::analyze_source(
+            &mut parser,
+            &JavaAdapter,
+            &file,
+            source.to_owned(),
+        )
+        .unwrap();
+        let expected = retained
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .java
+            .clone()
+            .unwrap();
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<JavaAdapter>::transient_cache_key(oid, &file);
+        analyzer
+            .query_file_state_snapshot
+            .store(Some(Arc::new(HashMap::from_iter([(
+                key,
+                Arc::new(retained),
+            )]))));
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "java");
+        analyzer.reset_full_hydration_count_for_test();
+        let facts = analyzer
+            .canonical_java_source_facts(&file, &moka::sync::Cache::new(1))
+            .unwrap();
+        assert_eq!(facts.facts, expected);
+        assert!(!facts.declaration_units.is_empty());
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn php_source_facts_require_publication_or_retained_primary_state() {
+        use crate::analyzer::php::PhpAdapter;
+        let source = "<?php class Owner { public string $value; }";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Php)
+            .file("owner.php", source)
+            .build();
+        let file = fixture.file("owner.php");
+        let mut analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), PhpAdapter);
+        let mut parser =
+            TreeSitterAnalyzer::<PhpAdapter>::build_parser(PhpAdapter.parser_language());
+        let retained = TreeSitterAnalyzer::<PhpAdapter>::analyze_source(
+            &mut parser,
+            &PhpAdapter,
+            &file,
+            source.to_owned(),
+        )
+        .unwrap();
+        let expected = retained.source_facts.as_ref().unwrap().php.clone().unwrap();
+        let cache = moka::sync::Cache::new(1);
+        assert!(
+            analyzer
+                .canonical_php_source_facts(&file, &cache, &|| false)
+                .is_none()
+        );
+        assert_eq!(cache.entry_count(), 0);
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "php");
+        analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
+        analyzer.transient_file_states.lock().unwrap().clear();
+        analyzer.query_file_state_snapshot.store(None);
+        let retained_key = TreeSitterAnalyzer::<PhpAdapter>::transient_cache_key(oid, &file);
+        assert!(analyzer.retained_file_state(&file, &retained_key).is_none());
+        analyzer.reset_full_hydration_count_for_test();
+        assert!(
+            analyzer
+                .canonical_php_source_facts(&file, &cache, &|| true)
+                .is_none()
+        );
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        let key = TreeSitterAnalyzer::<PhpAdapter>::transient_cache_key(oid, &file);
+        analyzer
+            .query_file_state_snapshot
+            .store(Some(Arc::new(HashMap::from_iter([(
+                key,
+                Arc::new(retained),
+            )]))));
+        let facts = analyzer
+            .canonical_php_source_facts(&file, &cache, &|| true)
+            .unwrap();
+        let admission = std::cell::Cell::new(0);
+        assert!(
+            analyzer
+                .canonical_php_source_facts(&file, &cache, &|| {
+                    let previous = admission.get();
+                    admission.set(previous + 1);
+                    previous == 0
+                })
+                .is_none()
+        );
+        analyzer.query_file_state_snapshot.store(None);
+        cache.insert(
+            (
+                analyzer.language_generation("php").unwrap(),
+                oid,
+                file.clone(),
+            ),
+            Arc::clone(&facts),
+        );
+        admission.set(0);
+        assert!(
+            analyzer
+                .canonical_php_source_facts(&file, &cache, &|| {
+                    let previous = admission.get();
+                    admission.set(previous + 1);
+                    previous == 0
+                })
+                .is_none()
+        );
+        assert_eq!(facts.facts, expected);
+        assert!(!facts.declaration_units.is_empty());
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn ruby_source_facts_reuse_retained_primary_state_without_publication_retry() {
+        use crate::analyzer::ruby::RubyAdapter;
+        let source = "autoload :Ready, \"ready\"\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
+            .file("main.rb", source)
+            .build();
+        let file = fixture.file("main.rb");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RubyAdapter);
+        let mut parser =
+            TreeSitterAnalyzer::<RubyAdapter>::build_parser(RubyAdapter.parser_language());
+        let retained = TreeSitterAnalyzer::<RubyAdapter>::analyze_source(
+            &mut parser,
+            &RubyAdapter,
+            &file,
+            source.to_owned(),
+        )
+        .unwrap();
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<RubyAdapter>::transient_cache_key(oid, &file);
+        analyzer
+            .query_file_state_snapshot
+            .store(Some(Arc::new(HashMap::from_iter([(
+                key,
+                Arc::new(retained),
+            )]))));
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "ruby");
+        analyzer.reset_full_hydration_count_for_test();
+        let facts = analyzer.canonical_ruby_source_facts(&file).unwrap();
+        assert_eq!(
+            facts.loads[0].autoload_constant.as_deref().unwrap(),
+            ["Ready"]
+        );
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        assert!(
+            !analyzer
+                .store_context
+                .store
+                .contains_parsed_blob(oid, "ruby")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn go_source_facts_reuse_retained_primary_state_without_publication_retry() {
+        let source = "package demo\ntype Owner struct { Value int }\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("owner.go", source)
+            .build();
+        let file = fixture.file("owner.go");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), GoAdapter);
+        let mut parser = TreeSitterAnalyzer::<GoAdapter>::build_parser(GoAdapter.parser_language());
+        let retained = TreeSitterAnalyzer::<GoAdapter>::analyze_source(
+            &mut parser,
+            &GoAdapter,
+            &file,
+            source.to_owned(),
+        )
+        .unwrap();
+        let expected = retained.source_facts.as_ref().unwrap().go.clone().unwrap();
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<GoAdapter>::transient_cache_key(oid, &file);
+        analyzer
+            .query_file_state_snapshot
+            .store(Some(Arc::new(HashMap::from_iter([(
+                key,
+                Arc::new(retained),
+            )]))));
+        analyzer
+            .store_context
+            .store
+            .mark_parsed_blob_incomplete_for_test(oid, "go");
+        analyzer.reset_full_hydration_count_for_test();
+        let facts = analyzer
+            .canonical_go_source_facts(&file, &moka::sync::Cache::new(1))
+            .unwrap();
+        assert_eq!(facts.facts, expected);
+        assert!(!facts.declaration_units.is_empty());
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn js_ts_source_facts_reuse_retained_primary_state_without_publication_retry() {
+        fn check<A: LanguageAdapter + Clone>(adapter: A, path: &str) {
+            let source = "export class Owner { run(value) { return value; } }";
+            let fixture =
+                crate::inline_project::InlineTestProject::with_language(adapter.language())
+                    .file(path, source)
+                    .build();
+            let file = fixture.file(path);
+            let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), adapter.clone());
+            let mut parser = TreeSitterAnalyzer::<A>::build_parser(adapter.parser_language());
+            let retained = TreeSitterAnalyzer::<A>::analyze_source(
+                &mut parser,
+                &adapter,
+                &file,
+                source.to_owned(),
+            )
+            .unwrap();
+            let expected = retained
+                .source_facts
+                .as_ref()
+                .unwrap()
+                .js_ts
+                .clone()
+                .unwrap();
+            let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+            let key = TreeSitterAnalyzer::<A>::transient_cache_key(oid, &file);
+            analyzer
+                .query_file_state_snapshot
+                .store(Some(Arc::new(HashMap::from_iter([(
+                    key,
+                    Arc::new(retained),
+                )]))));
+            analyzer
+                .store_context
+                .store
+                .mark_parsed_blob_incomplete_for_test(
+                    oid,
+                    adapter.storage_language_key_for_file(&file),
+                );
+            analyzer.reset_full_hydration_count_for_test();
+            let facts = analyzer
+                .canonical_js_ts_source_facts(&file, &moka::sync::Cache::new(1))
+                .unwrap();
+            assert_eq!(facts.facts, expected);
+            assert!(!facts.declaration_units.is_empty());
+            assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        }
+        check(JavascriptAdapter, "owner.js");
+        check(TypescriptAdapter, "owner.ts");
+    }
+
+    #[test]
+    fn signature_metadata_cold_reader_uses_persisted_rows_without_file_hydration() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file(
+                "Factory.java",
+                "class Factory { public void make() {} private void make() {} }",
+            )
+            .build();
+        let file = fixture.file("Factory.java");
+        let mut analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+        let state = analyzer.fetch_file_state(&file).expect("built Java state");
+        let (unit, expected) = state
+            .signature_metadata
+            .iter()
+            .find(|(unit, _)| unit.is_function() && unit.identifier() == "make")
+            .map(|(unit, rows)| (unit.clone(), rows.clone()))
+            .expect("two written metadata alternatives");
+        assert_eq!(expected.len(), 2);
+        let mut retained = (*state).clone();
+        let retained_metadata = vec![SignatureMetadata::new("retained projection", Vec::new())];
+        retained
+            .signature_metadata
+            .insert(unit.clone(), retained_metadata.clone());
+        retained
+            .signatures
+            .insert(unit.clone(), vec![retained_metadata[0].label().to_owned()]);
+        retained
+            .signature_metadata_signature_ordinals
+            .insert(unit.clone(), vec![0]);
+        let retained = Arc::new(retained);
+        drop(state);
+        assert!(
+            analyzer.state.dirty_snapshot().is_empty(),
+            "fixture must be persisted"
+        );
+        analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
+        analyzer.query_file_state_snapshot.store(None);
+        analyzer
+            .transient_file_states
+            .lock()
+            .expect("transient cache lock")
+            .clear();
+        analyzer
+            .query_read_cache_lock()
+            .file_states
+            .write()
+            .expect("query cache lock")
+            .clear();
+        analyzer.reset_full_hydration_count_for_test();
+
+        assert_eq!(analyzer.signature_metadata_vec_of(&unit), expected);
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "metadata must not fetch or hydrate the whole file on a cold cache"
+        );
+
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<JavaAdapter>::transient_cache_key(oid, &file);
+        let assert_retained = || {
+            assert_eq!(analyzer.signature_metadata_vec_of(&unit), retained_metadata);
+            let bounded = analyzer.signature_metadata_limited(&unit, 8);
+            assert!(bounded.complete);
+            assert_eq!(bounded.rows, retained_metadata);
+            assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        };
+        analyzer
+            .transient_file_states
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&retained));
+        assert_retained();
+        analyzer.transient_file_states.lock().unwrap().clear();
+
+        let cache = analyzer
+            .active_query_cache_handle(|cache| &cache.file_states)
+            .unwrap();
+        cache.write().unwrap().retain(key, Arc::clone(&retained));
+        assert_retained();
+        cache.write().unwrap().clear();
+
+        analyzer.begin_streaming_file_read(&file);
+        STREAMING_FILE_READS.with(|reads| {
+            reads
+                .borrow_mut()
+                .get_mut(&analyzer.streaming_file_read_id())
+                .unwrap()
+                .state = Some(retained);
+        });
+        assert_retained();
+        analyzer.end_streaming_file_read(&file);
+        drop(scope);
     }
 
     #[test]
@@ -19299,11 +22174,29 @@ mod tests {
         // 7/8 watermark is still above two entries, so exactly one is evicted.
         let mut store = ImportInfoStore::new(entry_bytes * 5 / 2);
 
-        store.retain(import_key(1), Arc::clone(&imports));
-        store.retain(import_key(2), Arc::clone(&imports));
+        store.retain(
+            import_key(1),
+            RetainedImportInfos {
+                imports: Arc::clone(&imports),
+                canonical: false,
+            },
+        );
+        store.retain(
+            import_key(2),
+            RetainedImportInfos {
+                imports: Arc::clone(&imports),
+                canonical: false,
+            },
+        );
         // Touching the first entry makes the second the least recent.
         assert!(store.get(&import_key(1)).is_some());
-        store.retain(import_key(3), Arc::clone(&imports));
+        store.retain(
+            import_key(3),
+            RetainedImportInfos {
+                imports: Arc::clone(&imports),
+                canonical: false,
+            },
+        );
 
         assert!(
             store.get(&import_key(1)).is_some(),
@@ -19317,7 +22210,13 @@ mod tests {
         assert!(store.retained_bytes <= store.max_bytes);
 
         // An evicted key is simply a miss: the caller rehydrates and re-retains.
-        store.retain(import_key(2), imports);
+        store.retain(
+            import_key(2),
+            RetainedImportInfos {
+                imports,
+                canonical: false,
+            },
+        );
         assert!(store.get(&import_key(2)).is_some());
         assert!(store.retained_bytes <= store.max_bytes);
     }
@@ -19331,11 +22230,80 @@ mod tests {
         let key = import_key(1);
         store.retain(
             key.clone(),
-            import_infos(&["use crate::target::collect_it;"]),
+            RetainedImportInfos {
+                imports: import_infos(&["use crate::target::collect_it;"]),
+                canonical: false,
+            },
         );
 
         assert!(store.get(&key).is_none());
         assert_eq!(store.retained_bytes, 0);
+    }
+
+    #[test]
+    fn checked_go_import_reader_ignores_legacy_cache_and_retention_cutoff() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                "package main\nimport \"fmt\"\nfunc main() { fmt.Println() }\n",
+            )
+            .build();
+        let file = fixture.file("main.go");
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), GoAdapter);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let oid = analyzer.resolve_live_oid_for_file(&file).unwrap();
+        let key = TreeSitterAnalyzer::<GoAdapter>::transient_cache_key(oid, &file);
+        let expected = analyzer.fetch_file_state(&file).unwrap().imports.clone();
+        assert!(!expected.is_empty());
+        assert!(analyzer.state.dirty_snapshot().is_empty());
+        analyzer.import_info_store_retain(key.clone(), Arc::from(Vec::<ImportInfo>::new()));
+        assert_eq!(
+            analyzer.import_info_of_checked(scope.token(), &file),
+            Some(expected.clone()),
+            "a legacy cached empty set cannot replace canonical imports"
+        );
+
+        *analyzer.import_info_store.lock().unwrap() = ImportInfoStore::new(1);
+        analyzer.reset_full_hydration_count_for_test();
+        for _ in 0..2 {
+            assert_eq!(
+                analyzer.import_info_of_checked(scope.token(), &file),
+                Some(expected.clone())
+            );
+            assert!(
+                analyzer.import_info_store_get_checked(&key).is_none(),
+                "the tiny retained cache must reject the import payload"
+            );
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "canonical import reads must not hydrate or reparse the whole file"
+        );
+    }
+
+    #[test]
+    fn checked_import_cache_preserves_canonical_provenance() {
+        let imports = import_infos(&["use crate::target::collect_it;"]);
+        let key = import_key(1);
+        let mut store = ImportInfoStore::new(IMPORT_INFO_STORE_MAX_BYTES);
+        store.retain(
+            key.clone(),
+            RetainedImportInfos {
+                imports: Arc::clone(&imports),
+                canonical: false,
+            },
+        );
+        assert!(!store.get(&key).unwrap().canonical);
+
+        store.retain(
+            key.clone(),
+            RetainedImportInfos {
+                imports,
+                canonical: true,
+            },
+        );
+        assert!(store.get(&key).unwrap().canonical);
     }
 
     /// The dirty overlay holds a parse the store has not accepted yet, so it
@@ -19367,7 +22335,8 @@ mod tests {
             key.clone(),
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
-                GenerationId::BOOTSTRAP,
+                singleton_generation_map("python", GenerationId::BOOTSTRAP),
+                Vec::new(),
                 32,
                 "forced test persistence failure".to_string(),
                 DirtyFileStateStatus::Retryable,
@@ -19475,6 +22444,831 @@ mod tests {
                 .all(|syntax| Arc::ptr_eq(&prepared[0], syntax))
         );
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn rust_workspace_inputs_publish_atomically_and_keep_source_locality() {
+        let manifest_v1 = "[package]\nname = \"sample\"\nedition = \"2021\"\n";
+        let source_v1 = "pub fn sample() {}\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", manifest_v1)
+            .file("src/lib.rs", source_v1)
+            .build();
+        let manifest = fixture.file("Cargo.toml");
+        let source = fixture.file("src/lib.rs");
+        let db = fixture.root().join("workspace-inputs.db");
+        let store = AnalyzerStore::open_persistent(&db).expect("persistent store");
+        let project = fixture.project_dyn();
+        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project),
+            RustAdapter,
+            AnalyzerConfig::default(),
+            store_context_from_store(project.as_ref(), store, false),
+            None,
+        )
+        .expect("Rust analyzer");
+
+        let current_configuration = |analyzer: &TreeSitterAnalyzer<RustAdapter>| -> Vec<u8> {
+            let snapshot = analyzer.selected_workspace_snapshots()["rust"].clone();
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            conn.query_row(
+                "SELECT retained.source_bytes
+                 FROM workspace_file_versions AS versions
+                 JOIN workspace_input_sources AS retained
+                   ON retained.content_oid = versions.blob_oid
+                 WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                   AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                   AND versions.valid_from <= ?4
+                   AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
+                rusqlite::params![
+                    analyzer.workspace_id().as_str(),
+                    snapshot.lang.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                ],
+                |row| row.get(0),
+            )
+            .expect("current Cargo manifest bytes")
+        };
+        let current_source_oid = |analyzer: &TreeSitterAnalyzer<RustAdapter>| -> String {
+            let snapshot = analyzer.selected_workspace_snapshots()["rust"].clone();
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            conn.query_row(
+                "SELECT blob_oid
+                 FROM workspace_file_versions
+                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                   AND input_kind = 'source' AND rel_path = 'src/lib.rs'
+                   AND valid_from <= ?4
+                   AND (valid_until IS NULL OR ?4 < valid_until)",
+                rusqlite::params![
+                    analyzer.workspace_id().as_str(),
+                    snapshot.lang.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                ],
+                |row| row.get(0),
+            )
+            .expect("current Rust source identity")
+        };
+
+        let first = analyzer.selected_workspace_snapshots()["rust"].revision;
+        assert_eq!(first, 1, "source and configuration publish one revision");
+        assert_eq!(current_configuration(&analyzer), manifest_v1.as_bytes());
+        assert_eq!(
+            current_source_oid(&analyzer),
+            Oid::hash_object(ObjectType::Blob, source_v1.as_bytes())
+                .expect("source identity")
+                .to_string()
+        );
+        assert_eq!(
+            analyzer
+                .state
+                .workspace_package_identity_input_digests
+                .get(&manifest)
+                .map(|digest| digest.content),
+            Some(crate::analyzer::canonical_hash::sha256_bytes(
+                manifest_v1.as_bytes()
+            ))
+        );
+
+        let source_v2 = "pub fn changed() {}\n";
+        source.write(source_v2).expect("updated Rust source");
+        let updated = analyzer.update(&BTreeSet::from([source.clone()]));
+        assert_eq!(updated.selected_workspace_snapshots()["rust"].revision, 2);
+        assert_eq!(current_configuration(&updated), manifest_v1.as_bytes());
+        assert_eq!(
+            current_source_oid(&updated),
+            Oid::hash_object(ObjectType::Blob, source_v2.as_bytes())
+                .expect("updated source identity")
+                .to_string()
+        );
+
+        let manifest_v2 = "[package]\nname = \"sample\"\nedition = \"2024\"\n";
+        manifest.write(manifest_v2).expect("updated Cargo manifest");
+        let updated_again = updated.update(&BTreeSet::from([manifest.clone()]));
+        assert_eq!(
+            updated_again.selected_workspace_snapshots()["rust"].revision,
+            3
+        );
+        assert_eq!(
+            current_configuration(&updated_again),
+            manifest_v2.as_bytes()
+        );
+        assert_eq!(
+            current_source_oid(&updated_again),
+            Oid::hash_object(ObjectType::Blob, source_v2.as_bytes())
+                .expect("source identity after configuration update")
+                .to_string()
+        );
+        assert_eq!(
+            updated_again
+                .state
+                .workspace_package_identity_input_digests
+                .get(&manifest)
+                .map(|digest| digest.content),
+            Some(crate::analyzer::canonical_hash::sha256_bytes(
+                manifest_v2.as_bytes()
+            ))
+        );
+
+        let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+        let source_history: i64 = conn
+            .query_row(
+                "SELECT count(*)
+                 FROM workspace_file_versions
+                 WHERE workspace_id = ?1 AND lang = 'rust'
+                   AND input_kind = 'source' AND rel_path = 'src/lib.rs'",
+                [analyzer.workspace_id().as_str()],
+                |row| row.get(0),
+            )
+            .expect("source history");
+        assert_eq!(
+            source_history, 2,
+            "configuration update preserves source locality"
+        );
+    }
+
+    #[test]
+    fn rust_untracked_crlf_manifest_reopens_with_isolated_selected_semantics() {
+        let manifest_a_v1 = "[package]\r\n# untracked workspace A bytes\r\nname = \"alpha\"\r\nversion = \"0.1.0\"\r\nedition = \"2021\"\r\n";
+        let manifest_a_v2 = "[package]\r\n# updated untracked workspace A bytes\r\nname = \"alpha\"\r\nversion = \"0.1.0\"\r\nedition = \"2024\"\r\n";
+        let manifest_b = "[package]\r\n# untracked workspace B bytes\r\nname = \"beta\"\r\nversion = \"0.1.0\"\r\nedition = \"2021\"\r\n";
+        let fixture_a = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", manifest_a_v1)
+            .file("src/lib.rs", "pub mod alpha_part;\n")
+            .file("src/alpha_part.rs", "pub fn target() {}\n")
+            .build();
+        let fixture_b = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", manifest_b)
+            .file("src/lib.rs", "pub mod beta_part;\n")
+            .file("src/beta_part.rs", "pub fn target() {}\n")
+            .build();
+        let cache = tempfile::tempdir().expect("shared cache directory");
+        let db = cache.path().join("rust-workspaces.db");
+        let open = |project: Arc<dyn Project>| {
+            let store = AnalyzerStore::open_persistent(&db).expect("persistent store");
+            let mut context = store_context_from_store(project.as_ref(), store, false);
+            context.build_tier_access = Arc::new(AnalyzerBuildTierAccess::new_active());
+            TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                Arc::clone(&project),
+                RustAdapter,
+                AnalyzerConfig::default(),
+                context,
+                None,
+            )
+            .expect("Rust analyzer")
+        };
+        let configuration_at = |snapshot: &crate::analyzer::store::WorkspaceSnapshotId,
+                                revision: i64|
+         -> Vec<u8> {
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            conn.query_row(
+                "SELECT retained.source_bytes
+                     FROM workspace_file_versions AS versions
+                     JOIN workspace_input_sources AS retained
+                       ON retained.content_oid = versions.blob_oid
+                     WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                       AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                       AND versions.valid_from <= ?4
+                       AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
+                rusqlite::params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang.as_str(),
+                    snapshot.generation.get(),
+                    revision,
+                ],
+                |row| row.get(0),
+            )
+            .expect("Cargo manifest bytes at retained revision")
+        };
+        let configuration_history =
+            |snapshot: &crate::analyzer::store::WorkspaceSnapshotId| -> Vec<Vec<u8>> {
+                let conn =
+                    crate::cache_db::open_unified_connection(&db).expect("workspace database");
+                let mut statement = conn
+                    .prepare(
+                        "SELECT retained.source_bytes
+                         FROM workspace_file_versions AS versions
+                         JOIN workspace_input_sources AS retained
+                           ON retained.content_oid = versions.blob_oid
+                         WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                           AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                         ORDER BY versions.valid_from",
+                    )
+                    .expect("configuration history query");
+                statement
+                    .query_map(
+                        rusqlite::params![
+                            snapshot.workspace_id.as_str(),
+                            snapshot.lang.as_str(),
+                            snapshot.generation.get(),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .expect("configuration history rows")
+                    .collect::<std::result::Result<Vec<Vec<u8>>, _>>()
+                    .expect("configuration history bytes")
+            };
+        let source_identity =
+            |snapshot: &crate::analyzer::store::WorkspaceSnapshotId| -> (i64, String, String) {
+                let conn =
+                    crate::cache_db::open_unified_connection(&db).expect("workspace database");
+                conn.query_row(
+                    "SELECT versions.file_version_id, versions.blob_oid,
+                            versions.projection_digest
+                     FROM workspace_file_versions AS versions
+                     WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                       AND versions.generation = ?3 AND versions.input_kind = 'source'
+                       AND versions.rel_path = 'src/lib.rs'
+                       AND versions.valid_from <= ?4
+                       AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
+                    rusqlite::params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.lang.as_str(),
+                        snapshot.generation.get(),
+                        snapshot.revision,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("current Rust source identity")
+            };
+        let assert_definition = |analyzer: &TreeSitterAnalyzer<RustAdapter>,
+                                 name: &str,
+                                 expected_file: &ProjectFile| {
+            let definitions = analyzer.get_definitions(name);
+            assert_eq!(definitions.len(), 1, "{definitions:?}");
+            let definition = definitions.first().expect("one definition");
+            assert_eq!(definition.source(), expected_file);
+            assert_eq!(definition.fq_name_str(), name);
+        };
+        let route_names = |snapshot: &crate::analyzer::store::WorkspaceSnapshotId| -> Vec<String> {
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            let mut statement = conn
+                .prepare(
+                    "SELECT declarations.module_name
+                         FROM workspace_file_versions AS versions
+                         JOIN blobs
+                           ON blobs.lang = versions.lang
+                          AND blobs.generation = versions.generation
+                          AND blobs.blob_oid = versions.blob_oid
+                         JOIN source_rust_module_routes AS routes
+                           ON routes.blob_id = blobs.id
+                         JOIN source_rust_module_declarations AS declarations
+                           ON declarations.blob_id = routes.blob_id
+                          AND declarations.declaration_id = routes.declaration_id
+                         WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                           AND versions.generation = ?3 AND versions.input_kind = 'source'
+                           AND versions.rel_path = 'src/lib.rs'
+                           AND versions.valid_from <= ?4
+                           AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)
+                         ORDER BY routes.ordinal",
+                )
+                .expect("selected Rust route query");
+            statement
+                .query_map(
+                    rusqlite::params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.lang.as_str(),
+                        snapshot.generation.get(),
+                        snapshot.revision,
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("selected Rust route rows")
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .expect("selected Rust route names")
+        };
+
+        let project_a = fixture_a.project_dyn();
+        let project_b = fixture_b.project_dyn();
+        let manifest_a = fixture_a.file("Cargo.toml");
+        let analyzer_a = open(Arc::clone(&project_a));
+        let a_initial = analyzer_a.selected_workspace_snapshots()["rust"].clone();
+        assert_eq!(a_initial.revision, 1);
+        assert_eq!(
+            configuration_at(&a_initial, a_initial.revision),
+            manifest_a_v1.as_bytes()
+        );
+        assert_eq!(
+            configuration_history(&a_initial),
+            vec![manifest_a_v1.as_bytes()]
+        );
+        assert_definition(
+            &analyzer_a,
+            "alpha.alpha_part.target",
+            &fixture_a.file("src/alpha_part.rs"),
+        );
+        assert_eq!(route_names(&a_initial), vec!["alpha_part".to_owned()]);
+        let a_source_identity = source_identity(&a_initial);
+        let cold_syntax_reads = analyzer_a
+            .store_context
+            .build_tier_access
+            .tier_access_count(InformationTier::Syntax);
+        assert_eq!(cold_syntax_reads, 2);
+        let cold_publications = analyzer_a
+            .store_context
+            .store
+            .parsed_blob_transaction_starts_for_test();
+
+        manifest_a
+            .write(manifest_a_v2)
+            .expect("updated Cargo manifest");
+        let updated_a = analyzer_a.update(&BTreeSet::from([manifest_a.clone()]));
+        let a_updated = updated_a.selected_workspace_snapshots()["rust"].clone();
+        assert_eq!(a_updated.revision, a_initial.revision + 1);
+        assert_eq!(
+            configuration_at(&a_updated, a_initial.revision),
+            manifest_a_v1.as_bytes()
+        );
+        assert_eq!(
+            configuration_at(&a_updated, a_updated.revision),
+            manifest_a_v2.as_bytes()
+        );
+        assert_eq!(
+            configuration_history(&a_updated),
+            vec![manifest_a_v1.as_bytes(), manifest_a_v2.as_bytes()]
+        );
+        assert_definition(
+            &updated_a,
+            "alpha.alpha_part.target",
+            &fixture_a.file("src/alpha_part.rs"),
+        );
+        assert_eq!(route_names(&a_updated), vec!["alpha_part".to_owned()]);
+        assert_eq!(source_identity(&a_updated), a_source_identity);
+        assert_eq!(
+            updated_a
+                .store_context
+                .build_tier_access
+                .tier_access_count(InformationTier::Syntax),
+            cold_syntax_reads
+        );
+        assert_eq!(
+            updated_a
+                .store_context
+                .store
+                .parsed_blob_transaction_starts_for_test(),
+            cold_publications
+        );
+        assert_eq!(
+            updated_a.state.persistence_stats,
+            PersistBatchStats::default()
+        );
+        drop(updated_a);
+        drop(analyzer_a);
+
+        let analyzer_b = open(Arc::clone(&project_b));
+        let b_snapshot = analyzer_b.selected_workspace_snapshots()["rust"].clone();
+        assert_ne!(a_updated.workspace_id, b_snapshot.workspace_id);
+        assert_eq!(b_snapshot.revision, 1);
+        assert_eq!(
+            configuration_at(&b_snapshot, b_snapshot.revision),
+            manifest_b.as_bytes()
+        );
+        assert_definition(
+            &analyzer_b,
+            "beta.beta_part.target",
+            &fixture_b.file("src/beta_part.rs"),
+        );
+        assert_eq!(route_names(&b_snapshot), vec!["beta_part".to_owned()]);
+        assert!(
+            analyzer_b
+                .get_definitions("alpha.alpha_part.target")
+                .is_empty()
+        );
+        assert_ne!(source_identity(&b_snapshot).1, a_source_identity.1);
+        drop(analyzer_b);
+
+        let reopened_a = open(project_a);
+        let a_reopened = reopened_a.selected_workspace_snapshots()["rust"].clone();
+        assert_eq!(a_reopened, a_updated);
+        assert_eq!(
+            configuration_at(&a_reopened, a_initial.revision),
+            manifest_a_v1.as_bytes()
+        );
+        assert_eq!(
+            configuration_at(&a_reopened, a_reopened.revision),
+            manifest_a_v2.as_bytes()
+        );
+        assert_definition(
+            &reopened_a,
+            "alpha.alpha_part.target",
+            &fixture_a.file("src/alpha_part.rs"),
+        );
+        assert_eq!(route_names(&a_reopened), vec!["alpha_part".to_owned()]);
+        assert_eq!(source_identity(&a_reopened), a_source_identity);
+        assert!(
+            reopened_a
+                .get_definitions("beta.beta_part.target")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened_a
+                .store_context
+                .build_tier_access
+                .tier_access_count(InformationTier::Syntax),
+            0
+        );
+        assert_eq!(
+            reopened_a.state.persistence_stats,
+            PersistBatchStats::default()
+        );
+        assert_eq!(
+            configuration_at(&b_snapshot, b_snapshot.revision),
+            manifest_b.as_bytes()
+        );
+    }
+
+    #[test]
+    fn rust_configuration_capture_failure_keeps_old_head_and_recovers() {
+        let manifest_v1 = "[package]\nname = \"sample\"\nedition = \"2021\"\n";
+        let manifest_v2 = "[package]\nname = \"sample\"\nedition = \"2024\"\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", manifest_v1)
+            .file("src/lib.rs", "pub fn sample() {}\n")
+            .build();
+        let manifest = fixture.file("Cargo.toml");
+        let project = Arc::new(ConfigurationCaptureFailureProject::new(
+            fixture.project().clone(),
+            manifest.clone(),
+        ));
+        let project_dyn: Arc<dyn Project> = Arc::clone(&project) as Arc<dyn Project>;
+        let db = fixture.root().join("workspace-inputs-failure.db");
+        let store = AnalyzerStore::open_persistent(&db).expect("workspace store");
+        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project_dyn),
+            RustAdapter,
+            AnalyzerConfig::default(),
+            store_context_from_store(project_dyn.as_ref(), store, false),
+            None,
+        )
+        .expect("initial Rust analyzer");
+        assert!(analyzer.workspace_package_inventory_complete());
+
+        let current_configuration = |analyzer: &TreeSitterAnalyzer<RustAdapter>| -> Vec<u8> {
+            let snapshot = analyzer.selected_workspace_snapshots()["rust"].clone();
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            conn.query_row(
+                "SELECT retained.source_bytes
+                 FROM workspace_file_versions AS versions
+                 JOIN workspace_input_sources AS retained
+                   ON retained.content_oid = versions.blob_oid
+                 WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+                   AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                   AND versions.valid_from <= ?4
+                   AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
+                rusqlite::params![
+                    analyzer.workspace_id().as_str(),
+                    snapshot.lang.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                ],
+                |row| row.get(0),
+            )
+            .expect("current Cargo manifest bytes")
+        };
+        let configuration_history = |analyzer: &TreeSitterAnalyzer<RustAdapter>| -> i64 {
+            let conn = crate::cache_db::open_unified_connection(&db).expect("workspace database");
+            conn.query_row(
+                "SELECT count(*)
+                 FROM workspace_file_versions
+                 WHERE workspace_id = ?1 AND lang = 'rust'
+                   AND input_kind = 'configuration'",
+                [analyzer.workspace_id().as_str()],
+                |row| row.get(0),
+            )
+            .expect("configuration history")
+        };
+
+        let old_revision = analyzer.selected_workspace_snapshots()["rust"].revision;
+        assert_eq!(current_configuration(&analyzer), manifest_v1.as_bytes());
+        assert_eq!(configuration_history(&analyzer), 1);
+
+        manifest.write(manifest_v2).expect("updated manifest");
+        project.fail_next_capture();
+        let failed = analyzer.update(&BTreeSet::from([manifest.clone()]));
+        // The failed update removed the file only after the immutable listing
+        // was captured, so restore it before opening the next generation.
+        manifest
+            .write(manifest_v2)
+            .expect("restore updated manifest");
+
+        assert!(!failed.workspace_package_inventory_complete());
+        assert_eq!(
+            failed.selected_workspace_snapshots()["rust"].revision,
+            old_revision,
+            "an incomplete configuration capture must retain the old head"
+        );
+        assert_eq!(current_configuration(&failed), manifest_v1.as_bytes());
+        assert_eq!(
+            configuration_history(&failed),
+            1,
+            "the failed generation must not publish a configuration revision"
+        );
+        let scope = AnalyzerQueryScope::new(&failed);
+        let error = scope
+            .store_error()
+            .expect("the build failure must reach the query boundary");
+        assert!(
+            error.to_string().contains("Cargo.toml"),
+            "capture failure must name the missing manifest: {error}"
+        );
+        drop(scope);
+
+        let recovered = failed.update(&BTreeSet::from([manifest]));
+        assert!(recovered.workspace_package_inventory_complete());
+        assert_eq!(
+            recovered.selected_workspace_snapshots()["rust"].revision,
+            old_revision + 1
+        );
+        assert_eq!(current_configuration(&recovered), manifest_v2.as_bytes());
+        assert_eq!(configuration_history(&recovered), 2);
+        let scope = AnalyzerQueryScope::new(&recovered);
+        assert!(
+            scope.store_error().is_none(),
+            "a successful rebuild clears the retained construction error"
+        );
+    }
+
+    fn native_configuration_lifecycle<A: LanguageAdapter + Clone>(
+        adapter: A,
+        source_path: &str,
+        source: &str,
+        config_path: &str,
+    ) {
+        let fixture = crate::inline_project::InlineTestProject::with_language(adapter.language())
+            .file(source_path, source)
+            .file(config_path, "first\r\n")
+            .file(".gitignore", ".bifrost/\nvendor/\n")
+            .build();
+        let project = fixture.project_dyn();
+        let db = fixture.root().join("selected-config.db");
+        let open = || {
+            TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                Arc::clone(&project),
+                adapter.clone(),
+                AnalyzerConfig::default(),
+                store_context_from_store(
+                    project.as_ref(),
+                    AnalyzerStore::open_persistent(&db).unwrap(),
+                    false,
+                ),
+                None,
+            )
+            .unwrap()
+        };
+        let first = open();
+        let initial = first
+            .selected_workspace_snapshots()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let first_key = first.language_content_identity();
+        let config = fixture.file(config_path);
+        config.write("second\n").unwrap();
+        let second = first.update(&BTreeSet::from([config.clone()]));
+        let next = second
+            .selected_workspace_snapshots()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(next.revision, initial.revision + 1);
+        assert_ne!(second.language_content_identity(), first_key);
+        let reopened = open();
+        assert_eq!(
+            second.language_content_identity(),
+            reopened.language_content_identity()
+        );
+        assert_eq!(
+            reopened
+                .selected_workspace_snapshots()
+                .values()
+                .next()
+                .unwrap(),
+            &next
+        );
+        let conn = crate::cache_db::open_unified_connection(&db).unwrap();
+        let source_versions: i64 = conn.query_row(
+            "SELECT count(*) FROM workspace_file_versions WHERE workspace_id = ?1 AND lang = ?2 AND input_kind = 'source'",
+            rusqlite::params![initial.workspace_id.as_str(), initial.lang], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            source_versions, 1,
+            "configuration edits must not republish source"
+        );
+        for (revision, expected) in [(initial.revision, "first\r\n"), (next.revision, "second\n")] {
+            let bytes: Vec<u8> = conn.query_row(
+                "SELECT retained.source_bytes FROM workspace_file_versions AS versions
+                 JOIN workspace_input_sources AS retained ON retained.content_oid = versions.blob_oid
+                 WHERE versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.rel_path = ?3
+                   AND versions.input_kind = 'configuration' AND versions.valid_from <= ?4
+                   AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
+                rusqlite::params![initial.workspace_id.as_str(), initial.lang, config_path, revision], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(bytes, expected.as_bytes());
+        }
+        let overlay = Arc::new(OverlayProject::new(Arc::clone(&project)));
+        assert!(overlay.set(config.abs_path(), "second\n".into()));
+        let unchanged = second.clone_with_project(Arc::new(overlay.snapshot()));
+        assert_eq!(
+            unchanged
+                .store_context
+                .store
+                .native_configuration_overlay_mismatch(
+                    unchanged.project.as_ref(),
+                    &unchanged.selected_workspace_snapshots(),
+                    &initial.lang,
+                    adapter.language(),
+                    &crate::CancellationToken::new()
+                )
+                .unwrap(),
+            crate::analyzer::store::NativeConfigurationOverlayAuthority::Current
+        );
+        assert!(overlay.set(config.abs_path(), "unsaved\n".into()));
+        let request = second.clone_with_project(Arc::new(overlay.snapshot()));
+        assert_eq!(
+            request
+                .store_context
+                .store
+                .native_configuration_overlay_mismatch(
+                    request.project.as_ref(),
+                    &request.selected_workspace_snapshots(),
+                    &initial.lang,
+                    adapter.language(),
+                    &crate::CancellationToken::new()
+                )
+                .unwrap(),
+            crate::analyzer::store::NativeConfigurationOverlayAuthority::Mismatch(
+                config_path.into()
+            )
+        );
+        assert_ne!(
+            request.language_content_identity(),
+            second.language_content_identity()
+        );
+        let captured = TreeSitterAnalyzer::<A>::workspace_configuration_inputs(
+            overlay.as_ref(),
+            &adapter,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .find(|input| input.relative_path() == config_path)
+                .unwrap()
+                .source_bytes(),
+            b"second\n"
+        );
+        let extra = fixture.file(if adapter.language() == Language::Go {
+            "extra/go.sum"
+        } else {
+            "extra/gradle.properties"
+        });
+        assert!(overlay.set(extra.abs_path(), "only in editor\n".into()));
+        let captured = TreeSitterAnalyzer::<A>::workspace_configuration_inputs(
+            overlay.as_ref(),
+            &adapter,
+            None,
+        )
+        .unwrap();
+        assert_eq!(captured.len(), 1);
+        let overlay_only = Arc::new(OverlayProject::new(Arc::clone(&project)));
+        assert!(overlay_only.set(extra.abs_path(), "only in editor\n".into()));
+        let cancellation = crate::CancellationToken::new();
+        assert_eq!(
+            second
+                .store_context
+                .store
+                .native_configuration_overlay_mismatch(
+                    overlay_only.as_ref(),
+                    &second.selected_workspace_snapshots(),
+                    &initial.lang,
+                    adapter.language(),
+                    &cancellation,
+                )
+                .unwrap(),
+            crate::analyzer::store::NativeConfigurationOverlayAuthority::Mismatch(
+                crate::path_utils::rel_path_string(&extra)
+            )
+        );
+        cancellation.cancel();
+        assert_eq!(
+            second
+                .store_context
+                .store
+                .native_configuration_overlay_mismatch(
+                    overlay_only.as_ref(),
+                    &second.selected_workspace_snapshots(),
+                    &initial.lang,
+                    adapter.language(),
+                    &cancellation,
+                )
+                .unwrap(),
+            crate::analyzer::store::NativeConfigurationOverlayAuthority::Cancelled
+        );
+        let source_file = fixture.file(source_path);
+        source_file.write(format!("{source}\n")).unwrap();
+        let source_updated = second.update(&BTreeSet::from([source_file]));
+        assert_eq!(
+            source_updated
+                .selected_workspace_snapshots()
+                .values()
+                .next()
+                .unwrap()
+                .revision,
+            next.revision + 1
+        );
+        assert_ne!(
+            source_updated.language_content_identity(),
+            second.language_content_identity()
+        );
+    }
+
+    #[test]
+    fn java_native_configuration_lifecycle() {
+        native_configuration_lifecycle(
+            JavaAdapter,
+            "Sample.java",
+            "class Sample {}",
+            "gradle.properties",
+        );
+    }
+
+    #[test]
+    fn jvm_toolchain_native_configuration_lifecycle() {
+        native_configuration_lifecycle(
+            JavaAdapter,
+            "Sample.java",
+            "class Sample {}",
+            ".bifrost/jvm-toolchains.json",
+        );
+    }
+
+    #[test]
+    fn go_vendor_native_configuration_lifecycle() {
+        native_configuration_lifecycle(
+            GoAdapter,
+            "sample.go",
+            "package sample\ntype Item struct{}",
+            "vendor/modules.txt",
+        );
+    }
+
+    #[test]
+    fn go_native_configuration_lifecycle() {
+        native_configuration_lifecycle(
+            GoAdapter,
+            "sample.go",
+            "package sample\ntype Item struct{}",
+            "go.sum",
+        );
+    }
+
+    #[test]
+    fn rust_workspace_configuration_capture_uses_disk_and_keeps_overlay_only_paths_transient() {
+        let disk_manifest = "[package]\nname = \"sample\"\nedition = \"2021\"\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", disk_manifest)
+            .file("src/lib.rs", "pub fn sample() {}\n")
+            .build();
+        let base = fixture.project_dyn();
+        let overlay = Arc::new(OverlayProject::new(base));
+        let manifest = fixture.file("Cargo.toml");
+        assert!(overlay.set(
+            manifest.abs_path(),
+            "[package]\nname = \"overlay\"\nedition = \"2024\"\n".to_owned()
+        ));
+
+        let snapshot = WorkspaceBuildSnapshot::capture(overlay.as_ref(), None, &[Language::Rust])
+            .expect("workspace snapshot");
+        let captured = TreeSitterAnalyzer::<RustAdapter>::workspace_configuration_inputs(
+            overlay.as_ref(),
+            &RustAdapter,
+            Some(snapshot.as_ref()),
+        )
+        .expect("disk configuration capture");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].relative_path(), "Cargo.toml");
+        assert_eq!(captured[0].source_bytes(), disk_manifest.as_bytes());
+
+        let overlay_only = fixture.file("generated/Cargo.toml");
+        assert!(overlay.set(
+            overlay_only.abs_path(),
+            "[package]\nname = \"generated\"\n".to_owned()
+        ));
+        let snapshot = WorkspaceBuildSnapshot::capture(overlay.as_ref(), None, &[Language::Rust])
+            .expect("workspace snapshot with overlay-only path");
+        let captured = TreeSitterAnalyzer::<RustAdapter>::workspace_configuration_inputs(
+            overlay.as_ref(),
+            &RustAdapter,
+            Some(snapshot.as_ref()),
+        )
+        .expect("overlay-only configuration is transient");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].relative_path(), "Cargo.toml");
+        assert_eq!(captured[0].source_bytes(), disk_manifest.as_bytes());
     }
 
     #[test]
@@ -19766,6 +23560,164 @@ mod tests {
     }
 
     #[test]
+    fn legacy_source_identity_survives_primary_publication_and_reopen() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("Legacy.java", "class Legacy {}\n")
+            .build();
+        let file = fixture.file("Legacy.java");
+        let raw = b"// legacy \x97 comment\nclass Legacy {}\n";
+        std::fs::write(file.abs_path(), raw).expect("legacy source bytes");
+        let oid = Oid::hash_object(ObjectType::Blob, raw).expect("raw source identity");
+        let decoded = crate::analyzer::project::decode_source_bytes(raw.to_vec())
+            .expect("decoded parser source");
+        assert_ne!(
+            Oid::hash_object(ObjectType::Blob, decoded.as_bytes()).unwrap(),
+            oid
+        );
+        let db = fixture.root().join("legacy-source.db");
+        for _ in 0..2 {
+            let project: Arc<dyn Project> =
+                Arc::new(TestProject::new(fixture.root(), Language::Java));
+            let store = AnalyzerStore::open_persistent(&db).expect("persistent store");
+            let context = store_context_from_store(project.as_ref(), store, false);
+            let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                project,
+                JavaAdapter,
+                AnalyzerConfig::default(),
+                context,
+                None,
+            )
+            .expect("legacy primary publication");
+            assert!(
+                analyzer
+                    .get_all_declarations()
+                    .iter()
+                    .any(|unit| unit.short_name() == "Legacy")
+            );
+            assert_eq!(analyzer.resolve_live_oid_for_file(&file), Some(oid));
+            assert_eq!(
+                analyzer.source_for_oid(&file, oid).as_deref(),
+                Some(decoded.as_str())
+            );
+            assert!(analyzer.indexed_source_matches(&file, &decoded));
+            assert_eq!(
+                analyzer
+                    .structural_snapshot_key(&file, &decoded)
+                    .unwrap()
+                    .oid,
+                oid
+            );
+            let (prepared_oid, snapshot) = analyzer
+                .source_snapshot_limited(&file, usize::MAX)
+                .expect("prepared source")
+                .expect("source snapshot");
+            assert_eq!(prepared_oid, oid);
+            assert_eq!(snapshot.source(), decoded);
+            assert!(
+                analyzer
+                    .store_context
+                    .store
+                    .contains_blob(oid, "java")
+                    .expect("published blob")
+            );
+        }
+    }
+
+    #[test]
+    fn content_oid_memo_does_not_alias_distinct_raw_snapshots_with_same_decoded_text() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/Legacy.java");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        let raw_first = b"class Legacy { /* invalid byte: \x80 */ }\n";
+        let raw_second = b"class Legacy { /* invalid byte: \x81 */ }\n";
+        std::fs::write(file.abs_path(), raw_first).expect("first raw source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        let decoded_first = crate::analyzer::project::decode_source_bytes(raw_first.to_vec())
+            .expect("first decoded source");
+        let decoded_second = crate::analyzer::project::decode_source_bytes(raw_second.to_vec())
+            .expect("second decoded source");
+        assert_eq!(decoded_first, decoded_second);
+        let first_oid = Oid::hash_object(ObjectType::Blob, raw_first).expect("first raw oid");
+        let second_oid = Oid::hash_object(ObjectType::Blob, raw_second).expect("second raw oid");
+        assert_ne!(first_oid, second_oid);
+
+        analyzer.reset_blob_hash_count_for_test();
+        assert_eq!(
+            analyzer.content_oid_of(&file, &decoded_first),
+            Some(first_oid)
+        );
+        std::fs::write(file.abs_path(), raw_second).expect("second raw source");
+        assert_eq!(
+            analyzer.content_oid_of(&file, &decoded_second),
+            Some(second_oid)
+        );
+        assert_eq!(
+            analyzer.blob_hash_count_for_test(),
+            1,
+            "the shared memo hashes the decoded text once while raw identity is selected per snapshot"
+        );
+    }
+
+    #[test]
+    fn live_blob_persistence_rejects_source_changed_between_identity_and_parse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        let old_source = "pub fn old_name() { old_name(); }\n";
+        let new_source = "pub fn new_name() { new_name(); }\n";
+        file.write(old_source).expect("Rust source");
+
+        let project = Arc::new(CountingOverlayProject::new(&root, old_source));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let store = Arc::clone(&analyzer.store_context.store);
+        let old_oid =
+            Oid::hash_object(ObjectType::Blob, old_source.as_bytes()).expect("old source OID");
+        let generation = analyzer.store_context.generations["rust"];
+        let initial = store
+            .rust_usage_facts(old_oid, "rust")
+            .expect("initial Rust usage facts");
+        assert!(
+            initial
+                .identifier_occurrences
+                .iter()
+                .any(|occurrence| occurrence.identifier == "old_name"),
+            "the old publication must contain the old identifier"
+        );
+
+        project.arm_source_swap(new_source);
+        analyzer.persist_live_blobs(std::slice::from_ref(&file));
+
+        let after_changed_parse = store
+            .rust_usage_facts(old_oid, "rust")
+            .expect("old Rust usage facts remain readable");
+        assert_eq!(
+            after_changed_parse, initial,
+            "a changed parse must not replace the old OID's publication"
+        );
+        assert!(
+            !after_changed_parse
+                .identifier_occurrences
+                .iter()
+                .any(|occurrence| occurrence.identifier == "new_name")
+        );
+
+        store.delete_rust_facts_for_test("rust");
+        project.arm_source_swap(new_source);
+        analyzer.persist_live_blobs(std::slice::from_ref(&file));
+        assert!(
+            store
+                .blobs_with_rust_facts("rust", generation, &[old_oid])
+                .expect("probe missing old publication")
+                .is_empty(),
+            "a changed parse must not manufacture a missing old publication"
+        );
+    }
+
+    #[test]
     fn warm_rebuild_uses_bulk_presence_without_redundant_point_contains_queries() {
         const UNIQUE_FILES: usize = 10;
         let temp = tempfile::tempdir().expect("temp dir");
@@ -19878,6 +23830,36 @@ mod tests {
     /// for the bytes in hand -- for the indexed disk source, for a dirty
     /// rewrite of the same file, and for an unsaved overlay -- and a repeat
     /// question about unchanged bytes does not run SHA-1 again.
+    /// A location lookup asks for a file's current state once per declaration.
+    /// Within one request the file's text is read, copied and hashed once, not
+    /// once per declaration: on tract's 850 KB generated file the per-ask copy
+    /// and hash cost about 0.2 s per point, and about 1.3 s more when the
+    /// allocator returned each copy's pages to the kernel.
+    #[test]
+    fn a_request_reads_and_hashes_a_files_current_text_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/lib.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        let source = (0..20)
+            .map(|index| format!("pub fn f{index}() {{}}\n"))
+            .collect::<String>();
+        file.write(&source).expect("source");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let units = analyzer.location_declarations(&file);
+        assert_eq!(units.len(), 20, "{units:?}");
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        analyzer.blob_oids.text_hashes.store(0, Ordering::Relaxed);
+        for unit in &units {
+            assert!(!analyzer.location_ranges(unit).is_empty(), "{unit:?}");
+        }
+        assert_eq!(analyzer.blob_oids.text_hashes.load(Ordering::Relaxed), 1);
+        drop(scope);
+    }
+
     #[test]
     fn content_oid_of_matches_git_hash_object_and_hashes_each_source_once() {
         let temp = tempfile::tempdir().expect("temp dir");

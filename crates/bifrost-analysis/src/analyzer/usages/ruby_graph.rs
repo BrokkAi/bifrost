@@ -14,8 +14,9 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::ruby::parse_ruby_tree;
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    parse_and_collect_with_domain,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
+    build_edge_output_with_completeness, build_file_declarations,
+    parse_source_and_collect_with_declarations_and_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -68,27 +69,49 @@ fn build_ruby_edges<Output, F>(
     files: &[ProjectFile],
     domain: EdgeNodeDomain<'_>,
     keep_file: F,
-) -> Output
+) -> Option<Output>
 where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_ruby::LANGUAGE.into();
-    build_edge_output(files, keep_file, |file| {
-        parse_and_collect_with_domain(
-            analyzer,
+    let result = build_edge_output_with_completeness(files, keep_file, |file| {
+        let visible_files =
+            RubySemanticIndex::build_for_lookup(graph, ruby).visible_files_from(file)?;
+        let source = analyzer.project().read_source(file).ok()?;
+        if !analyzer.indexed_source_matches(file, &source) {
+            return None;
+        }
+        let declarations = build_file_declarations(analyzer, file);
+        parse_source_and_collect_with_declarations_and_domain(
+            source,
             file,
             domain,
             ParseSpec::whole(&language),
+            declarations,
             |input| {
                 graph.with_definitions(|support| {
                     brokk_bifrost_ruby::graph::inverted::scan_file(
-                        graph, ruby, support, file, input,
+                        graph,
+                        ruby,
+                        support,
+                        file,
+                        input,
+                        visible_files,
                     )
                 })
             },
         )
-    })
+    });
+    match result {
+        UsageEdgeBuildResult::Complete(output) => Some(output),
+        UsageEdgeBuildResult::Uncacheable { omitted_files, .. } => {
+            analyzer.record_query_failure(crate::analyzer::store::StoreError::new(format!(
+                "Ruby edge inputs are unavailable: {omitted_files:?}"
+            )));
+            None
+        }
+    }
 }
 
 pub fn build_ruby_usage_edges(
@@ -97,7 +120,7 @@ pub fn build_ruby_usage_edges(
     keep_file: impl Fn(&ProjectFile) -> bool + Sync,
 ) -> Option<UsageEdges> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    resolver.build_edges(analyzer, nodes, keep_file)
 }
 
 pub(crate) fn build_rooted_ruby_usage_edges(
@@ -106,7 +129,7 @@ pub(crate) fn build_rooted_ruby_usage_edges(
     keep_file: impl Fn(&ProjectFile) -> bool + Sync,
 ) -> Option<UsageEdges> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
+    resolver.build_rooted_edges(analyzer, callers, keep_file)
 }
 
 pub(crate) fn build_ruby_usage_edge_weights(
@@ -115,7 +138,7 @@ pub(crate) fn build_ruby_usage_edge_weights(
     keep_file: impl Fn(&ProjectFile) -> bool + Sync,
 ) -> Option<UsageEdgeWeights> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    resolver.build_edge_weights(analyzer, nodes, keep_file)
 }
 
 /// Ruby's implementation of the shared query-path contract.
@@ -170,6 +193,13 @@ impl RubyQueryResolver<'_> {
             );
         };
 
+        if !ruby.canonical_sources_ready() {
+            return GraphUsageOutcome::terminal_failure(
+                target.fq_name(),
+                GraphFailureReason::UnavailableCanonicalFacts("Ruby source facts are unavailable"),
+                STRATEGY,
+            );
+        }
         let semantic = RubySemanticIndex::build(graph, ruby, &spec);
         let scan_files = scan_scope.candidate_files();
 
@@ -189,7 +219,15 @@ impl RubyQueryResolver<'_> {
                 continue;
             };
             let line_starts = compute_line_starts(&source);
-            let visible_files = semantic.visible_files_from(file);
+            let Some(visible_files) = semantic.visible_files_from(file) else {
+                return GraphUsageOutcome::terminal_failure(
+                    target.fq_name(),
+                    GraphFailureReason::UnavailableCanonicalFacts(
+                        "Ruby load closure is unavailable",
+                    ),
+                    STRATEGY,
+                );
+            };
             graph.with_definitions(|support| {
                 let mut scan = RubyFileScan {
                     index: analyzer,

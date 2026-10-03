@@ -1780,6 +1780,27 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         site_id,
                     ));
                 }
+                CodeQueryResultValue::ResultSubjectUse { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&paint(
+                        Style::new().fg(Color::Cyan).bold(),
+                        &path,
+                        use_color,
+                    ));
+                    if let Some(range) = value.receiver_range {
+                        out.push_str(&format!(":{}:{}", range.start_line, range.start_column));
+                    }
+                    out.push_str(&format!(
+                        "\n  result subject use: {} [proof={}; completeness={}]\n  subject {}\n",
+                        value.outcome.label(),
+                        value.proof,
+                        value.completeness,
+                        sanitize_terminal_text(value.subject_id.as_deref().unwrap_or("unproven")),
+                    ));
+                    if let Some(reason) = value.reason {
+                        out.push_str(&format!("  reason {}\n", sanitize_terminal_text(reason)));
+                    }
+                }
                 CodeQueryResultValue::ResultContractUse { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let operation =
@@ -3410,6 +3431,8 @@ mod tests {
                             parameter_ordinal: Some(1),
                             port_id: Some("procedure:parameter:1".to_owned()),
                             decorator_name: "Query".to_owned(),
+                            annotation_type: None,
+                            annotation_status: None,
                             local_name: Some("NestQuery".to_owned()),
                             imported_name: Some("Query".to_owned()),
                             module: Some("@nestjs/common".to_owned()),

@@ -406,6 +406,7 @@ fn import_semantic_document(
             visibility: Visibility::Public,
             is_abstract: false,
             is_sealed: false,
+            callable_surface_complete: false,
             has_explicit_type_terms: false,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
@@ -529,6 +530,7 @@ fn import_semantic_document(
                 .is_some_and(|statement| statement.status == CsmiCoverageStatus::Complete);
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
+            non_overridable: None,
             ambient_use: None,
             id: member_id,
             owner: owner_id,
@@ -943,7 +945,7 @@ fn import_semantic_document(
         language,
         ecosystem,
         compatibility: Compatibility {
-            bifrost: format!(">={}", env!("CARGO_PKG_VERSION")),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         provenance,
@@ -958,14 +960,15 @@ fn import_semantic_document(
         python_correspondence: None,
         shards,
     };
-    if let Some(evidence) = python_correspondence {
-        pack.python_correspondence = Some(evidence);
-        let native_sha256 = super::python::native_correspondence_digest(&pack);
-        pack.python_correspondence
-            .as_mut()
-            .expect("correspondence carrier was just set")
-            .native_sha256 = native_sha256;
-    } else if python_identity && model.artifact_selectors[0].purl.starts_with("pkg:pypi/") {
+    pack.python_correspondence = python_correspondence;
+    let retain_python_profile = python_identity
+        && (model.artifact_selectors[0].purl.starts_with("pkg:pypi/")
+            || !model.compatibility_constraints.is_empty()
+            || model
+                .extension_facts
+                .iter()
+                .any(|fact| fact.vocabulary == CSMI_PYTHON_PROFILE_ID));
+    if retain_python_profile {
         let native_sha256 = super::python::native_profile_digest(&pack);
         let evidence = PortableProfileEvidence {
             native_sha256,
@@ -973,6 +976,12 @@ fn import_semantic_document(
                 .vocabulary_uses
                 .iter()
                 .filter(|use_| use_.identifier == CSMI_PYTHON_PROFILE_ID)
+                .cloned()
+                .collect(),
+            compatibility_constraints: model
+                .compatibility_constraints
+                .iter()
+                .filter(|constraint| constraint.vocabulary == CSMI_PYTHON_PROFILE_ID)
                 .cloned()
                 .collect(),
             extension_facts: model
@@ -990,25 +999,38 @@ fn import_semantic_document(
             provenance_records: document.provenance_records.clone(),
             default_provenance: document.default_provenance.clone(),
         };
-        let Some(Locator::Interchange {
-            profile_evidence, ..
-        }) = pack
+        let Some(locator) = pack
             .shards
             .iter_mut()
             .find_map(|shard| match &mut shard.payload {
-                AuthoredPayload::DeclarationFacts { types, .. } => {
-                    types.first_mut().map(|fact| &mut fact.locator)
-                }
+                AuthoredPayload::DeclarationFacts { types, members, .. } => types
+                    .first_mut()
+                    .map(|fact| &mut fact.locator)
+                    .or_else(|| members.first_mut().map(|fact| &mut fact.locator)),
                 _ => None,
             })
         else {
             return Err(CsmiImportError::Unsupported {
                 path: "symbols".to_owned(),
-                semantic: "Python distribution has no declared module to carry profile evidence"
-                    .to_owned(),
+                semantic: "Python profile evidence has no declaration to carry it".to_owned(),
             });
         };
+        let Locator::Interchange {
+            profile_evidence, ..
+        } = locator
+        else {
+            unreachable!("validated Python identities use interchange locators")
+        };
         *profile_evidence = Some(Box::new(evidence));
+    }
+    let native_sha256 = pack
+        .python_correspondence
+        .as_ref()
+        .map(|_| super::python::native_correspondence_digest(&pack));
+    if let Some((correspondence, native_sha256)) =
+        pack.python_correspondence.as_mut().zip(native_sha256)
+    {
+        correspondence.native_sha256 = native_sha256;
     }
     Ok(pack)
 }
@@ -2513,12 +2535,22 @@ fn summary_from_csmi(
         .and_then(|id| symbols.get(id))
         .cloned()
         .unwrap_or_default();
-    let symbol = model
+    let callable = model
         .symbols
         .iter()
         .find(|symbol| symbol.id == summary.callable)
-        .and_then(callable_name)
-        .ok_or_else(|| CsmiImportError::Identity("summary callable has no name".to_owned()))?;
+        .ok_or_else(|| CsmiImportError::Identity("summary callable has no identity".to_owned()))?;
+    let symbol = if callable.scheme == CSMI_PYTHON_PROFILE_ID {
+        // A Python namespace is a qualified identity, not a file path whose
+        // final component may be interpreted as an extension by target readers.
+        super::python::qualified_name(
+            &super::python::identity_from_symbol(callable, &model.artifact_selectors)
+                .map_err(CsmiImportError::Identity)?,
+        )
+    } else {
+        callable_name(callable)
+            .ok_or_else(|| CsmiImportError::Identity("summary callable has no name".to_owned()))?
+    };
     let target = AuthoredProcedureTarget {
         path: owner,
         symbol,
@@ -2619,6 +2651,7 @@ fn summary_from_csmi(
         target,
         completeness,
         ordinary_heap_unchanged: false,
+        no_concurrency_effects: false,
         covers_overrides: false,
         normal_continuation_absent: false,
         normal_result_count: (!shape.results.is_empty()).then_some(shape.results.len() as u32),

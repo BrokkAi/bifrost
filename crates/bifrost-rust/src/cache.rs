@@ -59,14 +59,7 @@ pub fn weight_declaration_facts(
                     .iter()
                     .map(|(domain, condition)| {
                         domain.weight_bytes()
-                            + match condition {
-                                crate::lexical_scope::RustCfgCondition::Always => 0,
-                                crate::lexical_scope::RustCfgCondition::Atom(atom)
-                                | crate::lexical_scope::RustCfgCondition::NotAtom(atom) => {
-                                    atom.len()
-                                }
-                                crate::lexical_scope::RustCfgCondition::Unknown => 0,
-                            }
+                            + condition.estimated_retained_bytes()
                             + size_of::<(
                                 crate::usage::Domain,
                                 crate::lexical_scope::RustCfgCondition,
@@ -81,6 +74,32 @@ pub fn weight_declaration_facts(
         + domain_cfg_occurrences
         + size_of::<crate::usage_queries::RustDeclarationFacts>())
     .min(u32::MAX as usize) as u32
+}
+
+pub fn weight_declaration_source_properties<K>(
+    _key: &K,
+    value: &Arc<crate::graph_support::RustDeclarationSourceProperties>,
+) -> u32 {
+    let bytes =
+        value
+            .iter()
+            .map(|(unit, properties)| {
+                size_of::<CodeUnit>()
+                    + unit.fq_name().len()
+                    + size_of::<
+                        Vec<brokk_bifrost_core::analyzer::rust_facts::RustDeclarationPropertyFact>,
+                    >()
+                    + properties.capacity()
+                        * size_of::<
+                            brokk_bifrost_core::analyzer::rust_facts::RustDeclarationPropertyFact,
+                        >()
+                    + properties
+                        .iter()
+                        .map(|property| property.estimated_retained_bytes())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+    bytes.min(u32::MAX as usize) as u32
 }
 
 /// Byte weight of one blob's persisted Rust usage facts.

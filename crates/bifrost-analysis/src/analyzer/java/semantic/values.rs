@@ -372,7 +372,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         .unwrap_or_default();
         let mut ordinal = 0_u32;
         for (slot, node) in slots {
-            let metadata = self.value_mapping(builder, node)?;
+            let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
+            let metadata = self.session.add_mapping_with_ast_identity(
+                builder,
+                anchor,
+                SourceMappingKind::Exact,
+                self.structural_node_index.identity(node),
+            )?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
             let value = if slot.receiver {

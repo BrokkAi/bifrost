@@ -1,6 +1,5 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -238,19 +237,6 @@ fn compact_csharp_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
-    let mut found = false;
-    walk_named_tree_preorder(root, true, |node| {
-        found |= csharp_method_has_runnable_test_attribute(node, source);
-        if found {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        }
-    });
-    found
-}
-
 /// Whether this method declaration carries a runner-recognized test attribute.
 ///
 /// The owner check stays structural: attributes on a class, parameter,
@@ -340,7 +326,8 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 #[cfg(test)]
 mod test_classification_tests {
-    use super::csharp_contains_tests;
+    use crate::declarations::parse_csharp_file;
+    use brokk_bifrost_core::analyzer::ProjectFile;
     use tree_sitter::Parser;
 
     fn contains_tests(source: &str) -> bool {
@@ -349,7 +336,10 @@ mod test_classification_tests {
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
             .expect("C# grammar");
         let tree = parser.parse(source, None).expect("C# tree");
-        csharp_contains_tests(tree.root_node(), source)
+        let file = ProjectFile::new(std::env::temp_dir(), "Tests.cs");
+        parse_csharp_file(&file, source, &tree)
+            .contains_tests
+            .expect("primary classification")
     }
 
     #[test]

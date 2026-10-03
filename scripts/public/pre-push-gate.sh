@@ -90,6 +90,9 @@ if [ "${available_gib:-0}" -lt 60 ]; then
   step "WARNING: ${available_gib}GiB free; the isolated all-features clippy build may exhaust disk"
 fi
 
+step "analysis lib default-feature clippy"
+cargo clippy --lib -p brokk-bifrost-analysis -- -D warnings
+
 clippy_log="$(mktemp -t pre-push-gate-clippy-XXXXXX.log)"
 clippy_cmd=(scripts/public/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings)
 if [ -z "${PYO3_PYTHON:-}" ] && command -v uv >/dev/null 2>&1; then

@@ -142,6 +142,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::CallResultObligation {
             value: Default::default(),
         },
+        CodeQueryResultValue::ResultSubjectUse {
+            value: Default::default(),
+        },
         CodeQueryResultValue::ResultContractUse {
             value: Default::default(),
         },
@@ -170,7 +173,20 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::DecoratedParameter {
-            value: Default::default(),
+            value: Box::new(CodeQueryDecoratedParameter {
+                annotation_type: Some(Box::new(CodeQueryDeclaration {
+                    path: "src/fixture/TraceMarker.java".to_owned(),
+                    language: "java",
+                    kind: "annotation_type_declaration",
+                    fq_name: "fixture.annotations.TraceMarker".to_owned(),
+                    start_line: 1,
+                    end_line: 1,
+                    id: Some("fixture-annotation-trace-marker".to_owned()),
+                    ..Default::default()
+                })),
+                annotation_status: Some(crate::analyzer::JavaAnnotationTypeStatus::Resolved),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::CallableApplicability {
             value: Default::default(),
@@ -287,9 +303,10 @@ pub fn code_query_result_fixtures_json() -> Value {
     let serialized =
         serde_json::to_value(result).expect("the canonical Rust result fixtures are serializable");
 
-    let actual = serialized["results"]
+    let rows = serialized["results"]
         .as_array()
-        .expect("serialized fixtures retain their result rows")
+        .expect("serialized fixtures retain their result rows");
+    let actual = rows
         .iter()
         .map(|row| {
             row["result_type"]
@@ -298,9 +315,10 @@ pub fn code_query_result_fixtures_json() -> Value {
         })
         .collect::<HashSet<_>>();
     let schema = code_query_result_json_schema();
-    let expected = schema["$defs"]["CodeQueryResultItem"]["oneOf"]
+    let variants = schema["$defs"]["CodeQueryResultItem"]["oneOf"]
         .as_array()
-        .expect("the result item schema is a tagged union")
+        .expect("the result item schema is a tagged union");
+    let expected = variants
         .iter()
         .map(|variant| {
             variant["properties"]["result_type"]["const"]
@@ -309,8 +327,46 @@ pub fn code_query_result_fixtures_json() -> Value {
         })
         .collect::<HashSet<_>>();
     assert_eq!(
+        rows.len(),
+        expected.len(),
+        "fixtures contain exactly one row per result variant"
+    );
+    assert_eq!(
+        actual.len(),
+        rows.len(),
+        "fixture result variants are unique"
+    );
+    assert_eq!(
         actual, expected,
         "fixture and schema result variants differ"
     );
+
+    let decorated_row = rows
+        .iter()
+        .find(|row| row["result_type"] == "decorated_parameter")
+        .expect("the serialized fixture includes its decorated parameter row");
+    assert!(
+        decorated_row.get("value").is_none(),
+        "tagged result values remain flattened onto the result row"
+    );
+    assert_eq!(
+        decorated_row["annotation_type"]["id"],
+        "fixture-annotation-trace-marker"
+    );
+    assert_eq!(
+        decorated_row["annotation_type"]["fq_name"],
+        "fixture.annotations.TraceMarker"
+    );
+    assert_eq!(decorated_row["annotation_status"], "resolved");
+
+    let decorated_schema = variants
+        .iter()
+        .find(|variant| variant["properties"]["result_type"]["const"] == "decorated_parameter")
+        .expect("the canonical schema includes decorated parameters");
+    let properties = decorated_schema["properties"]
+        .as_object()
+        .expect("the decorated parameter schema exposes canonical properties");
+    assert!(properties.contains_key("annotation_type"));
+    assert!(properties.contains_key("annotation_status"));
     serialized
 }

@@ -4,10 +4,11 @@
 //! `analyzer/ruby/adapter.rs`; every answer it gives comes from here or from
 //! [`crate::declarations`] and [`crate::test_detection`].
 
-use crate::declarations::{RubyVisitor, collect_ruby_identifiers};
+use crate::declarations::RubyVisitor;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
@@ -49,12 +50,22 @@ pub fn parse_ruby_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     let mut parsed = ParsedFile::new(String::new());
     let root = tree.root_node();
 
-    collect_ruby_identifiers(root, source, &mut parsed.type_identifiers);
-
-    let mut visitor = RubyVisitor {
+    let visitor = RubyVisitor {
         file,
         source,
         parsed: &mut parsed,
+        source_facts: PrimarySourceFactCollector::new(source),
+        imports: Vec::new(),
+        import_by_node: Default::default(),
+        generic_imports: Vec::new(),
+        ruby: Default::default(),
+        field_contexts: Default::default(),
+        field_owners: Vec::new(),
+        current_module: None,
+        module_functions: Default::default(),
+        pending_dispatch: Vec::new(),
+        mixin_roots: Default::default(),
+        mixin_containers: Vec::new(),
     };
     visitor.visit_program(root);
 

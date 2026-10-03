@@ -174,7 +174,6 @@ pub(super) struct CSharpMemoCaches {
     /// Real source files that declare at least one `global using` directive.
     /// The coarse graph factors workspace-global visibility through these
     /// configuration files instead of expanding every directive in every file.
-    pub(super) global_using_files: OnceLock<Vec<ProjectFile>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
     /// [`Self::global_using_namespaces`] sorted once for the visible-type
     /// search's deterministic candidate order (#2679).
@@ -231,7 +230,6 @@ impl CSharpMemoCaches {
             file_dependencies_by_namespace: PoolSafeMemo::new(),
             hierarchy_test_files: PoolSafeMemo::new(),
             compilation_index: PoolSafeMemo::new(),
-            global_using_files: OnceLock::new(),
             global_using_namespaces: OnceLock::new(),
             sorted_global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),

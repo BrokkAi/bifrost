@@ -19,6 +19,7 @@ use git2::{
 use growable_bloom_filter::GrowableBloom;
 
 use crate::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
+use crate::path_normalization::NormalizePath;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -767,7 +768,9 @@ fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
 ///
 /// The Git index supplies clean tracked paths without reading their bytes. The
 /// worktree diff supplies only changed, deleted, and untracked paths that need
-/// filesystem checks. Callers that need the blob identity should use
+/// filesystem checks. Initialized submodules contribute their own local index
+/// and dirty paths, prefixed relative to this repository. No child is fetched
+/// or initialized. Callers that need the blob identity should use
 /// [`all_working_tree_oid_values`]; this path-only form avoids hashing dirty
 /// files when a caller only needs the active file set.
 pub fn all_working_tree_paths(repo: &Repository) -> Result<HashSet<String>> {
@@ -803,25 +806,125 @@ pub fn working_tree_paths_under(repo: &Repository, subtree: &str) -> Result<Hash
     working_tree_paths(repo, Some(subtree))
 }
 
-fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
-    let workdir = workdir(repo)?;
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo, subtree)?;
-    let mut paths = HashSet::with_capacity(index.len() + dirty.len());
-
-    for entry in index.iter() {
-        let rel = index_path_to_string(&entry)?;
-        if subtree.is_some_and(|prefix| !rel.starts_with(prefix)) {
-            continue;
-        }
-        if !dirty.contains(&rel) || workdir.join(&rel).is_file() {
-            paths.insert(rel);
-        }
+/// Open only an already materialized gitlink; never initialize or fetch it.
+fn materialized_submodule(repo: &Repository, rel: &str) -> Result<Option<Repository>> {
+    let relative = Path::new(rel);
+    if !relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(format!("invalid submodule path: {rel}"));
     }
-    for rel in dirty {
-        if index.get_path(Path::new(&rel), 0).is_none() && workdir.join(&rel).is_file() {
-            paths.insert(rel);
+    let parent = workdir(repo)?
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let path = parent.join(relative);
+    // An uninitialized gitlink has no child Git metadata. Opening the parent
+    // through repository discovery would incorrectly treat it as a child.
+    if !path
+        .join(".git")
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if canonical != path || !canonical.starts_with(&parent) || canonical == parent {
+        return Err(format!(
+            "submodule path escapes its parent or uses a symlink: {rel}"
+        ));
+    }
+    let submodule = repo
+        .find_submodule(rel)
+        .map_err(|error| error.to_string())?;
+    let child = submodule.open().map_err(|error| error.to_string())?;
+    let child_root = workdir(&child)?
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if child_root != canonical {
+        return Err(format!(
+            "submodule working directory does not match gitlink: {rel}"
+        ));
+    }
+    Ok(Some(child))
+}
+
+fn contained_child_file(workdir: &Path, rel: &Path) -> Result<bool> {
+    let path = workdir.join(rel);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if !canonical.starts_with(workdir) {
+        return Err(format!(
+            "submodule source escapes its working directory: {}",
+            rel.display()
+        ));
+    }
+    Ok(true)
+}
+
+fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
+    let mut paths = HashSet::new();
+    // Strict descendant workdirs make traversal acyclic. The stack and full
+    // listing belong to this query only, not to a retained workspace index.
+    let mut pending = vec![(
+        repo.path().to_path_buf(),
+        String::new(),
+        subtree.map(str::to_owned),
+    )];
+    while let Some((gitdir, prefix, scope)) = pending.pop() {
+        let current = Repository::open(gitdir).map_err(|error| error.to_string())?;
+        let workdir = workdir(&current)?
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let mut index = current.index().map_err(|error| error.to_string())?;
+        index.read(true).map_err(|error| error.to_string())?;
+        let dirty = dirty_worktree_paths(&current, scope.as_deref())?;
+        let mut visited_gitlinks = HashSet::new();
+        for entry in index.iter() {
+            let rel = index_path_to_string(&entry)?;
+            if entry.mode == 0o160000 {
+                // Conflict stages may contain the same gitlink several times.
+                if !visited_gitlinks.insert(rel.clone()) {
+                    continue;
+                }
+                let child_prefix = format!("{rel}/");
+                let child_scope = match scope.as_deref() {
+                    Some(scope) if scope.starts_with(&child_prefix) => {
+                        Some(scope[child_prefix.len()..].to_owned())
+                    }
+                    Some(scope) if !child_prefix.starts_with(scope) => continue,
+                    _ => None,
+                };
+                if let Some(child) = materialized_submodule(&current, &rel)? {
+                    pending.push((
+                        child.path().to_path_buf(),
+                        format!("{prefix}{child_prefix}"),
+                        child_scope,
+                    ));
+                }
+                continue;
+            }
+            if scope
+                .as_deref()
+                .is_some_and(|scope| !rel.starts_with(scope))
+            {
+                continue;
+            }
+            if (!dirty.contains(&rel) || workdir.join(&rel).is_file())
+                && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
+            {
+                paths.insert(format!("{prefix}{rel}"));
+            }
+        }
+        for rel in dirty {
+            if index.get_path(Path::new(&rel), 0).is_none()
+                && workdir.join(&rel).is_file()
+                && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
+            {
+                paths.insert(format!("{prefix}{rel}"));
+            }
         }
     }
     Ok(paths)
@@ -890,14 +993,12 @@ pub fn working_tree_oids_targeted(
     working_tree_oids(repo, rel_paths)
 }
 
-/// Resolve every path in the index to the blob OID for its current working-tree
-/// bytes.
+/// Resolve the active working-tree paths, including materialized submodule
+/// files, to the blob OIDs of their visible bytes.
 pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
-    let index = repo.index().map_err(|e| e.to_string())?;
-    let rel_paths = index
-        .iter()
-        .map(|entry| index_path_to_string(&entry))
-        .collect::<Result<Vec<_>>>()?;
+    let rel_paths = all_working_tree_paths(repo)?
+        .into_iter()
+        .collect::<Vec<_>>();
     working_tree_oids(repo, &rel_paths)
 }
 
@@ -913,6 +1014,84 @@ pub fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<O
         return Ok(None);
     }
     Ok(Some(resolve_path_oid(workdir, &index, rel)?))
+}
+
+/// Whether one working-directory path belongs to the listing
+/// [`all_working_tree_paths`] builds, decided for that path alone.
+///
+/// The listing holds tracked paths whose file exists and untracked files Git
+/// does not ignore, so a path is listed when it is a file and either the index
+/// tracks it or no ignore rule matches it. A file watcher uses this to update
+/// a cached listing for one created, removed or renamed path without walking
+/// the worktree.
+pub fn working_tree_path_is_listed(repo: &Repository, rel_path: &Path) -> Result<bool> {
+    if !rel_path
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    let mut current = Repository::open(repo.path()).map_err(|error| error.to_string())?;
+    let mut relative = rel_path.to_path_buf();
+    let mut in_child = false;
+    loop {
+        let workdir = workdir(&current)?
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let normalized_workdir = workdir.to_path_buf().normalize();
+        let mut index = current.index().map_err(|error| error.to_string())?;
+        index.read(true).map_err(|error| error.to_string())?;
+        // A gitlink can only be an ancestor of this path. Point membership
+        // probes those index entries instead of scanning the whole index.
+        let gitlink = relative
+            .ancestors()
+            .filter(|path| !path.as_os_str().is_empty())
+            .find_map(|path| {
+                (0..=3)
+                    .filter_map(|stage| index.get_path(path, stage))
+                    .find(|entry| entry.mode == 0o160000)
+            })
+            .map(|entry| index_path_to_string(&entry))
+            .transpose()?;
+        if let Some(gitlink) = gitlink {
+            let Some(child) = materialized_submodule(&current, &gitlink)? else {
+                return Ok(false);
+            };
+            relative = relative
+                .strip_prefix(&gitlink)
+                .expect("gitlink prefix matched")
+                .to_path_buf();
+            current = child;
+            in_child = true;
+            continue;
+        }
+        if !workdir.join(&relative).is_file() {
+            return Ok(false);
+        }
+        if in_child && !contained_child_file(&workdir, &relative)? {
+            return Ok(false);
+        }
+        if index.get_path(&relative, 0).is_some() {
+            return Ok(true);
+        }
+        // Native Git does not enumerate the contents of an untracked nested
+        // repository. A point update must not admit them either.
+        if let Some(owner) = workdir.join(&relative).parent().and_then(discover) {
+            let owner_workdir = owner
+                .workdir()
+                .map(Path::canonicalize)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .map(NormalizePath::normalize);
+            if owner_workdir.as_deref() != Some(normalized_workdir.as_path()) {
+                return Ok(false);
+            }
+        }
+        return current
+            .is_path_ignored(&relative)
+            .map(|ignored| !ignored)
+            .map_err(|error| error.to_string());
+    }
 }
 
 /// Whether a path's working-tree content differs from the index entry.
@@ -1109,27 +1288,11 @@ pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
     let Some(repo) = discover(root) else {
         return Ok(HashSet::new());
     };
-    let workdir = workdir(&repo)?.to_path_buf();
-    let index = repo.index().map_err(|e| e.to_string())?;
-    let mut tracked_paths = HashSet::with_capacity(index.len());
-    let mut out = HashSet::with_capacity(index.len());
-
-    for entry in index.iter() {
-        let Ok(rel) = index_path_to_string(&entry) else {
-            continue;
-        };
-        tracked_paths.insert(rel.clone());
+    let workdir = workdir(&repo)?;
+    let mut out = HashSet::new();
+    for rel in all_working_tree_paths(&repo)? {
         if workdir.join(&rel).is_file()
-            && let Ok(oid) = hash_working_file(&workdir, &rel)
-        {
-            out.insert(oid.to_string());
-        }
-    }
-
-    for rel in dirty_paths(&repo)? {
-        if !tracked_paths.contains(&rel)
-            && workdir.join(&rel).is_file()
-            && let Ok(oid) = hash_working_file(&workdir, &rel)
+            && let Ok(oid) = hash_working_file(workdir, &rel)
         {
             out.insert(oid.to_string());
         }
@@ -1698,6 +1861,253 @@ mod tests {
         let paths = all_working_tree_paths(&repo).unwrap();
         assert!(!paths.contains("tracked.rs"), "{paths:?}");
         assert!(paths.contains("dirty.rs"), "{paths:?}");
+    }
+
+    fn initialized_child(parent: &Repository, rel: &str) -> Repository {
+        let root = parent.workdir().unwrap();
+        let child = init_repo(&root.join(rel));
+        std::fs::write(
+            child.workdir().unwrap().join("tracked.py"),
+            "def tracked(): return 1\n",
+        )
+        .unwrap();
+        let oid = commit_all(&child, "child");
+        register_gitlink(parent, rel, oid);
+        child
+    }
+
+    fn register_gitlink(parent: &Repository, rel: &str, oid: Oid) {
+        let root = parent.workdir().unwrap();
+        let modules = root.join(".gitmodules");
+        let mut text = if modules.exists() {
+            std::fs::read_to_string(&modules).unwrap()
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "[submodule \"{rel}\"]\n\tpath = {rel}\n\turl = https://example.invalid/child.git\n"
+        ));
+        std::fs::write(modules, text).unwrap();
+        let mut index = parent.index().unwrap();
+        index
+            .add(&IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: oid,
+                flags: 0,
+                flags_extended: 0,
+                path: rel.as_bytes().to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit_paths(parent, &[".gitmodules"], "register child");
+    }
+
+    #[test]
+    fn materialized_submodules_preserve_nested_source_scope_and_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        std::fs::write(temp.path().join("parent.py"), "def parent(): return 1\n").unwrap();
+        commit_all(&parent, "parent");
+        let child = initialized_child(&parent, "vendor/child");
+        let nested = initialized_child(&child, "nested");
+        let nested_root = nested.workdir().unwrap();
+        std::fs::write(nested_root.join(".gitignore"), "ignored.py\ntracked.py\n").unwrap();
+        std::fs::write(nested_root.join("ignored.py"), "ignored").unwrap();
+        std::fs::write(nested_root.join("new.py"), "def new(): return 2\n").unwrap();
+        let changed = b"def tracked(): return 42\n";
+        std::fs::write(nested_root.join("tracked.py"), changed).unwrap();
+
+        let paths = all_working_tree_paths(&parent).unwrap();
+        for path in [
+            "parent.py",
+            "vendor/child/tracked.py",
+            "vendor/child/nested/tracked.py",
+            "vendor/child/nested/new.py",
+        ] {
+            assert!(paths.contains(path), "{paths:?}");
+            assert!(
+                working_tree_path_is_listed(&parent, Path::new(path)).unwrap(),
+                "point membership rejected listed path {path:?}: {paths:?}"
+            );
+        }
+        for path in [
+            "vendor/child",
+            "vendor/child/nested",
+            "vendor/child/nested/ignored.py",
+            "vendor/child/.git/config",
+        ] {
+            assert!(!paths.contains(path), "{paths:?}");
+            assert!(!working_tree_path_is_listed(&parent, Path::new(path)).unwrap());
+        }
+        let scoped = working_tree_paths_under(&parent, "vendor/child/nested/").unwrap();
+        assert_eq!(
+            scoped,
+            paths
+                .iter()
+                .filter(|path| path.starts_with("vendor/child/nested/"))
+                .cloned()
+                .collect()
+        );
+        assert!(
+            !working_tree_paths_under(&parent, "vendor/childish/")
+                .unwrap()
+                .contains("vendor/child/tracked.py")
+        );
+        let oid = Oid::hash_object(ObjectType::Blob, changed)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            working_tree_oids_full(&parent).unwrap()["vendor/child/nested/tracked.py"],
+            oid
+        );
+        assert!(
+            existing_working_tree_oids(temp.path())
+                .unwrap()
+                .contains(&oid)
+        );
+        assert!(parent.find_blob(Oid::from_str(&oid).unwrap()).is_err());
+        std::fs::remove_file(nested_root.join("tracked.py")).unwrap();
+        assert!(
+            !all_working_tree_paths(&parent)
+                .unwrap()
+                .contains("vendor/child/nested/tracked.py")
+        );
+        assert!(
+            !working_tree_path_is_listed(&parent, Path::new("vendor/child/nested/tracked.py"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn materialized_submodules_skip_uninitialized_and_unregistered_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        std::fs::write(temp.path().join("parent.py"), "parent").unwrap();
+        commit_all(&parent, "parent");
+        let child = initialized_child(&parent, "child");
+        let oid = child.head().unwrap().target().unwrap();
+        register_gitlink(&parent, "missing", oid);
+        let unrelated = init_repo(&temp.path().join("unregistered"));
+        std::fs::write(
+            unrelated.workdir().unwrap().join("private.py"),
+            "unregistered",
+        )
+        .unwrap();
+        commit_all(&unrelated, "unregistered");
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(!paths.contains("missing"), "{paths:?}");
+        assert!(!paths.contains("unregistered/private.py"), "{paths:?}");
+        assert!(
+            !working_tree_path_is_listed(&parent, Path::new("unregistered/private.py")).unwrap()
+        );
+        assert!(!working_tree_path_is_listed(&parent, Path::new("missing/tracked.py")).unwrap());
+    }
+
+    #[test]
+    fn materialized_submodule_conflict_keeps_point_membership_in_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        initialized_child(&parent, "child");
+        let mut index = parent.index().unwrap();
+        let mut entry = index.get_path(Path::new("child"), 0).unwrap();
+        index.remove_path(Path::new("child")).unwrap();
+        for stage in 1..=3 {
+            entry.flags = (entry.flags & !0x3000) | (stage << 12);
+            index.add(&entry).unwrap();
+        }
+        index.write().unwrap();
+        assert!(index.has_conflicts());
+        assert!(index.get_path(Path::new("child"), 0).is_none());
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
+    }
+
+    #[test]
+    fn materialized_submodules_support_gitfile_checkouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        let child = initialized_child(&parent, "child");
+        let child_root = child.workdir().unwrap().to_path_buf();
+        child
+            .config()
+            .unwrap()
+            .set_str("core.worktree", child_root.to_str().unwrap())
+            .unwrap();
+        let gitdir = parent.path().join("modules/child");
+        std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        drop(child);
+        std::fs::rename(child_root.join(".git"), &gitdir).unwrap();
+        std::fs::write(
+            child_root.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let paths = all_working_tree_paths(&parent).unwrap();
+        assert!(paths.contains("child/tracked.py"), "{paths:?}");
+        assert!(!paths.contains("child/.git"), "{paths:?}");
+        assert!(working_tree_path_is_listed(&parent, Path::new("child/tracked.py")).unwrap());
+        let project = crate::analyzer::project::FilesystemProject::new(temp.path()).unwrap();
+        use crate::analyzer::project::Project;
+        assert!(
+            project
+                .analyzable_files(crate::analyzer::Language::Python)
+                .unwrap()
+                .iter()
+                .any(|file| file.rel_path() == Path::new("child/tracked.py"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_submodules_reject_source_and_directory_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = init_repo(temp.path());
+        let child = initialized_child(&parent, "child");
+        std::fs::write(outside.path().join("private.py"), "private").unwrap();
+        symlink(
+            outside.path().join("private.py"),
+            child.workdir().unwrap().join("escape.py"),
+        )
+        .unwrap();
+        assert!(
+            all_working_tree_paths(&parent)
+                .unwrap_err()
+                .contains("escapes")
+        );
+        assert!(
+            working_tree_path_is_listed(&parent, Path::new("child/escape.py"))
+                .unwrap_err()
+                .contains("escapes")
+        );
+        std::fs::remove_file(child.workdir().unwrap().join("escape.py")).unwrap();
+        let external = init_repo(outside.path());
+        commit_all(&external, "external");
+        register_gitlink(
+            &parent,
+            "linked",
+            external.head().unwrap().target().unwrap(),
+        );
+        symlink(outside.path(), temp.path().join("linked")).unwrap();
+        // Native Git may reject the replaced gitlink during status before
+        // the explicit containment check. Either path must fail closed.
+        assert!(all_working_tree_paths(&parent).is_err());
+        assert!(
+            working_tree_path_is_listed(&parent, Path::new("linked/private.py"))
+                .unwrap_err()
+                .contains("symlink")
+        );
     }
 
     #[test]

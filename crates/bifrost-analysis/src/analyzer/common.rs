@@ -1,5 +1,5 @@
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    max_line_length_limit, node_ident_text, node_source_text, node_source_text_trimmed,
+    max_line_length_limit, node_source_text, node_source_text_trimmed,
 };
 // The line cap's only remaining in-crate readers are the three suites that
 // build an over-long line to prove the parse guard fires; production reads it
@@ -15,10 +15,15 @@ pub use brokk_bifrost_core::analyzer::common::{
 // `graph::resolver::node_text`, moved with it). The segment-level `r#` strip
 // went to core's `symbol_path`, where the client-selector normalizer that needs
 // it lives.
-pub(crate) use brokk_bifrost_rust::declarations::RUST_IDENTIFIER_SIGIL;
 
 use crate::analyzer::{CodeUnit, FqName, IAnalyzer, Language, ProjectFile};
+use std::ffi::OsStr;
 use std::path::Path;
+
+pub(crate) fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {
+    language_for_file(file) == Language::Java
+        && file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
+}
 
 pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
     if file.root() == root {

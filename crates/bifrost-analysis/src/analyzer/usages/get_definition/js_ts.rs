@@ -1,15 +1,14 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
-use crate::analyzer::tree_walk::children_iter;
-use crate::analyzer::usages::js_ts_graph::{
-    browser_global_property_shape, unbound_browser_global_property,
-};
+use crate::analyzer::usages::js_ts_graph::browser_global_property_shape;
 use crate::navigation::NavigationOperation;
+use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor;
 use brokk_bifrost_js_ts::access_chain::{
     JsTsImportedMemberChainResolution, resolve_import_member_chain,
 };
+use brokk_bifrost_js_ts::graph::source::declaration_ids_for_unit;
 use brokk_bifrost_js_ts::imports::{
     js_ts_module_identity, js_ts_module_specifier_probed_paths, require_call_module_specifier,
     resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
@@ -41,7 +40,6 @@ use brokk_bifrost_js_ts::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
     ts_type_annotation_text,
 };
-use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module;
 
 use crate::analyzer::QueryReadIncomplete;
 use crate::analyzer::semantic::{
@@ -1474,13 +1472,8 @@ pub(super) fn resolve_js_ts(
         });
     }
     if same_file.is_empty() && binding_ranges.is_empty() && language == Language::JavaScript {
-        same_file = jsts_exact_browser_global_bare_candidates(
-            analyzer,
-            host,
-            support,
-            reference,
-            value_position,
-        );
+        same_file =
+            jsts_exact_browser_global_bare_candidates(host, support, reference, value_position);
     }
     if value_position {
         same_file = jsts_value_space_candidates(host, same_file);
@@ -1607,7 +1600,7 @@ fn ts_enclosing_enum_initializer_member_candidates(
 /// name. Module fields keep a file-scoped identity and fail the script gate
 /// below.
 fn jsts_script_global_bare_candidates(
-    analyzer: &dyn IAnalyzer,
+    _analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     reference: &str,
@@ -1616,7 +1609,7 @@ fn jsts_script_global_bare_candidates(
     let candidates = support
         .fqn(reference)
         .into_iter()
-        .filter(|candidate| jsts_candidate_is_script_global_binding(analyzer, candidate, reference))
+        .filter(|candidate| jsts_candidate_is_script_global_binding(host, candidate, reference))
         .collect();
     if value_position {
         jsts_value_space_candidates(host, candidates)
@@ -1635,55 +1628,20 @@ fn jsts_script_global_bare_candidates(
 /// today, but a name that binds anywhere narrower than the program is not part
 /// of the shared global scope even if it does.
 fn jsts_candidate_is_script_global_binding(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
     candidate: &CodeUnit,
     name: &str,
 ) -> bool {
-    let language = crate::analyzer::common::language_for_file(candidate.source());
-    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+    let Some(facts) = host.source_facts(candidate.source()) else {
+        return false;
+    };
+    if facts.facts.file_is_external_module {
         return false;
     }
-    let Ok(source) = candidate.source().read_to_string() else {
-        return false;
-    };
-    let Some(tree) = parse_js_ts_tree(candidate.source(), &source, language) else {
-        return false;
-    };
-    let root = tree.root_node();
-    if js_program_is_external_module(root, &source) {
-        return false;
-    }
-    let program = JstsReceiverBindingScope {
-        start_byte: root.start_byte(),
-        end_byte: root.end_byte(),
-    };
-    analyzer.ranges(candidate).iter().any(|range| {
-        smallest_named_node_covering(root, range.start_byte, range.end_byte)
-            .map(|node| jsts_declaration_binder(node, &source, name))
-            .and_then(|binder| jsts_binding_scope_for_declaration(binder, &source))
-            == Some(program)
+    let declarations = declaration_ids_for_unit(&facts, candidate);
+    facts.facts.declaration_bindings.iter().any(|binding| {
+        declarations.contains(&binding.declaration) && binding.name == name && binding.is_program
     })
-}
-
-/// The node whose binding scope decides where a declaration binds `name`.
-///
-/// A declaration statement is not always the binder: `var isNumber = function
-/// () {}` binds through its `variable_declarator`, which hoists to the
-/// enclosing function or program, while a function, class, interface, or type
-/// declaration binds where the declaration itself sits.
-fn jsts_declaration_binder<'tree>(node: Node<'tree>, source: &str, name: &str) -> Node<'tree> {
-    if !matches!(node.kind(), "variable_declaration" | "lexical_declaration") {
-        return node;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| {
-            child.kind() == "variable_declarator"
-                && child
-                    .child_by_field_name("name")
-                    .is_some_and(|binder| node_text(binder, source) == name)
-        })
-        .unwrap_or(node)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1796,8 +1754,17 @@ fn merge_js_ts_binding_outcomes(
     let mut diagnostics = Vec::new();
     let mut crossed_external_boundary = false;
     let mut unresolved_import = false;
+    let mut unavailable = false;
+    let mut incomplete = false;
+    let mut stopped = None;
     for outcome in outcomes {
         match outcome.status {
+            DefinitionLookupStatus::Unavailable => unavailable = true,
+            DefinitionLookupStatus::Incomplete => incomplete = true,
+            DefinitionLookupStatus::Cancelled => stopped = Some(DefinitionLookupStatus::Cancelled),
+            DefinitionLookupStatus::ExceededBudget(limit) => {
+                stopped = Some(DefinitionLookupStatus::ExceededBudget(limit))
+            }
             DefinitionLookupStatus::UnresolvableImportBoundary => crossed_external_boundary = true,
             DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::UnsupportedLanguage
@@ -1826,6 +1793,20 @@ fn merge_js_ts_binding_outcomes(
         });
         outcome
     };
+    if unavailable {
+        outcome.status = DefinitionLookupStatus::Unavailable;
+    }
+    if incomplete {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+    }
+    if let Some(status) = stopped.as_ref().copied() {
+        // A stopped import branch cannot publish the prefix accumulated by
+        // sibling branches. Preserve the operational terminal status and its
+        // diagnostics, but withhold all target candidates.
+        outcome.status = status;
+        outcome.definitions.clear();
+        outcome.lexical_definition = None;
+    }
     if crossed_external_boundary {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
                 claim: None,
@@ -1876,7 +1857,6 @@ fn jsts_candidate_is_bare_declaration(
 }
 
 fn jsts_exact_browser_global_bare_candidates(
-    analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     reference: &str,
@@ -1890,22 +1870,14 @@ fn jsts_exact_browser_global_bare_candidates(
                 .is_some_and(|(_, property)| property == reference)
         })
         .filter(|candidate| {
-            let Ok(source) = candidate.source().read_to_string() else {
+            let Some(facts) = host.source_facts(candidate.source()) else {
                 return false;
             };
-            let Some(tree) = parse_js_ts_tree(candidate.source(), &source, Language::JavaScript)
-            else {
-                return false;
-            };
-            let lexical_bindings = JsTsLexicalBindingIndex::build(tree.root_node(), &source);
-            unbound_browser_global_property(
-                analyzer,
-                candidate,
-                tree.root_node(),
-                &source,
-                &lexical_bindings,
-            )
-            .is_some()
+            let declarations = declaration_ids_for_unit(&facts, candidate);
+            facts.facts.property_receivers.iter().any(|property| {
+                declarations.contains(&property.declaration)
+                    && matches!(property.binding, JsTsReceiverBinding::Unbound)
+            })
         })
         .collect::<Vec<_>>();
     sort_units(&mut candidates);
@@ -2827,7 +2799,7 @@ fn jsts_focused_reference_receiver_property<'tree>(
 }
 
 fn jsts_exact_dotted_candidates(
-    analyzer: &dyn IAnalyzer,
+    _analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -2847,8 +2819,7 @@ fn jsts_exact_dotted_candidates(
         }
     }
     if let Some(qualifier) = qualifier {
-        candidates
-            .retain(|unit| jsts_dotted_receiver_has_global_identity(analyzer, unit, qualifier));
+        candidates.retain(|unit| jsts_dotted_receiver_has_global_identity(host, unit, qualifier));
     }
     if value_position {
         candidates = jsts_value_space_candidates(host, candidates);
@@ -2859,35 +2830,30 @@ fn jsts_exact_dotted_candidates(
 }
 
 fn jsts_dotted_receiver_has_global_identity(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
     candidate: &CodeUnit,
     receiver: &str,
 ) -> bool {
-    let language = crate::analyzer::common::language_for_file(candidate.source());
-    if !matches!(language, Language::JavaScript | Language::TypeScript) {
-        return false;
-    }
-    let Ok(source) = candidate.source().read_to_string() else {
+    let Some(facts) = host.source_facts(candidate.source()) else {
         return false;
     };
-    let Some(tree) = parse_js_ts_tree(candidate.source(), &source, language) else {
-        return false;
-    };
-    let root = tree.root_node();
-    if js_program_is_external_module(root, &source) {
+    if facts.facts.file_is_external_module {
         return false;
     }
-    analyzer.ranges(candidate).iter().any(|range| {
-        jsts_visible_receiver_binding_scope(root, &source, receiver, range.start_byte)
-            == Some(JstsReceiverBindingScope {
-                start_byte: root.start_byte(),
-                end_byte: root.end_byte(),
-            })
+    let declarations = declaration_ids_for_unit(&facts, candidate);
+    facts.facts.declaration_bindings.iter().any(|binding| {
+        declarations.contains(&binding.declaration)
+            && binding.name == receiver
+            && binding.is_program
+    }) || facts.facts.property_receivers.iter().any(|property| {
+        declarations.contains(&property.declaration)
+            && property.receiver_root == receiver
+            && matches!(property.binding, JsTsReceiverBinding::Program)
     })
 }
 
 fn ts_exact_global_dotted_candidates(
-    analyzer: &dyn IAnalyzer,
+    _analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     reference: &str,
@@ -2896,7 +2862,7 @@ fn ts_exact_global_dotted_candidates(
     let mut candidates = support
         .fqn(reference)
         .into_iter()
-        .filter(|candidate| ts_unit_is_global_declaration(analyzer, candidate))
+        .filter(|candidate| ts_unit_is_global_declaration(host, candidate))
         .collect();
     if value_position {
         candidates = jsts_value_space_candidates(host, candidates);
@@ -2906,74 +2872,19 @@ fn ts_exact_global_dotted_candidates(
     candidates
 }
 
-fn ts_unit_is_global_declaration(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    let Ok(source) = unit.source().read_to_string() else {
+fn ts_unit_is_global_declaration(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
+    let Some(facts) = host.source_facts(unit.source()) else {
         return false;
     };
-    let Some(tree) = parse_js_ts_tree(unit.source(), &source, Language::TypeScript) else {
-        return false;
-    };
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let is_external_module = root
-        .named_children(&mut cursor)
-        .any(|child| matches!(child.kind(), "import_statement" | "export_statement"));
-    if !is_external_module {
-        return true;
+    let declarations = declaration_ids_for_unit(&facts, unit);
+    if !facts.facts.file_is_esm {
+        return !declarations.is_empty();
     }
-    let global_namespace_exports = ts_global_namespace_exports(root, &source);
-
-    analyzer.ranges(unit).iter().any(|range| {
-        let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
-        else {
-            return false;
-        };
-        loop {
-            if ts_is_global_internal_module(node, &source) {
-                return true;
-            }
-            if node.kind() == "internal_module"
-                && node
-                    .child_by_field_name("name")
-                    .map(|name| node_text(name, &source).to_string())
-                    .is_some_and(|name| global_namespace_exports.contains(&name))
-            {
-                return true;
-            }
-            let Some(parent) = node.parent() else {
-                return false;
-            };
-            node = parent;
-        }
-    })
-}
-
-fn ts_global_namespace_exports(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut names = HashSet::default();
-    let mut cursor = root.walk();
-    for statement in root
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "export_statement")
-    {
-        let mut has_as = false;
-        let mut has_namespace = false;
-        for child in children_iter(statement) {
-            match child.kind() {
-                "as" => has_as = true,
-                "namespace" => has_namespace = true,
-                _ => {}
-            }
-        }
-        if has_as
-            && has_namespace
-            && let Some(name) = statement
-                .named_children(&mut statement.walk())
-                .find(|child| child.kind() == "identifier")
-        {
-            names.insert(node_text(name, source).to_string());
-        }
-    }
-    names
+    facts
+        .facts
+        .declarations
+        .iter()
+        .any(|declaration| declarations.contains(&declaration.declaration) && declaration.is_global)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3867,7 +3778,16 @@ fn ts_synthetic_member_is_supported_by_receiver_initializer(
     let Some(tree) = parse_js_ts_tree(receiver.source(), &source, Language::TypeScript) else {
         return false;
     };
-    let imports = compute_jsts_import_binder(&source, &tree);
+    let Some(file_facts) = host.source_facts(receiver.source()) else {
+        return false;
+    };
+    let imports = JsTsImportBinder::from_source_facts_with_lexical_bindings(
+        &file_facts.facts,
+        &file_facts.imports,
+        &file_facts.source,
+        tree.root_node(),
+        JsTsLexicalBindingIndex::build(tree.root_node(), &source),
+    );
     // The analyzer's shared resolver, so this route reuses its warm config and
     // workspace-package memos instead of building cold ones per call.
     let aliases = host.alias_resolver().as_ref();
@@ -3999,6 +3919,10 @@ fn ts_call_preserves_argument_shape(
     .any(|callee| ts_function_preserves_parameter_shape(analyzer, &callee, argument_index))
 }
 
+/// Keep this source-time body/parameter analysis live: it proves whether a
+/// callable forwards the selected argument shape, which is not a persisted
+/// declaration fact. Import identity used by the surrounding initializer
+/// route is canonicalized separately.
 fn ts_function_preserves_parameter_shape(
     analyzer: &dyn IAnalyzer,
     callee: &CodeUnit,

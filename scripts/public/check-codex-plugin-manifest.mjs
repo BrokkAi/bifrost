@@ -456,6 +456,9 @@ assert.match(
 // plugins/bifrost-agent and the copies must not drift.
 for (const [canonical, vendored] of [
   ["plugins/bifrost-agent/bin/bifrost-launcher.mjs", "plugins/bifrost-dsh/bin/bifrost-launcher.mjs"],
+  ...["open-packs.mjs", "open-packs.d.mts", "pack-release.schema.json", "pack-release.v1.schema.json"].map((file) => [
+    `plugins/bifrost-agent/bin/${file}`, `plugins/bifrost-dsh/bin/${file}`,
+  ]),
   ["plugins/bifrost-agent/bifrost-release.json", "plugins/bifrost-dsh/bifrost-release.json"],
 ]) {
   if (!fs.readFileSync(canonical).equals(fs.readFileSync(vendored))) {

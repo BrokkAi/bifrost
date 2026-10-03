@@ -2202,6 +2202,8 @@ pub enum PolicyLocationRelationship {
     Subject,
     /// The occurrence an assertion required but did not find.
     ExpectedOccurrence,
+    /// A later member access masked by the first access raising.
+    AlsoFailsAt,
     /// One occurrence row that actually joined to the subject node.
     ActualOccurrence,
     /// The candidate the resolver selected for the asserted reference.

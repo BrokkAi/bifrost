@@ -28,8 +28,19 @@ use tree_sitter::Tree;
 pub(crate) struct RustAdapter;
 
 impl LanguageAdapter for RustAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&super::source_publication::SOURCE_STORAGE)
+    }
+
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    /// `parse_rust_file` fills none of the language-specific families: Rust
+    /// relations are crate rows, not supertypes, and the other four belong to
+    /// Ruby, Scala, C++ and the materializing languages.
+    fn side_fact_families(&self) -> crate::analyzer::store::SideFactFamilies {
+        crate::analyzer::store::SideFactFamilies::NONE
     }
 
     /// Relative to `brokk-bifrost-rust`'s crate root: the `.scm` assets moved
@@ -74,6 +85,27 @@ impl LanguageAdapter for RustAdapter {
 
     fn default_package_anchor(&self) -> Option<PackageAnchor> {
         Some(PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    fn has_workspace_package_identity_inputs(&self) -> bool {
+        true
+    }
+
+    fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
+        file.rel_path()
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+    }
+
+    /// The same parse crate reconciliation reads, minus what no Rust reader
+    /// consumes. A manifest that does not parse has no meaning to compare, so
+    /// any edit to it rebuilds.
+    fn workspace_package_identity_digest(&self, source: &[u8]) -> Option<[u8; 32]> {
+        brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument::from_source_bytes(
+            source.into(),
+        )
+        .ok()
+        .map(|document| document.topology_digest())
     }
 
     fn resolve_package_anchor(
@@ -122,5 +154,13 @@ impl LanguageAdapter for RustAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
+    }
+
+    fn declaration_visibility_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::source_facts::SOURCE_DECLARATION_VISIBILITY_VERSION)
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
     }
 }

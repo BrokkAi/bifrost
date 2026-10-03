@@ -1,5 +1,8 @@
-use brokk_bifrost_core::analyzer::common::{node_ident_text, parse_source_region};
-use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::common::{
+    node_ident_text, parse_source_range_with_cancellation, parse_source_region,
+};
+use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPathKind};
+use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -8,8 +11,7 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::imports::{
-    RustImportBindingName, rust_import_binding_name, rust_import_body,
-    rust_imports_from_use_declaration, split_rust_import_module_and_name,
+    RustImportBindingName, rust_import_binding_name, rust_imports_from_use_declaration,
 };
 use crate::syntax::{outer_attributes, unwrap_attributes};
 
@@ -24,52 +26,178 @@ pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
         if attribute_item.kind() != "attribute_item" {
             break;
         }
-        let Some(attribute) = attribute_item.named_child(0) else {
-            return RustCfgCondition::Unknown;
-        };
-        let Some(path) = attribute.named_child(0) else {
-            return RustCfgCondition::Unknown;
-        };
-        if node_text(path, source).trim() == "cfg" {
-            if condition != RustCfgCondition::Always {
-                return RustCfgCondition::Unknown;
+        match cfg_attribute_condition(attribute_item, source) {
+            Err(()) => return RustCfgCondition::Unknown,
+            Ok(None) => {}
+            Ok(Some(candidate)) => {
+                condition = RustCfgCondition::conjunction([condition, candidate]);
             }
-            condition = attribute
-                .child_by_field_name("arguments")
-                .and_then(|arguments| rust_cfg_argument_condition(arguments, source))
-                .unwrap_or(RustCfgCondition::Unknown);
         }
     }
     condition
 }
 
-fn rust_cfg_argument_condition(arguments: Node<'_>, source: &str) -> Option<RustCfgCondition> {
-    if arguments.kind() != "token_tree" {
+pub fn rust_crate_cfg_condition(root: Node<'_>, source: &str) -> RustCfgCondition {
+    let mut condition = RustCfgCondition::Always;
+    let mut cursor = root.walk();
+    for attribute_item in root
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "inner_attribute_item")
+    {
+        match cfg_attribute_condition(attribute_item, source) {
+            Err(()) => return RustCfgCondition::Unknown,
+            Ok(None) => {}
+            Ok(Some(candidate)) => {
+                condition = RustCfgCondition::conjunction([condition, candidate]);
+            }
+        }
+    }
+    condition
+}
+
+fn cfg_attribute_condition(
+    attribute_item: Node<'_>,
+    source: &str,
+) -> Result<Option<RustCfgCondition>, ()> {
+    let attribute = attribute_item.named_child(0).ok_or(())?;
+    let path = attribute.named_child(0).ok_or(())?;
+    if node_text(path, source).trim() != "cfg" {
+        return Ok(None);
+    }
+    Ok(Some(
+        attribute
+            .child_by_field_name("arguments")
+            .and_then(|arguments| rust_cfg_argument_condition(arguments, source))
+            .unwrap_or(RustCfgCondition::Unknown),
+    ))
+}
+
+pub(crate) fn rust_cfg_argument_condition(
+    arguments: Node<'_>,
+    source: &str,
+) -> Option<RustCfgCondition> {
+    use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
+    enum Work<'tree> {
+        Predicate(Vec<Node<'tree>>),
+        Emit(RustCfgInstruction),
+    }
+    fn arguments_of(node: Node<'_>) -> Option<Vec<Vec<Node<'_>>>> {
+        if node.kind() != "token_tree" {
+            return None;
+        }
+        let mut groups = Vec::new();
+        let mut group = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.is_extra() {
+                continue;
+            }
+            match child.kind() {
+                "(" | ")" => {}
+                "," => {
+                    if group.is_empty() {
+                        return None;
+                    }
+                    groups.push(std::mem::take(&mut group));
+                }
+                _ => group.push(child),
+            }
+        }
+        if !group.is_empty() {
+            groups.push(group);
+        }
+        Some(groups)
+    }
+    let mut groups = arguments_of(arguments)?;
+    if groups.len() != 1 {
         return None;
     }
-    let mut cursor = arguments.walk();
-    let children = arguments.named_children(&mut cursor).collect::<Vec<_>>();
-    let first = *children.first()?;
-    if node_text(first, source).trim() == "not" {
-        let nested = *children.get(1)?;
-        return (children.len() == 2 && nested.kind() == "token_tree")
-            .then(|| rust_cfg_argument_condition(nested, source))
-            .flatten()
-            .and_then(|condition| match condition {
-                RustCfgCondition::Atom(atom) => Some(RustCfgCondition::NotAtom(atom)),
-                _ => None,
-            });
+    let mut work = vec![Work::Predicate(groups.pop()?)];
+    let mut output = Vec::new();
+    while let Some(task) = work.pop() {
+        let nodes = match task {
+            Work::Emit(instruction) => {
+                output.push(instruction);
+                continue;
+            }
+            Work::Predicate(nodes) => nodes,
+        };
+        let first = *nodes.first()?;
+        if first.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(first, source);
+        match nodes.as_slice() {
+            [_] => output.push(RustCfgInstruction::Atom(name.to_string())),
+            [_, equals, literal] if equals.kind() == "=" => {
+                let value = crate::cargo_routes::rust_static_string_literal(*literal, source)?;
+                if name == "feature" {
+                    output.push(RustCfgInstruction::Atom(format!("feature = {value:?}")));
+                } else {
+                    output.push(RustCfgInstruction::KeyValue {
+                        key: name.to_string(),
+                        value,
+                    });
+                }
+            }
+            [_, nested] if nested.kind() == "token_tree" => {
+                let nested = arguments_of(*nested)?;
+                let instruction = match name {
+                    "all" => RustCfgInstruction::All(nested.len()),
+                    "any" => RustCfgInstruction::Any(nested.len()),
+                    "not" if nested.len() == 1 => RustCfgInstruction::Not,
+                    _ => return None,
+                };
+                work.push(Work::Emit(instruction));
+                work.extend(nested.into_iter().rev().map(Work::Predicate));
+            }
+            _ => return None,
+        }
     }
-    let last = *children.last()?;
-    (first.kind() == "identifier" && children.len() >= 2)
-        .then(|| {
-            source
-                .get(first.start_byte()..last.end_byte())
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(|text| RustCfgCondition::Atom(text.to_string()))
-        })
-        .flatten()
+    Some(match output.as_slice() {
+        [RustCfgInstruction::Atom(atom)] => RustCfgCondition::Atom(atom.clone()),
+        [RustCfgInstruction::Atom(atom), RustCfgInstruction::Not] => {
+            RustCfgCondition::NotAtom(atom.clone())
+        }
+        _ => RustCfgCondition::Expression(output.into_boxed_slice()),
+    })
+}
+
+/// Effective activation is source-owned and includes every enclosing item and
+/// the crate's inner attributes. No selected host or manifest is consulted.
+pub fn rust_effective_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
+    rust_effective_cfg_condition_with_cache(node, source, &mut HashMap::default())
+}
+
+/// The cache belongs to one live tree. In particular, do not reuse primary
+/// node ids for temporary embedded replay trees.
+pub(crate) fn rust_effective_cfg_condition_with_cache(
+    mut node: Node<'_>,
+    source: &str,
+    cache: &mut HashMap<usize, RustCfgCondition>,
+) -> RustCfgCondition {
+    node = unwrap_attributes(node);
+    let mut pending = Vec::new();
+    let mut condition = loop {
+        if let Some(condition) = cache.get(&node.id()) {
+            break condition.clone();
+        }
+        let own = if node.kind() == "source_file" {
+            rust_crate_cfg_condition(node, source)
+        } else {
+            rust_cfg_condition(node, source)
+        };
+        pending.push((node.id(), own));
+        let Some(parent) = crate::syntax::parent_outside_attributes(node) else {
+            break RustCfgCondition::Always;
+        };
+        node = parent;
+    };
+    for (id, own) in pending.into_iter().rev() {
+        condition = RustCfgCondition::conjunction([condition, own]);
+        cache.insert(id, condition.clone());
+    }
+    condition
 }
 
 /// Source bytes retained by the shared Rust parse memo. Entries are weighed by
@@ -151,7 +279,7 @@ fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
     })
 }
 
-fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
+pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSED_BYTES.fetch_add(source.len(), Ordering::Relaxed);
     let mut parser = Parser::new();
@@ -205,6 +333,18 @@ pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<
     parse_source_region(&tree_sitter_rust::LANGUAGE.into(), source, start, end)
 }
 
+/// Parse an AST-provided range without scanning the source prefix to recover
+/// line/column positions for each embedded invocation.
+pub(crate) fn parse_rust_range_tree(source: &str, range: tree_sitter::Range) -> Option<Tree> {
+    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSED_BYTES.fetch_add(
+        range.end_byte.saturating_sub(range.start_byte),
+        Ordering::Relaxed,
+    );
+    parse_source_range_with_cancellation(&tree_sitter_rust::LANGUAGE.into(), source, range, None)
+}
+
 /// Number of Rust source texts actually handed to tree-sitter since the last
 /// reset — the complexity signal pinned by the issue #1219 regression tests.
 #[cfg(any(test, feature = "test-support"))]
@@ -245,13 +385,66 @@ pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo
     ) {
         return;
     }
-    let raw = import.raw_snippet.trim();
-    if raw.ends_with("::*;") {
-        let module_specifier = rust_import_body(raw)
-            .and_then(|body| body.strip_suffix("::*"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+    let path = import
+        .path
+        .as_ref()
+        .expect("Rust import binding requires a structured path");
+    insert_rust_import_binding_fields(
+        binder,
+        path.kind,
+        &path.segments,
+        import.is_wildcard,
+        import.is_global,
+        import.alias.as_deref(),
+        import.identifier.as_deref(),
+    );
+}
+
+pub(crate) fn insert_rust_source_import_binding(
+    binder: &mut ImportBinder,
+    import: &SourceImportFact,
+) {
+    if import.alias.as_deref() == Some("_") {
+        return;
+    }
+    let path = import
+        .path
+        .as_ref()
+        .expect("Rust source imports have structured paths");
+    insert_rust_import_binding_fields(
+        binder,
+        path.kind,
+        &path.segments,
+        import.is_wildcard,
+        import.is_global,
+        import.alias.as_deref(),
+        import.identifier.as_deref(),
+    );
+}
+
+fn insert_rust_import_binding_fields(
+    binder: &mut ImportBinder,
+    path_kind: Option<StructuredImportPathKind>,
+    segments: &[String],
+    is_wildcard: bool,
+    is_global: bool,
+    alias: Option<&str>,
+    identifier: Option<&str>,
+) {
+    if path_kind == Some(StructuredImportPathKind::ExternCrate) {
+        return;
+    }
+    assert!(!segments.is_empty(), "Rust import path must have a segment");
+    let render_module = |segments: &[String]| {
+        let module = segments.join("::");
+        if is_global && !module.is_empty() {
+            format!("::{module}")
+        } else {
+            module
+        }
+    };
+    if is_wildcard {
+        let module_specifier = render_module(segments);
         if module_specifier.is_empty() {
             return;
         }
@@ -266,25 +459,21 @@ pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo
         );
         return;
     }
-    let Some((module_specifier, imported_name)) =
-        split_rust_import_module_and_name(&import.raw_snippet)
-    else {
-        // A single-segment aliased import has no `::` for the splitter to
-        // separate module from name: `use forc_pkg as pkg;` — the desugaring of
-        // the grouped `use forc_pkg::{self as pkg}` — aliases a whole crate or
-        // module root to a local name. Bind the alias as a namespace so `pkg`
-        // (and `pkg::Item`) resolves through the aliased root exactly like
-        // `forc_pkg` would (issue #1089: sway forc-pkg exposed as `pkg`).
-        if let Some(alias) = import.alias.as_deref() {
-            let module = rust_import_body(raw)
-                .map(|body| body.rsplit_once(" as ").map_or(body, |(module, _)| module))
-                .map(str::trim)
-                .unwrap_or_default();
-            if !alias.is_empty() && !module.is_empty() && !module.contains("::") {
+    let (module_segments, imported_name) = if segments.len() > 1 || is_global {
+        let (imported_name, module_segments) = segments
+            .split_last()
+            .expect("non-empty structured Rust import path");
+        (module_segments, imported_name.clone())
+    } else {
+        // A single unanchored segment aliases a whole namespace, including
+        // normalized `use forc_pkg::{self as pkg}` (issue #1089).
+        if let Some(alias) = alias {
+            let module = &segments[0];
+            if !alias.is_empty() && !module.is_empty() {
                 binder.bindings.insert(
                     alias.to_string(),
                     ImportBinding {
-                        module_specifier: module.to_string(),
+                        module_specifier: module.clone(),
                         namespace_imported_module: None,
                         kind: ImportKind::Namespace,
                         imported_name: None,
@@ -294,25 +483,20 @@ pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo
         }
         return;
     };
-    let local_name = import
-        .alias
-        .clone()
-        .or_else(|| import.identifier.clone())
+    let module_specifier = render_module(module_segments);
+    let local_name = alias
+        .map(str::to_string)
+        .or_else(|| identifier.map(str::to_string))
         .unwrap_or_else(|| imported_name.clone());
     let (local_name, kind, imported_name, module_specifier) = if imported_name == "self" {
-        let namespace_name = module_specifier
-            .rsplit("::")
-            .next()
-            .unwrap_or(module_specifier.as_str())
-            .to_string();
+        let namespace_name = module_segments.last().cloned().unwrap_or_default();
         (
             namespace_name,
             ImportKind::Namespace,
             None,
             module_specifier,
         )
-    } else if import.alias.is_none()
-        && !raw.contains('{')
+    } else if alias.is_none()
         && imported_name
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch == '_')
@@ -501,8 +685,18 @@ pub fn lexical_package_at(file_package: &str, source: &str, byte: usize) -> Stri
     let Some(tree) = parse_rust_tree(source) else {
         return file_package.to_string();
     };
+    lexical_package_in_tree(file_package, tree.root_node(), source, byte)
+}
+
+/// Derive the lexical module identity from a tree already held by a query.
+pub fn lexical_package_in_tree(
+    file_package: &str,
+    root: Node<'_>,
+    source: &str,
+    byte: usize,
+) -> String {
     let mut modules = Vec::new();
-    let mut current = tree.root_node();
+    let mut current = root;
     loop {
         let mut cursor = current.walk();
         let next = current
@@ -669,6 +863,9 @@ impl RustLexicalScopeIndex {
                         index.add_parameter_bindings(node, body, source, child_function);
                     }
                 }
+                "function_signature_item" => {
+                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
+                }
                 "closure_expression" => {
                     if let Some(body) = node.child_by_field_name("body") {
                         index.add_parameter_bindings(node, body, source, function);
@@ -724,7 +921,7 @@ impl RustLexicalScopeIndex {
                 "type_item" if !associated_type => {
                     index.add_item_binding(node, scope_start, scope_end, source, function, module);
                 }
-                "struct_item" | "enum_item" | "trait_item" | "mod_item" => {
+                "struct_item" | "enum_item" | "union_item" | "trait_item" | "mod_item" => {
                     index.add_item_binding(node, scope_start, scope_end, source, function, module);
                     if node.kind() == "mod_item" {
                         let module_range = (node.start_byte(), node.end_byte());
@@ -1326,6 +1523,81 @@ fn apply_from_stdin() -> u8 { 1 }
 
         assert_eq!(binding.kind, ImportKind::Named);
         assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
+    }
+
+    #[test]
+    fn import_binding_uses_structured_path_instead_of_display_text() {
+        let source = "use crate::models::{Thing as Local, lower};\n";
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let use_node = tree.root_node().named_child(0).expect("use declaration");
+        let mut imports = rust_imports_from_use_declaration(use_node, source);
+        assert_eq!(imports.len(), 2);
+        for import in &mut imports {
+            import.raw_snippet = "use misleading::DisplayOnly;".to_string();
+        }
+
+        let mut binder = ImportBinder::empty();
+        for import in &imports {
+            insert_rust_import_binding(&mut binder, import);
+        }
+
+        let local = binder.bindings.get("Local").expect("aliased import");
+        assert_eq!(local.kind, ImportKind::Named);
+        assert_eq!(local.module_specifier, "crate::models");
+        assert_eq!(local.imported_name.as_deref(), Some("Thing"));
+
+        let lower = binder.bindings.get("lower").expect("lowercase import");
+        assert_eq!(lower.kind, ImportKind::Namespace);
+        assert_eq!(lower.module_specifier, "crate::models::lower");
+        assert_eq!(lower.imported_name, None);
+    }
+
+    #[test]
+    fn extern_crate_is_structured_and_does_not_enter_use_binder() {
+        let source = "extern crate dependency as dep;\n";
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let imports = crate::imports::rust_import_projection(tree.root_node(), source, "");
+        assert_eq!(imports.len(), 1);
+        let import = &imports[0].import;
+        assert!(import.is_extern_crate());
+        assert_eq!(import.path(), ["dependency"]);
+
+        let mut binder = ImportBinder::empty();
+        insert_rust_import_binding(&mut binder, &import.info);
+        assert!(binder.bindings.is_empty());
+    }
+
+    #[test]
+    fn absolute_single_segment_import_keeps_legacy_split_behavior() {
+        let source = "use ::crate;\nuse crate as alias;\nuse ::crate as absolute_alias;\n";
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let mut binder = ImportBinder::empty();
+        let mut cursor = tree.root_node().walk();
+        for node in tree
+            .root_node()
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "use_declaration")
+        {
+            for import in rust_imports_from_use_declaration(node, source) {
+                insert_rust_import_binding(&mut binder, &import);
+            }
+        }
+
+        let crate_binding = binder.bindings.get("crate").expect("absolute crate");
+        assert_eq!(crate_binding.kind, ImportKind::Namespace);
+        assert_eq!(crate_binding.module_specifier, "::crate");
+
+        let alias = binder.bindings.get("alias").expect("single alias");
+        assert_eq!(alias.kind, ImportKind::Namespace);
+        assert_eq!(alias.module_specifier, "crate");
+
+        let absolute_alias = binder
+            .bindings
+            .get("absolute_alias")
+            .expect("absolute alias");
+        assert_eq!(absolute_alias.kind, ImportKind::Named);
+        assert_eq!(absolute_alias.module_specifier, "");
+        assert_eq!(absolute_alias.imported_name.as_deref(), Some("crate"));
     }
 
     #[test]

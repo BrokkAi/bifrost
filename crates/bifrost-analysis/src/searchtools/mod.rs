@@ -6,6 +6,7 @@ use crate::analyzer::common::{
 use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,
 };
+use crate::analyzer::languages::language_support;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, FuzzyResolveBudget, FuzzyResolveStop, is_bare_symbol_query,
@@ -176,10 +177,17 @@ pub(crate) use scan_usages::is_test_like_file;
 pub(crate) use scan_usages::scan_usage_reference_sites_by_location;
 pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
-pub use scan_usages::usage_graph;
+#[cfg(test)]
+pub(crate) use scan_usages::selected_usage_graph_result;
+#[cfg(any(test, feature = "test-support"))]
+pub use scan_usages::{
+    SelectedUsageGraphBuildOutcome, SelectedUsageGraphTelemetry,
+    build_selected_unscoped_usage_graph,
+};
 pub use scan_usages::{
     scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
 };
+pub use scan_usages::{usage_graph, usage_graph_with_cancellation};
 pub use selectors::AmbiguousSymbol;
 pub use selectors::DefinitionCandidate;
 pub use selectors::DefinitionDiagnostic;
@@ -212,6 +220,8 @@ pub use summaries::list_symbols;
 pub use summaries::most_relevant_files;
 pub use summaries::most_relevant_files_history_only;
 pub use summaries::most_relevant_files_with_cancellation;
+#[cfg(any(test, feature = "test-support"))]
+pub use summaries::most_relevant_files_with_selected_exact_graph_builder;
 
 // Only the moved `#[cfg(test)]` test module reaches this name through the
 // `crate::searchtools::` path today; without a non-test crate consumer, a
@@ -538,50 +548,11 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
-struct CachedCppOccurrenceClassifier {
-    source_len: usize,
-    content_hash: u64,
-    classifier: Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>,
-}
-
-thread_local! {
-    /// Per-thread 1-entry memo for the C++ occurrence classifier. Building it
-    /// reparses the whole file with tree-sitter, and the definitions/scan
-    /// paths construct one per candidate unit -- on multi-megabyte generated
-    /// files (phalcon's 9.5 MB phalcon.zep.c, #1698) that meant one full parse
-    /// per candidate unit, hours per tool call. Keyed by (length, content
-    /// hash) so an edit invalidates; one entry per thread keeps it bounded.
-    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<Option<CachedCppOccurrenceClassifier>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn cpp_occurrence_classifier_for(
-    source: &str,
-) -> Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>> {
-    use std::hash::Hasher as _;
-    let mut hasher = rustc_hash::FxHasher::default();
-    hasher.write(source.as_bytes());
-    let content_hash = hasher.finish();
-    CPP_OCCURRENCE_CLASSIFIER.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        match &*guard {
-            Some(cached)
-                if cached.source_len == source.len() && cached.content_hash == content_hash =>
-            {
-                cached.classifier.clone()
-            }
-            _ => {
-                let built =
-                    crate::analyzer::CppOccurrenceClassifier::new(source).map(std::rc::Rc::new);
-                *guard = Some(CachedCppOccurrenceClassifier {
-                    source_len: source.len(),
-                    content_hash,
-                    classifier: built.clone(),
-                });
-                built
-            }
-        }
-    })
+fn declaration_navigation_occurrences(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<Vec<crate::analyzer::languages::DeclarationNavigationOccurrence>> {
+    language_support(language_for_target(unit))?.declaration_navigation_occurrences(analyzer, unit)
 }
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
@@ -589,43 +560,31 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range
     if ranges.len() < 2 {
         return ranges.into_iter().next();
     }
-    // A class with a forward declaration and a definition has one physical
-    // occurrence per site; the definition is the primary one, the same way it
-    // is for a callable with a prototype (#1650, #3297).
-    let classifier = (language_for_target(code_unit) == Language::Cpp
-        && (code_unit.is_callable() || code_unit.is_class()))
-    .then(|| analyzer.indexed_source(code_unit.source()))
-    .flatten()
-    .and_then(|source| cpp_occurrence_classifier_for(&source));
-    primary_range_from_ranges(code_unit, ranges, classifier.as_deref())
-}
-
-fn primary_range_with_cpp_classifier(
-    analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
-    classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
-) -> Option<Range> {
-    let ranges = analyzer.ranges(code_unit);
-    primary_range_from_ranges(code_unit, ranges, classifier)
+    let occurrences = if language_for_target(code_unit) == Language::Cpp
+        && (code_unit.is_callable() || code_unit.is_class())
+    {
+        Some(declaration_navigation_occurrences(analyzer, code_unit)?)
+    } else {
+        None
+    };
+    primary_range_from_ranges(ranges, occurrences.as_deref())
 }
 
 fn primary_range_from_ranges(
-    code_unit: &CodeUnit,
     ranges: Vec<Range>,
-    classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
+    occurrences: Option<&[crate::analyzer::languages::DeclarationNavigationOccurrence]>,
 ) -> Option<Range> {
-    if language_for_target(code_unit) == Language::Cpp
-        && (code_unit.is_callable() || code_unit.is_class())
-        && let Some(classifier) = classifier
-        && let Some(definition) = ranges
+    if let Some(occurrences) = occurrences
+        && let Some(definition) = occurrences
             .iter()
-            .filter(|range| {
-                classifier.classify(code_unit, range)
-                    == crate::analyzer::CppOccurrenceRole::Definition
+            .filter(|occurrence| {
+                occurrence.role == crate::analyzer::languages::DeclarationNavigationRole::Definition
+                    && ranges.contains(&occurrence.range)
             })
+            .map(|occurrence| occurrence.range)
             .min_by_key(|range| (range.start_line, range.start_byte))
     {
-        return Some(*definition);
+        return Some(definition);
     }
     ranges
         .into_iter()

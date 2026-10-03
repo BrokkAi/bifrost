@@ -94,9 +94,7 @@ jobs:
             "bifrost-agent-${RELEASE_TAG}.tar.gz" \
             "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" \
             "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" \
-            "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256" \
-            "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" \
-            "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256"; do
+            "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256"; do
             test -s "$asset_dir/$required"
           done
           tar -xOf "$asset_dir/bifrost-agent-${RELEASE_TAG}.tar.gz" bifrost-agent/package.json |
@@ -170,7 +168,6 @@ jobs:
         brokk-bifrost-runtime
         brokk-bifrost-semantic-packs
         brokk-bifrost-mcp
-        brokk-bifrost-lsp
         brokk-bifrost
     steps:
       - name: Check every published crate with bounded propagation retry

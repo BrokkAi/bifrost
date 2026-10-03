@@ -128,7 +128,7 @@ impl AnalyzerDelegate {
             Self::Php(analyzer) => Self::Php(analyzer.clone_with_project(project)),
             Self::Python(analyzer) => Self::Python(analyzer.clone_with_project(project)),
             Self::TypeScript(analyzer) => Self::TypeScript(analyzer.clone_with_project(project)),
-            Self::Rust(analyzer) => Self::Rust(analyzer.clone_with_project(project)),
+            Self::Rust(analyzer) => Self::Rust(analyzer.clone_for_index_warm(project)),
             Self::Scala(analyzer) => Self::Scala(analyzer.clone_for_index_warm(project)),
             Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
             Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_for_index_warm(project)),
@@ -223,20 +223,7 @@ impl AnalyzerDelegate {
     fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
         language_for_file(file) == language
             || self.analyzer().is_analyzed(file)
-            || self.needs_config_update_for(file)
-    }
-
-    fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
-        match self {
-            Self::Java(_) | Self::Scala(_) | Self::Kotlin(_) => {
-                crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
-            }
-            Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
-            Self::Cpp(_) => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
-            Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
-            Self::Go(_) => is_go_module_manifest(file),
-            _ => false,
-        }
+            || is_language_configuration_input(language, file)
     }
 
     pub(crate) fn update_all(&self) -> Self {
@@ -432,6 +419,26 @@ impl WorkspaceBuildContext {
             self.store_context.clone(),
             None,
         )
+    }
+}
+
+/// Whether `file` is a configuration input of `language`'s analyzer: a file
+/// that is not a source of that language but changes what its analyzer
+/// publishes, such as `Cargo.toml` for Rust or `tsconfig.json` for
+/// TypeScript. The workspace analyzer routes an edit to such a file to the
+/// language's delegate, and the MCP file watcher watches every directory that
+/// holds one, so both sides must agree on this one predicate.
+pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -> bool {
+    match language {
+        Language::Java | Language::Scala | Language::Kotlin => {
+            crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
+        }
+        Language::CSharp => crate::analyzer::csharp::is_csharp_dependency_input(file),
+        Language::Cpp => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
+        Language::JavaScript | Language::TypeScript => is_js_ts_config_file(file),
+        Language::Go => is_go_module_manifest(file),
+        Language::Rust => crate::analyzer::rust::is_cargo_manifest(file),
+        Language::Php | Language::Python | Language::Ruby | Language::None => false,
     }
 }
 
@@ -794,6 +801,16 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .unwrap_or_default()
     }
 
+    fn import_info_of_checked(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        self.delegate_for_file(file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+            .and_then(|provider| provider.import_info_of_checked(token, file))
+    }
+
     fn import_infos_for_files(
         &self,
         files: &[ProjectFile],
@@ -897,7 +914,14 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             else {
                 continue;
             };
-            let outcome = provider.additional_direct_file_dependencies(&group, cancellation)?;
+            let Some(outcome) = provider.additional_direct_file_dependencies(&group, cancellation)
+            else {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                complete = false;
+                continue;
+            };
             complete &= outcome.complete;
             for (file, targets) in outcome.dependencies {
                 out.entry(file).or_default().extend(targets);
@@ -1482,6 +1506,11 @@ impl CodeUnitIndex for MultiAnalyzer {
         }
     }
 
+    fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
+        self.delegate_for_file(file)
+            .is_some_and(|delegate| delegate.analyzer().declares(file, unit))
+    }
+
     /// Routed to the owning delegate so its request-scoped memo answers
     /// (#2679); the trait default on `self` would rebuild uncached per call.
     fn class_range_index(
@@ -1698,6 +1727,16 @@ impl CodeUnitIndex for MultiAnalyzer {
 }
 
 impl IAnalyzer for MultiAnalyzer {
+    fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        let mut inventory = crate::analyzer::QueryBatch::complete(Vec::new(), 0);
+        for delegate in self.delegates.values() {
+            inventory = inventory.merge(delegate.analyzer().source_file_inventory());
+        }
+        inventory.rows.sort();
+        inventory.rows.dedup();
+        inventory
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -3082,48 +3121,74 @@ mod tests {
 
     #[test]
     fn java_build_inputs_are_routed_as_delegate_relevant_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = FileSetProject::new(
-            temp.path().canonicalize().unwrap(),
-            std::iter::empty::<std::path::PathBuf>(),
-        );
-        let delegate = AnalyzerDelegate::Java(JavaAnalyzer::from_project(project));
-        assert!(delegate.needs_config_update_for(&project_file("pom.xml")));
-        assert!(
-            delegate
-                .needs_config_update_for(&project_file("gradle/dependency-locks/runtime.lockfile"))
-        );
-        assert!(
-            delegate.needs_config_update_for(&project_file("buildSrc/src/main/java/Plugin.java"))
-        );
-        assert!(!delegate.needs_config_update_for(&project_file("src/App.java")));
+        assert!(is_language_configuration_input(
+            Language::Java,
+            &project_file("pom.xml")
+        ));
+        assert!(is_language_configuration_input(
+            Language::Java,
+            &project_file("gradle/dependency-locks/runtime.lockfile")
+        ));
+        assert!(is_language_configuration_input(
+            Language::Java,
+            &project_file("buildSrc/src/main/java/Plugin.java")
+        ));
+        assert!(!is_language_configuration_input(
+            Language::Java,
+            &project_file("src/App.java")
+        ));
     }
 
     #[test]
     fn csharp_dependency_inputs_are_routed_as_delegate_relevant_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = FileSetProject::new(
-            temp.path().canonicalize().unwrap(),
-            std::iter::empty::<std::path::PathBuf>(),
-        );
-        let delegate = AnalyzerDelegate::CSharp(CSharpAnalyzer::from_project(project));
-        assert!(delegate.needs_config_update_for(&project_file("obj/project.assets.json")));
-        assert!(delegate.needs_config_update_for(&project_file("App.csproj")));
-        assert!(delegate.needs_config_update_for(&project_file("bin/App.dll")));
-        assert!(!delegate.needs_config_update_for(&project_file("src/App.cs")));
+        assert!(is_language_configuration_input(
+            Language::CSharp,
+            &project_file("obj/project.assets.json")
+        ));
+        assert!(is_language_configuration_input(
+            Language::CSharp,
+            &project_file("App.csproj")
+        ));
+        assert!(is_language_configuration_input(
+            Language::CSharp,
+            &project_file("bin/App.dll")
+        ));
+        assert!(!is_language_configuration_input(
+            Language::CSharp,
+            &project_file("src/App.cs")
+        ));
     }
 
     #[test]
     fn go_module_manifests_are_routed_as_delegate_relevant_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = FileSetProject::new(
-            temp.path().canonicalize().unwrap(),
-            std::iter::empty::<std::path::PathBuf>(),
-        );
-        let delegate = AnalyzerDelegate::Go(GoAnalyzer::from_project(project));
-        assert!(delegate.needs_config_update_for(&project_file("go.mod")));
-        assert!(delegate.needs_config_update_for(&project_file("go.sum")));
-        assert!(!delegate.needs_config_update_for(&project_file("pkg/foo.go")));
+        assert!(is_language_configuration_input(
+            Language::Go,
+            &project_file("go.mod")
+        ));
+        assert!(is_language_configuration_input(
+            Language::Go,
+            &project_file("go.sum")
+        ));
+        assert!(!is_language_configuration_input(
+            Language::Go,
+            &project_file("pkg/foo.go")
+        ));
+    }
+
+    #[test]
+    fn cargo_manifests_are_routed_as_delegate_relevant_changes() {
+        assert!(is_language_configuration_input(
+            Language::Rust,
+            &project_file("Cargo.toml")
+        ));
+        assert!(is_language_configuration_input(
+            Language::Rust,
+            &project_file("crates/dep/Cargo.toml")
+        ));
+        assert!(!is_language_configuration_input(
+            Language::Rust,
+            &project_file("src/lib.rs")
+        ));
     }
 
     /// A two-language workspace on disk, as a `MultiAnalyzer` over real

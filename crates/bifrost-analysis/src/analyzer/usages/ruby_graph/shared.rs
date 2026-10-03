@@ -17,7 +17,7 @@ impl<'a> RubyEdgeResolver<'a> {
     pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Ruby);
-        if files.is_empty() {
+        if files.is_empty() || !ruby.canonical_sources_ready() {
             return None;
         }
         Some(Self { ruby, files })
@@ -28,7 +28,7 @@ impl<'a> RubyEdgeResolver<'a> {
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Option<UsageEdges>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -49,7 +49,7 @@ impl<'a> RubyEdgeResolver<'a> {
         analyzer: &dyn IAnalyzer,
         callers: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Option<UsageEdges>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
@@ -70,7 +70,7 @@ impl<'a> RubyEdgeResolver<'a> {
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdgeWeights
+    ) -> Option<UsageEdgeWeights>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {

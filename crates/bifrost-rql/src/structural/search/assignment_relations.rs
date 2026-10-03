@@ -8,8 +8,9 @@ use crate::query::{AssignmentRelationFilter, AssignmentRelationKind};
 use brokk_bifrost_analysis::analyzer::{
     CAssignmentCandidate, CAssignmentSyntaxVerdict, OverwrittenLocalCandidate,
     OverwrittenLocalSourceKind, PlainAssignmentCandidate, PlainAssignmentVerdict,
-    c_assignment_candidates, java_overwritten_local_candidates, js_ts_overwritten_local_candidates,
-    plain_assignment_candidates,
+    c_assignment_candidates, go_overwritten_local_candidates, java_overwritten_local_candidates,
+    js_ts_overwritten_local_candidates, plain_assignment_candidates,
+    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
 };
 use brokk_bifrost_flow::flow_state::{
     BindingInitializationAnswer, FlowCertainty, FlowRelation, FlowStateAxis, FlowStateCompleteness,
@@ -98,7 +99,14 @@ fn ordinary_assignment_relation_expansions(
     let language = dialect.language();
     let pilot = matches!(
         language,
-        Language::Java | Language::JavaScript | Language::TypeScript | Language::Python
+        Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Python
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Go
+            | Language::Rust
     );
     let self_selected = filter.includes(AssignmentRelationKind::SelfAssignment);
     let swap_selected = filter.includes(AssignmentRelationKind::FailedSwap);
@@ -326,7 +334,14 @@ fn overwritten_unread_expansions(
     let dialect = procedure.handle.artifact().key().language();
     if !matches!(
         dialect.language(),
-        Language::Java | Language::JavaScript | Language::TypeScript
+        Language::Java
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Python
+            | Language::Go
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Rust
     ) {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
@@ -348,6 +363,13 @@ fn overwritten_unread_expansions(
         }
         Language::JavaScript | Language::TypeScript => {
             js_ts_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+        }
+        Language::Python => {
+            python_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+        }
+        Language::Go => go_overwritten_local_candidates(workspace, &procedure.handle, cancellation),
+        Language::CSharp | Language::Kotlin | Language::Rust => {
+            single_target_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
         }
         _ => unreachable!("dialect was validated"),
     };
@@ -1154,8 +1176,10 @@ fn qualify_failed_swap(
         {
             return None;
         }
-        if procedure.handle.artifact().key().language().language() == Language::Java
-            && (first.swap_type.is_none() || first.swap_type != second.swap_type)
+        if matches!(
+            procedure.handle.artifact().key().language().language(),
+            Language::Java | Language::CSharp
+        ) && (first.swap_type.is_none() || first.swap_type != second.swap_type)
         {
             return open(Some(second_read.value), "assignment_conversion_unproved");
         }

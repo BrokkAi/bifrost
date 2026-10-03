@@ -13,6 +13,7 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
 use std::sync::Arc;
 use tree_sitter::Tree;
 
@@ -25,7 +26,6 @@ mod kotlin;
 mod php;
 mod python;
 mod ruby;
-mod rust;
 mod scala;
 
 pub(crate) use cpp::resolve_cpp_type_bounded;
@@ -36,7 +36,6 @@ pub(crate) use kotlin::resolve_kotlin_type_bounded;
 pub(crate) use php::resolve_php_type_bounded;
 pub(crate) use python::resolve_python_type_bounded;
 pub(crate) use ruby::resolve_ruby_type_bounded;
-pub(crate) use rust::resolve_rust_type_bounded;
 pub(crate) use scala::resolve_scala_type_bounded;
 
 #[derive(Debug, Clone)]
@@ -61,6 +60,13 @@ pub struct TypeLookupOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeLookupStatus {
     Resolved,
+    Unavailable,
+    /// Resolution produced a source-backed partial answer, but the resolver
+    /// could not establish an exhaustive result. This is not a proven absence
+    /// and must never be projected as a precise singleton.
+    Incomplete,
+    /// Resolution was stopped by an operational cancellation request.
+    Cancelled,
     NoType,
     Ambiguous,
     UnsupportedLanguage,
@@ -76,6 +82,9 @@ impl TypeLookupStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Resolved => "resolved",
+            Self::Unavailable => "unavailable",
+            Self::Incomplete => "incomplete",
+            Self::Cancelled => "cancelled",
             Self::NoType => "no_type",
             Self::Ambiguous => "ambiguous",
             Self::UnsupportedLanguage => "unsupported_language",
@@ -339,9 +348,11 @@ fn finish_bounded_resolution(
                 limit.as_str()
             ),
         ),
-        BoundedResolution::Cancelled { .. } => {
-            unreachable!("type lookup runs without a cancellation token")
-        }
+        BoundedResolution::Cancelled { .. } => diagnostic_outcome(
+            TypeLookupStatus::Cancelled,
+            "cancelled",
+            "bounded type resolution was cancelled before it completed",
+        ),
     };
     finish_lookup_outcome(outcome, site)
 }
@@ -405,11 +416,9 @@ fn validate_caller_reference_site(
 ///
 /// The structural-receiver resolver is the primary route: the same bounded core
 /// the receiver query dispatches through answers here under the caller's
-/// budget. Three languages keep their own bounded arms -- Java and JS/TS
-/// because their receiver analysis runs elsewhere (a Java resolution session,
-/// the JS/TS syntax index), and Rust because the interactive arm may cold-parse
-/// a declaration's file where the receiver query's cache refuses to. Every arm
-/// takes the same budget; no arm runs unbounded.
+/// budget. Java and JS/TS keep their own bounded arms because their receiver
+/// analysis runs elsewhere (a Java resolution session, the JS/TS syntax index).
+/// Every arm takes the same budget; no arm runs unbounded.
 #[allow(clippy::too_many_arguments)]
 fn bounded_type_resolution(
     analyzer: &dyn IAnalyzer,
@@ -422,11 +431,6 @@ fn bounded_type_resolution(
     budget: ReceiverAnalysisBudget,
 ) -> Option<BoundedResolution<TypeLookupOutcome>> {
     match language {
-        Language::Rust => {
-            return Some(rust::resolve_rust_type_interactive(
-                analyzer, file, source, tree, site, budget, None,
-            ));
-        }
         Language::Java => {
             support.set_language(language);
             let session = JavaResolutionSession::bounded(support, budget, None);
@@ -564,6 +568,55 @@ pub(super) fn sort_units(units: &mut [CodeUnit]) {
     });
 }
 
+pub(crate) fn projection_target_kind(
+    projections: &[crate::analyzer::resolution::LoweredBindingProjection],
+) -> (
+    TypeLookupTargetKind,
+    Option<BindingProjectionKind>,
+    Vec<BindingProjectionKind>,
+) {
+    let mut kinds = Vec::new();
+    for kind in projections.iter().map(|projection| projection.kind()) {
+        // These outputs serve impl ownership and field lookup. They do not
+        // compete with the source expression's public type projection.
+        if matches!(
+            kind,
+            BindingProjectionKind::TargetNominalTypeIdentity
+                | BindingProjectionKind::TargetMemberOwnerType
+        ) {
+            continue;
+        }
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let selected = if kinds.contains(&BindingProjectionKind::TargetCallableResultType) {
+        Some(BindingProjectionKind::TargetCallableResultType)
+    } else if kinds.contains(&BindingProjectionKind::TargetConstructorOwnerType) {
+        Some(BindingProjectionKind::TargetConstructorOwnerType)
+    } else if kinds.contains(&BindingProjectionKind::TargetDeclaredValueType) {
+        Some(BindingProjectionKind::TargetDeclaredValueType)
+    } else if kinds.contains(&BindingProjectionKind::TargetTypeIdentity) {
+        Some(BindingProjectionKind::TargetTypeIdentity)
+    } else if kinds.contains(&BindingProjectionKind::TargetTypeOrDeclaredValueType) {
+        Some(BindingProjectionKind::TargetTypeOrDeclaredValueType)
+    } else {
+        None
+    };
+    let kind = if matches!(
+        selected,
+        Some(
+            BindingProjectionKind::TargetTypeIdentity
+                | BindingProjectionKind::TargetConstructorOwnerType
+        )
+    ) {
+        TypeLookupTargetKind::TypeReference
+    } else {
+        TypeLookupTargetKind::ValueExpression
+    };
+    (kind, selected, kinds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +706,37 @@ public class Consumer
             outcome.diagnostics[0].message.contains("scope_nodes"),
             "{outcome:#?}"
         );
+    }
+
+    #[test]
+    fn cancelled_finish_preserves_terminal_status_without_type_targets() {
+        let site = ResolvedReferenceSite {
+            path: "Budget.cs".to_string(),
+            text: "product".to_string(),
+            range: crate::analyzer::Range {
+                start_byte: 0,
+                end_byte: "product".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: 0,
+            focus_end_byte: "product".len(),
+        };
+        let outcome = finish_bounded_resolution(
+            Some(BoundedResolution::Cancelled {
+                work: Default::default(),
+            }),
+            Language::CSharp,
+            site,
+        );
+        assert_eq!(outcome.status, TypeLookupStatus::Cancelled);
+        assert_eq!(outcome.status.as_str(), "cancelled");
+        assert!(outcome.types.is_empty(), "{outcome:#?}");
+        assert_eq!(
+            outcome.reference.as_ref().map(|site| site.text.as_str()),
+            Some("product")
+        );
+        assert_eq!(outcome.diagnostics[0].kind, "cancelled");
     }
 
     /// The same lookup the tiny budget cuts off completes under the interactive

@@ -4,27 +4,16 @@
 //! `analyzer/cpp/adapter.rs`; every answer it gives comes from here or from
 //! [`crate::test_detection`] and [`crate::queries`].
 
-use crate::declarations::{
-    CppVisitor, collect_cpp_identifiers, collect_cpp_includes, recover_quoted_includes,
-};
-use crate::graph::resolver::OrphanedNamespaceScopeIndex;
+use crate::declarations::{parse_cpp_readings, parse_cpp_readings_with_object_macro_fields};
 use crate::graph::syntax::ObjectMacroReplacement;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
-use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::hash::HashMap;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Tree};
-
-/// A primary reading plus evidence for whether a C tag reading can differ.
-/// The witness covers the complete visitor, including recovery.
-#[derive(Debug)]
-pub struct CppPrimaryReading {
-    pub parsed: ParsedFile,
-    pub c_tag_scope_witness: bool,
-}
 
 /// The file extension `CppAdapter` reports. `Language::Cpp` also covers `.c`,
 /// `.cc`, `.cxx` and the header spellings; this is only the canonical one.
@@ -75,17 +64,16 @@ pub fn parse_cpp_file_with_object_macro_fields(
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
-    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-    parse_cpp_reading_with_object_macro_fields(
+    parse_cpp_readings_with_object_macro_fields(
         file,
         source,
         root,
-        LanguageDialect::for_path(Language::Cpp, file.rel_path()),
         &ancestry,
+        &[LanguageDialect::for_path(Language::Cpp, file.rel_path())],
         object_macro_fields,
-        &orphaned_namespaces,
     )
-    .parsed
+    .pop()
+    .expect("one dialect reading")
 }
 
 /// Extract `file` under an explicitly named dialect.
@@ -99,9 +87,7 @@ pub fn parse_cpp_file_with_object_macro_fields(
 /// dialect the path itself does not name.
 ///
 /// This entry point owns the whole tree's work, including the parent index the
-/// walk asks its ancestor questions of. A caller that wants both readings of
-/// one tree must use [`parse_cpp_file_with_ancestry`] and
-/// [`parse_cpp_c_reading`] instead, which share that index.
+/// walk asks its ancestor questions of.
 pub fn parse_cpp_file_in_dialect(
     file: &ProjectFile,
     source: &str,
@@ -110,209 +96,47 @@ pub fn parse_cpp_file_in_dialect(
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
-    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-    parse_cpp_reading(file, source, root, dialect, &ancestry, &orphaned_namespaces).parsed
+    parse_cpp_readings(file, source, root, &ancestry, &[dialect])
+        .pop()
+        .expect("one dialect reading")
 }
 
-/// Extract `file` under the dialect its own path selects, asking its ancestor
-/// questions of a caller-owned index over the same tree.
-///
-/// The index costs one hash entry per node and is a property of the tree, not
-/// of the reading, so a header that gets both readings builds it once. See
-/// [`parse_cpp_c_reading`] for the second reading.
+/// Extract the primary dialect from a caller-owned tree and parent index.
 pub fn parse_cpp_file_with_ancestry<'tree>(
     file: &ProjectFile,
     source: &str,
     root: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
 ) -> ParsedFile {
-    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-    parse_cpp_file_with_ancestry_and_orphaned_namespaces(
+    let dialect = LanguageDialect::for_path(Language::Cpp, file.rel_path());
+    parse_cpp_readings(file, source, root, ancestry, &[dialect])
+        .pop()
+        .expect("one dialect reading")
+}
+
+/// Extract a header's C++ and C readings together. Both declaration policies
+/// consume one primary event stream. Exact construction-ID finalization gives
+/// each dialect stable content-owned source and structural projections. The C
+/// reading is absent when the primary declaration walk proves identical tag scope.
+pub fn parse_cpp_file_with_readings<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+) -> (ParsedFile, Option<ParsedFile>) {
+    let mut readings = parse_cpp_readings(
         file,
         source,
         root,
         ancestry,
-        &orphaned_namespaces,
-    )
-    .parsed
-}
-
-/// Extract the primary reading and its C tag-scope execution witness using
-/// caller-owned recovery state.
-///
-/// The recovery index is a property of the tree and source, rather than of a
-/// dialect reading. Callers that need both the C++ and C readings should build
-/// it once and pass it to this function and
-/// [`parse_cpp_c_reading_with_orphaned_namespaces`]. The witness remains
-/// sticky across the root walk, all recovery work, and every queued reparse.
-pub fn parse_cpp_file_with_ancestry_and_orphaned_namespaces<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    ancestry: &ParentIndex<'tree>,
-    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> CppPrimaryReading {
-    parse_cpp_reading(
-        file,
-        source,
-        root,
-        LanguageDialect::for_path(Language::Cpp, file.rel_path()),
-        ancestry,
-        orphaned_namespaces,
-    )
-}
-
-/// The C reading of a tree whose other reading is already in hand.
-///
-/// The dialect decides exactly one thing: where a struct/union/enum tag
-/// declared inside another aggregate's member list is declared (the
-/// `c_tag_semantics` readers in [`crate::declarations`]). Everything else this
-/// file's extraction produces is a property of the tree and of the source text
-/// -- the parent index, the `#include` sweep, the identifier sweep, and the
-/// quoted-include line recovery -- so the C reading takes those from `primary`
-/// rather than recomputing them over the same bytes. A debug build re-runs the
-/// sweeps and asserts they agree, which is what holds the claim honest if a
-/// future walk ever starts contributing to one of those families.
-pub fn parse_cpp_c_reading<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    ancestry: &ParentIndex<'tree>,
-    primary: &ParsedFile,
-) -> ParsedFile {
-    let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-    parse_cpp_c_reading_with_orphaned_namespaces(
-        file,
-        source,
-        root,
-        ancestry,
-        primary,
-        &orphaned_namespaces,
-    )
-}
-
-/// Extract the C reading while reusing the primary reading's recovery index.
-///
-/// The declaration walk remains separate because C tag scope changes the
-/// identity and ownership of declarations. Only recovery state proven to be
-/// dialect-independent is shared.
-pub fn parse_cpp_c_reading_with_orphaned_namespaces<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    ancestry: &ParentIndex<'tree>,
-    primary: &ParsedFile,
-    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> ParsedFile {
-    let mut parsed = ParsedFile::new(String::new());
-    parsed.imports = primary.imports.clone();
-    parsed.type_identifiers = primary.type_identifiers.clone();
-    {
-        let mut visitor = CppVisitor {
-            file,
-            source,
-            parsed: &mut parsed,
-            c_tag_semantics: true,
-            c_tag_scope_witness: false,
-            recovered_class_sibling_scopes: HashMap::default(),
-            consumed_fragment_regions: Vec::new(),
-            orphaned_namespaces,
-            partitioned_regions: Vec::new(),
-            namespace_forward_scans: HashMap::default(),
-            field_owners: None,
-            recovery_captures: Vec::new(),
-            object_macro_fields: HashMap::default(),
-            ambiguous_object_macro_fields: HashSet::default(),
-        };
-        visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
-    }
-    parsed.finalize_deferred_replacements();
-
-    #[cfg(debug_assertions)]
-    {
-        let mut recomputed = ParsedFile::new(String::new());
-        collect_cpp_includes(root, source, &mut recomputed);
-        collect_cpp_identifiers(root, source, &mut recomputed.type_identifiers);
-        recover_quoted_includes(source, &mut recomputed);
-        assert_eq!(
-            parsed.imports, recomputed.imports,
-            "the C reading's includes are the C++ reading's includes: {:?}",
-            file
-        );
-        assert_eq!(
-            parsed.type_identifiers, recomputed.type_identifiers,
-            "the C reading's identifiers are the C++ reading's identifiers: {:?}",
-            file
-        );
-    }
-
-    parsed
-}
-
-/// One complete reading of `root`, sweeps included.
-fn parse_cpp_reading<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    dialect: LanguageDialect,
-    ancestry: &ParentIndex<'tree>,
-    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> CppPrimaryReading {
-    parse_cpp_reading_with_object_macro_fields(
-        file,
-        source,
-        root,
-        dialect,
-        ancestry,
-        HashMap::default(),
-        orphaned_namespaces,
-    )
-}
-
-fn parse_cpp_reading_with_object_macro_fields<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    dialect: LanguageDialect,
-    ancestry: &ParentIndex<'tree>,
-    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
-    orphaned_namespaces: &OrphanedNamespaceScopeIndex,
-) -> CppPrimaryReading {
-    let mut parsed = ParsedFile::new(String::new());
-
-    collect_cpp_includes(root, source, &mut parsed);
-    collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
-
-    let c_tag_scope_witness;
-    {
-        let mut visitor = CppVisitor {
-            file,
-            source,
-            parsed: &mut parsed,
-            c_tag_semantics: dialect == LanguageDialect::CppC,
-            c_tag_scope_witness: false,
-            recovered_class_sibling_scopes: HashMap::default(),
-            consumed_fragment_regions: Vec::new(),
-            orphaned_namespaces,
-            partitioned_regions: Vec::new(),
-            namespace_forward_scans: HashMap::default(),
-            field_owners: None,
-            recovery_captures: Vec::new(),
-            object_macro_fields,
-            ambiguous_object_macro_fields: HashSet::default(),
-        };
-        visitor.visit_container(root, ancestry, "", None, None, None, Vec::new());
-        c_tag_scope_witness = visitor.c_tag_scope_witness;
-    }
-    // A line scan over the source rather than a tree walk: it recovers the
-    // quoted directives a parse error hid from the tree, skipping any snippet
-    // the sweep above already recorded.
-    recover_quoted_includes(source, &mut parsed);
-    parsed.finalize_deferred_replacements();
-    CppPrimaryReading {
-        parsed,
-        c_tag_scope_witness,
-    }
+        &[
+            LanguageDialect::for_path(Language::Cpp, file.rel_path()),
+            LanguageDialect::CppC,
+        ],
+    );
+    let c = (readings.len() == 2).then(|| readings.pop().expect("C reading"));
+    let primary = readings.pop().expect("primary reading");
+    (primary, c)
 }
 
 /// Whether two readings of one blob disagree about any identity-bearing
@@ -332,6 +156,7 @@ pub fn cpp_projections_differ(left: &ParsedFile, right: &ParsedFile) -> bool {
         || left.ranges != right.ranges
         || left.signatures != right.signatures
         || left.type_aliases != right.type_aliases
+        || left.resolution_facts != right.resolution_facts
 }
 
 pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {
@@ -349,6 +174,7 @@ pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionNameFact, ResolutionNameId};
     use tree_sitter::Parser;
 
     fn cpp_tree(source: &str) -> tree_sitter::Tree {
@@ -606,17 +432,9 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
             );
 
             let ancestry = ParentIndex::new(root);
-            let orphaned_namespaces = OrphanedNamespaceScopeIndex::build(root, source);
-            let primary = parse_cpp_file_with_ancestry_and_orphaned_namespaces(
-                &file,
-                source,
-                root,
-                &ancestry,
-                &orphaned_namespaces,
-            );
-            let c_tag_scope_witness = primary.c_tag_scope_witness;
-            let shared_primary = primary.parsed;
-
+            let (shared_primary, shared_c) =
+                parse_cpp_file_with_readings(&file, source, root, &ancestry);
+            let c_tag_scope_witness = shared_c.is_some();
             if *name == "tag reparsed under a recovered export class" {
                 assert!(
                     root.has_error(),
@@ -696,14 +514,7 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
                 "C++ reading of {name}"
             );
             if *expected_witness {
-                let shared_c = parse_cpp_c_reading_with_orphaned_namespaces(
-                    &file,
-                    source,
-                    root,
-                    &ancestry,
-                    &shared_primary,
-                    &orphaned_namespaces,
-                );
+                let shared_c = shared_c.expect("a witnessed C reading is emitted");
                 assert_eq!(
                     independent_c_facts,
                     published_facts(&shared_c),
@@ -735,14 +546,36 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
         let tree = cpp_tree(source);
         let root = tree.root_node();
         let ancestry = ParentIndex::new(root);
-        let primary = parse_cpp_file_with_ancestry(&file, source, root, &ancestry);
-        let c_reading = parse_cpp_c_reading(&file, source, root, &ancestry, &primary);
+        let (primary, c_reading) = parse_cpp_file_with_readings(&file, source, root, &ancestry);
+        let c_reading = c_reading.expect("nested tag requires a C reading");
         assert!(
             cpp_projections_differ(&primary, &c_reading),
             "the C reading should mint `inner` at file scope: {:#?} vs {:#?}",
             primary.declarations(),
             c_reading.declarations()
         );
+    }
+
+    #[test]
+    fn projection_difference_includes_resolution_facts() {
+        let source = "struct Widget {};\n";
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "src/widget.h",
+        );
+        let tree = cpp_tree(source);
+        let primary = parse_cpp_file(&file, source, &tree);
+        let mut fact_only_difference = primary.clone();
+        assert!(!cpp_projections_differ(&primary, &fact_only_difference));
+
+        fact_only_difference
+            .resolution_facts
+            .names
+            .push(ResolutionNameFact {
+                id: ResolutionNameId::new(0),
+                spelling: "fact-only-difference".to_owned(),
+            });
+        assert!(cpp_projections_differ(&primary, &fact_only_difference));
     }
 
     /// Every `#include` is an include claim, wherever it is written. The

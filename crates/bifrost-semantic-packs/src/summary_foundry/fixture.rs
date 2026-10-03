@@ -508,7 +508,8 @@ fn pack_source(
     language: &dyn FixtureLanguage,
 ) -> String {
     let pack = AuthoredSemanticModelPack {
-        schema_version: 2,
+        schema_version:
+            brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: FIXTURE_PACK_ID.to_owned(),
         version: FIXTURE_PACKAGE_VERSION.to_owned(),
         producer: Producer {
@@ -518,7 +519,7 @@ fn pack_source(
         language: language.language().to_owned(),
         ecosystem: language.ecosystem().to_owned(),
         compatibility: Compatibility {
-            bifrost: ">=0.8.0, <1.0.0".to_owned(),
+            bifrost: None,
             toolchains: Vec::new(),
         },
         provenance: Provenance {
@@ -563,6 +564,7 @@ fn pack_source(
                     },
                     completeness,
                     ordinary_heap_unchanged: false,
+                    no_concurrency_effects: false,
                     covers_overrides: false,
                     normal_continuation_absent: false,
                     normal_result_count: None,

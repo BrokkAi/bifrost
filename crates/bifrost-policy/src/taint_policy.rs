@@ -70,8 +70,8 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivatedProcedureSummary, ActiveSemanticModelSnapshot, CompiledProcedureSummary,
-    CompiledSummaryEffect, ProcedureSummaryMatch, ProcedureSummaryMemberKey,
-    ProcedureSummaryTargetKey, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
+    CompiledSummaryEffect, ProcedureSummaryMatch, ProcedureSummaryTargetKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
     UnmaterializedExternalSummaryCallShapeBinding,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::{
@@ -233,14 +233,16 @@ enum TaintPolicyCompilation {
         /// Non-empty means the run does not cover the whole selection, so it
         /// must not report `Complete`.
         refusals: Vec<String>,
+        incomplete_selectors: Vec<String>,
         authored_selector_summary: bool,
     },
     /// A compile whose endpoint selection was empty, so there is nothing to
-    /// solve. The run is complete and clean, and `empty_endpoints` names the
-    /// sets that matched nothing so the report does not read as a proof.
+    /// solve. `empty_endpoints` names the sets that matched nothing; an
+    /// incomplete selector still prevents a complete negative verdict.
     Clean {
         work: PolicyWorkReport,
         refusals: Vec<String>,
+        incomplete_selectors: Vec<String>,
         empty_endpoints: EmptyEndpointSets,
     },
 }
@@ -274,11 +276,12 @@ fn compiled_payload(
     refusals: Vec<String>,
     empty_endpoints: Option<EmptyEndpointSets>,
     authored_selector_summary: bool,
+    incomplete_selectors: Vec<String>,
 ) -> TaintProjectionPayload {
     let mut diagnostics = empty_endpoints
         .map(|empty| empty_selection_diagnostics(policy_id, empty))
         .unwrap_or_default();
-    if refusals.is_empty() {
+    if refusals.is_empty() && incomplete_selectors.is_empty() {
         return TaintProjectionPayload {
             projections: Vec::new(),
             completion: if authored_selector_summary {
@@ -292,20 +295,28 @@ fn compiled_payload(
             authored_arm_closures: Vec::new(),
         };
     }
-    let completion =
-        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
-            .expect("one incomplete reason is canonical");
-    diagnostics.extend(refusals.into_iter().filter_map(|message| {
-        PolicyDiagnostic::try_new(
-            PolicyDiagnosticCode::EvaluationFailure,
-            PolicyDiagnosticSeverity::Warning,
-            PolicyDiagnosticImpact::RunIncomplete,
-            message,
-            None,
-            Vec::new(),
-        )
-        .ok()
-    }));
+    let mut reasons = Vec::new();
+    if !refusals.is_empty() {
+        reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+    }
+    if !incomplete_selectors.is_empty() {
+        reasons.push(PolicyIncompleteReason::PartialDiscovery);
+    }
+    let completion = PolicyRunCompletion::inconclusive(reasons)
+        .expect("nonempty selector gaps have canonical reasons");
+    diagnostics.extend(
+        refusals
+            .into_iter()
+            .chain(incomplete_selectors)
+            .map(|message| {
+                PolicyDiagnostic::new_bounded(
+                    PolicyDiagnosticCode::EvaluationFailure,
+                    PolicyDiagnosticSeverity::Warning,
+                    PolicyDiagnosticImpact::RunIncomplete,
+                    message,
+                )
+            }),
+    );
     TaintProjectionPayload {
         projections: Vec::new(),
         completion,
@@ -596,6 +607,7 @@ impl ProductionTaintPolicyEvaluator {
                     roots,
                     work,
                     refusals,
+                    incomplete_selectors,
                     authored_selector_summary,
                 }) => {
                     payloads.insert(
@@ -606,6 +618,7 @@ impl ProductionTaintPolicyEvaluator {
                             refusals,
                             None,
                             authored_selector_summary,
+                            incomplete_selectors,
                         ),
                     );
                     for compiled in roots {
@@ -626,10 +639,17 @@ impl ProductionTaintPolicyEvaluator {
                 Ok(TaintPolicyCompilation::Clean {
                     work,
                     refusals,
+                    incomplete_selectors,
                     empty_endpoints,
                 }) => {
-                    let payload =
-                        compiled_payload(&policy_id, work, refusals, Some(empty_endpoints), false);
+                    let payload = compiled_payload(
+                        &policy_id,
+                        work,
+                        refusals,
+                        Some(empty_endpoints),
+                        false,
+                        incomplete_selectors,
+                    );
                     payloads.insert(policy_id, payload);
                 }
                 Err(failure) => {
@@ -1581,6 +1601,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
 }
 
 struct SelectedSummaryFamily {
+    payload_identity: usize,
     language: String,
     payload: Vec<CompiledProcedureSummary>,
     root_ids: HashSet<String>,
@@ -1663,12 +1684,14 @@ impl<'a> TaintPolicyCompiler<'a> {
                 work,
                 refusals: refusal_messages(&self.refused_sites),
                 authored_selector_summary: self.authored_selector_summary,
+                incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
             }),
             Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty_endpoints)) => {
                 Ok(TaintPolicyCompilation::Clean {
                     work,
                     refusals: refusal_messages(&self.refused_sites),
                     empty_endpoints,
+                    incomplete_selectors: self.selectors.take_incomplete_taint_selectors(),
                 })
             }
             Err(error) => Err(Box::new(TaintPolicyCompileFailure { error, work })),
@@ -2487,7 +2510,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         _binding: &PolicyPort,
     ) -> Result<Vec<SelectedSite>, TaintPolicyCompileError> {
         self.selectors
-            .select(selector)
+            .select_taint(selector)
             .map_err(taint_selector_error)
     }
 
@@ -2658,7 +2681,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                                 )
                             })?,
                         };
-                        Some((&named, ProofStatus::Proven, EvidenceCompleteness::Complete))
+                        Some((
+                            &named,
+                            selection.proof.clone(),
+                            selection.completeness.clone(),
+                        ))
                     } else {
                         match self.resolve_named_argument(call, name, selector, &selection.file)? {
                             NamedArgumentResolution::Bound(bound) => {
@@ -2706,7 +2733,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                             )
                         })?,
                     };
-                    Some((&named, ProofStatus::Proven, EvidenceCompleteness::Complete))
+                    Some((
+                        &named,
+                        selection.proof.clone(),
+                        selection.completeness.clone(),
+                    ))
                 }
                 _ => Some((binding, ProofStatus::Proven, EvidenceCompleteness::Complete)),
             };
@@ -4205,6 +4236,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             let family = families
                 .entry(family_key)
                 .or_insert_with(|| SelectedSummaryFamily {
+                    payload_identity: selected.payload.as_ptr() as usize,
                     language: selected.shard.manifest.language.clone(),
                     payload: selected.payload.to_vec(),
                     root_ids: HashSet::new(),
@@ -4322,13 +4354,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         // materialized-external binding above is untouched.
         let mut unmaterialized_families = HashMap::<usize, SelectedSummaryFamily>::new();
         for target in unmaterialized {
-            let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
-                target.language().semantic_pack_label(),
-                target.owner_fqn(),
-                target.member(),
-                target.has_receiver(),
-                target.arity(),
-            ));
+            let matched = active.procedure_summaries_for_external_target(target);
             let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                 continue;
             };
@@ -4336,6 +4362,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             let family = unmaterialized_families
                 .entry(family_key)
                 .or_insert_with(|| SelectedSummaryFamily {
+                    payload_identity: selected.payload.as_ptr() as usize,
                     language: selected.shard.manifest.language.clone(),
                     payload: selected.payload.to_vec(),
                     root_ids: HashSet::new(),
@@ -4426,18 +4453,12 @@ impl<'a> TaintPolicyCompiler<'a> {
                 });
                 let mut applicable = Vec::new();
                 for target in candidates {
-                    let matched =
-                        active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
-                            target.language().semantic_pack_label(),
-                            target.owner_fqn(),
-                            target.member(),
-                            target.has_receiver(),
-                            target.arity(),
-                        ));
+                    let matched = active.procedure_summaries_for_external_target(target);
                     let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                         continue;
                     };
-                    if selected.record.model_id == summary.model_id
+                    if selected.payload.as_ptr() as usize == family.payload_identity
+                        && selected.record.model_id == summary.model_id
                         && selected.record.id == summary.id
                     {
                         let binding = selected
@@ -4518,6 +4539,13 @@ impl<'a> TaintPolicyCompiler<'a> {
 fn select_unmaterialized_flow_summary<'matched, 'model>(
     matched: &'matched ProcedureSummaryMatch<'model>,
 ) -> Result<Option<&'matched ActivatedProcedureSummary<'model>>, TaintPolicyCompileError> {
+    if matched.applicability
+        == brokk_bifrost_analysis::analyzer::semantic_model::ProcedureSummaryApplicability::Incomplete
+    {
+        // Keep the unresolved call boundary and any partial findings. An
+        // existing model with incomplete applicability cannot close it.
+        return Ok(None);
+    }
     match matched.disposition {
         SemanticModelMatchDisposition::Empty if matched.records.is_empty() => Ok(None),
         SemanticModelMatchDisposition::Empty => Err(TaintPolicyCompileError::Model(
@@ -5270,7 +5298,12 @@ fn solve_and_project_batch(
                         }
                     }
                 };
-                payload.completion = PolicyRunCompletion::inconclusive(vec![reason])
+                let mut reasons = match &payload.completion {
+                    PolicyRunCompletion::Inconclusive { reasons } => reasons.clone(),
+                    _ => Vec::new(),
+                };
+                reasons.push(reason);
+                payload.completion = PolicyRunCompletion::inconclusive(reasons)
                     .map_err(|error| error.to_string())?;
                 payload.authored_arm_closures.clear();
                 if let Some(cause) = cause {
@@ -8504,6 +8537,7 @@ mod tests {
             Vec::new(),
             None,
             true,
+            Vec::new(),
         );
         assert_eq!(clean.completion, PolicyRunCompletion::ProvenBySummary);
 
@@ -8513,11 +8547,35 @@ mod tests {
             vec!["contract-violating workspace target".to_owned()],
             None,
             true,
+            Vec::new(),
         );
         assert!(matches!(
             refused.completion,
             PolicyRunCompletion::Inconclusive { .. }
         ));
+    }
+
+    #[test]
+    fn incomplete_selector_preserves_partial_discovery_without_refusal() {
+        let policy_id = PolicyId::new("test.issue-3712").expect("valid policy id");
+        let payload = compiled_payload(
+            &policy_id,
+            PolicyWorkReport::default(),
+            Vec::new(),
+            None,
+            false,
+            vec!["selector /analysis/sources/entries/input is incomplete".to_owned()],
+        );
+        assert!(matches!(
+            payload.completion,
+            PolicyRunCompletion::Inconclusive { ref reasons }
+                if reasons == &[PolicyIncompleteReason::PartialDiscovery]
+        ));
+        assert_eq!(payload.diagnostics.len(), 1);
+        assert_eq!(
+            payload.diagnostics[0].impact(),
+            super::PolicyDiagnosticImpact::RunIncomplete
+        );
     }
 
     /// One taint flow: `source_one` returns attacker input and `sink_one`

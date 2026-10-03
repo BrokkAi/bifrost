@@ -44,6 +44,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        delegated_locals: HashSet::default(),
         local_callables: HashMap::default(),
         constructible_types,
         value_classes,
@@ -252,14 +253,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, None, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, None, stack)
+            }
             Work::LabeledStatement {
                 node,
                 label,
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, Some(label), stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, Some(label), stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -886,15 +893,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return self.edge(builder, entry, next);
         };
         let terminal = self.point(builder, node, Vec::new())?;
-        let value =
+        let operand =
             self.expression_value(builder, value_node, expression_value_kind(value_node))?;
         let mut evaluations = Vec::new();
+        // `x op= v` reads the target, resolves through the `op` or `opAssign`
+        // operator convention, and (for `op`) writes the result back. The
+        // read happens before the write whichever convention resolves.
+        let compound = is_compound_assignment(node);
+        let value = if compound {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
+            )?;
+            // A simple name is read as itself; a member or index target is
+            // read through its unlowered assignable expression.
+            let read = match assignment_target(target_node) {
+                AssignmentTarget::Name(name) => name,
+                _ => target_node,
+            };
+            let current = self.expression_value(builder, read, expression_value_kind(read))?;
+            let result = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+            self.session.append_language_defined_value_flows(
+                builder,
+                terminal,
+                [current, operand],
+                result,
+            )?;
+            evaluations.push(read);
+            result
+        } else {
+            operand
+        };
         match assignment_target(target_node) {
             AssignmentTarget::Name(name) => {
                 if let Some(text) = node_text(self.prepared.source(), name) {
                     let local = self.local_at(text, name.start_byte());
                     let target = local.or_else(|| self.parameters.get(text).copied());
                     if let Some(target) = target {
+                        if self.delegated_locals.contains(&target) {
+                            self.add_gap(
+                                builder,
+                                terminal,
+                                SemanticGapSubject::Point,
+                                SemanticCapability::Calls,
+                                SemanticGapKind::Unsupported,
+                                "assigning a delegated local calls the delegate's setValue, which is not yet a call site",
+                            )?;
+                        }
                         let kind = if local.is_some() {
                             ValueFlowKind::Local
                         } else {
@@ -1238,6 +1287,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let (condition, body) =
             while_statement_parts(node).ok_or_else(|| missing_slot(node, "loop condition"))?;
         let body_entry = self.point(builder, body.unwrap_or(node), Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, entry, body_entry)?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {
@@ -1291,6 +1342,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let (body, condition) =
             do_while_statement_parts(node).ok_or_else(|| missing_slot(node, "loop condition"))?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
+        // A do body starts every iteration, so it is its own header.
+        self.session.record_loop_site(builder, node, entry, entry)?;
         let loop_scope = builder.push_scope(
             Some(scope),
             ScopeBinding::Loop {

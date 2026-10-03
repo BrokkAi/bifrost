@@ -1,22 +1,152 @@
 //! The Rust cargo-route tests that need a live analyzer.
 //!
-//! `RustCargoRouteIndex` and the module-route fact extraction it composes from
+//! `RustCargoRouteIndex` and the canonical module-route fact reader it consumes
 //! live in [`brokk_bifrost_rust::cargo_routes`]; only the assertions that reach
 //! the analyzer -- its `cargo_routes()` memo, and the store rows analysis wrote
 //! for it to read -- have to be built from a real `RustAnalyzer`, so they stay
 //! here (the Go block-2 precedent).
 //!
-//! The direct half of passthrough-macro discovery -- that
-//! `extract_rust_module_route_facts` plus `module_child_edges` replay only the
-//! faithful item macros -- is pinned inside the Rust crate by
+//! The direct half of passthrough-macro discovery -- that coordinated
+//! `parse_rust_file` facts plus `module_child_edges` replay only faithful item
+//! macros -- is pinned inside the Rust crate by
 //! `the_module_route_fixture_exercises_every_declaration_shape` and
-//! `module_child_edges_reproduce_the_frozen_syntax_walk`, over the same shapes.
+//! `module_child_edges_use_coordinated_route_facts`, over the same shapes.
 
 #[cfg(test)]
 mod tests {
-    use crate::analyzer::ProjectFile;
+    use crate::analyzer::{AnalyzerQueryScope, CodeUnitIndex, Language, ProjectFile, RustAnalyzer};
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_rust::cargo_routes::RustCargoTargetRelation;
+    use brokk_bifrost_rust::graph_support::RustCargoRouteError;
     use std::path::{Path, PathBuf};
+
+    fn readiness_fixture() -> BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"routes\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub mod part;\n")
+            .file("src/part.rs", "pub fn target() {}\n")
+            .build()
+    }
+
+    #[test]
+    fn missing_canonical_routes_are_unavailable_and_retry_after_preparation() {
+        let fixture = readiness_fixture();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 2);
+        analyzer.analyzer_store().delete_rust_facts_for_test("rust");
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            assert!(matches!(
+                analyzer.cargo_routes_while(&|| true),
+                Err(RustCargoRouteError::Unavailable)
+            ));
+            assert!(matches!(
+                analyzer.cargo_routes(),
+                Err(RustCargoRouteError::Unavailable)
+            ));
+            assert!(scope.store_error().is_some());
+        }
+        assert!(!analyzer.cargo_routes_ready_for_test());
+        assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
+        assert!(!analyzer.rust_usage_facts_ready());
+        analyzer.warm_usage_facts();
+        assert!(analyzer.rust_usage_facts_ready());
+        let routes = analyzer
+            .cargo_routes_while(&|| true)
+            .expect("retry after canonical preparation");
+        assert_eq!(
+            routes.target_roots_for_file(&fixture.file("src/part.rs")),
+            vec![fixture.file("src/lib.rs")]
+        );
+        assert!(analyzer.cargo_routes_ready_for_test());
+    }
+
+    #[test]
+    fn failed_canonical_route_read_never_publishes_a_partial_index() {
+        let fixture = readiness_fixture();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 2);
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(matches!(
+            analyzer.cargo_routes_while(&|| true),
+            Err(RustCargoRouteError::Unavailable)
+        ));
+        let error = scope
+            .store_error()
+            .expect("route SQL error must reach the query boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical Rust Cargo-route publication"),
+            "{error}"
+        );
+        assert!(!analyzer.cargo_routes_ready_for_test());
+        assert_eq!(analyzer.module_route_fact_fallback_count_for_test(), 0);
+    }
+
+    #[test]
+    fn incomplete_live_blob_is_not_filtered_out_of_route_readiness() {
+        let fixture = readiness_fixture();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/part.rs");
+        let oid = analyzer
+            .live_path_snapshot()
+            .oid_for_path(&file)
+            .expect("live file identity");
+        analyzer
+            .analyzer_store()
+            .mark_parsed_blob_incomplete_for_test(oid, "rust");
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            assert!(matches!(
+                analyzer.cargo_routes_while(&|| true),
+                Err(RustCargoRouteError::Unavailable)
+            ));
+            assert!(scope.store_error().is_some());
+        }
+        assert!(!analyzer.cargo_routes_ready_for_test());
+        analyzer.warm_usage_facts();
+        assert!(analyzer.rust_usage_facts_ready());
+        let routes = analyzer
+            .cargo_routes_while(&|| true)
+            .expect("repaired live publication");
+        assert_eq!(
+            routes.target_roots_for_file(&file),
+            vec![fixture.file("src/lib.rs")]
+        );
+    }
+
+    #[test]
+    fn cancelled_canonical_route_build_does_not_poison_a_retry() {
+        let fixture = readiness_fixture();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert!(matches!(
+            analyzer.cargo_routes_while(&|| false),
+            Err(RustCargoRouteError::Cancelled)
+        ));
+        assert!(!analyzer.cargo_routes_ready_for_test());
+        assert!(analyzer.cargo_routes_while(&|| true).is_ok());
+    }
+
+    #[test]
+    fn published_files_without_cargo_have_valid_empty_routes() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub fn target() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let routes = analyzer
+            .cargo_routes_while(&|| true)
+            .expect("no manifest is not missing publication");
+        assert!(
+            routes
+                .target_roots_for_file(&fixture.file("src/lib.rs"))
+                .is_empty()
+        );
+    }
 
     #[test]
     fn passthrough_macro_routes_require_faithful_item_replay_and_lexical_visibility() {
@@ -125,11 +255,16 @@ inline_only! { mod escaped_inline; }
         let analyzer = crate::analyzer::RustAnalyzer::from_project(
             crate::analyzer::TestProject::new(root.clone(), crate::analyzer::Language::Rust),
         );
-        let routes = analyzer.cargo_routes();
+        let routes = analyzer.cargo_routes().expect("published Cargo routes");
 
+        // `feature_items` decorates each item with `#[$meta]`, which can be
+        // any attribute: the crate does not decide its invocations
+        // (`source_rust_item_macros.decoration_cfg` is NULL), so the route
+        // index does not claim the module either. A `cfg` decoration, even
+        // one no profile activates (`cfg(any())`), is decided; the index
+        // evaluates no profile and leaves that to the crate's module walk.
         for module in [
             "replayed",
-            "feature_replayed",
             "transitively_replayed",
             "before_shadow",
             "inline_scope/inline_replayed",
@@ -143,6 +278,7 @@ inline_only! { mod escaped_inline; }
             );
         }
         for module in [
+            "feature_replayed",
             "dropped_left",
             "dropped_right",
             "stringified_item",
@@ -176,7 +312,7 @@ inline_only! { mod escaped_inline; }
         // analyzed workspace does not need it.
         analyzer.reset_module_route_fact_fallback_count_for_test();
 
-        let routes = analyzer.cargo_routes();
+        let routes = analyzer.cargo_routes().expect("published Cargo routes");
 
         let library = ProjectFile::new(root.clone(), "src/lib.rs");
         assert_eq!(
@@ -228,7 +364,7 @@ inline_only! { mod escaped_inline; }
         let analyzer = crate::analyzer::RustAnalyzer::from_project(
             crate::analyzer::TestProject::new(root.clone(), crate::analyzer::Language::Rust),
         );
-        let routes = analyzer.cargo_routes();
+        let routes = analyzer.cargo_routes().expect("published Cargo routes");
 
         let app_library = ProjectFile::new(root.clone(), "app/src/lib.rs");
         let engine_library = ProjectFile::new(root.clone(), "engine/src/lib.rs");

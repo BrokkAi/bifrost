@@ -318,3 +318,37 @@ fn authoritative_batch_prepares_union_roots_once_and_keeps_per_target_file_bound
         "each later one-file request adds exactly one file-major traversal"
     );
 }
+
+#[test]
+fn csharp_inverse_scans_use_overlay_source_in_revision_a_b_a() {
+    use crate::analyzer::{CodeUnitIndex, OverlayProject, Project, ProjectFile};
+    use crate::inline_project::InlineTestProject;
+    use std::sync::Arc;
+
+    let disk = "class C { public void Target() {} public void Run() {} }";
+    let dirty = "class C { public void Target() {} public void Run() { Target(); } }";
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file("Overlay.cs", disk)
+        .build();
+    let file = ProjectFile::new(fixture.root(), "Overlay.cs");
+    let base = CSharpAnalyzer::from_project(fixture.project().clone());
+    let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+    let roots = HashSet::from_iter([file.clone()]);
+    for (source, expected_sites) in [(disk, 0), (dirty, 1), (disk, 0)] {
+        assert!(overlay.set(file.abs_path(), source.to_owned()));
+        let analyzer = base.clone_with_project(overlay.clone() as Arc<dyn Project>);
+        let target = analyzer
+            .get_definitions("C.Target")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("target declaration");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let batch = CSharpAuthoritativeUsageBatch::new(&analyzer, scope.token(), &roots)
+            .expect("C# authoritative batch");
+        let result = batch
+            .find_usages(std::slice::from_ref(&target), &roots, 100)
+            .into_fuzzy_result();
+        assert_eq!(csharp_usage_sites(result, &target).len(), expected_sites);
+    }
+    assert_eq!(std::fs::read_to_string(file.abs_path()).unwrap(), disk);
+}

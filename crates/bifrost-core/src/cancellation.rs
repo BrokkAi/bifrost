@@ -15,6 +15,8 @@ pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
     timed_out: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    soft_deadline: Option<Instant>,
+    parent: Option<Arc<CancellationToken>>,
     /// What the work under this token is doing right now. See
     /// [`CancellationToken::enter_phase`].
     phase: Arc<Mutex<Option<String>>>,
@@ -26,6 +28,8 @@ pub struct CancellationToken {
     cancel_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
     timeout_after_checks: Option<Arc<AtomicUsize>>,
+    #[cfg(any(test, feature = "test-support"))]
+    soft_deadline_after_checks: Option<Arc<AtomicUsize>>,
 }
 
 /// Restores the phase that was current when it was entered.
@@ -80,6 +84,18 @@ impl CancellationToken {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Return a token with operation-local cancellation that still observes
+    /// cancellation and deadlines from this token.
+    #[doc(hidden)]
+    pub fn child(&self) -> Self {
+        Self {
+            parent: Some(Arc::new(self.clone())),
+            phase: Arc::clone(&self.phase),
+            phase_sink: self.phase_sink.clone(),
+            ..Self::default()
+        }
     }
 
     /// Record what this token's work is doing, until the guard is dropped.
@@ -163,9 +179,50 @@ impl CancellationToken {
         self
     }
 
+    /// Return a token that can report a non-cancelling soft deadline.
+    ///
+    /// A soft deadline lets a caller stop starting bounded units of work and
+    /// return an explicitly incomplete result before the hard request deadline
+    /// cancels the operation. It never changes [`Self::is_cancelled`] or
+    /// [`Self::is_timed_out`]. Repeated calls keep the earliest deadline.
+    pub fn with_soft_deadline(mut self, deadline: Instant) -> Self {
+        self.soft_deadline = Some(
+            self.soft_deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+        self
+    }
+
+    /// Whether this token or one of its parents has passed its soft deadline.
+    ///
+    /// Unlike a hard deadline, observing this value never cancels the token.
+    pub fn soft_deadline_passed(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(remaining) = &self.soft_deadline_after_checks {
+            let previous = remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .unwrap_or(0);
+            if previous <= 1 {
+                return true;
+            }
+        }
+        self.soft_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.soft_deadline_passed())
+    }
+
     /// Whether cancellation was triggered by this token's wall-clock deadline.
     pub fn is_timed_out(&self) -> bool {
         self.timed_out.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_timed_out())
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -210,7 +267,9 @@ impl CancellationToken {
         if self.cancelled.load(Ordering::Acquire) {
             return true;
         }
-        false
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_cancelled())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -230,6 +289,15 @@ impl CancellationToken {
             ..Self::default()
         }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn soft_deadline_after_checks_for_test(checks: usize) -> Self {
+        Self {
+            soft_deadline_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +312,25 @@ mod tests {
         assert!(!clone.is_cancelled());
         token.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn child_observes_parent_without_propagating_local_cancellation() {
+        let parent = CancellationToken::new();
+        let child = parent.child();
+        {
+            let _phase = child.enter_phase("native resolution");
+            assert_eq!(parent.phase().as_deref(), Some("native resolution"));
+        }
+        assert_eq!(parent.phase(), None);
+
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!parent.is_cancelled());
+
+        let sibling = parent.child();
+        parent.cancel();
+        assert!(sibling.is_cancelled());
     }
 
     #[test]
@@ -302,5 +389,27 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
+    }
+
+    #[test]
+    fn soft_deadline_is_inherited_and_never_cancels() {
+        let token = CancellationToken::default().with_soft_deadline(Instant::now());
+        let child = token.child();
+
+        assert!(child.soft_deadline_passed());
+        assert!(!child.is_cancelled());
+        assert!(!child.is_timed_out());
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn soft_deadline_test_hook_trips_after_the_requested_checks_without_cancelling() {
+        let token = CancellationToken::soft_deadline_after_checks_for_test(2);
+
+        assert!(!token.soft_deadline_passed());
+        assert!(token.soft_deadline_passed());
+        assert!(token.soft_deadline_passed());
+        assert!(!token.is_cancelled());
+        assert!(!token.is_timed_out());
     }
 }

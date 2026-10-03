@@ -153,6 +153,21 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         Vec::new()
     }
 
+    /// Return the complete, unbounded import set for `file` when the provider
+    /// can prove that its source-owned import publication is available.
+    /// `Some(Vec::new())` is an authoritative import-free file; `None` means
+    /// that the file's import facts are unavailable and must not be treated as
+    /// an empty set.  The legacy [`Self::import_info_of`] method intentionally
+    /// retains its recovery semantics for callers that cannot preserve this
+    /// distinction.
+    fn import_info_of_checked(
+        &self,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+    ) -> Option<Vec<ImportInfo>> {
+        None
+    }
+
     /// Resolve imported source units from already-loaded import facts. Providers
     /// that cannot do this cheaply return `None` and use `imported_code_units_of`.
     fn imported_code_units_from_infos(

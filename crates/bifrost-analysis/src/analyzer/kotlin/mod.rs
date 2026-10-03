@@ -232,6 +232,11 @@ impl KotlinAnalyzer {
         self.inner.bulk_hydration_count_for_test()
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_retained_file_states_for_test(&mut self) {
+        self.inner.clear_retained_file_states_for_test();
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let jvm_config = config.jvm.clone();
@@ -1148,8 +1153,16 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
 }
 
 impl LanguageSupport for KotlinSupport {
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        crate::analyzer::jvm::is_jvm_configuration_input_path(path)
+    }
+
     fn language(&self) -> Language {
         Language::Kotlin
+    }
+
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
     }
 
     fn expand_imported_external_callee(

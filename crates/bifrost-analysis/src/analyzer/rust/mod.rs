@@ -12,8 +12,25 @@ pub(crate) mod generated_model;
 mod graph_support;
 mod hierarchy;
 mod imports;
+pub(crate) mod native_call_projection;
+mod native_graph;
+#[cfg(test)]
+pub(crate) use native_graph::{
+    RustNativeWorkspaceGraphOutcome, build_rust_native_workspace_graph_for_files,
+};
+pub(crate) mod external_calls;
+mod native_outgoing;
+pub(crate) mod native_points;
+mod native_rename;
+mod native_usages;
+pub use native_usages::RustNativeUsageStrategy;
 mod rustdoc_artifact;
+pub(crate) mod selected_projection;
+pub(crate) mod selected_reverse;
+pub(crate) mod selected_shadow;
 mod semantic;
+pub(in crate::analyzer) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 #[cfg(test)]
 mod usage_queries_tests;
@@ -26,22 +43,15 @@ use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    ExternalCalleeSite, ImportedExternalCallee, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver, fqn_bulk_nodes,
+    BoundedReceiverQuery, DeadCodeSupport, ExternalCalleeSite, ImportedExternalCallee,
+    LanguageSupport, StructuralReceiverResolver,
 };
 use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof, resolve_rust_bounded,
-    rust_call_written_arity, rust_import_binder_external_callee,
+    BoundedResolution, DefinitionLookupOutcome, ExactExternalCallProof,
 };
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_rust_type_bounded};
-use crate::analyzer::usages::rust_graph::{
-    RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
-};
+use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -52,6 +62,7 @@ use crate::analyzer::{
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
+use external_calls::{rust_call_written_arity, rust_import_binder_external_callee};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,23 +71,41 @@ use std::sync::{Arc, OnceLock};
 use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
 pub(crate) use adapter::RustAdapter;
 use brokk_bifrost_core::analyzer::rust_facts::{RustModuleRouteFacts, RustUsageFacts};
-use brokk_bifrost_rust::cache::{weight_declaration_facts, weight_rust_usage_facts};
-use brokk_bifrost_rust::graph_support::{RustFactSource, RustLiveBlobs};
+use brokk_bifrost_rust::cache::{
+    weight_declaration_facts, weight_declaration_source_properties, weight_rust_usage_facts,
+};
+use brokk_bifrost_rust::graph_support::{
+    RustCargoRouteError, RustDeclarationSourceProperties, RustFactSource, RustLiveBlobs,
+    RustPlacedDeclaration, RustTraitImplRow, RustUnresolvedImpl,
+};
+use brokk_bifrost_rust::hierarchy::RustHierarchySourceFacts;
 use brokk_bifrost_rust::usage_queries::RustDeclarationFacts;
 use brokk_bifrost_rust::usage_walks::RustWalkCaches;
 
 /// The key of the per-blob fact cache: the rows are content-addressed, and the
 /// generation component retires the whole cache when extraction semantics move.
 type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid);
-use brokk_bifrost_rust::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
+type RustHierarchySourceFactsCacheKey =
+    (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile);
+
+/// Query occurrences and their immutable fact product share one selected blob.
+#[cfg(test)]
+pub(crate) struct RustPrimarySourceAt {
+    pub(crate) occurrences: Vec<brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId>,
+    pub(crate) facts: Arc<RustHierarchySourceFacts>,
+}
+
+fn weight_rust_hierarchy_source_facts<K>(_key: &K, value: &Arc<RustHierarchySourceFacts>) -> u32 {
+    value.estimated_retained_bytes().clamp(1, u32::MAX as usize) as u32
+}
+use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
 use brokk_bifrost_rust::crate_naming;
-pub(crate) use brokk_bifrost_rust::declarations::{rust_package_name, rust_type_identifiers};
+#[cfg(test)]
+pub(crate) use brokk_bifrost_rust::declarations::rust_package_name;
+pub(crate) use brokk_bifrost_rust::declarations::rust_type_identifiers;
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
-pub use brokk_bifrost_rust::graph::ast::rust_reference_namespace;
-pub(crate) use brokk_bifrost_rust::imports::{
-    resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package, rust_focused_use_path, rust_import_binding_name,
-};
+pub use brokk_bifrost_rust::graph_support::rust_reference_namespace;
+pub(crate) use brokk_bifrost_rust::imports::rust_import_binding_name;
 use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
 use cache::weight_export_index;
 use clones::build_rust_clone_candidate_data;
@@ -84,19 +113,12 @@ pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
 pub use external::RustDependencyPackAdapter;
 pub use rustdoc_artifact::RustdocJsonPackProducer;
 
-use brokk_bifrost_rust::graph_support::RustPackageFileIndex;
 pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
 use brokk_bifrost_rust::graph_support::is_rust_enum_variant_declaration;
-pub(crate) use brokk_bifrost_rust::graph_support::{
-    forward_export_fqn_from_files, has_rust_value_constructor, is_rust_const_or_static_declaration,
-    is_rust_enum_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
-    is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
-    resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
-    rust_associated_type_declaration_for_exact_node, trait_implementer_names,
+pub(crate) use brokk_bifrost_rust::graph_support::is_rust_public_like_declaration;
+use brokk_bifrost_rust::graph_support::{
+    ReferenceContextError, ReferenceContextResult, RustPackageFileIndex,
 };
-
-use brokk_bifrost_rust::hierarchy::RustHierarchyIndex;
-pub(crate) use brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type;
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
@@ -105,15 +127,6 @@ pub use brokk_bifrost_rust::lexical_scope::{
 };
 pub use brokk_bifrost_rust::usage::RustReferenceNamespace;
 use brokk_bifrost_rust::usage::RustSymbolNamespace;
-pub(crate) use brokk_bifrost_rust::usage::{
-    RustBindingSeeds, usage_binding_local_names, usage_binding_names, usage_binding_seeds,
-    usage_binding_seeds_while, usage_candidate_files_from_binding_seeds_while,
-    usage_crate_export_targets, usage_declaration_visible_at, usage_exact_root_for_resolution,
-    usage_exact_root_for_resolution_with_walks, usage_has_exact_scoped_binding,
-    usage_identity_visible_at, usage_import_path_matches_seed, usage_importers,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_reference_at_with_walks,
-    usage_root_declaration_matches_at,
-};
 
 pub fn rust_declaration_matches_reference_namespace(
     declaration: &CodeUnit,
@@ -123,7 +136,10 @@ pub fn rust_declaration_matches_reference_namespace(
         .is_some_and(|symbol_namespace| symbol_namespace.accepts(reference))
 }
 
-pub fn rust_declaration_is_enum_variant(rust: &RustAnalyzer, declaration: &CodeUnit) -> bool {
+pub fn rust_declaration_is_enum_variant(
+    rust: &RustAnalyzer,
+    declaration: &CodeUnit,
+) -> Result<bool, RustCargoRouteError> {
     is_rust_enum_variant_declaration(rust, declaration)
 }
 
@@ -135,9 +151,9 @@ pub struct RustAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    // PoolSafeMemo, not OnceLock: the build hydrates and parses every file on
-    // rayon, and this cache is reached from inside rayon workers (see
-    // `pool_memo`). A blocking get_or_init there can deadlock the pool.
+    // The current builder reads persisted rows and composes routes serially.
+    // PoolSafeMemo's pool-independent path lets Rayon callers share that work
+    // with cancellable waits, without duplicating the build on each worker.
     cargo_routes: Arc<PoolSafeMemo<RustCargoRouteIndex>>,
     package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
     /// `resolve_module_files` calls. A use-path's module files are invariant in
@@ -145,8 +161,6 @@ pub struct RustAnalyzer {
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
     export_name_canonicalization_count: Arc<AtomicUsize>,
-    scanned_candidate_file_count: Arc<AtomicUsize>,
-    usage_binding_seed_preparation_count: Arc<AtomicUsize>,
     /// Files the Cargo-route build had to parse because their blob carried no
     /// persisted module-route rows (#1793).
     module_route_fact_fallback_count: Arc<AtomicUsize>,
@@ -161,6 +175,15 @@ pub struct RustAnalyzer {
     /// (structural parents, visibility) and not only the file's bytes; the
     /// analyzer is replaced wholesale on `update`, so the cache retires with it.
     declaration_facts: Cache<ProjectFile, Arc<RustDeclarationFacts>>,
+    declaration_source_properties: Cache<
+        (crate::analyzer::store::GenerationId, git2::Oid, ProjectFile),
+        Arc<RustDeclarationSourceProperties>,
+    >,
+    /// One mounted file's canonical hierarchy inputs. The generation, blob,
+    /// and mounted file all participate in the key: source rows are
+    /// content-owned, while CodeUnit links are placement-dependent.
+    rust_hierarchy_source_facts:
+        Cache<RustHierarchySourceFactsCacheKey, Arc<RustHierarchySourceFacts>>,
     /// The fact catch-up state for this generation: whether the live blobs
     /// without persisted Rust facts have been found and repaired.
     fact_catch_up: Arc<fact_catch_up::RustFactCatchUp>,
@@ -168,14 +191,6 @@ pub struct RustAnalyzer {
     /// analyzer stays small: nine `Cache` handles inline would make this struct
     /// the outsized variant of `AnalyzerDelegate`.
     walk_caches: Arc<RustWalkCaches>,
-    /// `PoolSafeMemo`, not `OnceLock`: the build parses every workspace
-    /// file and is reached from request-path rayon workers through
-    /// `TypeHierarchyProvider` and `member_family`. It runs on the
-    /// dedicated build pool so a global-pool worker parks on it instead of
-    /// building the whole workspace hierarchy inline (#1772).
-    hierarchy_index: Arc<PoolSafeMemo<RustHierarchyIndex>>,
-    #[allow(dead_code)]
-    type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
@@ -203,83 +218,200 @@ impl RustAnalyzer {
 
     /// One blob's persisted per-file usage facts, read once per
     /// `(generation, blob)` and then served from the bounded cache.
-    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>> {
+    fn rust_usage_facts_of_blob(
+        &self,
+        oid: git2::Oid,
+    ) -> Result<Arc<RustUsageFacts>, RustCargoRouteError> {
         let key: RustFactCacheKey = (self.inner.language_generation("rust"), oid);
         if let Some(cached) = self.rust_usage_facts.get(&key) {
-            return Some(cached);
+            return Ok(cached);
         }
-        let facts = self.analyzer_store().rust_usage_facts(oid, "rust").ok()?;
-        if facts.modules.is_empty() {
-            return None;
+        let facts = self
+            .analyzer_store()
+            .rust_usage_facts(oid, "rust")
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading canonical Rust usage facts for blob {oid}")),
+                );
+                RustCargoRouteError::Unavailable
+            })?;
+        if !facts
+            .modules
+            .first()
+            .is_some_and(|root| root.module_name.is_empty() && root.is_inline)
+        {
+            self.inner
+                .record_store_error(crate::analyzer::store::StoreError::new(format!(
+                    "canonical Rust usage publication has no root module for blob {oid}: {:?}",
+                    facts.modules
+                )));
+            return Err(RustCargoRouteError::Unavailable);
         }
         let facts = Arc::new(facts);
         self.rust_usage_facts.insert(key, Arc::clone(&facts));
-        Some(facts)
+        Ok(facts)
     }
 
     /// One file's declaration identities and their visibility domains, derived
     /// once per file and then served from the bounded cache.
-    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+    fn rust_declaration_facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<RustDeclarationFacts>, RustCargoRouteError> {
         if let Some(cached) = self.declaration_facts.get(file) {
-            return cached;
+            return Ok(cached);
         }
         let facts = Arc::new(
             brokk_bifrost_rust::usage_queries::rust_declaration_facts(
                 self,
-                AnalyzerQueryScope::new(self).token(),
                 file,
                 &self.declarations(file),
                 &|| true,
-            )
+            )?
             .expect("uninterrupted Rust declaration-fact derivation"),
         );
         self.declaration_facts
             .insert(file.clone(), Arc::clone(&facts));
-        facts
+        Ok(facts)
     }
 
-    pub(crate) fn declaration_candidates_by_identifier(&self, identifier: &str) -> Vec<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_identifier(identifier)
-            .into_iter()
-            .collect()
-    }
-
-    pub(crate) fn declaration_candidates_by_identifier_in_file(
+    fn selected_rust_source(
         &self,
         file: &ProjectFile,
-        identifier: &str,
-    ) -> Vec<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_identifier_in_file(file, identifier)
-            .into_iter()
-            .collect()
-    }
-
-    pub(crate) fn declaration_candidates_by_identifier_in_file_limited(
-        &self,
-        file: &ProjectFile,
-        identifier: &str,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_identifier_in_file_limited(
-                file,
-                identifier,
-                limit,
-                continue_query,
-            )
-    }
-
-    pub(crate) fn declaration_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
-            return Vec::new();
+    ) -> Result<(crate::analyzer::store::GenerationId, git2::Oid), RustCargoRouteError> {
+        let generation = self
+            .inner
+            .language_generation("rust")
+            .expect("Rust analyzer has a Rust storage generation");
+        let Some(oid) = self.live_path_snapshot().oid_for_path(file) else {
+            // A file this adapter does not own has no canonical Rust source
+            // and never will, so asking about one is not a store failure. It
+            // used to record one, and a recorded store error fails the whole
+            // request: a mixed-language `usage_graph` naming only Rust paths
+            // exited 1 on a C++ header. Only a missing *Rust* source is a
+            // store problem.
+            if crate::analyzer::common::language_for_file(file) == Language::Rust {
+                self.inner
+                    .record_store_error(crate::analyzer::store::StoreError::new(format!(
+                        "canonical Rust source is absent from the live snapshot: {file:?}"
+                    )));
+            }
+            return Err(RustCargoRouteError::Unavailable);
         };
-        self.declaration_candidates_by_identifier(identifier)
-            .into_iter()
-            .filter(|candidate| candidate.fq_name() == fqn)
-            .collect()
+        Ok((generation, oid))
+    }
+
+    fn declaration_source_properties(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let (generation, oid) = self.selected_rust_source(file)?;
+        let key = (generation, oid, file.clone());
+        if let Some(cached) = self.declaration_source_properties.get(&key) {
+            return Ok(cached);
+        }
+        let rows = self
+            .analyzer_store()
+            .rust_declaration_properties(oid, generation, &RustAdapter, file, keep_going)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading canonical Rust declaration properties for {file:?} ({oid})"
+                )));
+                RustCargoRouteError::Unavailable
+            })?
+            .ok_or(RustCargoRouteError::Cancelled)?;
+        let mut properties = RustDeclarationSourceProperties::default();
+        for (unit, property) in rows {
+            if !keep_going() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            properties.entry(unit).or_default().push(property);
+        }
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let properties = Arc::new(properties);
+        self.declaration_source_properties
+            .insert(key, Arc::clone(&properties));
+        Ok(properties)
+    }
+
+    /// One mounted file's complete canonical hierarchy input. Publication is
+    /// read from the current generation and failures are never inserted into
+    /// the bounded cache; the store's `None` result is cancellation.
+    pub(crate) fn canonical_rust_hierarchy_source_facts(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustHierarchySourceFacts>, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let (generation, oid) = self.selected_rust_source(file)?;
+        self.rust_hierarchy_source_facts_for_key((generation, oid, file.clone()), keep_going)
+    }
+
+    fn rust_hierarchy_source_facts_for_key(
+        &self,
+        key: RustHierarchySourceFactsCacheKey,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustHierarchySourceFacts>, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let (generation, oid, file) = &key;
+        if let Some(cached) = self.rust_hierarchy_source_facts.get(&key) {
+            return Ok(cached);
+        }
+        let facts = self
+            .analyzer_store()
+            .rust_hierarchy_source_facts(*oid, *generation, &RustAdapter, file, keep_going)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading canonical Rust hierarchy source facts for {file:?} ({oid})"
+                )));
+                RustCargoRouteError::Unavailable
+            })?
+            .ok_or(RustCargoRouteError::Cancelled)?;
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let facts = Arc::new(facts);
+        self.rust_hierarchy_source_facts
+            .insert(key, Arc::clone(&facts));
+        Ok(facts)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_rust_primary_source_at(
+        &self,
+        file: &ProjectFile,
+        range: std::ops::Range<usize>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<RustPrimarySourceAt, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let (generation, oid) = self.selected_rust_source(file)?;
+        let occurrences = self
+            .analyzer_store()
+            .rust_primary_occurrences_at(oid, generation, range, keep_going)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading canonical Rust primary query occurrences for {file:?} ({oid})"
+                )));
+                RustCargoRouteError::Unavailable
+            })?
+            .ok_or(RustCargoRouteError::Cancelled)?;
+        // Occurrence IDs are blob-local. Never recapture live identity between
+        // point selection and hierarchy loading if a mount changes during I/O.
+        let facts =
+            self.rust_hierarchy_source_facts_for_key((generation, oid, file.clone()), keep_going)?;
+        Ok(RustPrimarySourceAt { occurrences, facts })
     }
 
     pub(crate) fn declaration_candidates_by_fqn_limited(
@@ -300,17 +432,6 @@ impl RustAnalyzer {
                 .retain(|candidate| candidate.fq_name() == fqn);
         }
         candidates
-    }
-
-    pub(crate) fn member_candidates_for_owner_limited(
-        &self,
-        owner_fqn: &str,
-        name: &str,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        let exact_fqn = format!("{owner_fqn}.{name}");
-        self.declaration_candidates_by_fqn_limited(&exact_fqn, limit, continue_query)
     }
 
     pub(crate) fn signature_metadata_limited(
@@ -345,11 +466,6 @@ impl RustAnalyzer {
         limit: usize,
     ) -> LimitedQueryRows<Range> {
         self.inner.ranges_limited(code_unit, limit)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
-        self.inner.prepared_syntax_parse_count_for_test(file)
     }
 
     /// Per-instance counters behind the #1230 complexity pins. Each is shared by
@@ -389,39 +505,6 @@ impl RustAnalyzer {
             .load(Ordering::Relaxed)
     }
 
-    pub(crate) fn note_scanned_candidate_file(&self) {
-        self.scanned_candidate_file_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[doc(hidden)]
-    pub fn reset_scanned_candidate_file_count_for_test(&self) {
-        self.scanned_candidate_file_count
-            .store(0, Ordering::Relaxed);
-    }
-
-    #[doc(hidden)]
-    pub fn scanned_candidate_file_count_for_test(&self) -> usize {
-        self.scanned_candidate_file_count.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn note_usage_binding_seed_preparation(&self) {
-        self.usage_binding_seed_preparation_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[doc(hidden)]
-    pub fn reset_usage_binding_seed_preparation_count_for_test(&self) {
-        self.usage_binding_seed_preparation_count
-            .store(0, Ordering::Relaxed);
-    }
-
-    #[doc(hidden)]
-    pub fn usage_binding_seed_preparation_count_for_test(&self) -> usize {
-        self.usage_binding_seed_preparation_count
-            .load(Ordering::Relaxed)
-    }
-
     #[doc(hidden)]
     pub fn reset_analyzed_file_listing_count_for_test(&self) {
         self.inner.reset_analyzed_file_listing_count_for_test();
@@ -435,16 +518,36 @@ impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.imported_code_units =
+            build_weighted_cache(self.memo_budget / 4, weight_code_unit_set);
+        clone.referencing_files =
+            build_weighted_cache(self.memo_budget / 8, weight_project_file_set);
+        clone.export_indexes = build_weighted_cache(self.memo_budget / 8, weight_export_index);
+        clone.reverse_import_index = Arc::new(PoolSafeMemo::new());
         clone.cargo_routes = Arc::new(PoolSafeMemo::new());
         clone.package_file_index = Arc::new(OnceLock::new());
+        clone.declaration_facts =
+            build_weighted_cache(self.memo_budget / 8, weight_declaration_facts);
+        clone.rust_hierarchy_source_facts =
+            build_weighted_cache(self.memo_budget / 16, weight_rust_hierarchy_source_facts);
+        clone.fact_catch_up = Arc::new(fact_catch_up::RustFactCatchUp::new());
+        clone.walk_caches = Arc::new(RustWalkCaches::new(self.memo_budget));
+        clone
+    }
+
+    pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
+        let mut clone = self.clone();
+        clone.inner = clone.inner.clone_with_project(project);
         clone
     }
 
     /// Explicit inverse-analysis support. Forward definition and type queries
     /// resolve only the importing file's manifest route.
-    fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
-        self.cargo_routes
-            .get_or_build(|| self.build_cargo_routes(), || self.build_cargo_routes())
+    fn cargo_routes(&self) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError> {
+        // Preparation belongs to warm_usage_facts, not a route read. This
+        // accessor is also reachable through forward resolution helpers, so
+        // repairing the workspace here would bypass their query budgets.
+        self.cargo_routes_while(&|| true)
     }
 
     /// [`Self::cargo_routes`], abandoning the build once `keep_going` stops
@@ -452,28 +555,42 @@ impl RustAnalyzer {
     /// for the next complete build.
     fn cargo_routes_while(
         &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Arc<RustCargoRouteIndex>> {
-        self.cargo_routes.get_or_build_while(
-            &|| keep_going(),
-            || self.build_cargo_routes_while(keep_going),
-            || self.build_cargo_routes_while(keep_going),
-        )
-    }
-
-    fn build_cargo_routes(&self) -> RustCargoRouteIndex {
-        self.build_cargo_routes_while(&|| true)
-            .expect("uninterrupted Rust Cargo-route construction")
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError> {
+        // This build only reads frozen mounts, SQL, and Cargo manifests; it
+        // cannot enter parser preparation or require a rayon worker. Failures
+        // and cancelled builds publish nothing to the memo.
+        let routes = self
+            .cargo_routes
+            .get_or_try_build_pool_independent_while(&|| keep_going(), || {
+                match self.build_cargo_routes_while(keep_going) {
+                    Ok(routes) => Ok(Some(routes)),
+                    Err(RustCargoRouteError::Cancelled) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })?
+            .ok_or(RustCargoRouteError::Cancelled)?;
+        self.note_rust_publication_verified();
+        Ok(routes)
     }
 
     fn build_cargo_routes_while(
         &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<RustCargoRouteIndex> {
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<RustCargoRouteIndex, RustCargoRouteError> {
         let _scope = brokk_bifrost_core::profiling::scope("RustAnalyzer::build_cargo_routes");
-        let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-        let facts = self.rust_module_route_facts(&files, keep_going)?;
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let mut mounts = self
+            .inner
+            .live_file_mounts_for_fact_publication_while(&|| keep_going())
+            .ok_or(RustCargoRouteError::Cancelled)?;
+        mounts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let facts = self.rust_module_route_facts(&mounts, keep_going)?;
+        let files: Vec<_> = mounts.into_iter().map(|(file, _)| file).collect();
         RustCargoRouteIndex::build_while(&files, &facts, &|| keep_going())
+            .ok_or(RustCargoRouteError::Cancelled)
     }
 
     /// The persisted module-route facts of every analyzed Rust file, in one
@@ -484,69 +601,52 @@ impl RustAnalyzer {
     /// The cost is now one chunked index seek per fact table over the live
     /// blobs, so it grows with rows read rather than with source bytes parsed.
     ///
-    /// A live blob with no rows is repaired the only way it can be: by parsing
-    /// that file. It is a per-file recovery, never a whole-workspace one --
-    /// analysis writes these rows, so the shortfall is normally empty and
-    /// `module_route_fact_fallback_count_for_test` pins that.
+    /// Missing publication is unavailable, never an independent parser path.
+    /// Normal preparation or explicit warming can repair it before a retry;
+    /// this bounded consumer only composes already-published canonical output.
     fn rust_module_route_facts(
         &self,
-        files: &[ProjectFile],
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<HashMap<ProjectFile, RustModuleRouteFacts>> {
-        keep_going().then_some(())?;
-        let scope = AnalyzerQueryScope::new(self);
-        let snapshot = self.live_path_snapshot();
-        let oids: Vec<(ProjectFile, git2::Oid)> = files
-            .iter()
-            .filter_map(|file| Some((file.clone(), snapshot.oid_for_path(file)?)))
-            .collect();
-        // A failed read is not a separate error path: every file it did not
-        // answer for takes the same per-file recovery a missing row takes, and
-        // the fallback counter is where that shows up.
+        files: &[(ProjectFile, git2::Oid)],
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<HashMap<ProjectFile, RustModuleRouteFacts>, RustCargoRouteError> {
+        if !keep_going() {
+            return Err(RustCargoRouteError::Cancelled);
+        }
+        let mut missing = Vec::new();
+        let generation = self
+            .inner
+            .language_generation("rust")
+            .expect("Rust analyzer has a Rust storage generation");
+        let keys: Vec<_> = files.iter().map(|(_, oid)| *oid).collect();
         let stored = self
             .analyzer_store()
-            .rust_module_route_facts(
-                "rust",
-                &oids.iter().map(|(_, oid)| *oid).collect::<Vec<_>>(),
-            )
-            .unwrap_or_default();
+            .rust_module_route_facts_while("rust", generation, &keys, &|| keep_going())
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context("reading canonical Rust Cargo-route publication"),
+                );
+                RustCargoRouteError::Unavailable
+            })?
+            .ok_or(RustCargoRouteError::Cancelled)?;
         let mut by_file = HashMap::default();
-        let mut missing = Vec::new();
-        let mut oid_by_file: HashMap<&ProjectFile, git2::Oid> = HashMap::default();
-        for (file, oid) in &oids {
-            oid_by_file.insert(file, *oid);
-        }
-        for file in files {
-            keep_going().then_some(())?;
-            match oid_by_file.get(file).and_then(|oid| stored.get(oid)) {
-                Some(found) => {
-                    by_file.insert(file.clone(), found.clone());
+        for (file, oid) in files {
+            if !keep_going() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            match stored.get(oid) {
+                Some(facts) if facts.file_extent().is_some() => {
+                    by_file.insert(file.clone(), facts.clone());
                 }
-                None => missing.push(file.clone()),
+                _ => missing.push(file.clone()),
             }
         }
-        for file in missing {
-            keep_going().then_some(())?;
-            let Some(prepared) = self.prepared_syntax(scope.token(), &file) else {
-                continue;
-            };
-            self.module_route_fact_fallback_count
-                .fetch_add(1, Ordering::Relaxed);
-            let root = prepared.tree().root_node();
-            let item_macros = brokk_bifrost_rust::declarations::rust_rules_item_macro_definitions(
-                root,
-                prepared.source(),
-            );
-            by_file.insert(
-                file,
-                brokk_bifrost_rust::cargo_routes::extract_rust_module_route_facts(
-                    root,
-                    prepared.source(),
-                    &item_macros,
-                ),
-            );
+        if !missing.is_empty() {
+            self.inner.record_store_error(crate::analyzer::store::StoreError::new(format!(
+                "canonical Rust Cargo-route publication is unavailable for live files: {missing:?}"
+            )));
+            return Err(RustCargoRouteError::Unavailable);
         }
-        Some(by_file)
+        Ok(by_file)
     }
 
     #[cfg(test)]
@@ -555,10 +655,6 @@ impl RustAnalyzer {
     }
 
     #[cfg(test)]
-    pub(crate) fn hierarchy_index_built_for_test(&self) -> bool {
-        self.hierarchy_index.is_ready()
-    }
-
     /// Files the Cargo-route build recovered by parsing. The structural claim of
     /// #1793 is that this reads zero on a warm workspace: the index composes
     /// from rows and never from a workspace parse.
@@ -572,62 +668,6 @@ impl RustAnalyzer {
     pub fn reset_module_route_fact_fallback_count_for_test(&self) {
         self.module_route_fact_fallback_count
             .store(0, Ordering::Relaxed);
-    }
-
-    pub(crate) fn candidates_in_same_cargo_target_root(
-        &self,
-        file: &ProjectFile,
-        candidates: Vec<CodeUnit>,
-    ) -> Option<Vec<CodeUnit>> {
-        self.cargo_routes()
-            .candidates_in_same_target_root(file, candidates)
-    }
-
-    pub(crate) fn cargo_target_roots_for_file(&self, file: &ProjectFile) -> Vec<ProjectFile> {
-        self.cargo_routes().target_roots_for_file(file)
-    }
-
-    pub(crate) fn file_uses_rust_2015_edition(&self, file: &ProjectFile) -> bool {
-        self.cargo_routes().file_uses_rust_2015_edition(file)
-    }
-
-    pub(crate) fn has_available_declared_cargo_dependency(
-        &self,
-        file: &ProjectFile,
-        route: &str,
-    ) -> bool {
-        self.cargo_routes()
-            .has_available_declared_dependency(file, route)
-    }
-
-    pub(crate) fn files_share_cargo_target(
-        &self,
-        left: &ProjectFile,
-        right: &ProjectFile,
-    ) -> Option<bool> {
-        match self.cargo_routes().target_relation(left, right) {
-            RustCargoTargetRelation::Shared => Some(true),
-            RustCargoTargetRelation::Disjoint => Some(false),
-            RustCargoTargetRelation::Unknown => None,
-        }
-    }
-
-    pub(crate) fn candidates_in_cargo_library_route(
-        &self,
-        file: &ProjectFile,
-        route: &str,
-        candidates: Vec<CodeUnit>,
-    ) -> Option<Vec<CodeUnit>> {
-        self.cargo_routes()
-            .candidates_in_library_route(file, route, candidates)
-    }
-
-    pub(crate) fn resolve_cargo_crate_root_file(
-        &self,
-        file: &ProjectFile,
-        route: &str,
-    ) -> Option<ProjectFile> {
-        self.cargo_routes().resolve_crate_root_file(file, route)
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {
@@ -648,15 +688,19 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
-            usage_binding_seed_preparation_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 16, weight_declaration_facts),
+            declaration_source_properties: build_weighted_cache(
+                memo_budget / 16,
+                weight_declaration_source_properties,
+            ),
+            rust_hierarchy_source_facts: build_weighted_cache(
+                memo_budget / 16,
+                weight_rust_hierarchy_source_facts,
+            ),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            hierarchy_index: Arc::new(PoolSafeMemo::new()),
-            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -686,15 +730,19 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
-            usage_binding_seed_preparation_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 16, weight_declaration_facts),
+            declaration_source_properties: build_weighted_cache(
+                memo_budget / 16,
+                weight_declaration_source_properties,
+            ),
+            rust_hierarchy_source_facts: build_weighted_cache(
+                memo_budget / 16,
+                weight_rust_hierarchy_source_facts,
+            ),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            hierarchy_index: Arc::new(PoolSafeMemo::new()),
-            type_relations: Arc::new(OnceLock::new()),
         })
     }
 
@@ -714,13 +762,41 @@ impl RustAnalyzer {
     }
 }
 
+/// Whether `file` is a Cargo manifest, the non-source input that names crates
+/// and their path dependencies. `Cargo.toml` maps to no language, so the
+/// workspace analyzer must route it to the Rust delegate by name.
+///
+/// It is the only Rust configuration file routed here (decided in #3756):
+/// - `Cargo.lock` and `rust-toolchain.toml` are read only by dependency
+///   discovery (`dependency_discovery.rs`), to choose the dependency and
+///   standard-library packs. They are Cargo pack inputs
+///   (`CargoDependencyResolver::dependency_inputs`), and the host refreshes
+///   pack activation when one changes. Crate rows, cfg and feature activation,
+///   and Cargo routes do not read them, and pack-derived semantic artifacts
+///   are keyed by the active packs, so routing them here would rebuild for no
+///   change in results.
+/// - `.cargo/config.toml` is read by nothing: its `[patch]`, `build.target`
+///   and `--cfg` rustflags are not honored (#3768). Route it when they are.
+pub(crate) fn is_cargo_manifest(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .file_name()
+        .is_some_and(|name| name == "Cargo.toml")
+}
+
 /// Whether every changed file the Rust analyzer would reindex still hashes to
 /// what the store holds, so `update` can hand back a clone instead of
 /// rebuilding.
+///
+/// A changed manifest is never "unchanged": it moves crate membership and
+/// dependency routes without touching a Rust source, and only the underlying
+/// analyzer's update re-derives the crate rows for it.
 fn rust_indexed_sources_unchanged(
     index: &dyn CodeUnitIndex,
     changed_files: &BTreeSet<ProjectFile>,
 ) -> bool {
+    if changed_files.iter().any(is_cargo_manifest) {
+        return false;
+    }
     changed_files
         .iter()
         .filter(|file| file_language(file) == Language::Rust || index.is_analyzed(file))
@@ -753,6 +829,44 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.structural_parent_of(code_unit)
     }
 
+    fn declaration_candidates_by_fqn_while(
+        &self,
+        fq_name: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> ReferenceContextResult<Vec<CodeUnit>> {
+        if !keep_going() {
+            return Err(ReferenceContextError::Interrupted);
+        }
+        if !self.inner.workspace_declaration_identities_authoritative() {
+            return Err(RustCargoRouteError::Unavailable.into());
+        }
+        let mut interrupted = false;
+        let candidates = self.declaration_candidates_by_fqn_limited(fq_name, usize::MAX, || {
+            let proceed = keep_going();
+            interrupted |= !proceed;
+            proceed
+        });
+        if interrupted || !keep_going() {
+            return Err(ReferenceContextError::Interrupted);
+        }
+        if !candidates.complete {
+            return Err(RustCargoRouteError::Unavailable.into());
+        }
+        Ok(candidates.rows)
+    }
+
+    fn declaration_source_properties(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError> {
+        self.declaration_source_properties(file, keep_going)
+    }
+
+    fn direct_ancestors(&self, code_unit: &CodeUnit) -> Result<Vec<CodeUnit>, RustCargoRouteError> {
+        self.direct_ancestors(code_unit)
+    }
+
     fn prepared_syntax(
         &self,
         token: QueryToken<'_>,
@@ -761,14 +875,14 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.prepared_syntax(token, file)
     }
 
-    fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
+    fn cargo_routes(&self) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError> {
         self.cargo_routes()
     }
 
     fn cargo_routes_while(
         &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Arc<RustCargoRouteIndex>> {
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustCargoRouteIndex>, RustCargoRouteError> {
         self.cargo_routes_while(keep_going)
     }
 
@@ -782,8 +896,23 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.import_binder_of(token, file)
     }
 
-    fn export_index_of(&self, file: &ProjectFile) -> Arc<crate::analyzer::usages::ExportIndex> {
+    fn export_index_of(
+        &self,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_rust::graph_support::ReferenceContextResult<
+        Arc<crate::analyzer::usages::ExportIndex>,
+    > {
         self.export_index_of(file)
+    }
+
+    fn export_index_of_while(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> brokk_bifrost_rust::graph_support::ReferenceContextResult<
+        Arc<crate::analyzer::usages::ExportIndex>,
+    > {
+        self.export_index_of_while(file, progress)
     }
 
     fn note_module_file_resolution(&self) {
@@ -809,53 +938,321 @@ impl RustLiveBlobs for LiveSnapshotBlobs {
     }
 }
 
+fn placed_declarations(rows: Vec<(git2::Oid, u32, String)>) -> Vec<RustPlacedDeclaration> {
+    rows.into_iter()
+        .map(|(blob, declaration, rel_path)| RustPlacedDeclaration {
+            rel_path,
+            blob,
+            declaration,
+        })
+        .collect()
+}
+
 /// The store-backed half of the Rust usage substrate. Everything here is
-/// something only the analyzer can answer: the store handle behind the four
-/// inverted lookups, the live blob mapping, the caches it owns, and the
-/// catch-up that guarantees the rows exist before a walk reads them.
+/// something only the analyzer can answer: the store handle behind the six
+/// inverted lookups, the live blob mapping, and the caches it owns.
+/// Publication preparation is deliberately not part of this query interface.
 impl RustFactSource for RustAnalyzer {
-    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>> {
+    fn rust_usage_facts_of_blob(
+        &self,
+        oid: git2::Oid,
+    ) -> Result<Arc<RustUsageFacts>, RustCargoRouteError> {
         self.rust_usage_facts_of_blob(oid)
     }
 
-    fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid> {
+    fn rust_import_target_blobs(
+        &self,
+        module_path: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_import_target_blobs("rust", module_path)
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading Rust import targets for {module_path:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_module_import_candidate_blobs(&self, component: &str) -> Vec<git2::Oid> {
+    fn rust_module_import_candidate_blobs(
+        &self,
+        component: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_module_import_candidate_blobs("rust", component)
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading Rust module import candidates for {component:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_export_blobs(&self, exported_name: &str) -> Vec<git2::Oid> {
+    fn rust_export_blobs(
+        &self,
+        exported_name: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_export_blobs("rust", exported_name)
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading Rust exports for {exported_name:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(git2::Oid, u32)> {
+    fn rust_traits_implemented_by(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_traits_implemented_by(
+                declaration.blob,
+                declaration.declaration,
+                &declaration.rel_path,
+            )
+            .map(placed_declarations)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading Rust traits implemented by {declaration:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_types_implementing(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_types_implementing(
+                declaration.blob,
+                declaration.declaration,
+                &declaration.rel_path,
+            )
+            .map(placed_declarations)
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading Rust types implementing {declaration:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_trait_impl_rows(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustTraitImplRow>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_trait_impl_rows(
+                declaration.blob,
+                declaration.declaration,
+                &declaration.rel_path,
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| RustTraitImplRow {
+                        impl_blob: row.impl_blob,
+                        impl_rel_path: row.impl_rel_path,
+                        impl_declaration: row.impl_declaration,
+                        subject: row.subject.map(|(blob, declaration, rel_path)| {
+                            RustPlacedDeclaration {
+                                rel_path,
+                                blob,
+                                declaration,
+                            }
+                        }),
+                    })
+                    .collect()
+            })
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading Rust impl rows for trait {declaration:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_traits_of_impl(
+        &self,
+        impl_item: &RustPlacedDeclaration,
+    ) -> Result<Vec<RustPlacedDeclaration>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_traits_of_impl(impl_item.blob, impl_item.declaration, &impl_item.rel_path)
+            .map(placed_declarations)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading the Rust traits stated by impl {impl_item:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_item_macro_decisions(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<brokk_bifrost_rust::graph_support::RustItemMacroDecision>, RustCargoRouteError>
+    {
+        let blob = self
+            .live_blobs()
+            .oid_for_path(file)
+            .ok_or(RustCargoRouteError::Unavailable)?;
+        let rel_path = crate::path_utils::rel_path_string(file);
+        self.analyzer_store()
+            .rust_item_macro_decisions(blob, &rel_path)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(
+                        |row| brokk_bifrost_rust::graph_support::RustItemMacroDecision {
+                            invocation:
+                                brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId::new(
+                                    row.invocation,
+                                ),
+                            name: row.name,
+                            decided: row.decided,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading the Rust item macro decisions of {file:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_macro_expansion_blobs(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<brokk_bifrost_rust::graph_support::RustMacroExpansionBlob>, RustCargoRouteError>
+    {
+        self.analyzer_store()
+            .rust_macro_expansion_blobs(names)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(
+                        |row| brokk_bifrost_rust::graph_support::RustMacroExpansionBlob {
+                            blob: row.blob,
+                            via: row.via,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading the Rust macro expansion candidates for {names:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_trait_impl_spellings(
+        &self,
+        declaration: &RustPlacedDeclaration,
+    ) -> Result<Vec<String>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_trait_impl_spellings(
+                declaration.blob,
+                declaration.declaration,
+                &declaration.rel_path,
+            )
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading Rust trait impl spellings for {declaration:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_alias_blobs_mentioning(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_alias_blobs_mentioning("rust", identifier)
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading Rust alias blobs mentioning {identifier:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_unresolved_trait_impl_files(
+        &self,
+        spelling: &str,
+    ) -> Result<Vec<RustUnresolvedImpl>, RustCargoRouteError> {
+        self.analyzer_store()
+            .rust_unresolved_trait_impl_files(spelling)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(
+                        |(impl_blob, impl_rel_path, impl_declaration)| RustUnresolvedImpl {
+                            impl_blob,
+                            impl_rel_path,
+                            impl_declaration,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading unbound Rust trait impls spelled {spelling:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
+    }
+
+    fn rust_identifier_occurrence_blobs(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<(git2::Oid, u32)>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_identifier_occurrence_blobs("rust", identifier)
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner.record_store_error(error.context(format!(
+                    "reading Rust identifier occurrences for {identifier:?}"
+                )));
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_include_blobs(&self, file_name: &str) -> Vec<git2::Oid> {
+    fn rust_include_blobs(&self, file_name: &str) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_include_blobs("rust", file_name)
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner.record_store_error(
+                    error.context(format!("reading Rust include candidates for {file_name:?}")),
+                );
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_include_host_blobs(&self) -> Vec<git2::Oid> {
+    fn rust_include_host_blobs(&self) -> Result<Vec<git2::Oid>, RustCargoRouteError> {
         self.analyzer_store()
             .rust_include_host_blobs("rust")
-            .unwrap_or_default()
+            .map_err(|error| {
+                self.inner
+                    .record_store_error(error.context("reading Rust include hosts"));
+                RustCargoRouteError::Unavailable
+            })
     }
 
-    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+    fn rust_declaration_facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Arc<RustDeclarationFacts>, RustCargoRouteError> {
         self.rust_declaration_facts_of(file)
+    }
+
+    fn canonical_rust_hierarchy_source_facts(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Arc<RustHierarchySourceFacts>, RustCargoRouteError> {
+        self.canonical_rust_hierarchy_source_facts(file, keep_going)
     }
 
     fn live_blobs(&self) -> Arc<dyn RustLiveBlobs> {
@@ -864,10 +1261,6 @@ impl RustFactSource for RustAnalyzer {
 
     fn walk_caches(&self) -> &Arc<RustWalkCaches> {
         &self.walk_caches
-    }
-
-    fn ensure_rust_facts_caught_up(&self) {
-        self.ensure_rust_facts_caught_up();
     }
 
     fn reference_context_of<'a>(
@@ -988,6 +1381,14 @@ impl CodeUnitIndex for RustAnalyzer {
         self.inner.declarations(file)
     }
 
+    fn declares(&self, file: &ProjectFile, unit: &CodeUnit) -> bool {
+        self.inner.declares(file, unit)
+    }
+
+    fn declarations_named(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.inner.declarations_named(file, identifier)
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }
@@ -1106,7 +1507,13 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn abstract_member_implementations(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
-        self.rust_trait_member_implementations(code_unit)
+        match self.rust_trait_member_implementations(code_unit) {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_hierarchy_error(error);
+                None
+            }
+        }
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
@@ -1156,14 +1563,11 @@ impl IAnalyzer for RustAnalyzer {
     /// that reaches the same memo spends a global-pool worker on the build's
     /// parallelism.
     fn warm_query_indexes(&self) {
-        std::thread::scope(|scope| {
-            scope.spawn(|| self.warm_usage_facts());
-            self.hierarchy_index();
-        });
+        self.warm_usage_facts();
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.hierarchy_index.is_ready() && self.rust_usage_facts_warm()
+        self.rust_usage_facts_warm()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -1186,15 +1590,22 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
-            usage_binding_seed_preparation_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            declaration_facts: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_declaration_facts,
+            ),
+            declaration_source_properties: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_declaration_source_properties,
+            ),
+            rust_hierarchy_source_facts: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_rust_hierarchy_source_facts,
+            ),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            hierarchy_index: Arc::new(PoolSafeMemo::new()),
-            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1211,15 +1622,22 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
-            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
-            usage_binding_seed_preparation_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
-            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            declaration_facts: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_declaration_facts,
+            ),
+            declaration_source_properties: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_declaration_source_properties,
+            ),
+            rust_hierarchy_source_facts: build_weighted_cache(
+                self.memo_budget / 16,
+                weight_rust_hierarchy_source_facts,
+            ),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            hierarchy_index: Arc::new(PoolSafeMemo::new()),
-            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1316,7 +1734,16 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn file_is_test_only(&self, file: &ProjectFile) -> bool {
-        self.cargo_routes().file_is_test_only(file)
+        match self.cargo_routes() {
+            Ok(routes) => routes.file_is_test_only(file),
+            // This legacy boolean capability cannot carry availability. The
+            // route producer records the structured store failure on the query
+            // scope, which must reject the enclosing result; do not cache it.
+            Err(RustCargoRouteError::Unavailable) => false,
+            Err(RustCargoRouteError::Cancelled) => {
+                unreachable!("unbounded Cargo-route lookup cannot cancel")
+            }
+        }
     }
 
     fn find_structural_clone_smells(
@@ -1443,7 +1870,7 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
     }
 }
 
-static RUST_USAGE_STRATEGY: RustExportUsageGraphStrategy = RustExportUsageGraphStrategy::new();
+static RUST_USAGE_STRATEGY: RustNativeUsageStrategy = RustNativeUsageStrategy;
 
 pub(crate) struct RustSupport;
 
@@ -1481,16 +1908,17 @@ pub(crate) struct RustSupport;
 fn expand_rust_imported_external_callee(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    callee_text: &str,
+    _callee_text: &str,
     site: Option<&ExternalCalleeSite<'_>>,
 ) -> Option<ImportedExternalCallee> {
-    let (owner, member) = callee_text.rsplit_once("::")?;
-    let owner = owner.trim();
-    let member = member.trim();
-    if owner.is_empty() || member.is_empty() || owner.contains("::") {
-        return None;
-    }
     let site = site?;
+    let callee = external_calls::call_path(site.tree, site.callee_start_byte)?;
+    let segments = brokk_bifrost_rust::graph_support::rust_path_segments(callee)?;
+    let [owner, member] = segments.as_slice() else {
+        return None;
+    };
+    let owner = brokk_bifrost_rust::declarations::rust_node_text(*owner, site.source);
+    let member = brokk_bifrost_rust::declarations::rust_node_text(*member, site.source);
     // The declared callable this binder proves has to accept the written call,
     // so the expansion reads the call's written argument count from the same
     // parsed tree the callee reference came from. A callee whose call does not
@@ -1526,8 +1954,7 @@ fn expand_rust_imported_external_callee(
             analyzer,
             scope.token(),
             file,
-            site.source,
-            site.tree,
+            site,
             &import,
             member,
             parameter_count,
@@ -1570,6 +1997,10 @@ impl LanguageSupport for RustSupport {
         Language::Rust
     }
 
+    fn procedure_syntax_roles(&self) -> Option<crate::analyzer::languages::ProcedureSyntaxRoles> {
+        Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
     fn bind_generated_symbols(
         &self,
         file: &ProjectFile,
@@ -1584,6 +2015,13 @@ impl LanguageSupport for RustSupport {
     ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
     {
         Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
+    }
+
+    fn selected_macro_source_rows(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::store::resolution_operation::SelectedMacroSourceRows>
+    {
+        Some(&source_storage::RustMacroSourceRows)
     }
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
@@ -1633,10 +2071,28 @@ impl LanguageSupport for RustSupport {
     }
 
     fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
-        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+        crate::analyzer::languages::ReferenceLanguagePlugin::native(
             &RUST_USAGE_STRATEGY,
-            &RustEdgePass,
+            &native_graph::RustNativeWorkspaceGraphProvider,
         )
+    }
+
+    fn call_relation_provider(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_relations::CallRelationProvider> {
+        Some(&native_call_projection::RustNativeCallRelations)
+    }
+
+    fn rename_provider(&self) -> Option<&'static dyn crate::symbol_rename::RenameProvider> {
+        Some(&native_rename::RustNativeRenameProvider)
+    }
+
+    fn selected_inverse_reference_provider(
+        &self,
+    ) -> Option<
+        &'static dyn crate::analyzer::structural::reference_edges::SelectedInverseReferenceProvider,
+    > {
+        Some(&selected_shadow::RustNativeSelectedInverseProvider)
     }
 
     fn qualified_call_separator(&self) -> &'static str {
@@ -1656,28 +2112,19 @@ impl LanguageSupport for RustSupport {
     fn dead_code(&self) -> DeadCodeSupport {
         DeadCodeSupport {
             strategy: Some(&RUST_USAGE_STRATEGY),
-            bulk: Some(&RustDeadCodeBulk),
+            bulk: None,
         }
+    }
+
+    fn dead_code_needs_precise_scan(&self, analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+        resolve_analyzer::<RustAnalyzer>(analyzer).is_some_and(|rust| {
+            (candidate.is_function() || candidate.is_field() || rust.is_type_alias(candidate))
+                && rust.parent_of(candidate).is_some()
+        })
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&RustSupport)
-    }
-
-    /// Pre-build persisted Rust usage facts and the Cargo route index.
-    /// These are otherwise charged to whichever request first touches the Rust
-    /// usage graph, which can make a single interactive frontend request slow
-    /// on a large workspace (issue #1416). A no-op
-    /// for workspaces without Rust.
-    fn warm_usage_analysis(&self, analyzer: &dyn IAnalyzer) {
-        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            return;
-        };
-        // The build issues per-file store queries that are only cheap under
-        // request-scoped memoization; without a scope each lookup re-hydrates
-        // (observed ~65s instead of ~3.5s on the Bifrost workspace).
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
-        rust.warm_usage_facts();
     }
 
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
@@ -1693,115 +2140,19 @@ impl LanguageSupport for RustSupport {
     }
 }
 
-struct RustEdgePass;
-
-impl LanguageEdgePass for RustEdgePass {
-    fn id(&self) -> EdgePassId {
-        EdgePassId::Rust
-    }
-
-    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        crate::analyzer::usages::rust_graph::build_rooted_rust_usage_edges(
-            ctx.analyzer,
-            ctx.fqns,
-            ctx.keep_file,
-        )
-        .map(LanguageEdgeSites::Fqn)
-    }
-
-    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_rust_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeWeights::Fqn)
-    }
-}
-
 impl StructuralReceiverResolver for RustSupport {
     fn resolve_type_bounded(
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
-        resolve_rust_type_bounded(
-            query.analyzer,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
+        native_points::resolve_rust_type_bounded(query)
     }
 
     fn resolve_definition_bounded(
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        let scope = AnalyzerQueryScope::new(query.analyzer);
-        resolve_rust_bounded(
-            query.analyzer,
-            scope.token(),
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.budget,
-            query.cancellation,
-        )
-    }
-}
-
-struct RustDeadCodeBulk;
-
-impl DeadCodeBulkProof for RustDeadCodeBulk {
-    fn id(&self) -> EdgePassId {
-        EdgePassId::Rust
-    }
-
-    /// Inherent and trait members are held back: the bulk pass keys by fq name, which
-    /// cannot separate two `impl` blocks' identically named members.
-    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
-        let DeadCodeRouting {
-            analyzer,
-            candidate,
-            ..
-        } = routing;
-        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            return false;
-        };
-        // A type alias is class-kind since #2911, so the member kinds a precise
-        // scan owns are named through the alias marker rather than by excluding
-        // every class.
-        if !(candidate.is_function() || candidate.is_field() || rust.is_type_alias(candidate)) {
-            return false;
-        }
-        rust.parent_of(candidate).is_some()
-    }
-
-    /// The only proof with a standalone analyzer-availability check, and the only one
-    /// whose file cap is measured off the analyzer's own analyzed-file list rather than
-    /// the project's analyzable set for the language.
-    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-            return DeadCodeBulkPreflight::Unavailable("Rust analyzer capability was unavailable");
-        };
-        DeadCodeBulkPreflight::Ready {
-            label: "Rust",
-            files: rust.get_analyzed_files().len(),
-        }
-    }
-
-    fn build(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        candidates: &[CodeUnit],
-    ) -> Option<DeadCodeBulkEdges> {
-        let nodes = fqn_bulk_nodes(
-            analyzer,
-            Language::Rust,
-            |unit| unit.is_function() || unit.is_class(),
-            candidates,
-        );
-        build_rust_usage_edges(analyzer, &nodes, |_| true)
-            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+        native_points::resolve_rust_definition_bounded(query)
     }
 }
 
@@ -1873,5 +2224,57 @@ mod tests {
             "constructing an analyzer starts a generation too",
         );
         drop(rebuilt);
+    }
+}
+
+#[cfg(test)]
+mod foreign_file_tests {
+    use crate::analyzer::{AnalyzerQueryScope, Language, ProjectFile, TestProject};
+
+    /// Asking the Rust analyzer for a file it does not own is not a store
+    /// failure.
+    ///
+    /// A recorded store error fails the whole MCP request
+    /// (`searchtools_service.rs`, "Analyzer store failure while running ..."),
+    /// so a mixed-language `usage_graph` that named only Rust paths exited 1
+    /// on a C++ header that some other read had reached. The Rust adapter
+    /// reports "not mine" for a foreign file and leaves the request intact.
+    #[test]
+    fn a_foreign_file_is_unavailable_to_rust_without_failing_the_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"foreign\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").expect("write Rust");
+        std::fs::write(root.join("src/widget.h"), "struct Widget { int v; };\n")
+            .expect("write header");
+        let analyzer =
+            super::RustAnalyzer::from_project(TestProject::new(root.clone(), Language::Rust));
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let header = ProjectFile::new(root.clone(), "src/widget.h");
+        let outcome = analyzer.canonical_rust_hierarchy_source_facts(&header, &|| true);
+        assert!(
+            matches!(outcome, Err(super::RustCargoRouteError::Unavailable)),
+            "a foreign file has no canonical Rust source"
+        );
+        assert!(
+            scope.store_error().is_none(),
+            "a foreign file must not poison the request: {:?}",
+            scope.store_error()
+        );
+
+        // A Rust file the snapshot does know still answers, so the guard did
+        // not silence the ownership test itself.
+        let library = ProjectFile::new(root, "src/lib.rs");
+        assert!(
+            analyzer
+                .canonical_rust_hierarchy_source_facts(&library, &|| true)
+                .is_ok()
+        );
     }
 }

@@ -44,9 +44,9 @@ pub fn scan_file(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
+    visible_files: HashSet<ProjectFile>,
 ) -> PerFileEdges {
     let semantic = RubySemanticIndex::build_for_lookup(graph, ruby);
-    let visible_files = semantic.visible_files_from(file);
     let mut scan = RubyEdgeScan {
         semantic: &semantic,
         support,

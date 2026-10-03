@@ -1,8 +1,8 @@
-use crate::graph::common::{analyzed_files_for_language, language_for_target_filtered};
-use crate::graph::extractor::compute_export_index;
+use crate::graph::common::language_for_target_filtered;
+use crate::graph::source::export_index_from_source_facts;
 use crate::imports::resolve_js_ts_module_specifier;
-use crate::parse::js_ts_tree_sitter_language_for_file;
-use crate::syntax::{JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, slice};
+use crate::providers::JsTsSource;
+use crate::syntax::{JsTsImportBinder, JsTsLexicalBindingIndex, slice};
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::usages::model::{
@@ -14,7 +14,7 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 /// JS/TS resolution maps for one language: a re-export + importer index built from the
 /// per-file export/import indices plus analyzer-level module resolution
@@ -32,18 +32,17 @@ pub struct JsTsUsageIndex {
     pub importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
 }
 
-/// Build the cacheable [`JsTsUsageIndex`] for one language: parse every file once to
-/// derive its export/import indices, then build the re-export + importer maps — dropping
-/// the syntax trees as soon as the per-file indices are computed (the maps are the only
-/// thing the analyzer caches; the scan phase re-parses its candidate files on demand).
+/// Build the cacheable [`JsTsUsageIndex`] for one language from the published
+/// per-file source facts, then build the re-export + importer maps. Missing
+/// publication aborts the build; the graph never reparses a file to replace an
+/// unavailable source fact.
 pub fn build_jsts_usage_index(
-    analyzer: &dyn CodeUnitIndex,
+    analyzer: &dyn JsTsSource,
     aliases: &AliasResolver,
     language: Language,
     parallel: bool,
-) -> JsTsUsageIndex {
+) -> Option<JsTsUsageIndex> {
     build_jsts_usage_index_with_cancellation(analyzer, aliases, language, parallel, None)
-        .unwrap_or_default()
 }
 
 /// `aliases` is the analyzer's shared resolver rather than one built here from
@@ -52,13 +51,13 @@ pub fn build_jsts_usage_index(
 /// `tsconfig.json` again on every rebuild instead of reusing the config memo the
 /// rest of the analyzer has already warmed.
 pub fn build_jsts_usage_index_with_cancellation(
-    analyzer: &dyn CodeUnitIndex,
+    analyzer: &dyn JsTsSource,
     aliases: &AliasResolver,
     language: Language,
     parallel: bool,
     cancellation: Option<&CancellationToken>,
 ) -> Option<JsTsUsageIndex> {
-    let files = collect_jsts_files(analyzer, language);
+    let files = collect_jsts_files(analyzer, language)?;
     if tree_sitter_language_for(language).is_none() {
         return Some(JsTsUsageIndex::default());
     }
@@ -67,29 +66,25 @@ pub fn build_jsts_usage_index_with_cancellation(
         if is_cancelled(cancellation) {
             return None;
         }
-        let source = file.read_to_string().ok()?;
+        let facts = analyzer.source_facts(file)?;
         if is_cancelled(cancellation) {
             return None;
         }
-        let mut parser = Parser::new();
-        let file_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parser.set_language(&file_language).ok()?;
-        let tree = parser.parse(source.as_str(), None)?;
+        let exports = export_index_from_source_facts(&facts.facts, &facts.imports);
+        let binder =
+            JsTsImportBinder::from_source_facts(&facts.facts, &facts.imports, &facts.source);
         if is_cancelled(cancellation) {
             return None;
         }
-        let exports = compute_export_index(&source, &tree);
-        let binder = compute_import_binder(&source, &tree);
-        if is_cancelled(cancellation) {
-            return None;
-        }
-        // `tree`/`source` drop here — only the per-file indices outlive the parse.
         Some((file.clone(), exports, binder))
     };
     let per_file: Vec<(ProjectFile, ExportIndex, JsTsImportBinder)> = if parallel {
-        files.par_iter().filter_map(compute_file).collect()
+        files
+            .par_iter()
+            .map(compute_file)
+            .collect::<Option<Vec<_>>>()?
     } else {
-        files.iter().filter_map(compute_file).collect()
+        files.iter().map(compute_file).collect::<Option<Vec<_>>>()?
     };
     if is_cancelled(cancellation) {
         return None;
@@ -695,11 +690,22 @@ fn export_names_for_file(
     names
 }
 
-pub fn collect_jsts_files(analyzer: &dyn CodeUnitIndex, language: Language) -> Vec<ProjectFile> {
-    let mut result = analyzed_files_for_language(analyzer, language);
+pub fn collect_jsts_files(
+    analyzer: &dyn JsTsSource,
+    language: Language,
+) -> Option<Vec<ProjectFile>> {
+    let inventory = analyzer.source_file_inventory();
+    if !inventory.complete {
+        return None;
+    }
+    let mut result: Vec<_> = inventory
+        .rows
+        .into_iter()
+        .filter(|file| brokk_bifrost_core::analyzer::common::language_for_file(file) == language)
+        .collect();
     result.sort();
     result.dedup();
-    result
+    Some(result)
 }
 
 /// The default tree-sitter grammar for a JS/TS language, or `None` for anything else.

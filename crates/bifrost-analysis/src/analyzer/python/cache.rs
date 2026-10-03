@@ -138,13 +138,17 @@ mod tests {
         let second_targets = HashSet::from_iter(["module.target".to_string()]);
         let builds = AtomicUsize::new(0);
 
-        let first = analyzer.usage_edges_for_targets(&nodes, &first_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
-        });
-        let second = analyzer.usage_edges_for_targets(&nodes, &second_targets, || {
-            panic!("warm Python usage graph must reuse the cached edges")
-        });
+        let first = analyzer
+            .usage_edges_for_targets(&nodes, &first_targets, || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Some(UsageEdges::default())
+            })
+            .expect("first Python usage graph build");
+        let second = analyzer
+            .usage_edges_for_targets(&nodes, &second_targets, || {
+                panic!("warm Python usage graph must reuse the cached edges")
+            })
+            .expect("cached Python usage graph");
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(1, builds.load(Ordering::Relaxed));
@@ -152,7 +156,7 @@ mod tests {
         let different_targets = HashSet::from_iter(["module.other".to_string()]);
         analyzer.usage_edges_for_targets(&nodes, &different_targets, || {
             builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
+            Some(UsageEdges::default())
         });
         assert_eq!(
             2,
@@ -163,8 +167,38 @@ mod tests {
         let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
         updated.usage_edges_for_targets(&nodes, &first_targets, || {
             builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
+            Some(UsageEdges::default())
         });
         assert_eq!(3, builds.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unavailable_usage_edges_are_not_cached() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
+            root.path().to_path_buf(),
+            Language::Python,
+        )));
+        let nodes = HashSet::from_iter(["module.target".to_string()]);
+        let targets = HashSet::from_iter(["module.target".to_string()]);
+        let builds = AtomicUsize::new(0);
+
+        let missing = analyzer.usage_edges_for_targets(&nodes, &targets, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        assert!(missing.is_none());
+
+        let available = analyzer.usage_edges_for_targets(&nodes, &targets, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            Some(UsageEdges::default())
+        });
+        assert!(available.is_some());
+        assert_eq!(2, builds.load(Ordering::Relaxed));
+
+        analyzer.usage_edges_for_targets(&nodes, &targets, || {
+            panic!("available Python usage graph must be cached")
+        });
+        assert_eq!(2, builds.load(Ordering::Relaxed));
     }
 }

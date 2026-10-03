@@ -59,6 +59,33 @@ pub fn normalize_tool_arguments(
     Ok(arguments)
 }
 
+/// The workspace files a location request names, after
+/// [`normalize_tool_arguments`]. A request must observe the current content of
+/// every file it names, so the service brings exactly these up to date before
+/// answering when the watcher has not delivered their change yet.
+pub fn tool_named_files(tool_name: &str, arguments: &Value) -> Vec<String> {
+    let object_array_paths = |array_field: &str| {
+        arguments
+            .get(array_field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .map(|path| path.trim().to_owned())
+            .collect::<Vec<_>>()
+    };
+    match tool_name {
+        "get_definitions_by_location" => object_array_paths("references"),
+        "scan_usages_by_location" => object_array_paths("targets"),
+        "rename_symbol" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| vec![path.trim().to_owned()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn normalize_tool_arguments_for_cli(
     tool_name: &str,
     mut arguments: Value,

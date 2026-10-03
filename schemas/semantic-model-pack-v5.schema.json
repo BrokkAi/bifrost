@@ -3523,6 +3523,17 @@
         "name": {
           "type": "string"
         },
+        "non_overridable": {
+          "description": "Explicit declaration evidence. An omitted/default virtuality flag is unknown.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonOverridableEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "owner": {
           "type": "string"
         },
@@ -3590,6 +3601,13 @@
       "additionalProperties": false,
       "required": [
         "name"
+      ]
+    },
+    "NonOverridableEvidence": {
+      "description": "Evidence emitted only after a producer reads an exact Java final method.",
+      "type": "string",
+      "enum": [
+        "java_final_method"
       ]
     },
     "NormalResultTransferPartition": {
@@ -6850,6 +6868,11 @@
               "type": "null"
             }
           ]
+        },
+        "callable_surface_complete": {
+          "description": "Every directly declared externally visible callable and direct\nhierarchy edge is represented. This positive inventory claim excludes\ninherited members, fields, effects and overload applicability. False\nmeans unreviewed, even when the retained declarations look complete.",
+          "type": "boolean",
+          "default": false
         },
         "embedded_types": {
           "type": "array",

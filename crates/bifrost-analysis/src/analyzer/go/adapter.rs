@@ -1,15 +1,15 @@
 //! The `LanguageAdapter` forwarding shell for Go.
 //!
 //! Every answer below comes from [`brokk_bifrost_go`]; this file exists only
-//! because `LanguageAdapter` and `ParsedFile` are analysis-owned types the Go
-//! crate cannot name.
+//! because `LanguageAdapter` is an analysis-owned trait the Go crate cannot name.
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_go::adapter::{GO_COGNITIVE_CONFIG, GO_FILE_EXTENSION, go_extract_call_receiver};
 use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
 use brokk_bifrost_go::packages::{
-    canonical_go_package_name, canonical_go_workspace_package_name, go_vendor_package_alias,
+    canonical_go_package_name, canonical_go_workspace_package_name, go_module_path_from_source,
+    go_vendor_package_alias,
 };
 use brokk_bifrost_go::parse::go_reparse_grammar_gap;
 use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
@@ -20,6 +20,14 @@ use tree_sitter::Tree;
 pub(crate) struct GoAdapter;
 
 impl LanguageAdapter for GoAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::go::source_publication::SOURCE_STORAGE)
+    }
+
+    fn go_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::go_facts::GO_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::Go
     }
@@ -91,6 +99,25 @@ impl LanguageAdapter for GoAdapter {
             .is_some_and(|name| name == "go.mod")
     }
 
+    /// Only the `module` directive qualifies declarations: package identity
+    /// is the module path joined with the directory below the manifest. A
+    /// `require`, `replace`, `go` or `toolchain` edit reaches dependency packs,
+    /// which the host reactivates from the changed path itself. A manifest
+    /// that names no valid module leaves the inventory incomplete, so it is
+    /// compared by content and any edit to it rebuilds.
+    fn workspace_package_identity_digest(&self, source: &[u8]) -> Option<[u8; 32]> {
+        use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, sha256_bytes};
+        Some(
+            match std::str::from_utf8(source)
+                .ok()
+                .and_then(go_module_path_from_source)
+            {
+                Some(module_path) => hash_domain_bytes(b"go.mod module", module_path.as_bytes()),
+                None => sha256_bytes(source),
+            },
+        )
+    }
+
     fn workspace_package_aliases(
         &self,
         file: &ProjectFile,
@@ -146,5 +173,9 @@ impl LanguageAdapter for GoAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&GO_COGNITIVE_CONFIG)
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
     }
 }

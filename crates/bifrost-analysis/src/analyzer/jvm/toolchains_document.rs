@@ -10,7 +10,9 @@ use crate::workspace_document::{
     validate_workspace_relative_path,
 };
 
-const DOCUMENT_PATH: &str = ".bifrost/jvm-toolchains.json";
+pub(crate) const DOCUMENT_PATH: &str = ".bifrost/jvm-toolchains.json";
+
+const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,18 +32,36 @@ pub(crate) fn load_source_toolchains(
     workspace_root: &Path,
 ) -> Result<Vec<JvmSourceToolchainBinding>, String> {
     let root = WorkspaceRoot::open(workspace_root).map_err(|error| error.to_string())?;
-    let document =
-        match read_workspace_document(&root, Path::new(DOCUMENT_PATH), &["json"], 256 * 1024) {
-            Ok(document) => document,
-            Err(WorkspaceDocumentError::OpenFile { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                return Ok(Vec::new());
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-    parse_source_toolchains(document.source())
+    let document = match read_workspace_document(
+        &root,
+        Path::new(DOCUMENT_PATH),
+        &["json"],
+        MAX_DOCUMENT_BYTES as u64,
+    ) {
+        Ok(document) => document,
+        Err(WorkspaceDocumentError::OpenFile { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    parse_source_toolchains_bytes(document.source().as_bytes())
         .map_err(|error| format!("invalid {DOCUMENT_PATH}: {error}"))
+}
+
+/// Parse exact selected document bytes without consulting the workspace or JDK.
+/// The returned paths are bindings, not evidence of the JDK artifact contents.
+pub(crate) fn parse_source_toolchains_bytes(
+    source: &[u8],
+) -> Result<Vec<JvmSourceToolchainBinding>, String> {
+    if source.len() > MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "toolchain document exceeds {MAX_DOCUMENT_BYTES} bytes"
+        ));
+    }
+    let source = std::str::from_utf8(source).map_err(|error| error.to_string())?;
+    parse_source_toolchains(source)
 }
 
 fn parse_source_toolchains(source: &str) -> Result<Vec<JvmSourceToolchainBinding>, String> {
@@ -85,6 +105,26 @@ mod tests {
     use crate::analyzer::{
         JvmSourceToolchainSelectionOpen, JvmStandardLibraryDiscoveryConfig, ProjectFile,
     };
+
+    #[test]
+    fn selected_toolchain_bytes_enforce_document_bounds_and_preserve_bindings() {
+        let source = br#"{"schema_version":1,"source_toolchains":[{"source_root":"old","jdk_home":"jdks/21"}]}"#;
+        let config = JvmStandardLibraryDiscoveryConfig {
+            source_toolchains: parse_source_toolchains_bytes(source).unwrap(),
+            ..Default::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            config.selected_jdk_home_for_file(&ProjectFile::new(root.path(), "old/App.java")),
+            Ok(Path::new("jdks/21"))
+        );
+        assert!(parse_source_toolchains_bytes(b"\xff").is_err());
+        let mut oversized = source.to_vec();
+        oversized.resize(MAX_DOCUMENT_BYTES + 1, b' ');
+        assert!(parse_source_toolchains_bytes(&oversized).is_err());
+        oversized.truncate(MAX_DOCUMENT_BYTES);
+        assert!(parse_source_toolchains_bytes(&oversized).is_ok());
+    }
 
     #[test]
     fn document_preserves_specific_and_conflicting_source_bindings() {

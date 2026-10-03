@@ -1,7 +1,7 @@
 use super::ir::{
-    ArityConstraint, AssignmentRelationFilter, BindingFilter, BindingSeed, BranchRelationFilter,
-    CallArgumentSelector, CallIdentity, CallInputSelector, CandidateFilter, CodeQuery,
-    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ConfigurationCompletenessFilter,
+    AbsentMemberProofFilter, ArityConstraint, AssignmentRelationFilter, BindingFilter, BindingSeed,
+    BranchRelationFilter, CallArgumentSelector, CallIdentity, CallInputSelector, CandidateFilter,
+    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ConfigurationCompletenessFilter,
     ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationNodeKindFilter,
     ConfigurationRouteSegmentFilter, ControlRelationFilter, DeclarationStateFilter,
     DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter,
@@ -966,6 +966,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ReceiverEvidence
         | QueryStep::CallShape
         | QueryStep::CallResults
+        | QueryStep::ResultSubjectUses
         | QueryStep::CallArgumentGroups
         | QueryStep::CallArguments
         | QueryStep::CallBindings
@@ -979,13 +980,22 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::SwitchCoverage
         | QueryStep::ConcurrentAccessConflicts
         | QueryStep::ClassSet
-        | QueryStep::AbsentMember
         | QueryStep::DetachedTaskTransfers
         | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature
         | QueryStep::SignatureParameters
         | QueryStep::CallableApplicability
         | QueryStep::OverloadSelection => {}
+        // The default tier is omitted so a query written before the filter
+        // existed keeps its canonical form and semantic hash.
+        QueryStep::AbsentMember(proof) => {
+            if *proof != AbsentMemberProofFilter::default() {
+                object.insert(
+                    QueryStepField::FindingProof.label().to_string(),
+                    json!(proof.label()),
+                );
+            }
+        }
         QueryStep::DecoratorBindings(filter) => {
             object.extend(decorator_binding_filter_to_json(filter));
         }
@@ -1223,6 +1233,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
 fn row_literal_to_json(literal: &super::ir::QueryRowLiteral) -> Value {
     match literal {
         super::ir::QueryRowLiteral::String(value) => json!({ "string": value }),
+        super::ir::QueryRowLiteral::StringList(values) => json!({ "string_list": values }),
         super::ir::QueryRowLiteral::Integer(value) => json!({ "integer": value }),
         super::ir::QueryRowLiteral::Boolean(value) => json!({ "boolean": value }),
         super::ir::QueryRowLiteral::ConstrainedEnum(value) => json!({ "enum": value }),

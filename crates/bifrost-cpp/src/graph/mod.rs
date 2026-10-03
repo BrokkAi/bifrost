@@ -120,6 +120,12 @@ impl<'a> CppGraphSource<'a> {
         self.workspace.import_statements(file)
     }
 
+    /// Canonical AST-owned include paths for the file's primary reading.
+    /// `None` means the source-facts mount is unavailable.
+    pub fn canonical_include_paths(&self, file: &ProjectFile) -> Option<Vec<String>> {
+        self.cpp?.canonical_include_paths(self.token, file)
+    }
+
     pub fn workspace_definitions(&self) -> CppWorkspaceDefinitions<'a> {
         CppWorkspaceDefinitions(self.workspace, self.token)
     }
@@ -134,6 +140,20 @@ impl<'a> CppGraphSource<'a> {
 
     pub fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
         self.index.enclosing_code_unit(file, range)
+    }
+
+    pub fn declaration_source_occurrences(
+        &self,
+        unit: &CodeUnit,
+    ) -> Option<Vec<crate::source_facts::CppDeclarationOccurrence>> {
+        self.cpp?.declaration_source_occurrences(self.token, unit)
+    }
+
+    pub fn declaration_source_properties(
+        &self,
+        unit: &CodeUnit,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>> {
+        self.cpp?.declaration_source_properties(self.token, unit)
     }
 
     pub fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {

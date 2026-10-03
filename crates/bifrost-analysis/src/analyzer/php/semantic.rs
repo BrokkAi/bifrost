@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{DispatchExtensibility, Language, PhpAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v3";
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v4";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
@@ -1097,7 +1097,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 entry,
                 next,
                 scope,
-            } => self.statement(builder, node, entry, next, scope, stack),
+            } => {
+                self.session.record_statement_entry(builder, node, entry)?;
+                self.statement(builder, node, entry, next, scope, stack)
+            }
             Work::Expression {
                 node,
                 entry,
@@ -1881,6 +1884,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let loop_scope = self.push_loop_scope(
             builder,
             scope,
@@ -1928,6 +1933,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, body_entry, body_entry)?;
         let loop_scope = self.push_loop_scope(
             builder,
             scope,
@@ -1982,6 +1989,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             node
         };
         let body_entry = self.point(builder, body_anchor, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
         let update_entry = update
             .map(|update| self.point(builder, update, Vec::new()))
             .transpose()?;
@@ -4649,6 +4658,80 @@ fn is_statement_kind(kind: &str) -> bool {
             | "empty_statement"
             | "exit_statement"
     )
+}
+
+/// Procedure syntax roles for the PHP lowering. Declarations of functions,
+/// classes, constants and namespaces are not statements at their position;
+/// `foreach` iterates and is not a conditional loop.
+pub(crate) const PROCEDURE_SYNTAX_ROLES: crate::analyzer::languages::ProcedureSyntaxRoles =
+    crate::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: php_statement_kind,
+        loop_site: |node| {
+            use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+            let kind = match node.kind() {
+                "while_statement" => LoopKind::While,
+                "do_statement" => LoopKind::Do,
+                "for_statement" => LoopKind::For,
+                _ => return None,
+            };
+            let body = match kind {
+                LoopKind::For => match children_by_field_name(node, "body").as_slice() {
+                    [body] => Some(*body),
+                    _ => None,
+                },
+                _ => node.child_by_field_name("body"),
+            };
+            Some(LoopSyntax {
+                kind,
+                body,
+                condition: node.child_by_field_name("condition"),
+            })
+        },
+        procedure_matches: |_, node| is_php_procedure_node(node),
+        nested_procedure: |node| {
+            is_php_procedure_node(node)
+                || matches!(
+                    node.kind(),
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "trait_declaration"
+                        | "enum_declaration"
+                        | "declaration_list"
+                )
+        },
+    };
+
+fn is_php_procedure_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "method_declaration"
+            | "anonymous_function"
+            | "arrow_function"
+            | "property_hook"
+    )
+}
+
+fn php_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    Some(match node.kind() {
+        "compound_statement" | "colon_block" => "block",
+        "expression_statement" | "echo_statement" | "unset_statement" => "expression",
+        "return_statement" => "return",
+        "break_statement" => "break",
+        "continue_statement" => "continue",
+        "goto_statement" => "goto",
+        "named_label_statement" => "labeled",
+        "if_statement" => "if",
+        "while_statement" => "while",
+        "do_statement" => "do",
+        "for_statement" => "for",
+        "foreach_statement" => "enhanced_for",
+        "switch_statement" => "switch",
+        "try_statement" => "try",
+        "exit_statement" => "throw",
+        "empty_statement" => "empty",
+        _ => return None,
+    })
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {

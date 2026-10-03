@@ -33,7 +33,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
-    PolicyEvaluationRow, PolicyEvaluationRowKey,
+    PolicyEvaluationPolicyRow, PolicyEvaluationRow, PolicyEvaluationRowKey,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
@@ -75,13 +75,13 @@ use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
-    MAX_DIFF_FIXED_FINDINGS, PolicyDependencyPackActivationMode, PolicyDiffFixedFinding,
-    PolicyDiffReview, PolicyExecutionMetadata, PolicyExecutionStage, PolicyExecutionTermination,
-    PolicyOptionalReviews, PolicyPackActivationReview, PolicyPackDecision,
-    PolicyPackDecisionStatus, PolicyPackProcedureSummaryEvidence, PolicyReportBuilder,
-    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
-    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
-    PolicyStageTiming,
+    MAX_DIFF_FIXED_FINDINGS, PolicyDependencyPackActivationMode, PolicyDiffCounts,
+    PolicyDiffFixedFinding, PolicyDiffReview, PolicyDiffUnqualifiedPolicy, PolicyExecutionMetadata,
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyOptionalReviews,
+    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus,
+    PolicyPackProcedureSummaryEvidence, PolicyReportBuilder, PolicyReportBuilderError,
+    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
+    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -157,14 +157,10 @@ pub struct PolicyEvaluationOptions {
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
     diff_base: Option<String>,
-    /// Whether this batch may reuse persisted per-unit evaluation results.
-    ///
-    /// The coordinator does not read this yet: Milestone 2 of
-    /// `.agents/plans/impact-sliced-diff-base.md` wires it to the sliced
-    /// evaluation path. `false` forces the full dual-snapshot evaluation, which
-    /// is what every run does today, so the two settings are the same run until
-    /// that milestone lands. It exists now so the equivalence harness can pin
-    /// the contract the sliced path must meet before the sliced path exists.
+    /// Whether this batch may publish or reuse complete policy units in the
+    /// repository's analyzer cache. A full scan publishes fresh units; a diff
+    /// scan verifies inputs before reuse. `false` evaluates in full and skips
+    /// policy-unit cache access on either path.
     incremental: bool,
     /// Record each policy's evaluation wall time as the
     /// [`EVALUATION_ELAPSED_METRIC`] work metric of its run. Off by default:
@@ -246,11 +242,8 @@ impl PolicyEvaluationOptions {
         self
     }
 
-    /// Allow or forbid reuse of persisted per-unit evaluation results.
-    ///
-    /// See the field: nothing reads it before Milestone 2, and `false` is the
-    /// forced full dual-snapshot evaluation the equivalence harness compares
-    /// against.
+    /// Allow policy-unit publication and verified reuse, or force full
+    /// evaluation without policy-unit cache access.
     pub const fn with_incremental(mut self, incremental: bool) -> Self {
         self.incremental = incremental;
         self
@@ -2051,6 +2044,7 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let mut secondary_diagnostics = Vec::new();
+    let mut diff_base_policy_unqualified = Vec::new();
     let suppression_load = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("policy.registration.suppression_preflight");
@@ -2435,12 +2429,12 @@ fn evaluate_prepared_policy_inputs(
     }
 
     let preparation_started = Instant::now();
-    // One store per batch, and only where reuse is possible at all: the base
-    // publishes into it and the head reads from it. Without a diff base there
-    // is nothing published to reuse, and unit-wise execution would only add
-    // per-execution overhead until Milestone 3 persists units across runs.
-    let unit_store = (options.incremental() && options.diff_base().is_some())
-        .then(|| BatchUnitStore::of(workspace));
+    // Nested base evaluation receives its caller's context. Other scans use
+    // the same persisted store, so a full scan can publish units for a later
+    // diff scan without creating a separate cache identity.
+    let unit_store =
+        (options.incremental() && supplied_incremental.is_none() && workspace.is_some())
+            .then(|| BatchUnitStore::of(workspace));
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let owned_flow_state = supplied_flow_state
         .is_none()
@@ -2628,7 +2622,6 @@ fn evaluate_prepared_policy_inputs(
                 .collect::<Vec<_>>();
             let evaluation_key = workspace.map(|head| {
                 base_evaluation_key(
-                    &runnable_policies,
                     options,
                     scope_document.as_ref(),
                     batch_budget,
@@ -2695,8 +2688,15 @@ fn evaluate_prepared_policy_inputs(
         }
         None => None,
     };
-    // A head unit is reusable only against the base the units were published
-    // from, so the head slices exactly when that comparison exists.
+    // A diff head verifies against the exact base. A full scan computes every
+    // unit afresh and publishes only complete products; it cannot infer the
+    // provenance of an older unit by comparing the workspace with itself.
+    let publication_changed = (unit_store.is_some() && diff_baseline.is_none()).then(|| {
+        ChangedFacts::between(
+            workspace.expect("a policy store requires a workspace"),
+            workspace.expect("a policy store requires a workspace"),
+        )
+    });
     let head_incremental_owned = match (&unit_store, &diff_baseline, workspace) {
         (Some(store), Some(baseline), Some(head)) => baseline.changed.as_ref().map(|changed| {
             PolicyIncrementalContext::new(
@@ -2707,6 +2707,14 @@ fn evaluate_prepared_policy_inputs(
                 baseline.state,
             )
         }),
+        (Some(store), None, Some(head)) => Some(PolicyIncrementalContext::for_publication(
+            store.units(),
+            head,
+            publication_changed
+                .as_ref()
+                .expect("a full policy scan has its own facts"),
+            WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
+        )),
         _ => None,
     };
     // Exactly one of the two exists: the base half of a diff run is handed its
@@ -2907,13 +2915,31 @@ fn evaluate_prepared_policy_inputs(
         secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::DiffBaseUnreliable,
             format!(
-                "diff base `{}` ({}) was unreliable, so every head finding gates as if --diff-base had not been given: {detail}",
+                "diff base `{}` ({}) was unreliable; qualified policies use verified diff evidence and unqualified policies use full gating: {detail}",
                 baseline.requested_revision, baseline.resolved_commit
             ),
             None,
             None,
             Vec::new(),
         )?);
+    }
+    if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline) {
+        for policy in &baseline.unqualified_policies {
+            diff_base_policy_unqualified.push(policy.policy_id().clone());
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::DiffBasePolicyUnqualified,
+                format!(
+                    "diff base policy `{}` is unqualified ({}, {}); diagnostics: {:?}",
+                    policy.policy_id(),
+                    policy.completion(),
+                    policy.completion_detail(),
+                    policy.diagnostics()
+                ),
+                None,
+                None,
+                Vec::new(),
+            )?);
+        }
     }
 
     let suppression_reviews = match suppression_document.as_ref() {
@@ -3036,26 +3062,36 @@ fn evaluate_prepared_policy_inputs(
         }
         None => None,
     };
-    // A degraded diff review does not narrow the gate: every finding gates as
-    // if no diff base had been given.
-    let diff_gating = diff_review
-        .as_ref()
-        .is_some_and(|review| !review.degraded());
     let threshold_exceeded = fail_closed_gate
         || runs.values().flat_map(PolicyRun::findings).any(|finding| {
             finding.suppression().is_none()
                 && finding.scope().is_none()
                 && finding.baseline().is_none()
                 && options.fail_on().matches(finding.severity())
-                && (!diff_gating
-                    || finding
-                        .diff()
-                        .is_some_and(|diff| diff.disposition() == FindingDiffDisposition::New))
+                // Keep exact diff decisions for qualified policies when a
+                // different policy lacks complete base evidence. Findings
+                // without a decision retain the ordinary full gate.
+                && finding.diff().is_none_or(|diff| {
+                    diff.disposition() == FindingDiffDisposition::New
+                })
         });
     if let Some(review) = diff_review {
         builder.set_diff(review).map_err(|error| {
             PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
         })?;
+    }
+    for policy_id in diff_base_policy_unqualified {
+        if let Some(run) = runs.get(&policy_id) {
+            for finding in run.findings() {
+                if finding.diff().is_none() {
+                    continue;
+                }
+                return Err(PolicyCoordinatorError::new(format!(
+                    "unqualified diff-base policy {policy_id} unexpectedly has a finding diff decision for {}",
+                    finding.id()
+                )));
+            }
+        }
     }
     // Every diff-base run reports what it reused, including the run that
     // reused nothing. The section is charged to the report's retention budget
@@ -3063,9 +3099,9 @@ fn evaluate_prepared_policy_inputs(
     // other would be a retained size that depends on how the run executed, and
     // two runs that must agree byte for byte could retain a different prefix
     // of the same findings at the exact boundary.
-    let incremental_review = match head_incremental {
-        Some(incremental) => Some(incremental.review()),
-        None => options.diff_base().is_some().then(|| {
+    let incremental_review = options.diff_base().map(|_| match head_incremental {
+        Some(incremental) => incremental.review(),
+        None => {
             let reason = if options.incremental() {
                 // Reuse was asked for and there was nothing to reuse against:
                 // the base evaluation produced no comparison, which is the
@@ -3081,8 +3117,8 @@ fn evaluate_prepared_policy_inputs(
                     .map(|policy| policy.definition().metadata.id.clone()),
                 reason,
             )
-        }),
-    };
+        }
+    });
     if let Some(review) = incremental_review.clone() {
         builder.set_incremental(review).map_err(|error| {
             PolicyCoordinatorError::new(format!(
@@ -3411,13 +3447,30 @@ impl BatchUnitStore {
 /// all of them would produce the same base findings, which is what licenses
 /// replaying one run's answer for the other.
 fn base_evaluation_key(
-    policies: &[&LoadedPolicy],
     options: &PolicyEvaluationOptions,
     scope: Option<&PolicyScopeDocument>,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     inputs: WorkspaceUnitInputs,
 ) -> PolicyEvaluationRowKey {
+    // The base's own options, not the head's: it evaluates with the head's
+    // suppression and gate configuration deliberately stripped, and the
+    // budgets and registry limits it inherits decide what it retains.
+    let base_options = format!(
+        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
+        options.evaluation_date(),
+        options.require_explicit_schema_versions(),
+    );
+    PolicyEvaluationRowKey {
+        base_tree_oid: String::new(),
+        options_digest: StableDigest::sha256(base_options).to_string(),
+        configuration_fingerprint: inputs.configuration().to_string(),
+        active_model_set_hash: inputs.models().to_string(),
+        engine_epoch: inputs.epoch().to_string(),
+    }
+}
+
+fn policy_set_digest(policies: &[&LoadedPolicy]) -> String {
     let mut policy_set = policies
         .iter()
         .map(|policy| {
@@ -3430,22 +3483,7 @@ fn base_evaluation_key(
         })
         .collect::<Vec<_>>();
     policy_set.sort();
-    // The base's own options, not the head's: it evaluates with the head's
-    // suppression and gate configuration deliberately stripped, and the
-    // budgets and registry limits it inherits decide what it retains.
-    let base_options = format!(
-        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
-        options.evaluation_date(),
-        options.require_explicit_schema_versions(),
-    );
-    PolicyEvaluationRowKey {
-        base_tree_oid: String::new(),
-        policy_set_digest: StableDigest::sha256(policy_set.join("\u{2}")).to_string(),
-        options_digest: StableDigest::sha256(base_options).to_string(),
-        configuration_fingerprint: inputs.configuration().to_string(),
-        active_model_set_hash: inputs.models().to_string(),
-        engine_epoch: inputs.epoch().to_string(),
-    }
+    StableDigest::sha256(policy_set.join("\u{2}")).to_string()
 }
 
 /// Take the findings of a base evaluation an earlier run already completed,
@@ -3511,42 +3549,71 @@ fn reuse_persisted_diff_baseline(
         });
         return None;
     }
-    // The stored identities are keyed by the policy identifier the base ran,
-    // and the evaluation key covers the policy set exactly, so every recorded
-    // identifier is one of this run's policies. Reading the map through the
-    // runnable policies keeps the head's own `PolicyId` values and needs no
-    // reparse of a stored string.
-    let mut recorded: HashMap<&str, &Vec<[u8; 32]>> = HashMap::new();
-    for (policy_id, findings) in &evaluation.identities {
-        recorded.insert(policy_id.as_str(), findings);
+    // A shared evaluation row can contain policies from other runs. Admit a
+    // child only when its authored and resolved dependency identities match
+    // and its own completion is exhaustive. A missing or stale child requires
+    // one full base evaluation: the batch retention budget is global, so
+    // evaluating only that child could produce a different answer than the
+    // original ordered batch.
+    let mut recorded: HashMap<&str, _> = HashMap::new();
+    for policy in &evaluation.policies {
+        recorded.insert(policy.policy_id.as_str(), policy);
     }
     let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    let mut unqualified = Vec::new();
     for policy in policies {
         let policy_id = &policy.definition().metadata.id;
-        // A policy with no recorded identity found nothing at the base, which
-        // is a fact rather than a gap: the row is written for the whole policy
-        // set at once.
-        let Some(findings) = recorded.remove(policy_id.as_str()) else {
-            continue;
+        let Some(evidence) = recorded.remove(policy_id.as_str()) else {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units base_policy_missing={policy_id}")
+            });
+            return None;
         };
+        if evidence.source_hash != policy.source_hash().to_string()
+            || evidence.semantic_hash != policy.semantic_hash().to_string()
+        {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units base_policy_stale={policy_id}")
+            });
+            return None;
+        }
+        if evidence.completion != "complete" || !evidence.qualified {
+            unqualified.push(PolicyDiffUnqualifiedPolicy::new(
+                policy_id.clone(),
+                evidence.completion.clone(),
+                if evidence.qualified {
+                    evidence.completion_detail.clone()
+                } else {
+                    evidence.qualification_detail.clone()
+                },
+                evidence.diagnostics.clone(),
+            ));
+            continue;
+        }
         identities.insert(
             policy_id.clone(),
-            findings
+            evidence
+                .identities
                 .iter()
                 .map(|finding| PolicyFindingId::from_bytes(*finding))
                 .collect(),
         );
     }
-    debug_assert!(
-        recorded.is_empty(),
-        "a base evaluation records identities for the policy set its key names: {recorded:?}"
-    );
+    let requested_policy_set_digest = policy_set_digest(policies);
+    let policy_set_matches = evaluation.policy_set_digest == requested_policy_set_digest;
+    let aggregate_unreliable =
+        (policy_set_matches && evaluation.aggregate_unreliable) || !unqualified.is_empty();
+    let unreliable_detail = policy_set_matches
+        .then(|| evaluation.unreliable_detail.clone())
+        .flatten();
     Some(PolicyDiffBaselineOutcome {
         baseline: PolicyDiffBaseline {
             requested_revision: revision.to_string(),
             resolved_commit: evaluation.resolved_commit.clone(),
             identities,
-            unreliable_detail: None,
+            unqualified_policies: unqualified,
+            aggregate_unreliable,
+            unreliable_detail,
         },
         changed: Some(changed),
         publication: None,
@@ -3587,15 +3654,16 @@ impl PolicyDiffBaselineOutcome {
 
 /// Base-revision evaluation summary consumed by the diff join.
 ///
-/// `identities` holds the strong finding identities present at the base
-/// revision, keyed by policy so the per-run join is one set lookup. When
-/// `unreliable_detail` is present the base evaluation was unreliable, the
-/// identity map is empty, and diff gating degrades to full gating.
+/// `identities` holds strong finding identities only for qualified policies.
+/// `unqualified_policies` retains completion and diagnostic context for each
+/// policy whose evidence cannot support a diff decision.
 struct PolicyDiffBaseline {
     requested_revision: String,
     resolved_commit: String,
     identities: HashMap<PolicyId, HashSet<PolicyFindingId>>,
+    unqualified_policies: Vec<PolicyDiffUnqualifiedPolicy>,
     unreliable_detail: Option<String>,
+    aggregate_unreliable: bool,
 }
 
 /// Build the analyzer over the exported base revision, with the very
@@ -3692,16 +3760,16 @@ fn evaluate_policy_diff_baseline(
         })?
     };
     if base_inputs.is_empty() {
+        let detail =
+            "the head evaluation has no runnable policy, so the base revision was not evaluated";
         return Ok(DiffBaselinePhase::Evaluated(Box::new(
             PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
                 requested_revision: revision.to_string(),
                 resolved_commit: export.commit_id().to_string(),
                 identities: HashMap::new(),
-                unreliable_detail: Some(
-                    "the head evaluation has no runnable policy, so the base revision was not \
-                     evaluated"
-                        .to_string(),
-                ),
+                unqualified_policies: unqualified_without_run(policies, detail),
+                aggregate_unreliable: true,
+                unreliable_detail: Some(detail.to_string()),
             }),
         )));
     }
@@ -3755,15 +3823,18 @@ fn evaluate_policy_diff_baseline(
             },
             cancellation.unwrap_or(&uncancelled),
         ) {
+            let detail = format!(
+                "base pack activation failed, so base findings would misstate the configured \
+                 external surface: {error}"
+            );
             return Ok(DiffBaselinePhase::Evaluated(Box::new(
                 PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
                     requested_revision: revision.to_string(),
                     resolved_commit: export.commit_id().to_string(),
                     identities: HashMap::new(),
-                    unreliable_detail: Some(format!(
-                        "base pack activation failed, so base findings would misstate the configured \
-                     external surface: {error}"
-                    )),
+                    unqualified_policies: unqualified_without_run(policies, &detail),
+                    aggregate_unreliable: true,
+                    unreliable_detail: Some(detail),
                 }),
             )));
         }
@@ -3778,13 +3849,14 @@ fn evaluate_policy_diff_baseline(
     // The base evaluates unit by unit for the same reason the head does: a
     // whole execution cannot attribute its reads to seed files, so unit-wise
     // execution is the only way to publish a per-unit read set at all. Its
-    // store starts empty, so every unit is computed here and published; the
-    // changed facts it verifies against are the base compared with itself,
-    // which states exactly that nothing moved.
+    // store may contain units from a newer full scan. The base must compute
+    // its own units rather than trust that a matching seed also had the same
+    // cross-file reads. Its self-comparison supplies current blob identities
+    // for publication, not a proof that older unit inputs are unchanged.
     let base_changed =
         unit_store.map(|_| ChangedFacts::between(base.workspace(), base.workspace()));
     let base_incremental = match (unit_store, base_changed.as_ref()) {
-        (Some(store), Some(changed)) => Some(PolicyIncrementalContext::new(
+        (Some(store), Some(changed)) => Some(PolicyIncrementalContext::for_publication(
             store.units(),
             base.workspace(),
             changed,
@@ -3795,7 +3867,6 @@ fn evaluate_policy_diff_baseline(
                     .active_semantic_model_snapshot()
                     .as_deref(),
             ),
-            IncrementalBaseState::Evaluated,
         )),
         _ => None,
     };
@@ -3822,27 +3893,27 @@ fn evaluate_policy_diff_baseline(
         return Ok(DiffBaselinePhase::DeadlineReached);
     }
     let report = outcome.report();
-    if outcome.exit_status() == POLICY_EXIT_UNRELIABLE {
-        // An unreliable base classified nothing, so nothing it published may
-        // be reused: the head must not verify units against a base whose own
-        // evaluation the run refuses to trust.
-        return Ok(DiffBaselinePhase::Evaluated(Box::new(
-            PolicyDiffBaselineOutcome::without_units(PolicyDiffBaseline {
-                requested_revision: revision.to_string(),
-                resolved_commit: export.commit_id().to_string(),
-                identities: HashMap::new(),
-                unreliable_detail: Some(diff_base_unreliable_detail(report)),
-            }),
-        )));
-    }
     let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    let report_evidence_incomplete =
+        report.execution().termination().is_some() || report.diagnostics_truncated();
     for run in report.runs() {
+        if report_evidence_incomplete
+            || !run.completion().is_exhaustive()
+            || run.diagnostics_truncated()
+            || run.obligations_truncated()
+        {
+            continue;
+        }
+        // Presence of this entry records a complete empty answer when the
+        // policy found no strong identities.
+        let policy_id = run.policy_id().clone();
+        identities.entry(policy_id.clone()).or_default();
         for finding in run.findings() {
             // Weak identities are snapshot-local by construction and can never
             // equal a head identity, so only strong ones enter the join set.
             if finding.identity_stability() == FindingIdentityStability::Strong {
                 identities
-                    .entry(run.policy_id().clone())
+                    .entry(policy_id.clone())
                     .or_default()
                     .insert(finding.id());
             }
@@ -3851,6 +3922,81 @@ fn evaluate_policy_diff_baseline(
     // Computed here, while both analyzers are alive: the head verifies its
     // units against it after the base analyzer and its export are gone.
     let changed = head_workspace_changed_facts(unit_store, base.workspace(), head_workspace);
+    let base_runs = report
+        .runs()
+        .iter()
+        .map(|run| (run.policy_id(), run))
+        .collect::<HashMap<_, _>>();
+    let unqualified_policies = policies
+        .iter()
+        .filter(|policy| !identities.contains_key(&policy.definition().metadata.id))
+        .map(|policy| {
+            let policy_id = policy.definition().metadata.id.clone();
+            let Some(run) = base_runs.get(&policy_id) else {
+                return PolicyDiffUnqualifiedPolicy::new(
+                    policy_id,
+                    "missing",
+                    "the base report has no run for this loaded policy",
+                    Vec::new(),
+                );
+            };
+            let detail = if report.execution().termination().is_some() {
+                format!(
+                    "base execution terminated: {:?}",
+                    report.execution().termination()
+                )
+            } else if report.diagnostics_truncated() {
+                "base report diagnostics were truncated".to_string()
+            } else if run.diagnostics_truncated() {
+                "policy diagnostics were truncated".to_string()
+            } else if run.obligations_truncated() {
+                "policy obligations were truncated".to_string()
+            } else {
+                format!(
+                    "policy completion is not exhaustive: {}",
+                    serde_json::to_string(run.completion()).expect("policy completion serializes")
+                )
+            };
+            let mut diagnostics = run
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| {
+                    serde_json::to_string(diagnostic).expect("policy diagnostic serializes")
+                })
+                .collect::<Vec<_>>();
+            diagnostics.extend(report.diagnostics().iter().map(|diagnostic| {
+                serde_json::to_string(diagnostic).expect("report diagnostic serializes")
+            }));
+            if report.diagnostics_truncated() {
+                diagnostics.push("base report diagnostic collection was truncated".to_string());
+            }
+            if run.diagnostics_truncated() {
+                diagnostics.push("policy diagnostic collection was truncated".to_string());
+            }
+            if run.obligations_truncated() {
+                diagnostics.push("policy obligation collection was truncated".to_string());
+            }
+            PolicyDiffUnqualifiedPolicy::new(
+                policy_id,
+                policy_completion_label(run.completion()),
+                detail,
+                diagnostics,
+            )
+        })
+        .collect::<Vec<_>>();
+    let aggregate_unreliable = outcome.exit_status() == POLICY_EXIT_UNRELIABLE;
+    let unreliable_detail = aggregate_unreliable.then(|| diff_base_unreliable_detail(report));
+    let baseline = PolicyDiffBaseline {
+        requested_revision: revision.to_string(),
+        resolved_commit: export.commit_id().to_string(),
+        identities,
+        unqualified_policies,
+        aggregate_unreliable,
+        unreliable_detail,
+    };
+    if policy_deadline_reached(cancellation)? {
+        return Ok(DiffBaselinePhase::DeadlineReached);
+    }
     let publication =
         base_incremental
             .as_ref()
@@ -3860,20 +4006,14 @@ fn evaluate_policy_diff_baseline(
                     incremental,
                     key,
                     export.tree_id(),
-                    export.commit_id(),
                     report,
-                    &identities,
                     policies,
+                    &baseline,
                 )
             });
     Ok(DiffBaselinePhase::Evaluated(Box::new(
         PolicyDiffBaselineOutcome {
-            baseline: PolicyDiffBaseline {
-                requested_revision: revision.to_string(),
-                resolved_commit: export.commit_id().to_string(),
-                identities,
-                unreliable_detail: None,
-            },
+            baseline,
             changed,
             publication,
             state: IncrementalBaseState::Evaluated,
@@ -3890,83 +4030,142 @@ fn evaluate_policy_diff_baseline(
 /// reuse the per-file work behind them, and so the age sweep knows they belong
 /// to a live evaluation.
 ///
-/// Every runnable policy must have run exhaustively. A truncated or
-/// inconclusive run found some of the base's findings rather than all of them,
-/// and a later run joining against that set would report a persisting finding
-/// as new. The batch's own exit status does not answer this: a run that found
-/// something exits on the finding gate whatever its completion tier, so the
-/// tier is read per policy here.
+/// Every policy run is recorded with its completion and diagnostics. Only an
+/// exhaustive run carries identities and units that may qualify a diff join.
 fn base_evaluation_publication(
     incremental: &PolicyIncrementalContext<'_>,
     key: PolicyEvaluationRowKey,
     tree_id: brokk_bifrost_analysis::analyzer::Oid,
-    resolved_commit: &str,
     report: &PolicyReportDocument,
-    identities: &HashMap<PolicyId, HashSet<PolicyFindingId>>,
     policies: &[&LoadedPolicy],
+    baseline: &PolicyDiffBaseline,
 ) -> Option<PolicyEvaluationRow> {
-    let completions = report
+    let runs = report
         .runs()
         .iter()
-        .map(|run| (run.policy_id(), run.completion()))
+        .map(|run| (run.policy_id(), run))
         .collect::<HashMap<_, _>>();
-    for policy in policies {
-        let policy_id = &policy.definition().metadata.id;
-        let exhaustive = completions
-            .get(policy_id)
-            .is_some_and(|completion| completion.is_exhaustive());
-        if !exhaustive {
-            brokk_bifrost_analysis::profiling::note_with(|| {
+    let mut policy_rows = policies
+        .iter()
+        .filter_map(|policy| {
+            let policy_id = &policy.definition().metadata.id;
+            let run = runs.get(policy_id)?;
+            let findings = baseline.identities.get(policy_id);
+            let units = if findings.is_some() {
+                incremental
+                    .published_units()
+                    .iter()
+                    .find(|(published_policy, _)| *published_policy == *policy_id)
+                    .map(|(_, keys)| keys.iter().map(row_key).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let qualified = findings.is_some();
+            let qualification_detail = if qualified {
+                String::new()
+            } else if report.execution().termination().is_some() {
                 format!(
-                    "policy.units base_unpublishable policy={policy_id} completion={:?}",
-                    completions.get(policy_id)
+                    "base execution terminated: {:?}",
+                    report.execution().termination()
                 )
-            });
-            return None;
-        }
-    }
+            } else if report.diagnostics_truncated() {
+                "base report diagnostics were truncated".to_string()
+            } else if run.diagnostics_truncated() {
+                "policy diagnostics were truncated".to_string()
+            } else if run.obligations_truncated() {
+                "policy obligations were truncated".to_string()
+            } else {
+                format!(
+                    "policy completion is not exhaustive: {}",
+                    serde_json::to_string(run.completion()).expect("policy completion serializes")
+                )
+            };
+            Some(PolicyEvaluationPolicyRow {
+                policy_id: policy_id.to_string(),
+                source_hash: policy.source_hash().to_string(),
+                semantic_hash: policy.semantic_hash().to_string(),
+                completion: policy_completion_label(run.completion()).to_string(),
+                completion_detail: serde_json::to_string(run.completion())
+                    .expect("policy completion serializes"),
+                qualified,
+                qualification_detail,
+                diagnostics: run
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| {
+                        serde_json::to_string(diagnostic).expect("policy diagnostic serializes")
+                    })
+                    .chain(report.diagnostics().iter().map(|diagnostic| {
+                        serde_json::to_string(diagnostic).expect("report diagnostic serializes")
+                    }))
+                    .chain(
+                        (report.diagnostics_truncated())
+                            .then(|| "base report diagnostics were truncated".to_string()),
+                    )
+                    .chain(
+                        (run.diagnostics_truncated())
+                            .then(|| "policy diagnostics were truncated".to_string()),
+                    )
+                    .chain(
+                        (run.obligations_truncated())
+                            .then(|| "policy obligations were truncated".to_string()),
+                    )
+                    .collect(),
+                identities: findings
+                    .into_iter()
+                    .flat_map(|findings| findings.iter())
+                    .map(|finding| *finding.as_bytes())
+                    .collect(),
+                units,
+            })
+        })
+        .collect::<Vec<_>>();
+    policy_rows.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
     Some(PolicyEvaluationRow {
         key: PolicyEvaluationRowKey {
             base_tree_oid: tree_id.to_string(),
             ..key
         },
-        resolved_commit: resolved_commit.to_string(),
-        identities: sorted_evaluation_identities(identities),
-        units: incremental
-            .published_units()
+        resolved_commit: baseline.resolved_commit.clone(),
+        policy_set_digest: policy_set_digest(policies),
+        unreliable_detail: baseline.unreliable_detail.clone(),
+        aggregate_unreliable: baseline.aggregate_unreliable,
+        policies: policy_rows,
+        unqualified_policy_ids: baseline
+            .unqualified_policies
             .iter()
-            .map(|(policy_id, keys)| {
-                (
-                    policy_id.to_string(),
-                    keys.iter().map(row_key).collect::<Vec<_>>(),
-                )
-            })
+            .map(|policy| policy.policy_id().as_str().to_string())
             .collect(),
     })
 }
 
-/// The identity map as rows, in one order.
-///
-/// Both levels are sorted because the row is written from a hash map and two
-/// runs of the same base must write the same bytes; the store's own key makes
-/// the set the identity, but a stable order is what makes the write itself
-/// comparable.
-fn sorted_evaluation_identities(
-    identities: &HashMap<PolicyId, HashSet<PolicyFindingId>>,
-) -> Vec<(String, Vec<[u8; 32]>)> {
-    let mut rows = identities
+fn policy_completion_label(completion: &PolicyRunCompletion) -> &'static str {
+    match completion {
+        PolicyRunCompletion::Complete => "complete",
+        PolicyRunCompletion::ProvenSubset { .. } => "proven_subset",
+        PolicyRunCompletion::ProvenBySummary => "proven_by_summary",
+        PolicyRunCompletion::Inconclusive { .. } => "inconclusive",
+        PolicyRunCompletion::Unsupported { .. } => "unsupported",
+        PolicyRunCompletion::Failed { .. } => "failed",
+    }
+}
+
+fn unqualified_without_run(
+    policies: &[&LoadedPolicy],
+    detail: &str,
+) -> Vec<PolicyDiffUnqualifiedPolicy> {
+    policies
         .iter()
-        .map(|(policy_id, findings)| {
-            let mut findings = findings
-                .iter()
-                .map(|finding| *finding.as_bytes())
-                .collect::<Vec<_>>();
-            findings.sort_unstable();
-            (policy_id.to_string(), findings)
+        .map(|policy| {
+            PolicyDiffUnqualifiedPolicy::new(
+                policy.definition().metadata.id.clone(),
+                "not_evaluated",
+                detail,
+                Vec::new(),
+            )
         })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    rows
+        .collect()
 }
 
 /// Whether the base activates the shipped semantic models.
@@ -4042,21 +4241,17 @@ fn apply_policy_diff(
     baseline: &PolicyDiffBaseline,
     runs: &mut HashMap<PolicyId, PolicyRun>,
 ) -> Result<PolicyDiffReview, PolicyCoordinatorError> {
-    if baseline.unreliable_detail.is_some() {
-        return Ok(PolicyDiffReview::new(
-            baseline.requested_revision.clone(),
-            baseline.resolved_commit.clone(),
-            true,
-            0,
-            0,
-            Vec::new(),
-            0,
-        ));
-    }
     let mut matched: HashMap<&PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
     let mut new_count = 0_u64;
     let mut persisting_count = 0_u64;
     for (policy_id, run) in runs.iter_mut() {
+        if baseline
+            .unqualified_policies
+            .iter()
+            .any(|unqualified| unqualified.policy_id() == policy_id)
+        {
+            continue;
+        }
         let base_ids = baseline.identities.get(policy_id);
         for finding in run.findings_mut() {
             let weak_identity = finding.identity_stability() != FindingIdentityStability::Strong;
@@ -4110,11 +4305,14 @@ fn apply_policy_diff(
     Ok(PolicyDiffReview::new(
         baseline.requested_revision.clone(),
         baseline.resolved_commit.clone(),
-        false,
-        new_count,
-        persisting_count,
+        baseline.aggregate_unreliable,
+        baseline.unqualified_policies.clone(),
+        PolicyDiffCounts {
+            new: new_count,
+            persisting: persisting_count,
+            fixed: fixed_count,
+        },
         fixed,
-        fixed_count,
     ))
 }
 
@@ -7016,7 +7214,9 @@ mod tests {
             requested_revision: "HEAD".to_string(),
             resolved_commit: "0".repeat(40),
             identities: identity_map(base_outcome.report()),
+            unqualified_policies: Vec::new(),
             unreliable_detail: None,
+            aggregate_unreliable: false,
         };
         let mut runs = head_outcome
             .report()
@@ -7050,7 +7250,9 @@ mod tests {
             requested_revision: "HEAD".to_string(),
             resolved_commit: "0".repeat(40),
             identities: identity_map(head_outcome.report()),
+            unqualified_policies: Vec::new(),
             unreliable_detail: None,
+            aggregate_unreliable: false,
         };
         let mut reversed_runs = base_outcome
             .report()
@@ -7115,7 +7317,9 @@ mod tests {
                 requested_revision: "HEAD".to_string(),
                 resolved_commit: "0".repeat(40),
                 identities,
+                unqualified_policies: Vec::new(),
                 unreliable_detail: None,
+                aggregate_unreliable: false,
             }
         };
 
@@ -7247,6 +7451,349 @@ mod tests {
         assert_eq!(review.fixed()[0].policy_id().as_str(), "test.diff");
     }
 
+    #[test]
+    fn mixed_diff_base_reuses_only_complete_policy_evidence() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\nexport function over() {}\nexport function over() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/complete.rqlp",
+            &match_policy("test.complete", "Complete"),
+        );
+        write_policy(
+            workspace.path(),
+            "policies/incomplete.rqlp",
+            &match_policy("test.incomplete", "Incomplete")
+                .replace(":name \"target\"", ":name \"over\""),
+        );
+        commit_everything(workspace.path(), "base");
+
+        let per_policy = PolicyBudget::builder()
+            .with_max_findings(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let budget = PolicyBatchBudget::builder()
+            .with_per_policy(per_policy)
+            .unwrap()
+            .build()
+            .unwrap();
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+        .with_fail_on(PolicyFailOn::Warning)
+        .with_diff_base("HEAD".to_string());
+        let paths = [
+            PathBuf::from("policies/complete.rqlp"),
+            PathBuf::from("policies/incomplete.rqlp"),
+        ];
+
+        let cold = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("cold mixed evaluation");
+        let warm = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("warm mixed evaluation");
+        for outcome in [&cold, &warm] {
+            assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+            let review = outcome.report().diff().expect("diff review");
+            assert!(review.degraded());
+            assert_eq!(review.persisting_count(), 1);
+            assert_eq!(review.unqualified_policies().len(), 1);
+            assert_eq!(
+                review.unqualified_policies()[0].policy_id().as_str(),
+                "test.incomplete"
+            );
+            let complete = outcome
+                .report()
+                .runs()
+                .iter()
+                .find(|run| run.policy_id().as_str() == "test.complete")
+                .expect("complete run");
+            assert!(complete.completion().is_exhaustive());
+            assert_eq!(complete.findings().len(), 1);
+            assert_eq!(
+                complete.findings()[0]
+                    .diff()
+                    .map(PolicyFindingDiff::disposition),
+                Some(FindingDiffDisposition::Persisting),
+            );
+            let incomplete = outcome
+                .report()
+                .runs()
+                .iter()
+                .find(|run| run.policy_id().as_str() == "test.incomplete")
+                .expect("incomplete run");
+            assert!(!incomplete.completion().is_exhaustive());
+            assert!(
+                incomplete
+                    .findings()
+                    .iter()
+                    .all(|finding| finding.diff().is_none())
+            );
+        }
+        assert_eq!(
+            cold.report().diff().expect("cold review"),
+            warm.report().diff().expect("warm review"),
+        );
+        assert_eq!(
+            warm.report()
+                .incremental()
+                .expect("warm reuse review")
+                .base(),
+            IncrementalBaseState::Reused,
+        );
+
+        // Changing authored policy bytes invalidates its own cached child.
+        // The global report budget requires a full ordered base rerun rather
+        // than evaluating only the changed child with a fresh batch quota.
+        write_policy(
+            workspace.path(),
+            "policies/complete.rqlp",
+            &match_policy("test.complete", "Renamed complete"),
+        );
+        let changed = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("changed policy evaluates its base again");
+        assert_eq!(
+            changed
+                .report()
+                .incremental()
+                .expect("changed review")
+                .base(),
+            IncrementalBaseState::Evaluated,
+        );
+        assert_eq!(
+            changed
+                .report()
+                .diff()
+                .expect("changed diff")
+                .persisting_count(),
+            1
+        );
+        let changed_warm = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("unchanged policy reuses its new base answer");
+        assert_eq!(
+            changed_warm
+                .report()
+                .incremental()
+                .expect("new warm review")
+                .base(),
+            IncrementalBaseState::Reused,
+        );
+        assert_eq!(changed.report().diff(), changed_warm.report().diff());
+
+        // A newly requested policy is a missing child under the same shared
+        // key. It also forces a complete base evaluation, then becomes warm.
+        write_policy(
+            workspace.path(),
+            "policies/added.rqlp",
+            &match_policy("test.added", "Complete empty")
+                .replace(":name \"target\"", ":name \"never\""),
+        );
+        let paths_with_added = [
+            PathBuf::from("policies/complete.rqlp"),
+            PathBuf::from("policies/incomplete.rqlp"),
+            PathBuf::from("policies/added.rqlp"),
+        ];
+        let added = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths_with_added,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("new policy evaluates its base");
+        assert_eq!(
+            added.report().incremental().expect("added review").base(),
+            IncrementalBaseState::Evaluated,
+        );
+        assert_eq!(
+            added
+                .report()
+                .diff()
+                .expect("added diff")
+                .persisting_count(),
+            1
+        );
+        let added_run = added
+            .report()
+            .runs()
+            .iter()
+            .find(|run| run.policy_id().as_str() == "test.added")
+            .expect("added complete-empty policy ran");
+        assert!(added_run.completion().is_exhaustive());
+        assert!(added_run.findings().is_empty());
+        assert!(
+            added
+                .report()
+                .diff()
+                .expect("added diff")
+                .unqualified_policies()
+                .iter()
+                .all(|policy| policy.policy_id().as_str() != "test.added")
+        );
+        let added_warm = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths_with_added,
+            &options,
+            budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("new policy is reusable on the next run");
+        assert_eq!(
+            added_warm
+                .report()
+                .incremental()
+                .expect("added warm review")
+                .base(),
+            IncrementalBaseState::Reused,
+        );
+        assert_eq!(added.report().diff(), added_warm.report().diff());
+        assert!(
+            added_warm
+                .report()
+                .runs()
+                .iter()
+                .find(|run| run.policy_id().as_str() == "test.added")
+                .expect("reused complete-empty policy ran")
+                .findings()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_diff_child_keeps_batch_finding_limit_parity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/first.rqlp",
+            &match_policy("test.first", "First"),
+        );
+        write_policy(
+            workspace.path(),
+            "policies/second.rqlp",
+            &match_policy("test.second", "Second"),
+        );
+        commit_everything(workspace.path(), "base");
+        let paths = [
+            PathBuf::from("policies/first.rqlp"),
+            PathBuf::from("policies/second.rqlp"),
+        ];
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+        .with_diff_base("HEAD".to_string());
+        let budget = PolicyBatchBudget::builder()
+            .with_max_total_findings(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let evaluate = || {
+            evaluate_policy_files_with_limits(
+                workspace.path(),
+                &paths,
+                &options,
+                budget,
+                PolicyRegistryLimits::default(),
+            )
+            .expect("bounded diff evaluation")
+        };
+        let cold = evaluate();
+        let warm = evaluate();
+        assert_eq!(cold.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert_eq!(cold.report().diff(), warm.report().diff());
+        assert_eq!(
+            warm.report().incremental().expect("warm review").base(),
+            IncrementalBaseState::Reused,
+        );
+        assert_eq!(
+            warm.report()
+                .diff()
+                .expect("diff review")
+                .unqualified_policies()
+                .len(),
+            1
+        );
+
+        // A source change makes one child stale. Recomputing just that child
+        // with a fresh batch quota would manufacture a second complete
+        // finding; the full base rerun preserves the original truncation.
+        write_policy(
+            workspace.path(),
+            "policies/second.rqlp",
+            &match_policy("test.second", "Renamed second"),
+        );
+        let changed = evaluate();
+        assert_eq!(
+            changed
+                .report()
+                .incremental()
+                .expect("changed review")
+                .base(),
+            IncrementalBaseState::Evaluated,
+        );
+        assert_eq!(
+            changed
+                .report()
+                .diff()
+                .expect("changed diff")
+                .persisting_count(),
+            1
+        );
+        assert_eq!(
+            changed
+                .report()
+                .diff()
+                .expect("changed diff")
+                .unqualified_policies()
+                .len(),
+            1
+        );
+        let changed_warm = evaluate();
+        assert_eq!(
+            changed_warm
+                .report()
+                .incremental()
+                .expect("changed warm review")
+                .base(),
+            IncrementalBaseState::Reused,
+        );
+        assert_eq!(changed.report().diff(), changed_warm.report().diff());
+    }
+
     /// The base of a `--diff-base` run must be analyzed the way the head was.
     /// The analyzer configuration selects dependency discovery, dispatch
     /// expansion and per-language behavior, and it is folded into every content
@@ -7366,7 +7913,7 @@ mod tests {
         let review = outcome.report().diff().expect("diff review");
         assert!(review.degraded());
         assert_eq!(review.new_count(), 0);
-        assert_eq!(review.persisting_count(), 0);
+        assert_eq!(review.persisting_count(), 1);
         assert_eq!(review.fixed_count(), 0);
         let diagnostic = outcome
             .report()
@@ -7379,14 +7926,17 @@ mod tests {
             "{}",
             diagnostic.message()
         );
-        // No finding carries a diff decision under degraded gating.
+        // The unrelated aggregate diagnostic does not discard this policy's
+        // exact base evidence. The scan still exits unreliable.
         assert!(
             outcome
                 .report()
                 .runs()
                 .iter()
                 .flat_map(PolicyRun::findings)
-                .all(|finding| finding.diff().is_none())
+                .all(|finding| finding.diff().is_some_and(|diff| {
+                    diff.disposition() == FindingDiffDisposition::Persisting
+                }))
         );
     }
 

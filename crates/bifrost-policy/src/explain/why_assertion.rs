@@ -413,6 +413,7 @@ pub(super) const fn relationship_label(relationship: PolicyLocationRelationship)
         PolicyLocationRelationship::Declaration => "declaration_row",
         PolicyLocationRelationship::CallTarget => "call_target_row",
         PolicyLocationRelationship::ExpectedOccurrence => "expected_occurrence_row",
+        PolicyLocationRelationship::AlsoFailsAt => "also_fails_at_row",
         PolicyLocationRelationship::ActualOccurrence => "actual_occurrence_row",
         PolicyLocationRelationship::SelectedCandidate => "selected_candidate_row",
         PolicyLocationRelationship::ConsideredCandidate => "considered_candidate_row",

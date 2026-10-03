@@ -200,35 +200,70 @@ pub struct PolicyUnitRow {
     pub reads: Vec<ReadKey>,
 }
 
-/// The key of one whole base evaluation.
+/// The shared key of one base-evaluation context.
+///
+/// The policy id and its source and semantic identities are stored on each
+/// completed child row, so a policy-set change does not invalidate unrelated
+/// policy evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PolicyEvaluationRowKey {
     /// The git tree id of the exported workspace subtree, as lowercase hex.
     pub base_tree_oid: String,
-    pub policy_set_digest: String,
     pub options_digest: String,
     pub configuration_fingerprint: String,
     pub active_model_set_hash: String,
     pub engine_epoch: String,
 }
 
-/// One completed base evaluation: what it concluded, and what it published.
+/// One policy result under a shared base-evaluation context.
 ///
-/// The identities are the evaluation's answer -- the strong finding identities
-/// a later run joins its head findings against -- and they are recorded for
-/// every policy that ran, whatever its family. The units are the per-partition
-/// work that produced some of those findings; a policy that has no units
-/// contributes none, which costs the head reuse and costs the evaluation
-/// nothing.
+/// The policy row records its completion tier and diagnostics. Only a
+/// `complete` row's identities are eligible for diff classification; an empty
+/// identity vector on such a row is a complete answer with no findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluationPolicyRow {
+    pub policy_id: String,
+    /// The authored source identity, as lowercase hex.
+    pub source_hash: String,
+    /// The resolved policy and dependency identity, as lowercase hex.
+    pub semantic_hash: String,
+    /// Stable completion tier: `complete`, `proven_subset`, `proven_by_summary`,
+    /// `inconclusive`, `unsupported`, or `failed`.
+    pub completion: String,
+    /// Canonical JSON for the typed completion value, including its reasons.
+    pub completion_detail: String,
+    /// Why this row cannot classify findings when `qualified` is false.
+    pub qualification_detail: String,
+    /// Whether this result can classify findings from the head. A policy may
+    /// finish exhaustively while report-level evidence was truncated.
+    pub qualified: bool,
+    /// Complete per-policy diagnostic collection, each entry formatted from
+    /// the diagnostic's Debug representation.
+    pub diagnostics: Vec<String>,
+    /// Strong finding identities. Incomplete rows must keep this empty.
+    pub identities: Vec<[u8; 32]>,
+    /// Complete units this policy published during the evaluation.
+    pub units: Vec<PolicyUnitRowKey>,
+}
+
+/// Completed policy answers published under one base-evaluation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationRow {
     pub key: PolicyEvaluationRowKey,
     /// The commit the requested revision resolved to, as lowercase hex.
     pub resolved_commit: String,
-    /// The strong finding identities this evaluation produced, per policy.
-    pub identities: Vec<(String, Vec<[u8; 32]>)>,
-    /// The units this evaluation published, per policy.
-    pub units: Vec<(String, Vec<PolicyUnitRowKey>)>,
+    /// The runnable policy identities used to produce `unreliable_detail`.
+    /// This is metadata, not part of the shared evidence lookup key.
+    pub policy_set_digest: String,
+    /// The cold base's aggregate reliability explanation, if any.
+    pub unreliable_detail: Option<String>,
+    /// Whether the cold base's aggregate result was unreliable.
+    pub aggregate_unreliable: bool,
+    /// Exhaustive policy results published by this evaluation.
+    pub policies: Vec<PolicyEvaluationPolicyRow>,
+    /// Policies evaluated without an exhaustive result. Remove any older
+    /// answer for these ids so a prior complete row cannot mask this result.
+    pub unqualified_policy_ids: Vec<String>,
 }
 
 /// One loaded base evaluation.
@@ -240,7 +275,24 @@ pub struct PolicyEvaluationRow {
 #[derive(Debug, Clone)]
 pub struct LoadedPolicyEvaluation {
     pub resolved_commit: String,
-    pub identities: Vec<(String, Vec<[u8; 32]>)>,
+    pub policy_set_digest: String,
+    pub unreliable_detail: Option<String>,
+    pub aggregate_unreliable: bool,
+    pub policies: Vec<LoadedPolicyEvaluationPolicy>,
+}
+
+/// One loaded, exhaustively completed policy answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPolicyEvaluationPolicy {
+    pub policy_id: String,
+    pub source_hash: String,
+    pub semantic_hash: String,
+    pub completion: String,
+    pub completion_detail: String,
+    pub qualified: bool,
+    pub qualification_detail: String,
+    pub diagnostics: Vec<String>,
+    pub identities: Vec<[u8; 32]>,
 }
 
 /// The columns of `policy_units` a load needs, in one place so the reader and
@@ -352,84 +404,116 @@ impl AnalyzerStore {
         Ok(keys.iter().map(|key| found.remove(key)).collect())
     }
 
-    /// Record what one policy set concluded over one committed subtree, and
-    /// which units that evaluation published.
+    /// Record exhaustive policy answers over one committed subtree.
     ///
-    /// The identities are the record: they are written whether or not any
-    /// policy published a unit, because they are what a later run replaces the
-    /// base evaluation with. A membership whose unit row is gone -- its blob
-    /// was re-parsed between the flush and this write -- is dropped rather
-    /// than refusing the evaluation, since a unit is an optimization for the
-    /// head and never part of the answer. Publishing also sweeps, because a
-    /// base evaluation is keyed by a tree id and has no blob to follow out of
-    /// the cache.
+    /// Policy rows are replaced independently. A membership whose unit row is
+    /// gone -- its blob was re-parsed between the flush and this write -- is
+    /// dropped rather than refusing the policy answer, since a unit is an
+    /// optimization for the head and never part of the answer. Publishing also
+    /// sweeps, because a base evaluation is keyed by a tree id and has no blob
+    /// to follow out of the cache.
     pub fn publish_policy_evaluation(&self, evaluation: PolicyEvaluationRow) -> Result<()> {
         let published_at = now_secs();
         self.conn.execute(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut memberships: Vec<(String, i64)> = Vec::new();
-            for (policy_id, keys) in &evaluation.units {
-                for key in keys {
+            for policy in &evaluation.policies {
+                for key in &policy.units {
                     if let Some(unit_id) = unit_id_for_key(&tx, key)? {
-                        memberships.push((policy_id.clone(), unit_id));
+                        memberships.push((policy.policy_id.clone(), unit_id));
                     }
                 }
             }
             let key = &evaluation.key;
             tx.execute(
-                "DELETE FROM policy_evaluations
-                 WHERE base_tree_oid = ?1 AND policy_set_digest = ?2 AND options_digest = ?3
-                   AND configuration_fingerprint = ?4 AND active_model_set_hash = ?5
-                   AND engine_epoch = ?6",
-                params![
-                    key.base_tree_oid,
-                    key.policy_set_digest,
-                    key.options_digest,
-                    key.configuration_fingerprint,
-                    key.active_model_set_hash,
-                    key.engine_epoch,
-                ],
-            )?;
-            tx.execute(
                 "INSERT INTO policy_evaluations(
-                   base_tree_oid, policy_set_digest, options_digest,
-                   configuration_fingerprint, active_model_set_hash, engine_epoch,
-                   resolved_commit, published_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   base_tree_oid, options_digest, configuration_fingerprint,
+                   active_model_set_hash, engine_epoch, policy_set_digest,
+                   unreliable_detail, aggregate_unreliable, resolved_commit, published_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(base_tree_oid, options_digest, configuration_fingerprint,
+                             active_model_set_hash, engine_epoch)
+                 DO UPDATE SET resolved_commit = excluded.resolved_commit,
+                               policy_set_digest = excluded.policy_set_digest,
+                               unreliable_detail = excluded.unreliable_detail,
+                               aggregate_unreliable = excluded.aggregate_unreliable,
+                               published_at = excluded.published_at",
                 params![
                     key.base_tree_oid,
-                    key.policy_set_digest,
                     key.options_digest,
                     key.configuration_fingerprint,
                     key.active_model_set_hash,
                     key.engine_epoch,
+                    evaluation.policy_set_digest,
+                    evaluation.unreliable_detail,
+                    evaluation.aggregate_unreliable,
                     evaluation.resolved_commit,
                     published_at,
                 ],
             )?;
-            let evaluation_id = tx.last_insert_rowid();
-            {
-                let mut insert = tx.prepare_cached(
-                    "INSERT INTO policy_evaluation_identities(
-                       evaluation_id, policy_id, finding_id
-                     ) VALUES(?1, ?2, ?3)
-                     ON CONFLICT(evaluation_id, policy_id, finding_id) DO NOTHING",
+            let evaluation_id = tx.query_row(
+                "SELECT evaluation_id FROM policy_evaluations
+                 WHERE base_tree_oid = ?1 AND options_digest = ?2
+                   AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
+                   AND engine_epoch = ?5",
+                params![
+                    key.base_tree_oid,
+                    key.options_digest,
+                    key.configuration_fingerprint,
+                    key.active_model_set_hash,
+                    key.engine_epoch,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+            for policy_id in &evaluation.unqualified_policy_ids {
+                tx.execute(
+                    "DELETE FROM policy_evaluation_policies
+                     WHERE evaluation_id = ?1 AND policy_id = ?2",
+                    params![evaluation_id, policy_id],
                 )?;
-                for (policy_id, findings) in &evaluation.identities {
-                    for finding_id in findings {
-                        insert.execute(params![evaluation_id, policy_id, finding_id.as_slice()])?;
-                    }
-                }
             }
-            {
-                let mut insert = tx.prepare_cached(
-                    "INSERT INTO policy_evaluation_units(
-                       evaluation_id, policy_id, unit_id
-                     ) VALUES(?1, ?2, ?3)
-                     ON CONFLICT(evaluation_id, policy_id, unit_id) DO NOTHING",
+            for policy in &evaluation.policies {
+                tx.execute(
+                    "DELETE FROM policy_evaluation_policies
+                     WHERE evaluation_id = ?1 AND policy_id = ?2",
+                    params![evaluation_id, policy.policy_id],
                 )?;
+                tx.execute(
+                    "INSERT INTO policy_evaluation_policies(
+                       evaluation_id, policy_id, source_hash, semantic_hash,
+                       completion, completion_detail, qualified,
+                       qualification_detail, diagnostics
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        evaluation_id,
+                        policy.policy_id,
+                        policy.source_hash,
+                        policy.semantic_hash,
+                        policy.completion,
+                        policy.completion_detail,
+                        policy.qualified,
+                        policy.qualification_detail,
+                        serde_json::to_string(&policy.diagnostics)
+                            .expect("policy diagnostic strings serialize"),
+                    ],
+                )?;
+                for finding_id in &policy.identities {
+                    tx.execute(
+                        "INSERT INTO policy_evaluation_identities(
+                           evaluation_id, policy_id, finding_id
+                         ) VALUES(?1, ?2, ?3)",
+                        params![evaluation_id, policy.policy_id, finding_id.as_slice()],
+                    )?;
+                }
                 for (policy_id, unit_id) in &memberships {
-                    insert.execute(params![evaluation_id, policy_id, unit_id])?;
+                    if policy_id == &policy.policy_id {
+                        tx.execute(
+                            "INSERT INTO policy_evaluation_units(
+                               evaluation_id, policy_id, unit_id
+                             ) VALUES(?1, ?2, ?3)",
+                            params![evaluation_id, policy_id, unit_id],
+                        )?;
+                    }
                 }
             }
             sweep_policy_rows(&tx, published_at)?;
@@ -450,40 +534,84 @@ impl AnalyzerStore {
                 POLICY_EVALUATION_LOOKUP_SQL,
                 params![
                     key.base_tree_oid,
-                    key.policy_set_digest,
                     key.options_digest,
                     key.configuration_fingerprint,
                     key.active_model_set_hash,
                     key.engine_epoch,
                 ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((evaluation_id, resolved_commit)) = row else {
+        let Some((
+            evaluation_id,
+            resolved_commit,
+            policy_set_digest,
+            unreliable_detail,
+            aggregate_unreliable,
+        )) = row
+        else {
             return Ok(None);
         };
-        // The primary key clusters the rows by policy, so consecutive rows
-        // group without a sort and without a second pass over the answer.
-        let mut per_policy: Vec<(String, Vec<[u8; 32]>)> = Vec::new();
+        // The child row exists even for a complete policy with no findings;
+        // the LEFT JOIN therefore distinguishes that answer from no evidence.
+        let mut policies: Vec<LoadedPolicyEvaluationPolicy> = Vec::new();
         let mut statement = conn.prepare_cached(POLICY_EVALUATION_IDENTITY_SQL)?;
         let mut rows = statement.query(params![evaluation_id])?;
         while let Some(row) = rows.next()? {
             let policy_id = row.get::<_, String>(0)?;
-            let finding_id = row.get::<_, Vec<u8>>(1)?;
-            let finding_id = <[u8; 32]>::try_from(finding_id.as_slice()).map_err(|_| {
-                StoreError::new(format!(
-                    "policy evaluation {evaluation_id} records a finding identity of {} bytes",
-                    finding_id.len()
-                ))
-            })?;
-            match per_policy.last_mut() {
-                Some((last, findings)) if *last == policy_id => findings.push(finding_id),
-                _ => per_policy.push((policy_id, vec![finding_id])),
+            let source_hash = row.get::<_, String>(1)?;
+            let semantic_hash = row.get::<_, String>(2)?;
+            let completion = row.get::<_, String>(3)?;
+            let completion_detail = row.get::<_, String>(4)?;
+            let qualified = row.get::<_, bool>(5)?;
+            let qualification_detail = row.get::<_, String>(6)?;
+            let diagnostics_json = row.get::<_, String>(7)?;
+            match policies.last() {
+                Some(last) if last.policy_id == policy_id => {}
+                _ => policies.push(LoadedPolicyEvaluationPolicy {
+                    policy_id,
+                    source_hash,
+                    semantic_hash,
+                    completion,
+                    completion_detail,
+                    qualified,
+                    qualification_detail,
+                    diagnostics: serde_json::from_str(&diagnostics_json).map_err(|error| {
+                        StoreError::new(format!(
+                            "policy evaluation {evaluation_id} has invalid diagnostic JSON: {error}"
+                        ))
+                    })?,
+                    identities: Vec::new(),
+                }),
+            }
+            if let Some(finding_id) = row.get::<_, Option<Vec<u8>>>(8)? {
+                let finding_id = <[u8; 32]>::try_from(finding_id.as_slice()).map_err(|_| {
+                    StoreError::new(format!(
+                        "policy evaluation {evaluation_id} records a finding identity of {} bytes",
+                        finding_id.len()
+                    ))
+                })?;
+                policies
+                    .last_mut()
+                    .expect("the joined policy row was just loaded")
+                    .identities
+                    .push(finding_id);
             }
         }
         Ok(Some(LoadedPolicyEvaluation {
             resolved_commit,
-            identities: per_policy,
+            policy_set_digest,
+            unreliable_detail,
+            aggregate_unreliable,
+            policies,
         }))
     }
 }
@@ -505,19 +633,28 @@ pub(crate) fn policy_unit_batch_sql(values: &str) -> String {
 }
 
 /// The evaluation lookup, shared with its query-plan pin.
-pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit
+pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit,
+            policy_set_digest, unreliable_detail, aggregate_unreliable
      FROM policy_evaluations
-     WHERE base_tree_oid = ?1 AND policy_set_digest = ?2 AND options_digest = ?3
-       AND configuration_fingerprint = ?4 AND active_model_set_hash = ?5
-       AND engine_epoch = ?6";
+     WHERE base_tree_oid = ?1 AND options_digest = ?2
+       AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
+       AND engine_epoch = ?5";
 
 /// The identity read, shared with its query-plan pin.
 ///
 /// One seek on the leading column of a `WITHOUT ROWID` primary key, which
 /// returns the rows already grouped by policy.
 pub(crate) const POLICY_EVALUATION_IDENTITY_SQL: &str =
-    "SELECT policy_id, finding_id FROM policy_evaluation_identities
-     WHERE evaluation_id = ?1";
+    "SELECT policies.policy_id, policies.source_hash, policies.semantic_hash,
+            policies.completion, policies.completion_detail, policies.qualified,
+            policies.qualification_detail, policies.diagnostics,
+            identities.finding_id
+     FROM policy_evaluation_policies AS policies
+     LEFT JOIN policy_evaluation_identities AS identities
+       ON identities.evaluation_id = policies.evaluation_id
+      AND identities.policy_id = policies.policy_id
+     WHERE policies.evaluation_id = ?1
+     ORDER BY policies.policy_id, identities.finding_id";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -1209,7 +1346,6 @@ mod tests {
     fn evaluation_key() -> PolicyEvaluationRowKey {
         PolicyEvaluationRowKey {
             base_tree_oid: TREE.to_string(),
-            policy_set_digest: POLICY_HASH.to_string(),
             options_digest: CONFIGURATION.to_string(),
             configuration_fingerprint: CONFIGURATION.to_string(),
             active_model_set_hash: MODELS.to_string(),
@@ -1219,6 +1355,21 @@ mod tests {
 
     fn finding_id(seed: &str) -> [u8; 32] {
         *StableDigest::sha256(seed.as_bytes()).as_bytes()
+    }
+
+    fn policy_result(policy_id: &str, findings: &[&str]) -> PolicyEvaluationPolicyRow {
+        PolicyEvaluationPolicyRow {
+            policy_id: policy_id.to_string(),
+            source_hash: POLICY_HASH.to_string(),
+            semantic_hash: POLICY_HASH.to_string(),
+            completion: "complete".to_string(),
+            completion_detail: "\"complete\"".to_string(),
+            qualified: true,
+            qualification_detail: String::new(),
+            diagnostics: Vec::new(),
+            identities: findings.iter().map(|seed| finding_id(seed)).collect(),
+            units: Vec::new(),
+        }
     }
 
     #[test]
@@ -1232,17 +1383,18 @@ mod tests {
             .publish_policy_evaluation(PolicyEvaluationRow {
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
-                identities: vec![
-                    (
-                        "test.match".to_string(),
-                        vec![finding_id("first"), finding_id("second")],
-                    ),
-                    // A whole-family policy publishes no unit and still
-                    // records what it found, which is the whole point of the
-                    // identities table.
-                    ("test.taint".to_string(), vec![finding_id("taint")]),
+                policy_set_digest: POLICY_HASH.to_string(),
+                unreliable_detail: None,
+                aggregate_unreliable: false,
+                policies: vec![
+                    PolicyEvaluationPolicyRow {
+                        units: vec![seed_key("src/A.java")],
+                        ..policy_result("test.match", &["first", "second"])
+                    },
+                    // A policy can record findings without publishing a unit.
+                    policy_result("test.taint", &["taint"]),
                 ],
-                units: vec![("test.match".to_string(), vec![seed_key("src/A.java")])],
+                unqualified_policy_ids: Vec::new(),
             })
             .unwrap();
 
@@ -1251,23 +1403,75 @@ mod tests {
             .unwrap()
             .expect("the evaluation is found by its key");
         assert_eq!(loaded.resolved_commit, COMMIT);
-        let mut identities = loaded.identities;
-        for (_, findings) in &mut identities {
-            findings.sort_unstable();
+        assert_eq!(loaded.policies.len(), 2);
+        assert_eq!(loaded.policies[0].policy_id, "test.match");
+        assert!(loaded.policies[0].qualified);
+        assert_eq!(loaded.policies[0].identities.len(), 2);
+        assert_eq!(loaded.policies[0].completion, "complete");
+        assert_eq!(loaded.policies[1].policy_id, "test.taint");
+        assert_eq!(loaded.policies[1].identities, vec![finding_id("taint")]);
+    }
+
+    #[test]
+    fn a_complete_empty_policy_is_distinct_from_missing_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy-cache.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let key = evaluation_key();
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: COMMIT.to_string(),
+                policy_set_digest: POLICY_HASH.to_string(),
+                unreliable_detail: None,
+                aggregate_unreliable: false,
+                policies: vec![policy_result("test.clean", &[])],
+                unqualified_policy_ids: Vec::new(),
+            })
+            .unwrap();
+        drop(store);
+
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let loaded = store
+            .policy_evaluation_for_key(&key)
+            .unwrap()
+            .expect("the shared evaluation exists");
+        assert_eq!(loaded.policies.len(), 1);
+        assert_eq!(loaded.policies[0].policy_id, "test.clean");
+        assert_eq!(loaded.policies[0].completion, "complete");
+        assert!(loaded.policies[0].qualified);
+        assert!(loaded.policies[0].identities.is_empty());
+
+        for different_question in [
+            PolicyEvaluationRowKey {
+                base_tree_oid: "other-tree".to_string(),
+                ..key.clone()
+            },
+            PolicyEvaluationRowKey {
+                options_digest: "other-options-and-limits".to_string(),
+                ..key.clone()
+            },
+            PolicyEvaluationRowKey {
+                configuration_fingerprint: "other-configuration".to_string(),
+                ..key.clone()
+            },
+            PolicyEvaluationRowKey {
+                active_model_set_hash: "other-models".to_string(),
+                ..key.clone()
+            },
+            PolicyEvaluationRowKey {
+                engine_epoch: "other-epoch".to_string(),
+                ..key.clone()
+            },
+        ] {
+            assert!(
+                store
+                    .policy_evaluation_for_key(&different_question)
+                    .unwrap()
+                    .is_none(),
+                "a complete empty answer must not cross shared input keys: {different_question:?}"
+            );
         }
-        let mut expected = vec![
-            (
-                "test.match".to_string(),
-                vec![finding_id("first"), finding_id("second")],
-            ),
-            ("test.taint".to_string(), vec![finding_id("taint")]),
-        ];
-        for (_, findings) in &mut expected {
-            findings.sort_unstable();
-        }
-        identities.sort_by(|left, right| left.0.cmp(&right.0));
-        expected.sort_by(|left, right| left.0.cmp(&right.0));
-        assert_eq!(identities, expected);
     }
 
     #[test]
@@ -1278,8 +1482,14 @@ mod tests {
             .publish_policy_evaluation(PolicyEvaluationRow {
                 key: key.clone(),
                 resolved_commit: COMMIT.to_string(),
-                identities: vec![("test.policy".to_string(), vec![finding_id("only")])],
-                units: vec![("test.policy".to_string(), vec![seed_key("src/Gone.java")])],
+                policy_set_digest: POLICY_HASH.to_string(),
+                unreliable_detail: None,
+                aggregate_unreliable: false,
+                policies: vec![PolicyEvaluationPolicyRow {
+                    units: vec![seed_key("src/Gone.java")],
+                    ..policy_result("test.policy", &["only"])
+                }],
+                unqualified_policy_ids: Vec::new(),
             })
             .unwrap();
 
@@ -1287,10 +1497,7 @@ mod tests {
             .policy_evaluation_for_key(&key)
             .unwrap()
             .expect("an evaluation is its identities, not its units");
-        assert_eq!(
-            loaded.identities,
-            vec![("test.policy".to_string(), vec![finding_id("only")])]
-        );
+        assert_eq!(loaded.policies[0].identities, vec![finding_id("only")]);
         let conn = store.conn.lock().expect("store mutex");
         let memberships: i64 = conn
             .query_row("SELECT COUNT(*) FROM policy_evaluation_units", [], |row| {
@@ -1304,29 +1511,50 @@ mod tests {
     }
 
     #[test]
-    fn an_evaluation_republished_under_one_key_keeps_one_set_of_identities() {
+    fn an_evaluation_replaces_only_republished_policy_evidence() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let key = evaluation_key();
-        for seed in ["first", "second"] {
-            store
-                .publish_policy_evaluation(PolicyEvaluationRow {
-                    key: key.clone(),
-                    resolved_commit: COMMIT.to_string(),
-                    identities: vec![("test.policy".to_string(), vec![finding_id(seed)])],
-                    units: Vec::new(),
-                })
-                .unwrap();
-        }
-
+        let (first, second) = ("first", "second");
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: COMMIT.to_string(),
+                policy_set_digest: POLICY_HASH.to_string(),
+                unreliable_detail: None,
+                aggregate_unreliable: false,
+                policies: vec![
+                    policy_result("test.policy", &[first]),
+                    policy_result("test.other", &["other"]),
+                ],
+                unqualified_policy_ids: Vec::new(),
+            })
+            .unwrap();
+        store
+            .publish_policy_evaluation(PolicyEvaluationRow {
+                key: key.clone(),
+                resolved_commit: COMMIT.to_string(),
+                policy_set_digest: POLICY_HASH.to_string(),
+                unreliable_detail: None,
+                aggregate_unreliable: false,
+                policies: vec![policy_result("test.policy", &[second])],
+                unqualified_policy_ids: Vec::new(),
+            })
+            .unwrap();
         let loaded = store
             .policy_evaluation_for_key(&key)
             .unwrap()
             .expect("the evaluation is found by its key");
         assert_eq!(
-            loaded.identities,
-            vec![("test.policy".to_string(), vec![finding_id("second")])],
-            "the second evaluation replaced the first, cascade and all"
+            loaded
+                .policies
+                .iter()
+                .map(|policy| policy.policy_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test.other", "test.policy"],
+            "updating one child leaves the other policy's evidence intact"
         );
+        assert_eq!(loaded.policies[0].identities, vec![finding_id("other")]);
+        assert_eq!(loaded.policies[1].identities, vec![finding_id("second")]);
         let conn = store.conn.lock().expect("store mutex");
         let rows: i64 = conn
             .query_row(
@@ -1335,7 +1563,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 1);
+        assert_eq!(rows, 2);
     }
 
     /// The batched unit lookup must seek the unit key once per requested
@@ -1411,14 +1639,7 @@ mod tests {
             .unwrap();
         let plan = statement
             .query_map(
-                params![
-                    TREE,
-                    POLICY_HASH,
-                    CONFIGURATION,
-                    CONFIGURATION,
-                    MODELS,
-                    EPOCH
-                ],
+                params![TREE, POLICY_HASH, CONFIGURATION, MODELS, EPOCH],
                 |row| row.get::<_, String>(3),
             )
             .unwrap()
@@ -1463,13 +1684,18 @@ mod tests {
             .unwrap();
         assert!(
             plan.iter()
-                .any(|detail| detail
-                    .contains("SEARCH policy_evaluation_identities USING PRIMARY KEY")),
+                .any(|detail| detail.contains("SEARCH policies USING PRIMARY KEY")),
             "{state}: {plan:#?}"
         );
         assert!(
             plan.iter()
-                .all(|detail| !detail.contains("SCAN policy_evaluation_identities")),
+                .any(|detail| detail.contains("SEARCH identities USING PRIMARY KEY")),
+            "{state}: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN policies")
+                    && !detail.contains("SCAN identities")),
             "{state}: {plan:#?}"
         );
     }

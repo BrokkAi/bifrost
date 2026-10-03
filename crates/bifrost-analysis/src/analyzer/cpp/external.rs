@@ -846,6 +846,7 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        callable_surface_complete: false,
         has_explicit_type_terms: false,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
@@ -1213,6 +1214,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 },
                 is_abstract: false,
                 is_sealed: false,
+                callable_surface_complete: false,
                 has_explicit_type_terms: false,
                 type_parameters: basic_string_type_parameters
                     .get(&record.name)
@@ -1380,6 +1382,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 && record.kind == CppExternalMemberKind::Function
                 && syntax_complete_headers.contains(&record.source_path);
             members.push(MemberFact {
+                non_overridable: None,
                 ambient_use: None,
                 id: id.clone(),
                 owner: owner_id,
@@ -1466,7 +1469,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 language: "cpp".to_owned(),
                 ecosystem: "cpp-headers".to_owned(),
                 compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    bifrost: None,
                     toolchains: Vec::new(),
                 },
                 provenance: Provenance {

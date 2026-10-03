@@ -244,6 +244,8 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
         NormalizedKind::Constructor,
     ),
     ("lambda_expression", NormalizedKind::Lambda),
+    ("formal_parameter", NormalizedKind::Parameter),
+    ("spread_parameter", NormalizedKind::Parameter),
     ("class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
@@ -713,6 +715,17 @@ impl StructuralSpec for JavaStructuralSpec {
             }
             NormalizedKind::Method | NormalizedKind::Constructor | NormalizedKind::Class => {
                 if let Some(name) = node.child_by_field_name("name") {
+                    sink.set_name(name);
+                }
+                attach_decorators(sink, node);
+            }
+            NormalizedKind::Parameter => {
+                let name = if node.kind() == "spread_parameter" {
+                    super::declarations::spread_parameter_name(node)
+                } else {
+                    node.child_by_field_name("name")
+                };
+                if let Some(name) = name {
                     sink.set_name(name);
                 }
                 attach_decorators(sink, node);

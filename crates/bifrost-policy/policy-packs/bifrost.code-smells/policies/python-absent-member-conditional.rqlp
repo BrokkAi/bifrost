@@ -1,0 +1,24 @@
+; Evaluate the complete relation of Conditional absent-member findings. Each
+; finding names a class that certainly reaches the access and certainly lacks
+; the member, while other unclassified values may also reach it. Proven
+; findings belong to bifrost.correctness.python-absent-member.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.python-absent-member-conditional"
+  :name "Python absent member (conditional)"
+  :message "this Python receiver may hold a class that does not declare the accessed member when a proven input reaches it"
+  :severity warning
+  :description "Caller-driven class-set propagation proves that a class reaches this access and that its complete modeled surface lacks the accessed member, but other unclassified values may also reach the access. The finding states the condition: if the receiver holds that class, the access fails. A remainder that can mean the class should have been filtered on this path, such as an unmodeled guard or predicate, or an incomplete or budget-limited solve, suppresses the finding. Guard-only class membership, uncertain flow into the class, open member models, and dynamic writes that could install the member also suppress it. Missing Python declaration-model coverage makes the run inconclusive."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "python" "type-flow"]
+  :analysis (analysis
+    :type assertion
+    (bind :name finding
+      :query (rql :schema-version 1
+        (language python
+          (absent-member :proof conditional
+            (procedure-of
+              (callable))))))
+    (group :name by-access-class :by (finding.id)
+      (aggregate :name violations :op count))
+    (assert :group by-access-class :value violations :cardinality (exactly 0))))

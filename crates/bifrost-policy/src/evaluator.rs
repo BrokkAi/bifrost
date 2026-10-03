@@ -41,7 +41,8 @@ use brokk_bifrost_rql::structural::materialization_rows::{
 use brokk_bifrost_rql::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
 use brokk_bifrost_rql::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_rql::structural::reference_edges::{
-    EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
+    EdgeDerivationResult, ReferenceEdgeRow, SelectedInverseEdgeCache, forward_edges_for_file,
+    inverse_edges_for_declaration,
 };
 use brokk_bifrost_rql::structural::rewrite_path::RewriteOutcome;
 use brokk_bifrost_rql::structural::rewrite_paths::{
@@ -2725,6 +2726,7 @@ fn executable_match_query(
             | QueryValueKind::ReceiverEvidence
             | QueryValueKind::CallShape
             | QueryValueKind::CallResult
+            | QueryValueKind::ResultSubjectUse
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
             | QueryValueKind::CallBinding
@@ -3423,11 +3425,39 @@ fn terminal_presentation(
             },
             ProofReason::DirectStructuralMatch,
         ),
+        UnitRowItemTerminal::ResultSubjectUse {
+            proof,
+            completeness,
+            outcome,
+        } => {
+            let proven = &**proof == "proven" && &**outcome == "proven";
+            let certainty = if &**completeness == "complete" {
+                Vec::new()
+            } else {
+                vec![
+                    CertaintyReason::analyzer_ambiguity("result-subject-use-incomplete")
+                        .map_err(|_| ())?,
+                ]
+            };
+            (
+                certainty,
+                if proven {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if proven {
+                    ProofReason::ResolvedReference
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
         // Every remaining presented family is an exact record of what one
         // producer derived at one position: its own presence is proven, and
         // whatever completeness the row states is the row's own column, not a
         // proof tier of the position.
-        UnitRowItemTerminal::SourcePosition => (
+        UnitRowItemTerminal::SourcePosition | UnitRowItemTerminal::AbsentMemberFinding { .. } => (
             Vec::new(),
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
@@ -4286,6 +4316,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallResultObligation
         | DetailedCodeQueryDomain::ResultContractUse
         | DetailedCodeQueryDomain::ResultContractFailureUse
+        | DetailedCodeQueryDomain::ResultSubjectUse
         | DetailedCodeQueryDomain::NilnessOperation
         | DetailedCodeQueryDomain::SwitchCoverage
         | DetailedCodeQueryDomain::AssignmentRelation
@@ -4627,6 +4658,7 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, root_procedure_id.as_bytes());
         }
         DetailedCodeQueryKey::ClassSetRow { id }
+        | DetailedCodeQueryKey::ResultSubjectUse { id }
         | DetailedCodeQueryKey::AbsentMemberFinding { id } => {
             update_hash(&mut hasher, id.as_bytes());
         }

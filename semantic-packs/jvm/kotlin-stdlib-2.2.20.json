@@ -13,7 +13,6 @@
     "container": null
   },
   "compatibility": {
-    "bifrost": ">=0.8.19, <1.0.0",
     "toolchains": [
       {
         "name": "kotlin",

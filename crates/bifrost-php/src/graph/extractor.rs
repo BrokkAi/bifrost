@@ -34,7 +34,7 @@ pub fn scan_file(
     hierarchy: &PhpHierarchyIndex,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let Ok(source) = file.read_to_string() else {
+    let Ok(source) = php.project().read_source(file) else {
         return;
     };
     if source.is_empty() {

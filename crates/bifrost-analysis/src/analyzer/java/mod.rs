@@ -1,15 +1,35 @@
 mod adapter;
+mod annotation;
+pub use annotation::{
+    JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, resolve_java_annotation_type,
+};
 mod cache;
 mod call_conversion;
+pub use call_conversion::{JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence};
 mod checked_exceptions;
 pub(crate) use call_conversion::{
-    JavaFormalShape, formal_shapes, parse_declaring_file, primitive_actual_type, primitive_converts,
+    JavaFormalShape, declaration_declares_array, declared_type_node, formal_shapes,
+    parse_declaring_file, primitive_actual_type, primitive_converts, primitive_for_name,
 };
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
+// Exercise the native consumer before the approved atomic JVM cutover.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_call_relations;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_points;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_rename;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod native_usages;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod selected_reverse;
 mod semantic;
+mod source_facts;
+pub(crate) mod source_publication;
+pub(crate) mod source_storage;
 mod structural;
 use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
@@ -26,9 +46,11 @@ use crate::analyzer::common::{is_unparseable_source, language_for_file as file_l
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, PatternBindingNameProvider, analyzable_file_count,
-    fqn_bulk_nodes, overloaded_function_fqns, package_fq_name,
+    LanguageEdgeWeights, LanguageSupport, PatternBindingNameProvider, ProcedureSyntaxRoles,
+    analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns, package_fq_name,
 };
+use crate::analyzer::loop_facts::{LoopKind, LoopSyntax};
+use crate::analyzer::semantic::ProcedureKind;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::java_graph::{
     JavaDeadCodeBulkEligibility, JavaUsageGraphStrategy, build_java_usage_edge_weights,
@@ -59,9 +81,11 @@ use brokk_bifrost_jvm::java::declarations::{
 };
 use brokk_bifrost_jvm::java::exceptions::detect_exception_handling_smells_java;
 use brokk_bifrost_jvm::java::graph_support::{
-    JavaSource, java_constructor_context, java_extract_type_identifiers, java_package_name_of,
-    resolve_java_forward_type_name, resolve_java_forward_type_name_candidates,
+    JavaConstructorContext, JavaSource, java_constructor_context, java_extract_type_identifiers,
+    java_package_name_of, resolve_java_forward_type_name,
+    resolve_java_forward_type_name_candidates,
 };
+use brokk_bifrost_jvm::java::imports::static_import_path;
 use brokk_bifrost_jvm::java::structural::{
     java_parent_statement_body, java_switch_rule_value_expression_statement,
 };
@@ -366,15 +390,15 @@ impl JavaAnalyzer {
     }
 
     /// Classify exact-FQN callable candidates and the source-level constructor
-    /// shape from one coherent parser snapshot.
+    /// shape from one coherent indexed-facts query.
     pub(crate) fn constructor_context(
         &self,
         owner: &CodeUnit,
         candidates: Vec<CodeUnit>,
-        call_arity: usize,
-    ) -> (Vec<CodeUnit>, bool) {
-        let scope = AnalyzerQueryScope::new(self);
-        java_constructor_context(self, scope.token(), owner, candidates, call_arity)
+        call_arity: Option<usize>,
+    ) -> Option<JavaConstructorContext> {
+        let _scope = AnalyzerQueryScope::new(self);
+        java_constructor_context(self, owner, candidates, call_arity)
     }
 }
 
@@ -417,6 +441,15 @@ struct JavaFileClassIndexMemo {
 }
 
 impl JavaSource for JavaAnalyzer {
+    fn declaration_source_facts(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>> {
+        self.inner
+            .canonical_java_source_facts(file, &self.memo_caches.source_facts)
+    }
+
     fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
@@ -1240,15 +1273,78 @@ fn executable_statement_kind(node: tree_sitter::Node<'_>) -> Option<&'static str
     }
 }
 
+fn java_loop_site(node: tree_sitter::Node<'_>) -> Option<LoopSyntax<'_>> {
+    let kind = match node.kind() {
+        "while_statement" => LoopKind::While,
+        "for_statement" => LoopKind::For,
+        "do_statement" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node.child_by_field_name("condition"),
+    })
+}
+
+fn statement_procedure_matches(kind: ProcedureKind, node: tree_sitter::Node<'_>) -> bool {
+    match kind {
+        ProcedureKind::Method => node.kind() == "method_declaration",
+        ProcedureKind::Constructor => matches!(
+            node.kind(),
+            "constructor_declaration" | "compact_constructor_declaration"
+        ),
+        ProcedureKind::Lambda => node.kind() == "lambda_expression",
+        ProcedureKind::Initializer => matches!(
+            node.kind(),
+            "static_initializer" | "block" | "variable_declarator" | "enum_constant"
+        ),
+        _ => false,
+    }
+}
+
+fn statement_nested_procedure(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "lambda_expression"
+            | "static_initializer"
+            | "class_body"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    )
+}
+
 pub(crate) struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_rollout_points(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::languages::StructuralReceiverResolver> {
+        Some(&native_points::JavaNativeRolloutPoints)
+    }
+
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        crate::analyzer::jvm::is_jvm_configuration_input_path(path)
+    }
+
     fn language(&self) -> Language {
         Language::Java
     }
 
-    fn executable_statement_kind(&self, node: tree_sitter::Node<'_>) -> Option<&'static str> {
-        executable_statement_kind(node)
+    fn procedure_syntax_roles(&self) -> Option<ProcedureSyntaxRoles> {
+        Some(ProcedureSyntaxRoles {
+            statement_kind: executable_statement_kind,
+            loop_site: java_loop_site,
+            procedure_matches: statement_procedure_matches,
+            nested_procedure: statement_nested_procedure,
+        })
     }
 
     fn pattern_binding_name_provider(&self) -> Option<PatternBindingNameProvider> {
@@ -1260,6 +1356,21 @@ impl LanguageSupport for JavaSupport {
     ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
     {
         Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
+    }
+
+    fn expand_imported_external_callee(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_text: &str,
+        site: Option<&crate::analyzer::languages::ExternalCalleeSite<'_>>,
+    ) -> Option<crate::analyzer::languages::ImportedExternalCallee> {
+        crate::analyzer::usages::get_definition::java::expand_java_external_static_import_callee(
+            analyzer,
+            file,
+            callee_text,
+            site?,
+        )
     }
 
     /// Answers from `JavaAnalyzer::resolve_member_name_with_external` -- the
@@ -1431,6 +1542,8 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
             static_imports_present,
             scala_files_present,
         } = memo.downcast_mut().expect("Java bulk memo");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Java))
             > file_cap
         {
@@ -1445,15 +1558,15 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
             &empty_overloads
         };
         let has_static_imports = candidate.is_function()
-            && *static_imports_present.get_or_insert_with(|| java_static_imports_present(analyzer));
+            && *static_imports_present
+                .get_or_insert_with(|| java_static_imports_present(analyzer, token));
         let has_scala_files = *scala_files_present
             .get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala) > 0);
 
-        let scope = AnalyzerQueryScope::new(analyzer);
         matches!(
             dead_code_bulk_eligibility(
                 analyzer,
-                scope.token(),
+                token,
                 candidate,
                 overloads,
                 has_static_imports,
@@ -1486,16 +1599,19 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
     }
 }
 
-fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
-    analyzer
-        .project()
-        .analyzable_files(Language::Java)
-        .is_ok_and(|files| {
-            files.into_iter().any(|file| {
-                file.read_to_string()
-                    .is_ok_and(|source| source.contains("import static "))
-            })
-        })
+fn java_static_imports_present(analyzer: &dyn IAnalyzer, token: QueryToken<'_>) -> bool {
+    let Ok(files) = analyzer.project().analyzable_files(Language::Java) else {
+        return true;
+    };
+    files.into_iter().any(|file| {
+        let Some(provider) = analyzer.import_analysis_provider_for_file(&file) else {
+            return true;
+        };
+        provider
+            .import_info_of(token, &file)
+            .iter()
+            .any(|import| import.path.is_none() || static_import_path(import).is_some())
+    })
 }
 
 /// Java is the first language family of the #1477 M4 rollout.
@@ -1527,5 +1643,55 @@ impl crate::analyzer::usages::MemberFamilyProvider for JavaAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
         self.resolve_external_member_family(self, identity, max_visits, cancellation)
+    }
+}
+
+#[cfg(test)]
+mod java_static_import_presence_tests {
+    use super::*;
+    use crate::analyzer::{EmptyAnalyzer, Language, OverlayProject, Project};
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn comments_do_not_count_as_static_imports_but_active_imports_do() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "com/example/Target.java",
+                "package com.example; class Target { static void run() {} }\n",
+            )
+            .file(
+                "com/example/Consumer.java",
+                "package com.example;\n// import static com.example.Target.run;\nclass Consumer {}\n",
+            )
+            .build();
+        let disk_analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let disk_scope = AnalyzerQueryScope::new(&disk_analyzer);
+        assert!(!java_static_imports_present(
+            &disk_analyzer,
+            disk_scope.token()
+        ));
+
+        let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+        assert!(overlay.set(
+            project.file("com/example/Consumer.java").abs_path(),
+            "package com.example;\nimport /* keyword gap */ static com.example.Target.run;\nclass Consumer {}\n"
+                .to_owned(),
+        ));
+        let overlay_analyzer = JavaAnalyzer::new(overlay as Arc<dyn Project>);
+        let overlay_scope = AnalyzerQueryScope::new(&overlay_analyzer);
+        assert!(java_static_imports_present(
+            &overlay_analyzer,
+            overlay_scope.token()
+        ));
+    }
+
+    #[test]
+    fn missing_import_provider_keeps_precise_dead_code_route() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Sample.java", "class Sample {}\n")
+            .build();
+        let analyzer = EmptyAnalyzer::new(project.project_dyn());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(java_static_imports_present(&analyzer, scope.token()));
     }
 }

@@ -1151,7 +1151,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "incremental": {
                         "type": "boolean",
                         "default": true,
-                        "description": "When false, every policy is evaluated in full instead of reusing per-unit results a previous run published in this repository's analyzer cache. Reuse produces the same findings; turn it off only to compare against the full dual-snapshot evaluation."
+                        "description": "When true, a full scan publishes complete policy units and a diff scan reuses units only after verifying their inputs in this repository's analyzer cache. When false, evaluate every policy in full without policy-unit cache access. Canonical findings and exit status are the same either way."
                     },
                     "include_stage_timings": {
                         "type": "boolean",

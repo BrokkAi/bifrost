@@ -19,7 +19,6 @@
     }
   },
   "compatibility": {
-    "bifrost": ">=0.8.18, <1.0.0",
     "toolchains": [
       {
         "name": "jdk",

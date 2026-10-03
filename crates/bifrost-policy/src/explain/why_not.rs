@@ -620,7 +620,7 @@ pub(super) fn run_prefixes(
             && prefix.checked_sub(1).is_some_and(|index| {
                 matches!(
                     selector.plan.steps.get(index),
-                    Some(QueryStep::AbsentMember)
+                    Some(QueryStep::AbsentMember(_))
                 )
             })
             && executed_count < max_executions
@@ -632,7 +632,7 @@ pub(super) fn run_prefixes(
                 .steps
                 .last_mut()
                 .expect("an absent-member stage has a final step");
-            assert!(matches!(step, QueryStep::AbsentMember));
+            assert!(matches!(step, QueryStep::AbsentMember(_)));
             *step = QueryStep::ClassSet;
             executed_count = executed_count.saturating_add(1);
             let sibling = execute_query(sibling);

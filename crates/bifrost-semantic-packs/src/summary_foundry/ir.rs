@@ -501,6 +501,7 @@ impl FoundryEntry {
                 FoundryCompleteness::Complete => Completeness::Complete,
             },
             ordinary_heap_unchanged: false,
+            no_concurrency_effects: false,
             covers_overrides: false,
             normal_continuation_absent: false,
             normal_result_count: None,

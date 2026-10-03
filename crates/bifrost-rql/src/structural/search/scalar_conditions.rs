@@ -6,7 +6,8 @@
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_flow::scalar_state::{
-    ScalarCallEffects, ScalarStateDerivation, ScalarTyping, guard_decides, java_scalar_seeds,
+    ScalarCallEffects, ScalarStateDerivation, ScalarTyping, go_scalar_seeds, guard_decides,
+    java_scalar_seeds,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -127,7 +128,9 @@ fn supported_scalar_guard(
         | GuardPredicate::Opaque { .. } => false,
     };
     match language {
-        Language::Java => numeric() || matches!(predicate, GuardPredicate::Truthy { .. }),
+        Language::Java | Language::Go => {
+            numeric() || matches!(predicate, GuardPredicate::Truthy { .. })
+        }
         Language::JavaScript | Language::TypeScript | Language::Python => {
             numeric() || matches!(predicate, GuardPredicate::Truthy { .. })
         }
@@ -138,7 +141,9 @@ fn supported_scalar_guard(
 /// Derive the procedure's scalar states with the numeric typing its language
 /// establishes. Java seeds declared primitive formals and types every
 /// primitive local and formal. JavaScript and TypeScript numbers are binary64
-/// everywhere. Python integers are unbounded and its bindings untyped.
+/// everywhere. Python integers are unbounded and its bindings untyped. Go
+/// types declared and literal-initialized integer and Boolean bindings and
+/// keeps no numeric fact for any other.
 fn derive_scalar_states(
     language: Language,
     procedure: &ProcedureHandle,
@@ -147,6 +152,15 @@ fn derive_scalar_states(
     match language {
         Language::Java => {
             let seeds = java_scalar_seeds(procedure, prepared);
+            ScalarStateDerivation::derive_typed(
+                procedure,
+                ScalarCallEffects::default(),
+                &seeds.entry_facts,
+                &seeds.typing,
+            )
+        }
+        Language::Go => {
+            let seeds = go_scalar_seeds(procedure, prepared);
             ScalarStateDerivation::derive_typed(
                 procedure,
                 ScalarCallEffects::default(),
@@ -212,7 +226,8 @@ pub(super) fn scalar_condition_outcomes(
     // An unresolved call or callable reference leaves its own result and
     // dispatch open, but in Java, JavaScript/TypeScript and Python it cannot
     // rebind a caller local: none has by-reference arguments, and captured
-    // or escaped locals are already outside the solver's closed cells. Such a
+    // or escaped locals are already outside the solver's closed cells. A Go
+    // local whose address reaches a call is likewise outside them. Such a
     // gap therefore does not open every guard in the procedure. A value gap on
     // a binding itself still does, because the solver would otherwise refine
     // that binding as if its value were known.
@@ -426,6 +441,22 @@ pub(super) fn scalar_condition_outcomes(
             outcomes.extend(composed.outcomes(&JsTsConditionSyntax)?);
         }
         Language::Python => outcomes.extend(composed.outcomes(&PythonConditionSyntax)?),
+        Language::Go => {
+            let negation_guards = semantics
+                .guard_facts()
+                .iter()
+                .map(|guard| {
+                    let span = semantics
+                        .source_mapping(guard.source)
+                        .expect("validated guard owns its source mapping")
+                        .locator
+                        .anchor()
+                        .span();
+                    (span.start_byte() as usize, span.end_byte() as usize)
+                })
+                .collect();
+            outcomes.extend(composed.outcomes(&GoConditionSyntax { negation_guards })?);
+        }
         _ => {}
     }
     Ok(outcomes)
@@ -586,6 +617,42 @@ impl ConditionSyntax for JsTsConditionSyntax {
                 .ok_or(ScalarConditionGap::IncompleteCondition),
             Some(alternative) => Ok(alternative),
             None => following_statement(owner, "statement_block"),
+        }
+    }
+}
+
+/// Go splits `&&` and `||` like Java. Its lowering folds a negation into
+/// the guard of a comparison it normalizes, and that guard carries the `!`
+/// node's span; any other negation only swaps its operand's arms. The guard
+/// spans of the procedure tell the two apart.
+struct GoConditionSyntax {
+    negation_guards: HashSet<(usize, usize)>,
+}
+
+impl ConditionSyntax for GoConditionSyntax {
+    fn is_owner(&self, node: Node<'_>) -> bool {
+        node.kind() == "if_statement"
+    }
+
+    fn shape<'tree>(&self, node: Node<'tree>) -> ConditionShape<'tree> {
+        if node.kind() == "unary_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!")
+            && !self.negation_guards.contains(&node_span(node))
+        {
+            return ConditionShape::Negation(node.child_by_field_name("operand"));
+        }
+        c_family_shape(node)
+    }
+
+    fn false_destination<'tree>(
+        &self,
+        owner: Node<'tree>,
+    ) -> Result<Node<'tree>, ScalarConditionGap> {
+        match owner.child_by_field_name("alternative") {
+            Some(alternative) => Ok(alternative),
+            None => following_statement(owner, "statement_list"),
         }
     }
 }

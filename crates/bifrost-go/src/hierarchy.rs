@@ -4,31 +4,19 @@
 //! subtyping is structural -- a concrete type satisfies an interface by having
 //! its method set, with nothing written at either declaration site.
 
-use crate::declarations::{
-    go_field_declaration_is_embedded, go_identifier_is_exported, go_node_text,
-    is_predeclared_go_type,
+use crate::declarations::go_identifier_is_exported;
+use crate::graph::resolver::{
+    GoFactFile, GoGraphBuildError, GoGraphSource, go_fact_file_is_complete, go_fact_owner_fqns,
+    go_unit_parent_fqn, load_go_fact_files, mounted_units,
 };
-use crate::graph::resolver::{ParsedFile, parse_go_workspace};
-use crate::imports::{
-    default_go_import_local_name, go_import_path, parent_path_key, path_suffixes,
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::go_facts::{
+    GoChannelDirection, GoSourceTypeId, GoSourceTypeShape, GoTypeCompoundKind,
 };
-use crate::packages::canonical_go_package_name;
-use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
-use brokk_bifrost_core::analyzer::common::language_for_file;
-use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use rayon::prelude::*;
-use std::collections::BTreeSet;
-use tree_sitter::Node;
-
-/// The pre-#1748 build, kept as a parity oracle for the one that replaced it.
-#[cfg(any(test, feature = "test-support"))]
-#[path = "hierarchy_oracle.rs"]
-mod oracle;
 
 const EMPTY_INTERFACE_DESCENDANT_CAP: usize = 0;
 const MAX_STRUCTURAL_SATISFACTION_PAIRS: usize = 2_000_000;
@@ -108,9 +96,12 @@ struct EmbeddedType {
     pointer: bool,
 }
 
-struct EmbeddedTypeRef<'tree> {
-    node: Node<'tree>,
-    pointer: bool,
+enum NominalTypeResolution {
+    Resolved(String),
+    ExternalOrPredeclared,
+    Ambiguous,
+    Unresolved,
+    Unsupported,
 }
 
 #[derive(Default)]
@@ -133,106 +124,33 @@ pub struct GoHierarchyIndex {
     /// file did not parse or the pair cap fired, in which case no member's
     /// family can be stated as exhaustive.
     enumeration_complete: bool,
-    /// [`GoPackageIndex::packages_for`] calls the import pass made, which is
-    /// one per resolvable import when the package table is indexed.
-    #[cfg(any(test, feature = "test-support"))]
-    package_lookups: usize,
-    /// Whole-file AST walks this build ran, which is one per parsed file: the
-    /// walk records every phase's declaration sites at once. The build used to
-    /// walk each file five times (#1748).
-    #[cfg(any(test, feature = "test-support"))]
-    file_traversals: usize,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
 
 impl GoHierarchyIndex {
-    /// Build the index over this analyzer's Go files, parsing them here.
-    ///
-    /// The whole-workspace parse is the expensive half, so a caller that
-    /// builds both workspace indexes in one request parses once and calls
-    /// [`Self::build_from_parsed`] instead (#1748).
-    pub fn build(
-        token: QueryToken<'_>,
-        index: &dyn CodeUnitIndex,
-        imports: &dyn ImportAnalysisProvider,
-    ) -> Self {
-        let files: Vec<ProjectFile> = index
-            .get_analyzed_files()
-            .into_iter()
-            .filter(|file| language_for_file(file) == Language::Go)
-            .collect();
-        let parsed = parse_go_workspace(index.project(), &files);
-        Self::build_from_parsed(token, index, imports, &files, &parsed)
+    pub fn build(source: GoGraphSource<'_>) -> Result<Self, GoGraphBuildError> {
+        let mut builder = GoHierarchyBuilder::new(source);
+        builder.collect()?;
+        Ok(builder.finish())
     }
 
-    /// Build the index from a parse the caller already holds.
-    ///
-    /// `files` is the workspace's complete Go inventory in path order and
-    /// `parsed` what was read and parsed of it. A file the parse skipped
-    /// marks the enumeration incomplete, exactly as a failed read did when
-    /// this build parsed the workspace itself: a skipped file can hold a type
-    /// that satisfies an interface.
-    pub fn build_from_parsed(
-        token: QueryToken<'_>,
-        index: &dyn CodeUnitIndex,
-        imports: &dyn ImportAnalysisProvider,
-        files: &[ProjectFile],
-        parsed: &[(ProjectFile, ParsedFile)],
-    ) -> Self {
-        let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::build");
-        let parsed_by_file: HashMap<&ProjectFile, &ParsedFile> =
-            parsed.iter().map(|(file, parsed)| (file, parsed)).collect();
-        let mut all_files_parsed = true;
-        let mut package_entries = Vec::new();
-        let mut declared_names: HashMap<String, String> = HashMap::default();
-        let mut prepared = Vec::new();
-        for file in files {
-            let Some(parsed) = parsed_by_file.get(file) else {
-                all_files_parsed = false;
-                continue;
-            };
-            let package_name = canonical_go_package_name(file, &parsed.package_name);
-            declared_names
-                .entry(package_name.clone())
-                .or_insert_with(|| parsed.package_name.clone());
-            package_entries.push((file.clone(), package_name.clone()));
-            prepared.push((file, *parsed, package_name));
-        }
-        let package_index = GoPackageIndex::new(package_entries);
-        let hierarchy_files: Vec<HierarchyFile<'_>> = {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::resolve_imports");
-            prepared
-                .into_iter()
-                .map(|(file, parsed, package_name)| {
-                    let (imports, dot_imports) =
-                        import_packages(token, imports, file, &package_index, &declared_names);
-                    HierarchyFile {
-                        file,
-                        source: parsed.source.as_str(),
-                        root: parsed.tree.root_node(),
-                        package_name,
-                        imports,
-                        dot_imports,
-                    }
-                })
-                .collect()
-        };
-        let sites: Vec<FileSites<'_>> = {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::collect_sites");
-            hierarchy_files
-                .par_iter()
-                .map(|file| collect_file_sites(file.root))
-                .collect()
-        };
-        let mut builder = GoHierarchyBuilder::new(index, all_files_parsed);
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            builder.package_lookups = package_index.lookups.get();
-            builder.file_traversals = sites.len();
-        }
-        builder.collect(&hierarchy_files, &sites);
-        let _finish_scope = brokk_bifrost_core::profiling::scope("go_hierarchy::finish");
+    /// Build from a fact snapshot already loaded for a sibling workspace
+    /// product. This keeps the hierarchy on the same canonical source inputs
+    /// as the inverse edge index instead of loading each publication again.
+    pub(crate) fn build_from_fact_files(source: GoGraphSource<'_>, files: Vec<GoFactFile>) -> Self {
+        let mut builder = GoHierarchyBuilder::new(source);
+        builder.all_files_parsed = files.iter().all(go_fact_file_is_complete);
+        builder.owner_by_id = go_fact_owner_fqns(&files);
+        builder.files = files;
+        builder.collect_types();
+        builder.collect_aliases();
+        builder.collect_type_details();
+        builder.collect_methods();
+        builder.resolve_aliases();
+        builder.propagate_type_terms();
+        builder.promote_embedded_methods();
+        builder.resolve_member_units();
         builder.finish()
     }
 
@@ -262,6 +180,14 @@ impl GoHierarchyIndex {
             return GoMemberFamily::NotEnumerable;
         }
         if !self.tracked_methods.contains(&fq_name) {
+            // A declaration-backed function with a type owner can be absent
+            // from the mounted facts when that source file was unavailable.
+            // During an incomplete pass this is an unknown method, not proof
+            // that it has no family. File-scope functions remain a complete
+            // NotTracked answer.
+            if !self.enumeration_complete && member.owner_is_type_scope() {
+                return GoMemberFamily::NotEnumerable;
+            }
             return GoMemberFamily::NotTracked;
         }
         if !self.enumeration_complete {
@@ -286,224 +212,51 @@ impl GoHierarchyIndex {
     pub fn relations(&self) -> &[TypeRelation] {
         &self.relations
     }
-
-    /// How many times the import pass probed the package table. One probe per
-    /// import is the indexed cost; the scan this replaced had no probe count
-    /// because it visited every workspace file for every import.
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(dead_code)]
-    pub fn package_lookups(&self) -> usize {
-        self.package_lookups
-    }
-
-    /// Whole-file AST walks this build ran. One per parsed file is the pinned
-    /// cost: every phase reads the sites that one walk recorded.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn file_traversals(&self) -> usize {
-        self.file_traversals
-    }
-
-    /// Every fact this index states, rendered in a stable order.
-    ///
-    /// Two builds of the same workspace produce the same text whatever order
-    /// their maps iterate in, so a parity check can compare a refactored build
-    /// against the previous one (#1748) on a workspace far too large to
-    /// enumerate by hand.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn facts_text(&self) -> String {
-        fn edges(edges: &[GoMemberFamilyEdge]) -> String {
-            edges
-                .iter()
-                .map(|edge| format!("{}@{}", edge.member.fq_name(), edge.owner.fq_name()))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
-        let mut lines = Vec::new();
-        for (fqn, ancestors) in &self.direct_ancestors {
-            let ancestors: Vec<String> = ancestors.iter().map(CodeUnit::fq_name).collect();
-            lines.push(format!("ancestors {fqn} -> {}", ancestors.join(",")));
-        }
-        for (fqn, descendants) in &self.direct_descendants {
-            let mut descendants: Vec<String> = descendants.iter().map(CodeUnit::fq_name).collect();
-            descendants.sort();
-            lines.push(format!("descendants {fqn} -> {}", descendants.join(",")));
-        }
-        for fqn in &self.supported {
-            lines.push(format!("supported {fqn}"));
-        }
-        for (fqn, implements) in &self.member_implements {
-            lines.push(format!("implements {fqn} -> {}", edges(implements)));
-        }
-        for (fqn, implemented_by) in &self.member_implemented_by {
-            lines.push(format!("implemented_by {fqn} -> {}", edges(implemented_by)));
-        }
-        for fqn in &self.tracked_methods {
-            lines.push(format!("tracked {fqn}"));
-        }
-        for fqn in &self.unenumerated_methods {
-            lines.push(format!("unenumerated {fqn}"));
-        }
-        lines.push(format!("complete {}", self.enumeration_complete));
-        lines.sort();
-        lines.join("\n")
-    }
-
-    /// [`Self::facts_text`] as one hash, for reporting a whole-workspace
-    /// parity result.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn facts_digest(&self) -> String {
-        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
-            &brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
-                b"bifrost.go.hierarchy.facts.v1",
-                self.facts_text().as_bytes(),
-            ),
-        )
-    }
-}
-
-/// One parsed Go file as the hierarchy build reads it: the shared parse's
-/// source and tree, the file's canonical package, and the packages its
-/// imports bind.
-struct HierarchyFile<'a> {
-    file: &'a ProjectFile,
-    source: &'a str,
-    root: Node<'a>,
-    package_name: String,
-    imports: HashMap<String, Vec<String>>,
-    dot_imports: Vec<String>,
-}
-
-/// The declaration sites one file's single AST walk found.
-///
-/// The build's phases are order dependent -- a type reference resolves only
-/// once every workspace type name is known, and an interface's embedded
-/// element only once the alias table is complete -- so they cannot be merged
-/// into one pass over the workspace. They can share one pass over each
-/// *tree*: this records every phase's nodes as the single walk reaches them,
-/// and each later phase iterates the recorded nodes instead of walking the
-/// file again. Before it, one build walked every workspace AST five times
-/// (#1748).
-#[derive(Default)]
-struct FileSites<'a> {
-    type_specs: Vec<Node<'a>>,
-    type_aliases: Vec<Node<'a>>,
-    method_declarations: Vec<Node<'a>>,
-}
-
-/// One iterative walk of `root`, recording the sites every build phase needs.
-///
-/// A type declaration nests no further declaration site, so the walk stops
-/// there -- exactly where each of the five walks it replaces stopped at its
-/// own kind. A method body can declare a type, so a method is recorded and
-/// the walk keeps descending, which is what the type walks did.
-fn collect_file_sites(root: Node<'_>) -> FileSites<'_> {
-    let mut sites = FileSites::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "type_spec" => {
-                sites.type_specs.push(node);
-                continue;
-            }
-            "type_alias" => {
-                sites.type_aliases.push(node);
-                continue;
-            }
-            "method_declaration" => sites.method_declarations.push(node),
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    sites
 }
 
 struct GoHierarchyBuilder<'a> {
-    index: &'a dyn CodeUnitIndex,
-    /// Every analyzed file's declarations, read in one batch before the
-    /// phases run. `type_unit`, `collect_aliases` and `resolve_member_units`
-    /// each used to ask the store per file, which on a large workspace is
-    /// three whole-workspace sequences of point reads (#1748).
-    declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>>,
+    source: GoGraphSource<'a>,
+    files: Vec<GoFactFile>,
+    owner_by_id: HashMap<(brokk_bifrost_core::analyzer::ProjectFile, GoSourceTypeId), Vec<String>>,
     types: HashMap<String, GoTypeInfo>,
     aliases: HashMap<String, String>,
+    alias_names: HashSet<String>,
     alias_units: HashMap<String, CodeUnit>,
     /// Whether every analyzed Go file was read and parsed. A skipped file can
     /// hold a type that satisfies an interface, so the member family it would
     /// have contributed to is not exhaustive.
     all_files_parsed: bool,
-    /// [`GoPackageIndex::packages_for`] calls the import pass made.
-    #[cfg(any(test, feature = "test-support"))]
-    package_lookups: usize,
-    /// Whole-file AST walks this build ran.
-    #[cfg(any(test, feature = "test-support"))]
-    file_traversals: usize,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
 
 impl<'a> GoHierarchyBuilder<'a> {
-    fn new(index: &'a dyn CodeUnitIndex, all_files_parsed: bool) -> Self {
+    fn new(source: GoGraphSource<'a>) -> Self {
         Self {
-            index,
-            declarations_by_file: HashMap::default(),
+            source,
+            files: Vec::new(),
+            owner_by_id: HashMap::default(),
             types: HashMap::default(),
             aliases: HashMap::default(),
+            alias_names: HashSet::default(),
             alias_units: HashMap::default(),
-            all_files_parsed,
-            #[cfg(any(test, feature = "test-support"))]
-            package_lookups: 0,
-            #[cfg(any(test, feature = "test-support"))]
-            file_traversals: 0,
+            all_files_parsed: true,
             #[cfg(any(test, feature = "test-support"))]
             relations: Vec::new(),
         }
     }
 
-    /// Each phase carries its own span: this build is a whole-workspace pass and
-    /// its cost used to be invisible, so a profile of a large Go scan attributed
-    /// the entire build to the caller's `usages::candidate_discovery` span
-    /// (#1748). The spans are per phase, not per file, so they add one line each
-    /// to a trace rather than one per workspace file.
-    fn collect(&mut self, files: &[HierarchyFile<'_>], sites: &[FileSites<'_>]) {
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::read_declarations");
-            // One batched read of what `CodeUnitIndex::declarations` states
-            // per file. The three phases that asked the store per file --
-            // once per declared type, once per alias, once per method owner --
-            // now read it from memory (#1748).
-            let paths: Vec<ProjectFile> = files.iter().map(|file| file.file.clone()).collect();
-            self.declarations_by_file = self.index.declarations_of_files(&paths);
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::collect_types");
-            self.collect_types(files, sites);
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::collect_type_details");
-            self.collect_type_details(files, sites);
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::collect_methods");
-            self.collect_methods(files, sites);
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::resolve_aliases");
-            self.resolve_aliases();
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::propagate_type_terms");
-            self.propagate_type_terms();
-        }
-        {
-            let _scope =
-                brokk_bifrost_core::profiling::scope("go_hierarchy::promote_embedded_methods");
-            self.promote_embedded_methods();
-        }
-        {
-            let _scope = brokk_bifrost_core::profiling::scope("go_hierarchy::resolve_member_units");
-            self.resolve_member_units(files);
-        }
+    fn collect(&mut self) -> Result<(), GoGraphBuildError> {
+        self.load_facts()?;
+        self.collect_types();
+        self.collect_aliases();
+        self.collect_type_details();
+        self.collect_methods();
+        self.resolve_aliases();
+        self.propagate_type_terms();
+        self.promote_embedded_methods();
+        self.resolve_member_units();
+        Ok(())
     }
 
     fn finish(self) -> GoHierarchyIndex {
@@ -669,294 +422,229 @@ impl<'a> GoHierarchyBuilder<'a> {
             unenumerated_methods,
             enumeration_complete: self.all_files_parsed && pairs_within_cap,
             #[cfg(any(test, feature = "test-support"))]
-            package_lookups: self.package_lookups,
-            #[cfg(any(test, feature = "test-support"))]
-            file_traversals: self.file_traversals,
-            #[cfg(any(test, feature = "test-support"))]
             relations,
         }
     }
 
-    fn collect_types(&mut self, files: &[HierarchyFile<'_>], sites: &[FileSites<'_>]) {
+    fn load_facts(&mut self) -> Result<(), GoGraphBuildError> {
+        let (files, unavailable) =
+            load_go_fact_files(self.source, self.source.index.get_analyzed_files());
+        if !unavailable.is_empty() {
+            return Err(GoGraphBuildError::from_files(unavailable));
+        }
+        self.files = files;
+        // A valid but incomplete publication is retained as an explicitly
+        // unenumerated result. Only a missing/invalid canonical file input
+        // makes construction fail; pair caps and unsupported syntax remain
+        // ordinary hierarchy uncertainty in the returned index.
+        self.all_files_parsed = self.files.iter().all(go_fact_file_is_complete);
+        self.owner_by_id = go_fact_owner_fqns(&self.files);
+        Ok(())
+    }
+
+    fn collect_types(&mut self) {
         let mut discovered = Vec::new();
-        for (file, sites) in files.iter().zip(sites) {
-            for node in &sites.type_specs {
-                if let Some(info) = self.type_skeleton(file, *node) {
-                    discovered.push(info);
+        for file in &self.files {
+            for declaration in &file.facts.facts.declarations {
+                if !declaration.file_scope {
+                    continue;
+                }
+                let kind = match &file.facts.facts.types[declaration.ty.index()].shape {
+                    GoSourceTypeShape::Interface { .. } => GoTypeKind::Interface,
+                    _ => GoTypeKind::Concrete,
+                };
+                for unit in
+                    mounted_units(file, declaration.declaration).filter(|unit| unit.is_class())
+                {
+                    discovered.push((unit, kind));
+                }
+            }
+            // Inline struct/interface containers are owned by the field's
+            // mounted CodeUnit rather than by a type-declaration row. They
+            // still participate in method sets and must retain that owner.
+            for field in &file.facts.facts.fields {
+                let Some(type_id) = field.ty else { continue };
+                let kind = match &file.facts.facts.types[type_id.index()].shape {
+                    GoSourceTypeShape::Interface { .. } => GoTypeKind::Interface,
+                    GoSourceTypeShape::Struct { .. } => GoTypeKind::Concrete,
+                    _ => continue,
+                };
+                for unit in mounted_units(file, field.declaration).filter(|unit| unit.is_field()) {
+                    discovered.push((unit, kind));
                 }
             }
         }
-        for info in discovered {
-            self.types.insert(info.unit.fq_name(), info);
+        for (unit, kind) in discovered {
+            let unit_fqn = unit.fq_name();
+            self.types.entry(unit_fqn).or_insert_with(|| GoTypeInfo {
+                method_set: MethodSet::new(unit.clone()),
+                pointer_method_set: MethodSet::new(unit.clone()),
+                own_method_names: HashSet::default(),
+                declared_methods: Vec::new(),
+                method_units: HashMap::default(),
+                unit,
+                kind,
+                embedded: Vec::new(),
+                alias_target: None,
+                has_type_terms: false,
+            });
         }
     }
 
-    fn type_skeleton(&self, file: &HierarchyFile<'_>, node: Node<'_>) -> Option<GoTypeInfo> {
-        let name_node = node.child_by_field_name("name")?;
-        let type_node = node.child_by_field_name("type")?;
-        let name = go_node_text(name_node, file.source).trim();
-        if name.is_empty() {
-            return None;
-        }
-        let unit = self.type_unit(file.file, &file.package_name, name)?;
-        let kind = if type_node.kind() == "interface_type" {
-            GoTypeKind::Interface
-        } else {
-            GoTypeKind::Concrete
-        };
-        Some(GoTypeInfo {
-            method_set: MethodSet::new(unit.clone()),
-            pointer_method_set: MethodSet::new(unit.clone()),
-            own_method_names: HashSet::default(),
-            declared_methods: Vec::new(),
-            method_units: HashMap::default(),
-            unit,
-            kind,
-            embedded: Vec::new(),
-            alias_target: None,
-            has_type_terms: false,
-        })
+    fn type_owner_fqns(&self, file: &GoFactFile, id: GoSourceTypeId) -> Vec<String> {
+        self.owner_by_id
+            .get(&(file.file.clone(), id))
+            .cloned()
+            .unwrap_or_default()
     }
 
-    fn collect_type_details(&mut self, files: &[HierarchyFile<'_>], sites: &[FileSites<'_>]) {
-        self.collect_aliases(files, sites);
-        let mut embedded_by_type: HashMap<String, Vec<EmbeddedType>> = HashMap::default();
-        let mut methods_by_type: HashMap<String, Vec<DeclaredMethod>> = HashMap::default();
-        let mut has_type_terms = HashSet::default();
-
-        for (file, sites) in files.iter().zip(sites) {
-            for node in &sites.type_specs {
-                let Some(name_node) = node.child_by_field_name("name") else {
+    fn collect_type_details(&mut self) {
+        let files = self.files.iter().collect::<Vec<_>>();
+        for file in files {
+            for field in &file.facts.facts.fields {
+                if !field.embedded {
+                    continue;
+                }
+                let owners = self.type_owner_fqns(file, field.owner);
+                let Some(type_id) = field.ty else {
+                    self.all_files_parsed = false;
                     continue;
                 };
-                let Some(type_node) = node.child_by_field_name("type") else {
+                let target = match self.resolve_type_id_status(file, type_id) {
+                    NominalTypeResolution::Resolved(target) => target,
+                    // A predeclared or external embedded type has no
+                    // workspace method set to project. It is valid evidence,
+                    // not a missing file that should truncate unrelated
+                    // families.
+                    NominalTypeResolution::ExternalOrPredeclared
+                    | NominalTypeResolution::Unsupported => {
+                        continue;
+                    }
+                    NominalTypeResolution::Ambiguous | NominalTypeResolution::Unresolved => {
+                        self.all_files_parsed = false;
+                        continue;
+                    }
+                };
+                let target = resolve_alias_fqn(&self.aliases, &target);
+                let pointer = field
+                    .ty
+                    .is_some_and(|id| self.receiver_is_pointer(file, id));
+                for owner in owners {
+                    if self.types.contains_key(&target)
+                        && let Some(info) = self.types.get_mut(&owner)
+                    {
+                        info.embedded.push(EmbeddedType {
+                            fqn: target.clone(),
+                            pointer,
+                        });
+                    }
+                }
+            }
+            for embedding in &file.facts.facts.embeddings {
+                let owners = self.type_owner_fqns(file, embedding.owner);
+                let target = self
+                    .resolve_type_id(file, embedding.ty)
+                    .map(|target| resolve_alias_fqn(&self.aliases, &target));
+                for owner in owners {
+                    if let Some(target) = target.as_ref().and_then(|target| {
+                        self.types
+                            .get(target)
+                            .filter(|info| info.kind == GoTypeKind::Interface)
+                            .map(|_| target.clone())
+                    }) {
+                        if let Some(info) = self.types.get_mut(&owner) {
+                            info.embedded.push(EmbeddedType {
+                                fqn: target,
+                                pointer: false,
+                            });
+                        }
+                    } else if !self.is_empty_interface(file, embedding.ty)
+                        && let Some(info) = self.types.get_mut(&owner)
+                    {
+                        info.has_type_terms = true;
+                    }
+                }
+            }
+            for callable in &file.facts.facts.callables {
+                let Some(owner) = callable.owner else {
                     continue;
                 };
-                let name = go_node_text(name_node, file.source).trim();
-                let fqn = format!("{}.{name}", file.package_name);
-                match type_node.kind() {
-                    "interface_type" => {
-                        let mut embedded = Vec::new();
-                        let mut methods = Vec::new();
-                        self.collect_interface_details(
-                            file,
-                            type_node,
-                            &mut embedded,
-                            &mut methods,
-                            &mut has_type_terms,
-                        );
-                        embedded_by_type.insert(fqn.clone(), embedded);
-                        methods_by_type.insert(fqn, methods);
+                let Some(method) = self.method_key(file, callable) else {
+                    self.all_files_parsed = false;
+                    continue;
+                };
+                for owner_fqn in self.type_owner_fqns(file, owner) {
+                    if let Some(info) = self.types.get_mut(&owner_fqn) {
+                        info.method_set.insert(method.key.clone());
+                        info.declared_methods.push(method.clone());
                     }
-                    "struct_type" => {
-                        let embedded = embedded_type_refs(type_node)
-                            .filter_map(|embedded| {
-                                self.resolve_type_node(file, embedded.node).map(|fqn| {
-                                    EmbeddedType {
-                                        fqn,
-                                        pointer: embedded.pointer,
-                                    }
-                                })
-                            })
-                            .collect();
-                        embedded_by_type.insert(fqn, embedded);
-                    }
-                    _ => {}
                 }
             }
         }
+    }
 
-        for (fqn, embedded) in embedded_by_type {
-            if let Some(info) = self.types.get_mut(&fqn) {
-                info.embedded.extend(embedded);
+    fn collect_aliases(&mut self) {
+        for file in &self.files {
+            for alias in &file.facts.facts.aliases {
+                let alias_fqn = format!("{}.{}", file.package_name, alias.name);
+                self.alias_names.insert(alias_fqn.clone());
+                if let Some(unit) =
+                    mounted_units(file, alias.declaration).find(|unit| unit.is_field())
+                {
+                    self.alias_units.insert(alias_fqn, unit);
+                }
             }
         }
-        for (fqn, methods) in methods_by_type {
-            if let Some(info) = self.types.get_mut(&fqn) {
-                for method in methods {
-                    info.method_set.insert(method.key.clone());
+        for file in &self.files {
+            for alias in &file.facts.facts.aliases {
+                let alias_fqn = format!("{}.{}", file.package_name, alias.name);
+                let Some(target) = alias.target else {
+                    continue;
+                };
+                match self.resolve_type_id_status(file, target) {
+                    NominalTypeResolution::Resolved(target) => {
+                        self.aliases.insert(alias_fqn, target);
+                    }
+                    NominalTypeResolution::Ambiguous | NominalTypeResolution::Unresolved => {
+                        // A workspace name with multiple canonical import
+                        // candidates is unresolved evidence, not an empty
+                        // alias relation. Keep unrelated method families
+                        // honest by downgrading this hierarchy pass.
+                        self.all_files_parsed = false;
+                    }
+                    NominalTypeResolution::ExternalOrPredeclared
+                    | NominalTypeResolution::Unsupported => {}
+                }
+            }
+        }
+    }
+
+    fn collect_methods(&mut self) {
+        for file in &self.files {
+            for callable in &file.facts.facts.callables {
+                let Some(receiver) = callable.receiver else {
+                    continue;
+                };
+                let Some(method) = self.method_key(file, callable) else {
+                    self.all_files_parsed = false;
+                    continue;
+                };
+                let Some(receiver_fqn) = self.resolve_type_id(file, receiver) else {
+                    self.all_files_parsed = false;
+                    continue;
+                };
+                let pointer_receiver = self.receiver_is_pointer(file, receiver);
+                if let Some(info) = self.types.get_mut(&receiver_fqn) {
+                    if pointer_receiver {
+                        info.pointer_method_set.insert(method.key.clone());
+                    } else {
+                        info.own_method_names.insert(method.key.name.clone());
+                        info.method_set.insert(method.key.clone());
+                    }
                     info.declared_methods.push(method);
                 }
             }
         }
-        for fqn in has_type_terms {
-            if let Some(info) = self.types.get_mut(&fqn) {
-                info.has_type_terms = true;
-            }
-        }
-    }
-
-    fn collect_aliases(&mut self, files: &[HierarchyFile<'_>], sites: &[FileSites<'_>]) {
-        // An alias names a workspace definition rather than a declaration of
-        // its own file: `type Rusage = syscall.Rusage` in one build-tagged
-        // file resolves to the `Rusage` its sibling file declares. That is the
-        // one lookup this build still puts to the definition index, so the
-        // alias names go as one batch (the batch that used to carry every
-        // declared type as well, #1748) and each alias then costs no read.
-        let mut alias_fq_names: Vec<String> = files
-            .iter()
-            .zip(sites)
-            .flat_map(|(file, sites)| {
-                sites.type_aliases.iter().filter_map(move |node| {
-                    let name_node = node.child_by_field_name("name")?;
-                    let name = go_node_text(name_node, file.source).trim();
-                    (!name.is_empty()).then(|| format!("{}.{name}", file.package_name))
-                })
-            })
-            .collect();
-        alias_fq_names.sort();
-        alias_fq_names.dedup();
-        self.index.prefetch_definitions(&alias_fq_names);
-
-        let mut aliases = HashMap::default();
-        let mut alias_units = HashMap::default();
-        for (file, sites) in files.iter().zip(sites) {
-            for node in &sites.type_aliases {
-                let Some(name_node) = node.child_by_field_name("name") else {
-                    continue;
-                };
-                let Some(type_node) = node.child_by_field_name("type") else {
-                    continue;
-                };
-                let name = go_node_text(name_node, file.source).trim();
-                let alias_fqn = format!("{}.{name}", file.package_name);
-                if let Some(target) = self.resolve_type_node(file, type_node) {
-                    aliases.insert(alias_fqn.clone(), target);
-                }
-                let alias_unit = self.index.definitions(&alias_fqn).next();
-                let alias_unit = alias_unit
-                    .or_else(|| self.declared_unit(file.file, |unit| unit.identifier() == name));
-                if let Some(unit) = alias_unit {
-                    alias_units.insert(alias_fqn, unit);
-                }
-            }
-        }
-        self.aliases.extend(aliases);
-        self.alias_units.extend(alias_units);
-    }
-
-    /// The first declaration of `file` that satisfies `predicate`, in the
-    /// order [`CodeUnitIndex::declarations`] reports.
-    ///
-    /// The declarations come from the one batched workspace read this build
-    /// makes, so a type or alias name costs a hash probe and a scan of its own
-    /// file's declarations rather than a store lookup (#1748).
-    fn declared_unit(
-        &self,
-        file: &ProjectFile,
-        predicate: impl Fn(&CodeUnit) -> bool,
-    ) -> Option<CodeUnit> {
-        self.declarations_by_file
-            .get(file)?
-            .iter()
-            .find(|unit| predicate(unit))
-            .cloned()
-    }
-
-    fn collect_interface_details(
-        &self,
-        file: &HierarchyFile<'_>,
-        node: Node<'_>,
-        embedded: &mut Vec<EmbeddedType>,
-        methods: &mut Vec<DeclaredMethod>,
-        has_type_terms: &mut HashSet<String>,
-    ) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "method_elem" => {
-                    if let Some(method) = method_key(child, file.source, &file.package_name, |ty| {
-                        self.type_token(file, ty)
-                    }) {
-                        methods.push(method);
-                    }
-                }
-                "type_elem" => {
-                    let mut type_cursor = child.walk();
-                    for type_child in child.named_children(&mut type_cursor) {
-                        if let Some(target) = self.resolve_type_node(file, type_child) {
-                            let target = resolve_alias_fqn(&self.aliases, &target);
-                            if self
-                                .types
-                                .get(&target)
-                                .is_some_and(|info| info.kind == GoTypeKind::Interface)
-                            {
-                                embedded.push(EmbeddedType {
-                                    fqn: target,
-                                    pointer: false,
-                                });
-                            } else if let Some(name_node) = node
-                                .parent()
-                                .and_then(|parent| parent.child_by_field_name("name"))
-                            {
-                                if is_empty_interface_embed(type_child, file.source) {
-                                    continue;
-                                }
-                                has_type_terms.insert(format!(
-                                    "{}.{}",
-                                    file.package_name,
-                                    go_node_text(name_node, file.source).trim()
-                                ));
-                            }
-                        } else if let Some(name_node) = node
-                            .parent()
-                            .and_then(|parent| parent.child_by_field_name("name"))
-                        {
-                            if is_empty_interface_embed(type_child, file.source) {
-                                continue;
-                            }
-                            has_type_terms.insert(format!(
-                                "{}.{}",
-                                file.package_name,
-                                go_node_text(name_node, file.source).trim()
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn collect_methods(&mut self, files: &[HierarchyFile<'_>], sites: &[FileSites<'_>]) {
-        let mut additions: Vec<(String, bool, DeclaredMethod)> = Vec::new();
-        for (file, sites) in files.iter().zip(sites) {
-            for node in &sites.method_declarations {
-                if let Some((receiver, pointer_receiver, method)) =
-                    self.method_declaration(file, *node)
-                {
-                    additions.push((receiver, pointer_receiver, method));
-                }
-            }
-        }
-        for (receiver, pointer_receiver, method) in additions {
-            if let Some(info) = self.types.get_mut(&receiver)
-                && info.kind == GoTypeKind::Concrete
-            {
-                if pointer_receiver {
-                    info.pointer_method_set.insert(method.key.clone());
-                } else {
-                    info.own_method_names.insert(method.key.name.clone());
-                    info.method_set.insert(method.key.clone());
-                }
-                info.declared_methods.push(method);
-            }
-        }
-    }
-
-    fn method_declaration(
-        &self,
-        file: &HierarchyFile<'_>,
-        node: Node<'_>,
-    ) -> Option<(String, bool, DeclaredMethod)> {
-        let receiver = node.child_by_field_name("receiver")?;
-        let receiver_type = receiver_type_node(receiver)?;
-        let pointer_receiver = receiver_type.kind() == "pointer_type";
-        let receiver_fqn = self.resolve_type_node(file, receiver_type)?;
-        let method = method_key(node, file.source, &file.package_name, |ty| {
-            self.type_token(file, ty)
-        })?;
-        Some((receiver_fqn, pointer_receiver, method))
     }
 
     /// Join every declared method key to the `CodeUnit` the analyzer recorded
@@ -969,24 +657,42 @@ impl<'a> GoHierarchyBuilder<'a> {
     /// another. Go has no method overloading, so an owner and an identifier
     /// name at most one method, and the key that decides satisfaction is
     /// carried alongside rather than rebuilt from the unit.
-    fn resolve_member_units(&mut self, files: &[HierarchyFile<'_>]) {
+    fn resolve_member_units(&mut self) {
         let mut by_owner: HashMap<(String, String), CodeUnit> = HashMap::default();
-        for file in files {
-            let Some(declarations) = self.declarations_by_file.get(file.file) else {
-                continue;
-            };
-            for unit in declarations {
-                if !unit.is_function() {
-                    continue;
-                }
-                let Some(owner) = unit.owner_identifier() else {
+        for file in &self.files {
+            for callable in &file.facts.facts.callables {
+                let Some(owner_id) = callable.receiver.or(callable.owner) else {
                     continue;
                 };
-                let key = (
-                    format!("{}.{owner}", file.package_name),
-                    unit.identifier().to_string(),
-                );
-                by_owner.entry(key).or_insert_with(|| unit.clone());
+                let owners = callable
+                    .receiver
+                    .and_then(|id| self.resolve_type_id(file, id))
+                    .into_iter()
+                    .chain(
+                        callable
+                            .receiver
+                            .is_none()
+                            .then(|| self.type_owner_fqns(file, owner_id))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .collect::<Vec<_>>();
+                if owners.is_empty() {
+                    continue;
+                }
+                for unit in
+                    mounted_units(file, callable.declaration).filter(|unit| unit.is_function())
+                {
+                    let Some(owner) = go_unit_parent_fqn(&unit) else {
+                        continue;
+                    };
+                    if !owners.iter().any(|candidate| candidate == &owner) {
+                        continue;
+                    }
+                    by_owner
+                        .entry((owner, callable.name.clone()))
+                        .or_insert(unit);
+                }
             }
         }
         let resolved: Vec<(String, HashMap<MethodKey, CodeUnit>)> = self
@@ -1050,452 +756,369 @@ impl<'a> GoHierarchyBuilder<'a> {
         }
     }
 
-    /// Promotion reads the pre-promotion method sets of every type and writes
-    /// only the promoting type's own set, so no read can observe a write: the
-    /// promotions are computed against the borrowed map first and applied
-    /// after. The pass used to deep-clone the whole `types` map to get that
-    /// separation, which on a large workspace copies every method set and
-    /// `CodeUnit` in it (#1748).
     fn promote_embedded_methods(&mut self) {
-        let mut promotions: Vec<(String, MethodSet)> = Vec::with_capacity(self.types.len());
-        #[cfg(any(test, feature = "test-support"))]
-        let mut embedding_relations = Vec::new();
-        for (fqn, original) in &self.types {
-            let promoted = match original.kind {
-                GoTypeKind::Interface => {
-                    interface_promoted_methods(&self.types, &original.embedded)
-                }
-                GoTypeKind::Concrete => struct_promoted_methods(&self.types, original),
+        let snapshot = self.types.clone();
+        let keys: Vec<_> = self.types.keys().cloned().collect();
+        for fqn in keys {
+            let Some(original) = snapshot.get(&fqn) else {
+                continue;
             };
-            promotions.push((fqn.clone(), promoted));
+            let promoted = match original.kind {
+                GoTypeKind::Interface => interface_promoted_methods(&snapshot, &original.embedded),
+                GoTypeKind::Concrete => struct_promoted_methods(&snapshot, original),
+            };
+            let Some(info) = self.types.get_mut(&fqn) else {
+                continue;
+            };
+            info.method_set.extend(&promoted);
             #[cfg(any(test, feature = "test-support"))]
             for embedded in &original.embedded {
                 if let Some(embedded_unit) =
-                    self.types.get(&embedded.fqn).map(|info| info.unit.clone())
+                    snapshot.get(&embedded.fqn).map(|info| info.unit.clone())
                 {
-                    embedding_relations.push(TypeRelation {
-                        from: original.unit.clone(),
+                    self.relations.push(TypeRelation {
+                        from: info.unit.clone(),
                         to: embedded_unit,
                         kind: TypeRelationKind::Embedding,
                     });
                 }
             }
         }
-        for (fqn, promoted) in promotions {
-            let Some(info) = self.types.get_mut(&fqn) else {
-                continue;
-            };
-            info.method_set.extend(&promoted);
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.relations.extend(embedding_relations);
     }
 
-    fn resolve_type_node(&self, file: &HierarchyFile<'_>, node: Node<'_>) -> Option<String> {
-        let reference = type_ref_node(node)?;
-        match reference.kind() {
-            "qualified_type" => {
-                let qualifier = reference.child_by_field_name("package")?;
-                let name = reference.child_by_field_name("name")?;
-                let qualifier = go_node_text(qualifier, file.source).trim();
-                let name = go_node_text(name, file.source).trim();
-                file.imports.get(qualifier)?.iter().find_map(|package| {
-                    let candidate = format!("{package}.{name}");
-                    (self.types.contains_key(&candidate) || self.aliases.contains_key(&candidate))
-                        .then_some(candidate)
-                })
+    fn resolve_type_id(&self, file: &GoFactFile, id: GoSourceTypeId) -> Option<String> {
+        match self.resolve_type_id_status(file, id) {
+            NominalTypeResolution::Resolved(fqn) => Some(fqn),
+            NominalTypeResolution::Ambiguous
+            | NominalTypeResolution::ExternalOrPredeclared
+            | NominalTypeResolution::Unresolved
+            | NominalTypeResolution::Unsupported => None,
+        }
+    }
+
+    fn resolve_type_id_status(
+        &self,
+        file: &GoFactFile,
+        id: GoSourceTypeId,
+    ) -> NominalTypeResolution {
+        let mut current = id;
+        let mut seen = HashSet::default();
+        loop {
+            if !seen.insert(current) {
+                return NominalTypeResolution::Unresolved;
             }
-            "type_identifier" | "identifier" => {
-                let name = go_node_text(reference, file.source).trim();
-                if name == "any" {
-                    return None;
+            match &file.facts.facts.types[current.index()].shape {
+                GoSourceTypeShape::Named(name) => {
+                    let path = name.path();
+                    let Some(member) = path.last() else {
+                        return NominalTypeResolution::Unresolved;
+                    };
+                    if path.len() == 1 {
+                        let candidate = format!("{}.{}", file.package_name, member);
+                        if self.types.contains_key(&candidate)
+                            || self.alias_names.contains(&candidate)
+                        {
+                            return NominalTypeResolution::Resolved(candidate);
+                        }
+                        let imported_package_count =
+                            file.dot_imports.len() + file.dot_external_imports.len();
+                        if imported_package_count > 1 {
+                            return NominalTypeResolution::Ambiguous;
+                        }
+                        if imported_package_count == 0 {
+                            return if is_predeclared_go_type(member) {
+                                NominalTypeResolution::ExternalOrPredeclared
+                            } else {
+                                NominalTypeResolution::Unresolved
+                            };
+                        }
+                        let mut candidates: Vec<_> = file
+                            .dot_imports
+                            .iter()
+                            .map(|package| format!("{package}.{member}"))
+                            .filter(|candidate| {
+                                self.types.contains_key(candidate)
+                                    || self.alias_names.contains(candidate)
+                            })
+                            .collect();
+                        candidates.sort_unstable();
+                        candidates.dedup();
+                        return match candidates.len() {
+                            0 if !file.dot_external_imports.is_empty() => {
+                                NominalTypeResolution::ExternalOrPredeclared
+                            }
+                            0 => NominalTypeResolution::Unresolved,
+                            1 => NominalTypeResolution::Resolved(
+                                candidates.pop().expect("one candidate"),
+                            ),
+                            _ => NominalTypeResolution::Ambiguous,
+                        };
+                    }
+                    if path.len() != 2 {
+                        return NominalTypeResolution::Unsupported;
+                    }
+                    let Some(qualifier) = path.first() else {
+                        return NominalTypeResolution::Unresolved;
+                    };
+                    let imported_package_count = file.imports.get(qualifier).map_or(0, Vec::len)
+                        + file.external_imports.get(qualifier).map_or(0, Vec::len);
+                    if imported_package_count > 1 {
+                        return NominalTypeResolution::Ambiguous;
+                    }
+                    if imported_package_count == 0 {
+                        return NominalTypeResolution::Unresolved;
+                    }
+                    let mut candidates: Vec<_> = file
+                        .imports
+                        .get(qualifier)
+                        .into_iter()
+                        .flatten()
+                        .map(|package| format!("{package}.{member}"))
+                        .filter(|candidate| {
+                            self.types.contains_key(candidate)
+                                || self.alias_names.contains(candidate)
+                        })
+                        .collect();
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    return match candidates.len() {
+                        0 if file
+                            .external_imports
+                            .get(qualifier)
+                            .is_some_and(|packages| !packages.is_empty()) =>
+                        {
+                            NominalTypeResolution::ExternalOrPredeclared
+                        }
+                        0 => NominalTypeResolution::Unresolved,
+                        1 => NominalTypeResolution::Resolved(
+                            candidates.pop().expect("one candidate"),
+                        ),
+                        _ => NominalTypeResolution::Ambiguous,
+                    };
                 }
-                let same_package = format!("{}.{name}", file.package_name);
-                if self.types.contains_key(&same_package)
-                    || self.aliases.contains_key(&same_package)
+                GoSourceTypeShape::Pointer(inner) | GoSourceTypeShape::Negated(inner) => {
+                    current = *inner
+                }
+                GoSourceTypeShape::Generic { base, .. } => current = *base,
+                GoSourceTypeShape::Compound {
+                    kind: GoTypeCompoundKind::Parenthesized | GoTypeCompoundKind::Element,
+                    children,
+                } if children.len() == 1 => current = children[0],
+                _ => return NominalTypeResolution::Unsupported,
+            }
+        }
+    }
+
+    fn is_empty_interface(&self, file: &GoFactFile, id: GoSourceTypeId) -> bool {
+        let mut current = id;
+        let mut seen = HashSet::default();
+        loop {
+            if !seen.insert(current) {
+                return false;
+            }
+            match &file.facts.facts.types[current.index()].shape {
+                GoSourceTypeShape::Named(name)
+                    if name.path().len() == 1 && name.path()[0] == "any" =>
                 {
-                    return Some(same_package);
+                    return true;
                 }
-                file.dot_imports
-                    .iter()
-                    .map(|package| format!("{package}.{name}"))
-                    .find(|candidate| {
-                        self.types.contains_key(candidate) || self.aliases.contains_key(candidate)
-                    })
+                GoSourceTypeShape::Interface {
+                    has_named_children: false,
+                    ..
+                } => return true,
+                GoSourceTypeShape::Compound {
+                    kind: GoTypeCompoundKind::Parenthesized | GoTypeCompoundKind::Element,
+                    children,
+                } if children.len() == 1 => current = children[0],
+                _ => return false,
             }
-            _ => None,
         }
     }
 
-    fn type_token(&self, file: &HierarchyFile<'_>, node: Node<'_>) -> String {
-        match node.kind() {
-            "qualified_type" => self
-                .resolve_type_node(file, node)
-                .map(|fqn| resolve_alias_fqn(&self.aliases, &fqn))
-                .or_else(|| external_qualified_type_token(file, node))
-                .unwrap_or_else(|| go_node_text(node, file.source).trim().to_string()),
-            "type_identifier" | "identifier" => self
-                .resolve_type_node(file, node)
-                .map(|fqn| resolve_alias_fqn(&self.aliases, &fqn))
-                .unwrap_or_else(|| {
-                    let name = go_node_text(node, file.source).trim();
-                    if is_predeclared_go_type(name) {
-                        name.to_string()
-                    } else {
-                        format!("{}.{name}", file.package_name)
-                    }
-                }),
-            "pointer_type" => node
-                .named_child(0)
-                .map(|child| format!("*{}", self.type_token(file, child)))
-                .unwrap_or_else(|| go_node_text(node, file.source).trim().to_string()),
-            "slice_type" => node
-                .named_child(0)
-                .map(|child| format!("[]{}", self.type_token(file, child)))
-                .unwrap_or_else(|| go_node_text(node, file.source).trim().to_string()),
-            "array_type" => {
-                let length = node
-                    .child_by_field_name("length")
-                    .map(|child| go_node_text(child, file.source).trim().to_string())
-                    .unwrap_or_default();
-                let element = node
-                    .child_by_field_name("element")
-                    .map(|child| self.type_token(file, child))
-                    .unwrap_or_default();
-                format!("[{length}]{element}")
-            }
-            "map_type" => {
-                let key = node
-                    .child_by_field_name("key")
-                    .map(|child| self.type_token(file, child))
-                    .unwrap_or_default();
-                let value = node
-                    .child_by_field_name("value")
-                    .map(|child| self.type_token(file, child))
-                    .unwrap_or_default();
-                format!("map[{key}]{value}")
-            }
-            "channel_type" => {
-                let direction = channel_direction(node);
-                let value = node
-                    .named_child(0)
-                    .map(|child| self.type_token(file, child))
-                    .unwrap_or_else(|| go_node_text(node, file.source).trim().to_string());
-                format!("{direction}{value}")
-            }
-            "generic_type" => {
-                let mut cursor = node.walk();
-                let parts: Vec<_> = node
-                    .named_children(&mut cursor)
-                    .map(|child| self.type_token(file, child))
-                    .collect();
-                parts.join("[")
-            }
-            "type_elem" | "type_constraint" | "parenthesized_type" => {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .map(|child| self.type_token(file, child))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            }
-            "negated_type" => node
-                .named_child(0)
-                .map(|child| format!("~{}", self.type_token(file, child)))
-                .unwrap_or_else(|| go_node_text(node, file.source).trim().to_string()),
-            _ => go_node_text(node, file.source).trim().to_string(),
+    fn receiver_is_pointer(&self, file: &GoFactFile, id: GoSourceTypeId) -> bool {
+        matches!(
+            &file.facts.facts.types[id.index()].shape,
+            GoSourceTypeShape::Pointer(_)
+        )
+    }
+
+    fn type_token(&self, file: &GoFactFile, id: GoSourceTypeId) -> Option<String> {
+        // Render directly into one buffer. Source type depth is unbounded;
+        // recursive calls and a full String for every nested wrapper are not.
+        enum Part<'a> {
+            Type(GoSourceTypeId),
+            Text(&'a str),
         }
-    }
-
-    /// The `CodeUnit` the analyzer recorded for a type declared in `file`.
-    ///
-    /// Both arms read the file's own declarations. The persisted definition
-    /// this used to ask the store for is one of them -- a definition named
-    /// `package_name.name` whose source is this file is a declaration of this
-    /// file -- so the fully-qualified arm keeps its precedence over the
-    /// terminal-name arm without a lookup per declared type, and the batch of
-    /// definition lookups that fed it is gone (#1748).
-    fn type_unit(&self, file: &ProjectFile, package_name: &str, name: &str) -> Option<CodeUnit> {
-        let fqn = format!("{package_name}.{name}");
-        self.declared_unit(file, |unit| unit.is_class() && unit.fq_name() == fqn)
-            .or_else(|| {
-                self.declared_unit(file, |unit| unit.is_class() && unit.identifier() == name)
-            })
-    }
-}
-
-/// The workspace package table, keyed by every import path spelling that can
-/// bind to a file, so [`import_packages`] costs one hash probe per import
-/// instead of a scan of every workspace file (#1748: 48.6% of the samples in a
-/// warm `scan_usages_by_reference` on kubernetes were that scan).
-///
-/// The scan this replaces accepted a candidate when the candidate's canonical
-/// package equalled the import path, or when the import path was a trailing
-/// component sequence of the candidate's parent directory. The second rule is
-/// exactly "the import path is one of [`path_suffixes`] of the candidate's
-/// [`parent_path_key`]", so those suffixes are the keys and the package name
-/// is one more key. The rule is a disjunction, so a single bucket per spelling
-/// reproduces it exactly, and no separate predicate function is left that
-/// could drift away from the keys.
-struct GoPackageIndex {
-    /// `(file, canonical package)` for every parsed file, in the order the
-    /// scan visited them.
-    entries: Vec<(ProjectFile, String)>,
-    /// Import path spelling -> the `entries` positions that spelling binds.
-    by_import_path: HashMap<String, Vec<usize>>,
-    /// Counts [`Self::packages_for`] calls so a test can pin that resolution
-    /// stays one probe per import.
-    #[cfg(any(test, feature = "test-support"))]
-    lookups: std::cell::Cell<usize>,
-}
-
-impl GoPackageIndex {
-    fn new(entries: Vec<(ProjectFile, String)>) -> Self {
-        let mut by_import_path: HashMap<String, Vec<usize>> = HashMap::default();
-        for (position, (file, package)) in entries.iter().enumerate() {
-            // Positions arrive in increasing order, so the only position a
-            // bucket can already end with is this one. That happens whenever a
-            // file's package name is also a suffix of its own directory, the
-            // normal shape under a `go.mod`.
-            let mut bind = |key: &str| {
-                let bucket = by_import_path.entry(key.to_string()).or_default();
-                if bucket.last() != Some(&position) {
-                    bucket.push(position);
+        let mut pending = vec![Part::Type(id)];
+        let mut output = String::new();
+        while let Some(part) = pending.pop() {
+            let current = match part {
+                Part::Text(text) => {
+                    output.push_str(text);
+                    continue;
                 }
+                Part::Type(current) => current,
             };
-            bind(package);
-            for suffix in path_suffixes(&parent_path_key(file)) {
-                bind(suffix);
-            }
-        }
-        Self {
-            entries,
-            by_import_path,
-            #[cfg(any(test, feature = "test-support"))]
-            lookups: std::cell::Cell::new(0),
-        }
-    }
-
-    /// Every canonical package an `import "import_path"` written in `file`
-    /// binds, sorted and deduplicated. A file never answers its own import.
-    fn packages_for(&self, file: &ProjectFile, import_path: &str) -> Vec<String> {
-        #[cfg(any(test, feature = "test-support"))]
-        self.lookups.set(self.lookups.get() + 1);
-        let mut packages: Vec<String> = self
-            .by_import_path
-            .get(import_path)
-            .into_iter()
-            .flatten()
-            .map(|position| &self.entries[*position])
-            .filter(|(candidate, _package)| candidate != file)
-            .map(|(_candidate, package)| package.clone())
-            .collect();
-        packages.sort();
-        packages.dedup();
-        packages
-    }
-}
-
-fn import_packages(
-    token: QueryToken<'_>,
-    imports: &dyn ImportAnalysisProvider,
-    file: &ProjectFile,
-    package_index: &GoPackageIndex,
-    declared_names: &HashMap<String, String>,
-) -> (HashMap<String, Vec<String>>, Vec<String>) {
-    let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
-    let mut dot_imports = Vec::new();
-    for import in imports.import_info_of(token, file) {
-        let alias = import.alias.as_deref();
-        if alias == Some("_") {
-            continue;
-        }
-        let Some(path) = go_import_path(&import) else {
-            continue;
-        };
-        let mut packages = package_index.packages_for(file, &path);
-        if packages.is_empty() {
-            // Nothing in the workspace declares this package: keep the source
-            // spelling so callers can still report an import boundary.
-            packages.push(path.clone());
-        }
-        match alias {
-            Some(".") => dot_imports.extend(packages),
-            Some(alias) => by_alias
-                .entry(alias.to_string())
-                .or_default()
-                .extend(packages),
-            None => {
-                for package in packages {
-                    let local = declared_names
-                        .get(&package)
-                        .cloned()
-                        .unwrap_or_else(|| default_go_import_local_name(&package));
-                    by_alias.entry(local).or_default().push(package);
+            match &file.facts.facts.types[current.index()].shape {
+                GoSourceTypeShape::Named(name) => {
+                    let token = {
+                        let path = name.path();
+                        let member = path.last()?;
+                        let candidate = self.resolve_type_id(file, current);
+                        if let Some(candidate) = candidate {
+                            resolve_alias_fqn(&self.aliases, &candidate)
+                        } else {
+                            let package = if path.len() == 1 {
+                                let mut packages = file
+                                    .dot_imports
+                                    .iter()
+                                    .chain(file.dot_external_imports.iter());
+                                let package = packages.next();
+                                (packages.next().is_none()).then_some(package).flatten()
+                            } else if path.len() == 2 {
+                                let qualifier = &path[0];
+                                let mut packages =
+                                    file.imports.get(qualifier).into_iter().flatten().chain(
+                                        file.external_imports.get(qualifier).into_iter().flatten(),
+                                    );
+                                let package = packages.next();
+                                (packages.next().is_none()).then_some(package).flatten()
+                            } else {
+                                None
+                            };
+                            if let Some(package) = package {
+                                format!("{package}.{member}")
+                            } else if path.len() == 1
+                                && file.dot_imports.is_empty()
+                                && file.dot_external_imports.is_empty()
+                                && is_predeclared_go_type(member)
+                            {
+                                member.clone()
+                            } else if path.len() == 1
+                                && file.dot_imports.is_empty()
+                                && file.dot_external_imports.is_empty()
+                            {
+                                // Preserve the established package-scoped
+                                // token for an unresolved local name. This is
+                                // not an import fallback: any present dot
+                                // binding must be unique and known above.
+                                format!("{}.{}", file.package_name, member)
+                            } else {
+                                return None;
+                            }
+                        }
+                    };
+                    output.push_str(&token);
                 }
-            }
-        }
-    }
-    for packages in by_alias.values_mut() {
-        packages.sort();
-        packages.dedup();
-    }
-    dot_imports.sort();
-    dot_imports.dedup();
-    (by_alias, dot_imports)
-}
-
-fn method_key(
-    node: Node<'_>,
-    source: &str,
-    package_name: &str,
-    mut type_token: impl FnMut(Node<'_>) -> String,
-) -> Option<DeclaredMethod> {
-    let name_node = node.child_by_field_name("name")?;
-    let identifier = go_node_text(name_node, source).trim();
-    if identifier.is_empty() {
-        return None;
-    }
-    let identifier = identifier.to_string();
-    let name = if go_identifier_is_exported(&identifier) {
-        identifier.clone()
-    } else {
-        format!("{package_name}.{identifier}")
-    };
-    let mut tokens = Vec::new();
-    if let Some(parameters) = node.child_by_field_name("parameters") {
-        tokens.push(format!(
-            "params({})",
-            parameter_type_tokens(parameters, &mut type_token).join(",")
-        ));
-    }
-    if let Some(result) = node.child_by_field_name("result") {
-        let result_types = if result.kind() == "parameter_list" {
-            parameter_type_tokens(result, &mut type_token)
-        } else {
-            vec![type_token(result)]
-        };
-        tokens.push(format!("results({})", result_types.join(",")));
-    }
-    Some(DeclaredMethod {
-        key: MethodKey::new(name, Some(tokens.join(" "))),
-        identifier,
-    })
-}
-
-fn parameter_type_tokens(
-    node: Node<'_>,
-    type_token: &mut impl FnMut(Node<'_>) -> String,
-) -> Vec<String> {
-    let mut types = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "parameter_declaration" => {
-                let Some(ty) = parameter_type_node(child) else {
-                    continue;
-                };
-                let token = type_token(ty);
-                let count = parameter_name_count(child).max(1);
-                types.extend(std::iter::repeat_n(token, count));
-            }
-            "variadic_parameter_declaration" => {
-                let Some(ty) = parameter_type_node(child) else {
-                    continue;
-                };
-                let token = format!("...{}", type_token(ty));
-                let count = parameter_name_count(child).max(1);
-                types.extend(std::iter::repeat_n(token, count));
-            }
-            _ => {}
-        }
-    }
-    types
-}
-
-fn parameter_type_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("type")
-        .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))
-}
-
-fn parameter_name_count(node: Node<'_>) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| child.kind() == "identifier")
-        .count()
-}
-
-fn receiver_type_node(receiver: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = receiver.walk();
-    receiver
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "parameter_declaration")
-        .and_then(parameter_type_node)
-}
-
-fn embedded_type_refs(node: Node<'_>) -> impl Iterator<Item = EmbeddedTypeRef<'_>> {
-    let mut embedded = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "field_declaration" => collect_embedded_field(child, &mut embedded),
-            "field_declaration_list" => {
-                let mut field_cursor = child.walk();
-                for field in child.named_children(&mut field_cursor) {
-                    if field.kind() == "field_declaration" {
-                        collect_embedded_field(field, &mut embedded);
+                GoSourceTypeShape::Pointer(inner) => {
+                    output.push('*');
+                    pending.push(Part::Type(*inner));
+                }
+                GoSourceTypeShape::Slice(inner) => {
+                    output.push_str("[]");
+                    pending.push(Part::Type(*inner));
+                }
+                GoSourceTypeShape::Array {
+                    element,
+                    length_text,
+                    ..
+                } => {
+                    output.push('[');
+                    output.push_str(length_text);
+                    output.push(']');
+                    pending.push(Part::Type(*element));
+                }
+                GoSourceTypeShape::Map { key, value } => {
+                    output.push_str("map[");
+                    pending.push(Part::Type(*value));
+                    pending.push(Part::Text("]"));
+                    pending.push(Part::Type(*key));
+                }
+                GoSourceTypeShape::Channel { direction, element } => {
+                    output.push_str(match direction {
+                        GoChannelDirection::Both => "chan ",
+                        GoChannelDirection::Receive => "<-chan ",
+                        GoChannelDirection::Send => "chan<- ",
+                    });
+                    pending.push(Part::Type(*element));
+                }
+                GoSourceTypeShape::Generic {
+                    base,
+                    argument_text,
+                    ..
+                } => {
+                    // Preserve the prior named-child join, including its raw
+                    // argument-list spelling. An uncaptured list is unknown.
+                    pending.push(Part::Text(argument_text.as_deref()?));
+                    pending.push(Part::Text("["));
+                    pending.push(Part::Type(*base));
+                }
+                GoSourceTypeShape::Compound { children, .. } => {
+                    if children.is_empty() {
+                        return None;
+                    }
+                    for (ordinal, child) in children.iter().enumerate().rev() {
+                        pending.push(Part::Type(*child));
+                        if ordinal != 0 {
+                            pending.push(Part::Text("|"));
+                        }
                     }
                 }
+                GoSourceTypeShape::Negated(inner) => {
+                    output.push('~');
+                    pending.push(Part::Type(*inner));
+                }
+                GoSourceTypeShape::ImplicitArray { text, .. }
+                | GoSourceTypeShape::Struct { text }
+                | GoSourceTypeShape::Interface { text, .. }
+                | GoSourceTypeShape::Opaque { text } => output.push_str(text.as_deref()?),
             }
-            _ => {}
         }
+        Some(output)
     }
-    embedded.into_iter()
-}
 
-fn collect_embedded_field<'tree>(field: Node<'tree>, embedded: &mut Vec<EmbeddedTypeRef<'tree>>) {
-    if go_field_declaration_is_embedded(field)
-        && let Some(ty) = field.child_by_field_name("type")
-    {
-        embedded.push(EmbeddedTypeRef {
-            node: ty,
-            pointer: is_pointer_embedded_field(field, ty),
-        });
-    }
-}
-
-fn is_pointer_embedded_field(field: Node<'_>, ty: Node<'_>) -> bool {
-    if ty.kind() == "pointer_type" {
-        return true;
-    }
-    (0..field.child_count()).any(|index| {
-        field
-            .child(index)
-            .is_some_and(|child| child.end_byte() <= ty.start_byte() && child.kind() == "*")
-    })
-}
-
-fn type_ref_node(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "type_identifier" | "identifier" | "qualified_type" => Some(node),
-        "pointer_type" | "generic_type" | "parenthesized_type" | "negated_type" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).find_map(type_ref_node)
+    fn method_key(
+        &self,
+        file: &GoFactFile,
+        callable: &brokk_bifrost_core::analyzer::go_facts::GoCallableFact,
+    ) -> Option<DeclaredMethod> {
+        let identifier = callable.name.clone();
+        if identifier.is_empty() {
+            return None;
         }
-        _ => None,
+        let name = if go_identifier_is_exported(&identifier) {
+            identifier.clone()
+        } else {
+            format!("{}.{}", file.package_name, identifier)
+        };
+        let mut tokens = Vec::new();
+        if let Some(parameters) = &callable.parameters {
+            let types = parameters
+                .iter()
+                .map(|parameter| {
+                    let ty = parameter.ty.and_then(|id| self.type_token(file, id))?;
+                    Some(if parameter.variadic {
+                        format!("...{ty}")
+                    } else {
+                        ty
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            tokens.push(format!("params({})", types.join(",")));
+        }
+        if callable.result.is_some() {
+            let types = callable
+                .results
+                .iter()
+                .map(|parameter| parameter.ty.and_then(|id| self.type_token(file, id)))
+                .collect::<Option<Vec<_>>>()?;
+            tokens.push(format!("results({})", types.join(",")));
+        }
+        Some(DeclaredMethod {
+            key: MethodKey::new(name, Some(tokens.join(" "))),
+            identifier,
+        })
     }
-}
-
-fn is_empty_interface_embed(node: Node<'_>, source: &str) -> bool {
-    if matches!(node.kind(), "identifier" | "type_identifier")
-        && go_node_text(node, source).trim() == "any"
-    {
-        return true;
-    }
-    if node.kind() != "interface_type" {
-        return false;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next().is_none()
 }
 
 fn resolve_alias_fqn(aliases: &HashMap<String, String>, fqn: &str) -> String {
@@ -1638,37 +1261,32 @@ fn rebuild_direct_descendants(
     direct_descendants
 }
 
-fn channel_direction(node: Node<'_>) -> &'static str {
-    let mut chan_start = None;
-    let mut arrow_start = None;
-    for index in 0..node.child_count() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
-        match child.kind() {
-            "<-" => arrow_start = Some(child.start_byte()),
-            "chan" => chan_start = Some(child.start_byte()),
-            _ => {}
-        }
-    }
-    match (arrow_start, chan_start) {
-        (Some(arrow), Some(chan)) if arrow < chan => "<-chan ",
-        (Some(_), Some(_)) => "chan<- ",
-        _ => "chan ",
-    }
-}
-
-fn external_qualified_type_token(file: &HierarchyFile<'_>, node: Node<'_>) -> Option<String> {
-    let qualifier = node.child_by_field_name("package")?;
-    let name = node.child_by_field_name("name")?;
-    let qualifier = go_node_text(qualifier, file.source).trim();
-    let name = go_node_text(name, file.source).trim();
-    let mut packages = file.imports.get(qualifier)?.iter();
-    let package = packages.next()?;
-    packages
-        .next()
-        .is_none()
-        .then(|| format!("{package}.{name}"))
+fn is_predeclared_go_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
 }
 
 fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {
@@ -1835,79 +1453,4 @@ fn record_structural_relation(
         to: to.clone(),
         kind: TypeRelationKind::StructuralSatisfaction,
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::GoPackageIndex;
-    use brokk_bifrost_core::analyzer::ProjectFile;
-
-    /// The scan [`GoPackageIndex`] replaced, kept here as an oracle that does
-    /// not share a line of code with the index: a candidate binds an import
-    /// path when its canonical package equals the path, or when the path is a
-    /// trailing component sequence of the candidate's directory.
-    fn scan(
-        entries: &[(ProjectFile, String)],
-        file: &ProjectFile,
-        import_path: &str,
-    ) -> Vec<String> {
-        let mut packages: Vec<String> = entries
-            .iter()
-            .filter(|(candidate, _package)| candidate != file)
-            .filter(|(candidate, package)| {
-                let parent = candidate.parent().to_string_lossy().replace('\\', "/");
-                package == import_path
-                    || parent == import_path
-                    || parent.ends_with(&format!("/{import_path}"))
-            })
-            .map(|(_candidate, package)| package.clone())
-            .collect();
-        packages.sort();
-        packages.dedup();
-        packages
-    }
-
-    /// Same-suffix directories (`a/pkg`, `b/pkg`, `pkg`) plus a vendored copy,
-    /// which is where a suffix index can differ from the scan if its keys are
-    /// not derived from the same rule.
-    #[test]
-    fn package_index_answers_exactly_what_the_scan_answered() {
-        let root = std::env::temp_dir().join("bifrost-go-package-index");
-        let entries: Vec<(ProjectFile, String)> = [
-            ("a/pkg/one.go", "example.com/app/a/pkg"),
-            ("b/pkg/two.go", "example.com/app/b/pkg"),
-            ("pkg/three.go", "example.com/app/pkg"),
-            ("pkg/four.go", "example.com/app/pkg"),
-            (
-                "vendor/k8s.io/utils/pkg/five.go",
-                "example.com/app/vendor/k8s.io/utils/pkg",
-            ),
-        ]
-        .into_iter()
-        .map(|(path, package)| (ProjectFile::new(root.clone(), path), package.to_string()))
-        .collect();
-        let index = GoPackageIndex::new(entries.clone());
-
-        for (file, _package) in &entries {
-            for import_path in [
-                "pkg",
-                "a/pkg",
-                "b/pkg",
-                "utils/pkg",
-                "k8s.io/utils/pkg",
-                "vendor/k8s.io/utils/pkg",
-                "example.com/app/pkg",
-                "example.com/app/a/pkg",
-                "example.com/app/vendor/k8s.io/utils/pkg",
-                "example.com/app",
-                "nowhere/at/all",
-            ] {
-                assert_eq!(
-                    index.packages_for(file, import_path),
-                    scan(&entries, file, import_path),
-                    "import {import_path:?} from {file}"
-                );
-            }
-        }
-    }
 }

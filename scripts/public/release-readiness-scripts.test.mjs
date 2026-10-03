@@ -15,13 +15,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { fakeGhEnv } from "../fixtures/workflow-shell/fake-gh.mjs";
+import { run, scriptForDirectory } from "./release-script-test-helpers.mjs";
 
 const scriptsDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = path.resolve(scriptsDir, "..", "..");
-
-function script(name) {
-  return path.join(scriptsDir, name);
-}
+const script = scriptForDirectory(scriptsDir);
 
 // The workflows run these scripts under whatever bash the runner ships, which is
 // bash 5. macOS ships bash 3.2, whose `set -e` is more forgiving -- it does not
@@ -50,24 +48,6 @@ function withTempDir(body) {
     return body(dir);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-function run(command, args, options = {}) {
-  try {
-    const stdout = execFileSync(command, args, {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      ...options,
-      env: { ...process.env, ...(options.env ?? {}) },
-    });
-    return { status: 0, stdout, stderr: "" };
-  } catch (error) {
-    return {
-      status: error.status ?? 1,
-      stdout: error.stdout ?? "",
-      stderr: error.stderr ?? "",
-    };
   }
 }
 
@@ -546,6 +526,16 @@ test("a complete qualification bundle passes the inventory check", () => {
   withTempDir((dir) => {
     const result = inventoryRun(completeBundle(dir));
     assert.equal(result.status, 0, result.stderr);
+  });
+});
+
+test("a qualification bundle containing retired semantic-pack content is refused", () => {
+  withTempDir((dir) => {
+    const bundle = completeBundle(dir);
+    fs.writeFileSync(path.join(bundle, "bifrost-semantic-packs-v0.13.0.tar.gz"), "retired content");
+    const result = inventoryRun(bundle);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /holds 1 bifrost-semantic-packs-\*/u);
   });
 });
 

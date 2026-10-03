@@ -3568,6 +3568,7 @@ fn java_definition_at(
     ) else {
         return BoundedResolution::Complete {
             value: DefinitionLookupOutcome {
+                modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::InvalidLocation,
                 reference: None,
                 definitions: Vec::new(),
@@ -3755,7 +3756,11 @@ fn definition_outcome(
     }
     let truncated = definitions.len() > limit;
     definitions.truncate(limit);
-    let outcome = if definitions.is_empty() {
+    let outcome = if outcome.status == DefinitionLookupStatus::Unavailable {
+        ReceiverAnalysisOutcome::Unsupported {
+            reason: "canonical_facts_unavailable",
+        }
+    } else if definitions.is_empty() {
         ReceiverAnalysisOutcome::Unknown
     } else {
         match outcome.status {
@@ -3764,8 +3769,14 @@ fn definition_outcome(
             DefinitionLookupStatus::UnsupportedLanguage => ReceiverAnalysisOutcome::Unsupported {
                 reason: "receiver_analysis_language_unsupported",
             },
+            DefinitionLookupStatus::Unavailable => ReceiverAnalysisOutcome::Unsupported {
+                reason: "canonical_facts_unavailable",
+            },
             DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::UnresolvableImportBoundary
+            | DefinitionLookupStatus::Incomplete
+            | DefinitionLookupStatus::Cancelled
+            | DefinitionLookupStatus::ExceededBudget(_)
             | DefinitionLookupStatus::InvalidLocation
             | DefinitionLookupStatus::NotFound => ReceiverAnalysisOutcome::Unknown,
         }
@@ -4084,6 +4095,11 @@ where
             unique.push(value);
         }
     }
+    if status == TypeLookupStatus::Unavailable {
+        return ReceiverAnalysisOutcome::Unsupported {
+            reason: "canonical_facts_unavailable",
+        };
+    }
     if unique.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
@@ -4093,10 +4109,15 @@ where
             ReceiverAnalysisOutcome::Ambiguous(unique)
         }
         TypeLookupStatus::NoType
+        | TypeLookupStatus::Incomplete
+        | TypeLookupStatus::Cancelled
         | TypeLookupStatus::InvalidLocation
         | TypeLookupStatus::NotFound => ReceiverAnalysisOutcome::Unknown,
         TypeLookupStatus::UnsupportedLanguage => ReceiverAnalysisOutcome::Unsupported {
             reason: "receiver_analysis_language_unsupported",
+        },
+        TypeLookupStatus::Unavailable => ReceiverAnalysisOutcome::Unsupported {
+            reason: "canonical_facts_unavailable",
         },
         // The bounded resolvers report exhaustion as `BoundedResolution::Exceeded`,
         // which the ledger handles before an outcome reaches here; the status form

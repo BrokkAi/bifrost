@@ -76,6 +76,7 @@ fn classify_scala_conversion(
     )?;
     if conversion_types_match(&source_id, &target_id) {
         return Ok(ArgumentTypeConversion {
+            hierarchy: None,
             source: source_id,
             target: target_id,
             kind: ConversionKind::ScalaIdentity,
@@ -92,6 +93,7 @@ fn classify_scala_conversion(
                 }
             };
             Ok(ArgumentTypeConversion {
+                hierarchy: None,
                 source: source_id,
                 target: target_id,
                 kind,
@@ -103,6 +105,7 @@ fn classify_scala_conversion(
         Err(super::semantic_adaptation::AdaptationFailure::Unresolved) => {
             if catalog.value_class_boxes(source, actual, source_type, target_type) {
                 return Ok(ArgumentTypeConversion {
+                    hierarchy: None,
                     source: source_id,
                     target: target_id,
                     kind: ConversionKind::ScalaValueClassBoxing,
@@ -110,6 +113,7 @@ fn classify_scala_conversion(
             }
             if catalog.value_class_unboxes(source, actual, source_type, target_type) {
                 return Ok(ArgumentTypeConversion {
+                    hierarchy: None,
                     source: source_id,
                     target: target_id,
                     kind: ConversionKind::ScalaValueClassUnboxing,

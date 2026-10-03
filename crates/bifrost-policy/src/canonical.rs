@@ -1099,6 +1099,7 @@ fn row_predicate_to_json(predicate: &RowPredicate) -> Value {
 fn row_literal_to_json(literal: &RowLiteral) -> Value {
     match literal {
         RowLiteral::String(value) | RowLiteral::ConstrainedEnum(value) => json!(value),
+        RowLiteral::StringList(values) => json!(values),
         RowLiteral::Integer(value) => json!(value),
         RowLiteral::Boolean(value) => json!(value),
     }

@@ -11,7 +11,7 @@
 //! fixed-point pass goes through the caller's charge callback.
 
 use crate::declarations::rust_node_text;
-use crate::graph::ast::{rust_path_is_leading_absolute, rust_path_segments};
+use crate::graph_support::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::imports::{RustImportBindingName, rust_imports_with_visibility_from_use_declaration};
 use crate::syntax::{outer_attributes, unwrap_attributes};
 use std::collections::{HashMap, HashSet};
@@ -1097,7 +1097,7 @@ fn collect_imports(
                 imports.push(ImportBinding {
                     module_path: module_path.to_vec(),
                     local_name: String::new(),
-                    target_path: import.path,
+                    target_path: import.path().to_vec(),
                     wildcard: true,
                 });
             }
@@ -1112,7 +1112,7 @@ fn collect_imports(
                 imports.push(ImportBinding {
                     module_path: module_path.to_vec(),
                     local_name: name.to_string(),
-                    target_path: import.path,
+                    target_path: import.path().to_vec(),
                     wildcard: false,
                 });
             }

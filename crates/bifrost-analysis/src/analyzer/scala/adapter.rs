@@ -21,6 +21,22 @@ use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 pub(crate) struct ScalaAdapter;
 
 impl LanguageAdapter for ScalaAdapter {
+    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
+        Some(&crate::analyzer::scala::source_publication::SOURCE_STORAGE)
+    }
+
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+
+    fn scala_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::scala_facts::SCALA_SOURCE_FACTS_VERSION)
+    }
+
     fn language(&self) -> Language {
         Language::Scala
     }

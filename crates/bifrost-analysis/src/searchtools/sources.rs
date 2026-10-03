@@ -958,14 +958,20 @@ fn semantic_model_source_outcome_with_anchor(
 struct SourceRenderCache {
     cpp_identity: CppIdentityRenderCache,
     line_starts: HashMap<ProjectFile, std::rc::Rc<Vec<usize>>>,
-    function_ranges_by_name: HashMap<String, HashMap<ProjectFile, Vec<Range>>>,
+    function_ranges_by_name: HashMap<String, HashMap<ProjectFile, Vec<SourceOccurrence>>>,
+}
+
+#[derive(Clone)]
+struct SourceOccurrence {
+    range: Range,
+    role: Option<String>,
 }
 
 fn source_ranges_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     render_cache: &mut SourceRenderCache,
-) -> Vec<Range> {
+) -> Vec<SourceOccurrence> {
     // The unit's own recorded ranges are the floor for every unit, function or
     // not. A function additionally unions the ranges of its same-name siblings
     // in the same file (a C++ header declaration and its body definition), but
@@ -976,11 +982,17 @@ fn source_ranges_for_code_unit(
     // `angular.mock.$LogProvider` inside an IIFE -- has no row there at all.
     // Deriving its ranges only from `definitions()` rendered nothing, so a
     // selector the resolver had just printed answered not_found (#1057).
-    let mut ranges = render_cache.cpp_identity.definition_ranges(
-        analyzer,
-        code_unit,
-        analyzer.ranges(code_unit),
-    );
+    let mut ranges: Vec<_> = render_cache
+        .cpp_identity
+        .definition_ranges(analyzer, code_unit, analyzer.ranges(code_unit))
+        .into_iter()
+        .map(|range| SourceOccurrence {
+            role: render_cache
+                .cpp_identity
+                .occurrence_role(analyzer, code_unit, &range),
+            range,
+        })
+        .collect();
     if !code_unit.is_function() {
         return ranges;
     }
@@ -995,12 +1007,22 @@ fn source_ranges_for_code_unit(
     // candidate range set once per name. Looking up all same-name definitions
     // again for every file is quadratic on generated amalgamations such as
     // Phalcon's PHP_METHOD declarations.
-    let mut ranges_by_source: HashMap<ProjectFile, Vec<Range>> = HashMap::default();
+    let mut ranges_by_source: HashMap<ProjectFile, Vec<SourceOccurrence>> = HashMap::default();
     for candidate in analyzer.definitions(&fq_name) {
         ranges_by_source
             .entry(candidate.source().clone())
             .or_default()
-            .extend(analyzer.ranges(&candidate));
+            .extend(analyzer.ranges(&candidate).into_iter().map(|range| {
+                SourceOccurrence {
+                    // Sibling ranges belong to their exact overload. The caller
+                    // renders the same-name family once, so retain each owner's
+                    // canonical role before combining the physical occurrences.
+                    role: render_cache
+                        .cpp_identity
+                        .occurrence_role(analyzer, &candidate, &range),
+                    range,
+                }
+            }));
     }
     extend_with_sibling_ranges(&mut ranges, &ranges_by_source, code_unit.source());
     render_cache
@@ -1013,12 +1035,12 @@ fn source_ranges_for_code_unit(
 /// caller sorts and dedups by `(start_byte, end_byte)` before rendering, so the
 /// overlap between the two sets needs no handling here.
 fn extend_with_sibling_ranges(
-    ranges: &mut Vec<Range>,
-    ranges_by_source: &HashMap<ProjectFile, Vec<Range>>,
+    ranges: &mut Vec<SourceOccurrence>,
+    ranges_by_source: &HashMap<ProjectFile, Vec<SourceOccurrence>>,
     source: &ProjectFile,
 ) {
     if let Some(siblings) = ranges_by_source.get(source) {
-        ranges.extend(siblings.iter().copied());
+        ranges.extend(siblings.iter().cloned());
     }
 }
 
@@ -1040,11 +1062,11 @@ fn source_blocks_for_code_unit_with_cache(
         .canonical_selector(analyzer, token, code_unit);
 
     let mut ranges = source_ranges_for_code_unit(analyzer, code_unit, render_cache);
-    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    ranges.sort_by_key(|occurrence| (occurrence.range.start_byte, occurrence.range.end_byte));
     // definitions() can return the same candidate through multiple identity
     // paths; identical ranges render identical blocks, so drop the repeats
     // before paying for text extraction.
-    ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
+    ranges.dedup_by_key(|occurrence| (occurrence.range.start_byte, occurrence.range.end_byte));
 
     // The line-start table is derived data of the immutable indexed content;
     // compute it once per file per tool call instead of twice per range
@@ -1057,10 +1079,11 @@ fn source_blocks_for_code_unit_with_cache(
         .clone();
 
     let mut blocks = Vec::new();
-    for range in ranges {
-        let occurrence_role = render_cache
-            .cpp_identity
-            .occurrence_role(analyzer, code_unit, &range);
+    for SourceOccurrence {
+        range,
+        role: occurrence_role,
+    } in ranges
+    {
         let start_byte = if include_comments {
             expanded_comment_start(language, &content, range.start_byte)
         } else {

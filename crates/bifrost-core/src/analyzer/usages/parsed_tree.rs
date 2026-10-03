@@ -103,17 +103,21 @@ impl<'a> ParseSpec<'a> {
 }
 
 /// Parse a single file into source + tree + line starts, or `None` if the file is
-/// unreadable or empty. Used by the inverted edge builders to parse on demand
-/// inside the per-file parallel walk so each tree can be dropped right after.
+/// unreadable or the grammar rejects the parse. Used by the inverted edge builders
+/// to parse on demand inside the per-file parallel walk so each tree can be dropped
+/// right after.
 pub fn parse_tree_sitter_file(file: &ProjectFile, spec: ParseSpec<'_>) -> Option<ParsedTreeFile> {
     let source = file.read_to_string().ok()?;
     parse_tree_sitter_source(source, spec)
 }
 
+/// An empty source is parsed like any other: every grammar accepts it and yields a
+/// childless root, so the scan that walks it produces an exact empty result. It must
+/// not be reported as an absent parse -- the completeness-tracking edge driver
+/// (`build_edge_output_with_completeness`) treats a missing per-file result as an
+/// omitted file and refuses to publish the graph, and an empty `__init__.py` is
+/// ordinary Python.
 pub fn parse_tree_sitter_source(source: String, spec: ParseSpec<'_>) -> Option<ParsedTreeFile> {
-    if source.is_empty() {
-        return None;
-    }
     let tree = spec.parse(source.as_str())?;
     let line_starts = compute_line_starts(&source);
     Some(ParsedTreeFile {

@@ -32,6 +32,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::RuntimeKeyedReadValue { .. }
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallResult { .. }
+                | CodeQueryResultValue::ResultSubjectUse { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
                 | CodeQueryResultValue::CallBinding { .. }
@@ -600,6 +601,31 @@ impl CodeQueryResult {
                             value.site_id,
                         ));
                     }
+                    CodeQueryResultValue::ResultSubjectUse { value } => {
+                        let location = value.receiver_range.map_or_else(
+                            || value.path.clone(),
+                            |range| {
+                                format!(
+                                    "{}:{}:{}",
+                                    value.path, range.start_line, range.start_column
+                                )
+                            },
+                        );
+                        out.push_str(&format!(
+                            "{location} [result subject use; {}; {}; {}] origin={} receiver={}{}\n",
+                            value.proof,
+                            value.completeness,
+                            value.outcome.label(),
+                            value
+                                .origin
+                                .as_ref()
+                                .map_or("unknown", |origin| origin.id.as_str()),
+                            value.receiver_call_id.as_deref().unwrap_or("unknown"),
+                            value
+                                .reason
+                                .map_or_else(String::new, |reason| format!("; {reason}")),
+                        ));
+                    }
                     CodeQueryResultValue::ResultContractUse { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [result contract use; {}; {}; {}; {}] {}\n",
@@ -701,13 +727,23 @@ impl CodeQueryResult {
                         ));
                     }
                     CodeQueryResultValue::AbsentMemberFinding { value } => {
+                        let (tier, claim) = match &value.condition {
+                            Some(condition) => (
+                                format!("; conditional: {}", value.remainders.join(", ")),
+                                condition.clone(),
+                            ),
+                            None => (
+                                String::new(),
+                                format!("{} has no member `{}`", value.class, value.member),
+                            ),
+                        };
                         out.push_str(&format!(
-                            "{}:{}:{} [absent member] {} has no member `{}` (from {}:{}:{}; caller {}; witness {} steps)\n",
+                            "{}:{}:{} [absent member{}] {} (from {}:{}:{}; caller {}; witness {} steps)\n",
                             value.file,
                             value.range.start_line,
                             value.range.start_column,
-                            value.class,
-                            value.member,
+                            tier,
+                            claim,
                             value.origin_file,
                             value.origin_range.start_line,
                             value.origin_range.start_column,

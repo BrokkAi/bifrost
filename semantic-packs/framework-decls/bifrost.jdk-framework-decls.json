@@ -1543,6 +1543,7 @@
             "is_static": false,
             "is_abstract": true,
             "is_virtual": true,
+            "callable_family_complete": true,
             "signature": {
               "type_parameters": [],
               "parameters": [
