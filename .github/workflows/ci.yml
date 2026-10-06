@@ -12,6 +12,11 @@ jobs:
   source-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Exact public compilation passed on 16 GiB with two compiler jobs.
+    # Bound overlapping rustc/link processes; test scheduling stays unchanged.
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -21,6 +26,23 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt
+
+      - name: Cache public Rust dependencies
+        id: rust-cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: public-source-contract-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.cargo/config.toml', '.config/**', '.github/workflows/ci.yml') }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST ImageOS ImageVersion
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-on-failure: false
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Record dependency cache and initial runner storage
+        run: |
+          echo "dependency-cache-hit=${{ steps.rust-cache.outputs.cache-hit }}"
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          free -b
 
       - name: Install uv for source-owned sidecar tests
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
@@ -34,15 +56,27 @@ jobs:
       - name: Run source-owned unit tests
         env:
           JAVA_HOME: ''
-        run: cargo test --workspace --lib --locked
+        run: /usr/bin/time -v cargo test --workspace --lib --locked
+
+      - name: Record runner storage after unit tests
+        if: always()
+        run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
       - name: Run public doctests
-        run: cargo test --workspace --doc --locked
+        run: /usr/bin/time -v cargo test --workspace --doc --locked
+
+      - name: Record runner storage after doctests
+        if: always()
+        run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
       - name: Run MCP contract tests
         env:
           JAVA_HOME: ''
-        run: cargo test -p brokk-bifrost-mcp --locked
+        run: /usr/bin/time -v cargo test -p brokk-bifrost-mcp --locked
+
+      - name: Record runner storage after MCP tests
+        if: always()
+        run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:

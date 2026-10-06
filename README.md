@@ -186,8 +186,10 @@ The repository is organized around the public product surfaces:
 - **Open analysis content:**
   [`BrokkAi/bifrost-packs`](https://github.com/BrokkAi/bifrost-packs) is the home
   for open semantic packs and policy rules, including contributions, generation,
-  and independently versioned releases. The engine retains pack tooling and
-  existing embedded content during the v0.13.0 transition; [`.bifrost/`](.bifrost/)
+  and independently versioned releases. The v0.13 engine ships without product
+  rules; LSP/MCP and other hosts acquire compatible releases through the verified
+  cache flow. Parser assets and separate semantic-model packs remain engine
+  inputs. The engine retains pack tooling and regression fixtures; [`.bifrost/`](.bifrost/)
   contains project-level analysis defaults.
 - **Development support:** [`benchmark/`](benchmark/) covers reproducible
   measurements; [`scripts/`](scripts/) and [`tools/`](tools/) hold maintenance

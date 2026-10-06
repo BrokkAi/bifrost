@@ -74,5 +74,19 @@ fi
 
 echo "  semantic-pack installer: $installer_name"
 echo "  semantic-pack installer checksum: verified"
+if [[ "$release_tag" == v0.13.0 ]]; then
+  require_count 'core-policy-status.json' exactly 1
+  node - "$bundle/core-policy-status.json" <<'JS'
+const assert = require('node:assert/strict');
+const status = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+assert.equal(status.schema_version, 1);
+assert.equal(status.core.status, 'verified');
+assert.equal(status.core.rules, 'host-supplied');
+assert.equal(status.core.active_rule_packs, 0);
+assert.match(status.core.build_identity, /^[a-f0-9]{40}$/u);
+assert.match(status.core.binary_sha256, /^[a-f0-9]{64}$/u);
+assert.equal(status.external_content.status, 'not-qualified');
+JS
+fi
 [[ -f "$bundle/THIRD_PARTY_LICENSES.html" ]] ||
   die "qualification bundle has no THIRD_PARTY_LICENSES.html"

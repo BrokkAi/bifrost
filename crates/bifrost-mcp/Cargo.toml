@@ -65,6 +65,9 @@ test-support = []
 
 [dev-dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.13.0", features = ["test-support"] }
+# Catalog/evaluator regressions use repository fixtures explicitly. Normal
+# MCP builds and published policy archives contain no product rules.
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.13.0", features = ["test-support"] }
 # Operation-sequence property tests for the watcher's change accumulator.
 proptest = "1.11"
 # Two test suites need a real JSON Schema validator: the contract suite

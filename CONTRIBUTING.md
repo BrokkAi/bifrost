@@ -375,8 +375,12 @@ During v0.13.0 preparation, plugin acquisition must select compatible pack
 metadata and verify artifact hashes before exposing a cache to the server.
 A pending pack release or a matching version label does not establish runtime
 qualification. Offline reuse must retain the exact selected source commit,
-manifest, and artifact hashes. Existing embedded content remains until the
-engine content migration is completed separately.
+manifest, and artifact hashes. The v0.13 core ships without product rules;
+repository rule fixtures support regression tests and are excluded from
+published crate archives. Hosts own external rule acquisition and activation.
+Core qualification records the empty catalog and an explicit not-evaluated
+scan separately from requested external-content acceptance. Parser assets and
+separate semantic/type/declaration packs retain their existing boundaries.
 
 After the **Release** workflow succeeds, `publish-npm.yml` packages each native
 archive as a platform package. It publishes the platform packages first. It

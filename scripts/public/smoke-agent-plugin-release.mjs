@@ -58,14 +58,22 @@ async function smokeLaunch(label, launch, launcherCacheDir, includeCodexSandbox)
     CLAUDE_PLUGIN_ROOT: pluginDir,
   };
 
-  await prepare(launch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
+  const prepared = await prepare(launch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
+  const version = await execFileAsync(prepared.binaryPath, ["--version"], { env: launcherEnv });
+  const coreWithoutRules = /^bifrost 0\.13\.0(?:\s|$)/u.test(version.stdout);
+  if (coreWithoutRules) {
+    // This is the core/transport smoke. External acquisition and activation
+    // have their own exact-profile acceptance job.
+    launcherEnv.BIFROST_OPEN_PACKS_OFFLINE = "1";
+    delete launcherEnv.BIFROST_OPEN_POLICY_PACK_ROOT;
+  }
   if (includeCodexSandbox) {
     await withDisposableSmokeWorkspace((workspace) =>
       assertCodexSandboxWorkspaceBinding(launch, workspace, launcherEnv)
     );
   }
   await withDisposableSmokeWorkspace((workspace) =>
-    assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv)
+    assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv, coreWithoutRules)
   );
   await assertNoPluginWorkspaceCache(pluginDir);
   console.log(`Passed ${label} MCP launch smoke.`);
@@ -263,6 +271,7 @@ async function prepare(launcherPath, cwd, env, expectedSource) {
   );
   assert.equal(status.autoInstall, expectedSource !== "explicit");
   assert.match(status.binaryPath ?? "", /bifrost(?:\.exe)?$/);
+  return status;
 }
 
 async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, env) {
@@ -325,7 +334,7 @@ async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, en
   await assertWorkspaceCache(workspaceRoot, "Codex sandbox metadata");
 }
 
-async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
+async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env, coreWithoutRules = false) {
   const { logs } = await withMcpServer(codexLaunch, env, async ({ child, reader }) => {
     const initialize = await roundTrip(child, reader, {
       jsonrpc: "2.0",
@@ -378,6 +387,33 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     assert.equal(catalogContent?.schema_version, 2);
     const packs = catalogContent?.packs;
     assert.ok(Array.isArray(packs), "MCP list_policies returned the wrong catalog envelope");
+    if (coreWithoutRules) {
+      assert.deepEqual(packs, [], "v0.13 core MCP implicitly supplied product rules");
+      await assert.rejects(roundTrip(child, reader, {
+        jsonrpc: "2.0", id: 4, method: "tools/call",
+        params: { name: "run_policy", arguments: {
+          policy_ids: ["bifrost.correctness.dynamic-evaluation"],
+          evaluation_date: "2026-07-28", fail_on: "never",
+        } },
+      }), /MCP tools\/call failed:.*"code":-32602.*unknown built-in policy id.*bifrost\.correctness\.dynamic-evaluation/u,
+      "core MCP must reject an absent product rule as an invalid selector");
+      // Exercise the evaluator through an explicit host-authored file while
+      // keeping the core catalog empty. This is not pack-release admission.
+      await fs.writeFile(path.join(workspaceRoot, "host-smoke.rqlp"), `(policy
+        :schema-version 1 :id "host.smoke.dynamic-evaluation"
+        :name "Host smoke" :message "Review dynamic evaluation" :severity warning
+        :analysis (analysis :type match :selector
+          (rql :schema-version 1 (language python (call :callee (name "eval"))))))\n`);
+      const explicit = await roundTrip(child, reader, {
+        jsonrpc: "2.0", id: 5, method: "tools/call",
+        params: { name: "run_policy", arguments: {
+          policy_files: ["host-smoke.rqlp"], evaluation_date: "2026-07-28", fail_on: "never",
+        } },
+      });
+      assert.equal(explicit.result?.isError, false, `explicit host policy failed: ${JSON.stringify(explicit)}`);
+      assert.equal(explicit.result?.structuredContent?.report?.runs?.[0]?.findings?.[0]?.primary?.path, "BifrostPolicySmoke.py");
+      return;
+    }
     const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
     const security = packs.find((pack) => pack.id === "bifrost.security");
     assert.ok(codeSmells, "MCP list_policies omitted bifrost.code-smells");

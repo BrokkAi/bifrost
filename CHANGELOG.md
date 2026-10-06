@@ -19,7 +19,7 @@ projection and its commit history does not contain every source commit.
   binding evidence, with unsupported operators and scopes remaining incomplete.
 
 - Conditional absent-member queries now expose a conditional proof tier with
-  its remaining uncertainty reasons, and a built-in correctness policy can
+  its remaining uncertainty reasons, and a correctness policy can
   report these supported conditional cases without treating them as proven
   findings.
 
@@ -27,7 +27,7 @@ projection and its commit history does not contain every source commit.
   through selected package routes. Java import and rename queries now preserve
   nested static-import and binding identity.
 
-- C and C++ now have built-in branch checks for identical branches, repeated
+- C and C++ now have branch checks for identical branches, repeated
   conditions, and redundant Boolean returns, using lexical scope and binding
   evidence while leaving unsupported cases inconclusive.
 
@@ -40,6 +40,11 @@ projection and its commit history does not contain every source commit.
   explicit, and framework identity is not inferred.
 
 ### Changed
+
+- The v0.13 engine ships without product rules. LSP, MCP, and other hosts
+  acquire compatible rules from Bifrost-packs through a versioned, verified
+  cache. Without active host rules, scans explicitly report that no rules
+  were evaluated; parser assets and semantic-model tooling remain available.
 
 - Warm structural queries with an explicit language and unrestricted scope now
   verify only files selected by the existing index. They retain the full matcher

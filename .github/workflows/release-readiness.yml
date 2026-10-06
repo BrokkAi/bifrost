@@ -20,6 +20,11 @@ on:
         required: false
         default: ''
         type: string
+      qualify_open_content:
+        description: Also qualify optional host-acquired rules and their exact semantic-pack dependency
+        required: false
+        default: false
+        type: boolean
       requalify_from_run:
         description: >-
           Re-qualify a metadata-only correction. Give the run ID of the
@@ -882,7 +887,7 @@ jobs:
           --binary-path "${{ steps.staged.outputs.binary }}"
 
   policy-scan-smoke:
-    name: smoke policy scan with staged binary and verified open packs
+    name: qualify core engine and requested host-acquired rules
     # Metadata-only requalification reuses the prior qualification bundle and
     # skips source-dependent jobs, including this external-pack acceptance.
     if: ${{ inputs.requalify_from_run == '' }}
@@ -933,7 +938,24 @@ jobs:
           cp "$binary" "target/release/$BIN_NAME"
           chmod +x "target/release/$BIN_NAME"
           echo "STAGED_BIFROST=$PWD/target/release/$BIN_NAME" >> "$GITHUB_ENV"
+      - name: Verify the v0.13 core ships without product rules
+        if: ${{ needs.preflight.outputs.version == '0.13.0' }}
+        env:
+          EXPECTED_BUILD_IDENTITY: ${{ needs.preflight.outputs.build_identity }}
+        run: >-
+          node scripts/public/verify-core-without-rules.mjs
+          "$STAGED_BIFROST" "$EXPECTED_BUILD_IDENTITY"
+          "${RUNNER_TEMP}/core-policy-status.json"
+      - name: Preserve core qualification separately from optional content
+        if: ${{ needs.preflight.outputs.version == '0.13.0' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: core-policy-status-${{ needs.preflight.outputs.commit }}
+          path: ${{ runner.temp }}/core-policy-status.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Identify exact pack-consumer profile
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         id: pack-profile
         shell: bash
         run: |
@@ -943,6 +965,7 @@ jobs:
           [[ "$profile_sha256" =~ ^[0-9a-f]{64}$ ]]
           echo "sha256=$profile_sha256" >> "$GITHUB_OUTPUT"
       - name: Restore verified open-pack cache for this engine profile
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
@@ -950,6 +973,7 @@ jobs:
           restore-keys: |
             bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-
       - name: Acquire eligible integrity-verified Bifrost-packs release
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         id: open-packs
         shell: bash
         run: |
@@ -987,6 +1011,7 @@ jobs:
           echo "receipt_sha256=$receipt_sha256" >> "$GITHUB_OUTPUT"
           echo "OPEN_PACKS_RECEIPT=$receipt" >> "$GITHUB_ENV"
       - name: Download pinned Linux JDK acceptance input
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -998,6 +1023,7 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/jdk"
           tar -C "${RUNNER_TEMP}/jdk" --strip-components 1 -xzf "$archive"
       - name: Run exact installer and full offline policy acceptance
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         shell: bash
         env:
           JAVA_HOME: ${{ runner.temp }}/jdk
@@ -1013,11 +1039,13 @@ jobs:
           "$JAVA_HOME"
           "$SCRATCH_ROOT"
       - name: Cache acquired open packs by exact profile and selection receipt
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/open-packs-cache
           key: bifrost-open-packs-v1-${{ steps.pack-profile.outputs.sha256 }}-${{ steps.open-packs.outputs.receipt_sha256 }}
       - name: Record typed policy smoke status
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         shell: bash
         env:
           STATUS_DIR: ${{ runner.temp }}/offline-semantic-pack-acceptance
@@ -1034,6 +1062,7 @@ jobs:
             echo "- Evidence: \`policy-smoke-status.json\` in the qualification bundle"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload typed policy smoke status and pack selection receipt
+        if: ${{ inputs.qualify_open_content || needs.preflight.outputs.version != '0.13.0' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: policy-smoke-status-${{ needs.preflight.outputs.commit }}

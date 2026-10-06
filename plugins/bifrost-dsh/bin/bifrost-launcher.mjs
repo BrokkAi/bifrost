@@ -1111,7 +1111,7 @@ async function prepareLaunchOpenPacks(binaryPath, env, options) {
   } catch (error) {
     const code = error instanceof OpenPackError ? error.code : error?.code;
     if (!["unsupported", "pending", "no-compatible-release", "unavailable"].includes(code)) throw error;
-    const diagnostic = `[bifrost] Open pack selection ${code}: ${error.message} Continuing with the engine's embedded packs.\n`;
+    const diagnostic = `[bifrost] Open pack selection ${code}: ${error.message} Continuing without externally acquired rules; core analysis remains available.\n`;
     if (options.onOpenPackDiagnostic) options.onOpenPackDiagnostic(diagnostic, error);
     else process.stderr.write(diagnostic);
     return null;

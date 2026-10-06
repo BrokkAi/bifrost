@@ -1,6 +1,6 @@
-//! The shipped built-in policy catalog and its post-activation resolution.
+//! Host-supplied policy catalogs and their post-activation resolution.
 //!
-//! Built-in packs are embedded sources rather than workspace files, so the
+//! Catalog entries are explicit sources rather than workspace files, so the
 //! catalog boundary has no analyzer. Since issue #3316 a built-in policy may
 //! name a semantic-model callable by its qualified name (`subprocess.run`).
 //! That name is preserved unresolved here and resolved exactly once, after
@@ -40,14 +40,21 @@ pub const EFFECTS_PACK_ID: &str = "bifrost.effects";
 pub const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const OPEN_POLICY_PACK_ROOT_ENV: &str = "BIFROST_OPEN_POLICY_PACK_ROOT";
 
+// Retained authoring fixtures support evaluator regressions. Production builds
+// contain no product rules; hosts supply a verified external catalog.
+#[cfg(test)]
 const CODE_SMELLS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.code-smells/manifest.json");
+#[cfg(test)]
 const CORRECTNESS_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.correctness/manifest.json");
+#[cfg(test)]
 const SECURITY_MANIFEST_SOURCE: &str =
     include_str!("../policy-packs/bifrost.security/manifest.json");
+#[cfg(test)]
 const EFFECTS_MANIFEST_SOURCE: &str = include_str!("../policy-packs/bifrost.effects/manifest.json");
 
+#[cfg(test)]
 const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/loop-body-never-repeats.rqlp",
@@ -187,11 +194,13 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(test)]
 const CORRECTNESS_POLICY_SOURCES: &[(&str, &str)] = &[(
     "policies/resource-lifecycle.rqlp",
     include_str!("../policy-packs/bifrost.correctness/policies/resource-lifecycle.rqlp"),
 )];
 
+#[cfg(test)]
 const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/jvm/servlet-parameter-to-jdbc.rqlp",
@@ -369,6 +378,7 @@ const SECURITY_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(test)]
 const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
     (
         "policies/csharp/selected-boundary-no-network-io.rqlp",
@@ -432,6 +442,7 @@ const EFFECTS_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(test)]
 const EMBEDDED_POLICY_PACK_SOURCES: &[(&str, &str)] = &[
     ("bifrost.code-smells", CODE_SMELLS_MANIFEST_SOURCE),
     ("bifrost.correctness", CORRECTNESS_MANIFEST_SOURCE),
@@ -439,6 +450,7 @@ const EMBEDDED_POLICY_PACK_SOURCES: &[(&str, &str)] = &[
     ("bifrost.effects", EFFECTS_MANIFEST_SOURCE),
 ];
 
+#[cfg(test)]
 const EMBEDDED_POLICY_SOURCES: &[(&str, &[(&str, &str)])] = &[
     ("bifrost.code-smells", CODE_SMELLS_POLICY_SOURCES),
     ("bifrost.correctness", CORRECTNESS_POLICY_SOURCES),
@@ -718,7 +730,8 @@ pub struct BuiltInPolicyCatalog {
 }
 
 impl BuiltInPolicyCatalog {
-    /// Load the configured portable policy set, or the shipped embedded set.
+    /// Load host-supplied rules. A production core without rules has an empty
+    /// catalog; acquiring and verifying a release belongs to its host.
     fn load() -> Result<Self, BuiltInPolicyError> {
         if let Some(root) = std::env::var_os(OPEN_POLICY_PACK_ROOT_ENV) {
             if root.is_empty() {
@@ -729,28 +742,79 @@ impl BuiltInPolicyCatalog {
             return load_external_policy_catalog(Path::new(&root));
         }
 
-        Self::load_embedded()
+        // Test-support is explicitly enabled by repository regression suites,
+        // never by the default engine/host release features.
+        #[cfg(any(test, feature = "test-support"))]
+        return Self::load_regression_fixture();
+        #[cfg(not(any(test, feature = "test-support")))]
+        Self::without_rules()
     }
 
-    /// Build the shipped catalog from the checked-in embedded packs.
-    fn load_embedded() -> Result<Self, BuiltInPolicyError> {
-        let packs = EMBEDDED_POLICY_PACK_SOURCES
-            .iter()
-            .map(|(pack_id, manifest_source)| {
-                let sources = EMBEDDED_POLICY_SOURCES
-                    .iter()
-                    .find(|(embedded_id, _)| embedded_id == pack_id)
-                    .map(|(_, sources)| *sources)
-                    .unwrap_or_else(|| {
-                        panic!("pack `{pack_id}` has a manifest but no embedded source table")
-                    });
-                sources.iter().fold(
-                    EmbeddedPolicyPack::new(*manifest_source),
-                    |pack, (path, source)| pack.with_source(*path, *source),
-                )
+    /// Construct the core engine's empty catalog, before a host supplies rules.
+    pub fn without_rules() -> Result<Self, BuiltInPolicyError> {
+        Self::from_embedded_packs(Vec::new())
+    }
+
+    /// Build a regression fixture catalog, never a default product catalog.
+    #[cfg(any(test, feature = "test-support"))]
+    fn load_regression_fixture() -> Result<Self, BuiltInPolicyError> {
+        #[cfg(all(not(test), feature = "test-support"))]
+        {
+            // Repository integration suites explicitly enable test-support.
+            // Fixtures are excluded from published crate archives, so a
+            // downstream test-support build still defaults to an empty core.
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("policy-packs");
+            if !root.is_dir() {
+                return Self::without_rules();
+            }
+            let catalog = load_external_policy_catalog(&root)?;
+            let packs = [
+                CODE_SMELLS_PACK_ID,
+                CORRECTNESS_PACK_ID,
+                SECURITY_PACK_ID,
+                EFFECTS_PACK_ID,
+            ]
+            .into_iter()
+            .map(|id| {
+                let manifest = catalog.pack_manifest(id).ok_or_else(|| {
+                    BuiltInPolicyError::new(format!("regression fixture pack `{id}` is missing"))
+                })?;
+                let source = serde_json::to_string(manifest).map_err(|error| {
+                    BuiltInPolicyError::new(format!("invalid regression fixture: {error}"))
+                })?;
+                Ok(manifest.policies.iter().fold(
+                    EmbeddedPolicyPack::new(source),
+                    |pack, policy| {
+                        pack.with_source(
+                            policy.path.clone(),
+                            catalog.source_by_policy_id[&policy.id].clone(),
+                        )
+                    },
+                ))
             })
-            .collect();
-        Self::from_embedded_packs(packs)
+            .collect::<Result<Vec<_>, BuiltInPolicyError>>()?;
+            Self::from_embedded_packs(packs)
+        }
+        #[cfg(test)]
+        {
+            let packs = EMBEDDED_POLICY_PACK_SOURCES
+                .iter()
+                .map(|(pack_id, manifest_source)| {
+                    let sources = EMBEDDED_POLICY_SOURCES
+                        .iter()
+                        .find(|(embedded_id, _)| embedded_id == pack_id)
+                        .map(|(_, sources)| *sources)
+                        .unwrap_or_else(|| {
+                            panic!("pack `{pack_id}` has a manifest but no embedded source table")
+                        });
+                    sources.iter().fold(
+                        EmbeddedPolicyPack::new(*manifest_source),
+                        |pack, (path, source)| pack.with_source(*path, *source),
+                    )
+                })
+                .collect();
+            Self::from_embedded_packs(packs)
+        }
     }
 
     /// Build a catalog from embedded packs at the built-in identity boundary.
@@ -1382,6 +1446,28 @@ mod tests {
                 resolved,
             );
         }
+    }
+
+    #[test]
+    fn core_without_host_rules_has_no_policy_content() {
+        let catalog = BuiltInPolicyCatalog::without_rules().expect("empty core catalog");
+        assert!(catalog.document().packs.is_empty());
+        assert!(catalog.source_by_policy_id.is_empty());
+        assert!(
+            catalog
+                .select(&BuiltInPolicySelection::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            catalog
+                .select(&BuiltInPolicySelection {
+                    packs: vec![CODE_SMELLS_PACK_ID.to_owned()],
+                    ..BuiltInPolicySelection::default()
+                })
+                .is_err(),
+            "an absent product pack must not be implicitly restored"
+        );
     }
 
     #[test]

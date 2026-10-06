@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { prepareOpenPacks } from "../../plugins/bifrost-agent/bin/open-packs.mjs";
+import { OpenPackError, prepareOpenPacks } from "../../plugins/bifrost-agent/bin/open-packs.mjs";
 
 const execFileAsync = promisify(execFile);
 const options = {};
@@ -45,11 +45,29 @@ const { stdout } = await execFileAsync(
     maxBuffer: 1024 * 1024,
   },
 );
-const result = await prepareOpenPacks({
-  cacheDir: options["--cache-dir"],
-  engineProfile: JSON.parse(stdout),
-  refresh: true,
-});
+const engineProfile = JSON.parse(stdout);
+let result;
+try {
+  result = await prepareOpenPacks({
+    cacheDir: options["--cache-dir"],
+    engineProfile,
+    refresh: true,
+  });
+} catch (error) {
+  if (error instanceof OpenPackError && error.code === "no-compatible-release") {
+    // Negative evidence is not a selection receipt. Strict callers still fail;
+    // diagnostic callers may record unavailable content without claiming a scan.
+    await fs.mkdir(path.dirname(options["--receipt-path"]), { recursive: true });
+    await fs.writeFile(options["--receipt-path"], `${JSON.stringify({
+      schema_version: 1,
+      status: "not-evaluated",
+      reason: error.code,
+      external_content: { status: "not-qualified" },
+      engine_profile: engineProfile,
+    }, null, 2)}\n`, { flag: "wx" });
+  }
+  throw error;
+}
 for (const [name, value] of [
   ["--receipt-path", result.receipt],
   ["--env-path", result.env],

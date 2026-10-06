@@ -1258,9 +1258,19 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
     eprintln!("{}", scan_activation_summary(document));
 
     if document.packs.is_empty() {
-        // The honest empty-catalog run: the surface ships ahead of the pack
-        // wave, so a packless build completes cleanly with zero findings
-        // instead of erroring or fabricating a report it cannot evaluate.
+        // No policy evaluation occurred. Keep that distinct from a clean
+        // evaluated report, including when a machine client requested JSON.
+        if matches!(format, PolicyOutputFormat::Json) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "status": "not-evaluated",
+                    "reason": "no-active-rule-packs",
+                    "findings": [],
+                })
+            );
+        }
         return Ok(CliRunResult::PolicyStatus(POLICY_EXIT_CLEAN));
     }
 
@@ -1325,8 +1335,7 @@ fn builtin_pack_witness_lines(
 fn scan_activation_summary(document: &BuiltInPolicyCatalogManifest) -> String {
     let policies: usize = document.packs.iter().map(|pack| pack.policies.len()).sum();
     if document.packs.is_empty() {
-        "bifrost scan: this build ships no built-in policy packs; nothing was evaluated and there are no findings"
-            .to_string()
+        "bifrost scan: no host-supplied rule packs are active; no rules were evaluated".to_string()
     } else {
         format!(
             "bifrost scan: activated {} built-in policy packs ({} policies)",
@@ -1338,7 +1347,7 @@ fn scan_activation_summary(document: &BuiltInPolicyCatalogManifest) -> String {
 
 fn print_scan_help() {
     println!(
-        "bifrost scan {} — evaluate every built-in policy pack on a project with zero configuration.",
+        "bifrost scan {} — evaluate the host-supplied policy catalog on a project.",
         env!("CARGO_PKG_VERSION")
     );
     let body = r#"
@@ -1348,12 +1357,13 @@ USAGE:
 
     PATH is the project root to scan (default: current directory).
 
-    A scan activates the complete shipped policy catalog -- no --policy-file,
+    A scan activates the complete host-supplied policy catalog -- no --policy-file,
     no selectors -- and prints the activated pack identities, versions, and
     the catalog SHA-256 to stderr before the report, in the same line shape
     `bifrost --version` prints. Exit status follows the policy contract:
     0 clean, 1 findings at or above the --fail-on threshold, 2 unreliable.
-    A build that ships no packs scans to a clean, empty result and says so.
+    The core engine ships no rules. A host acquires verified rules from bifrost-packs.
+    Without a configured catalog, a scan reports that no rules were evaluated.
 
 OPTIONS:
     --list-builtin-policies
@@ -2139,7 +2149,7 @@ fn print_general_help() {
     // from the registry so it never drifts.
     let top = r#"
 USAGE:
-    bifrost scan [PATH]        Evaluate every built-in policy pack on a project with zero
+    bifrost scan [PATH]        Evaluate host-supplied policy packs on a project with host
                                configuration, witnessing the activated pack set on stderr.
                                Run `bifrost scan --help` for the scan options.
     bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
@@ -2151,7 +2161,7 @@ USAGE:
     bifrost pack-engine-profile Print the portable pack-consumer profile as JSON
     bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
                                Verify and install a native semantic-pack bundle
-    bifrost --policy           Evaluate the built-in policy packs on the project and exit
+    bifrost --policy           Evaluate host-supplied policy packs on the project and exit
     bifrost --policy-file PATH Evaluate workspace or built-in static-analysis policies and exit
     bifrost --list-policies    Print the built-in policy catalog and exit
     bifrost --list-row-schemas Print the row-relation field catalog and exit
@@ -3418,8 +3428,7 @@ mod scan_cli_tests {
         );
         assert_eq!(
             scan_activation_summary(&manifest),
-            "bifrost scan: this build ships no built-in policy packs; nothing was evaluated and \
-             there are no findings"
+            "bifrost scan: no host-supplied rule packs are active; no rules were evaluated"
         );
     }
 

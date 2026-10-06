@@ -529,6 +529,46 @@ test("a complete qualification bundle passes the inventory check", () => {
   });
 });
 
+function v013Bundle(dir, status) {
+  const bundle = completeBundle(dir);
+  const before = "bifrost-semantic-pack-v0.11.5-x86_64-unknown-linux-gnu.tar.gz";
+  const after = before.replace("v0.11.5", "v0.13.0");
+  fs.renameSync(path.join(bundle, before), path.join(bundle, after));
+  const digest = createHash("sha256").update("installer fixture").digest("hex");
+  fs.unlinkSync(path.join(bundle, `${before}.sha256`));
+  fs.writeFileSync(path.join(bundle, `${after}.sha256`), `${digest}  ${after}\n`);
+  if (status) fs.writeFileSync(path.join(bundle, "core-policy-status.json"), JSON.stringify(status));
+  return bundle;
+}
+
+const emptyCoreStatus = {
+  schema_version: 1,
+  core: { status: "verified", rules: "host-supplied", active_rule_packs: 0,
+    build_identity: "a".repeat(40), binary_sha256: "b".repeat(64) },
+  external_content: { status: "not-qualified" },
+};
+
+test("v0.13 requires verified core-without-rules evidence in the release bundle", () => {
+  withTempDir((dir) => {
+    const result = inventoryRun(v013Bundle(dir, emptyCoreStatus));
+    assert.equal(result.status, 0, result.stderr);
+  });
+});
+test("v0.13 cannot reuse a bundle missing core-without-rules evidence", () => {
+  withTempDir((dir) => {
+    const result = inventoryRun(v013Bundle(dir));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /core-policy-status/u);
+  });
+});
+test("v0.13 refuses a bundle that labels embedded rules as core qualification", () => {
+  withTempDir((dir) => {
+    const status = structuredClone(emptyCoreStatus);
+    status.core.active_rule_packs = 1;
+    assert.notEqual(inventoryRun(v013Bundle(dir, status)).status, 0);
+  });
+});
+
 test("a qualification bundle containing retired semantic-pack content is refused", () => {
   withTempDir((dir) => {
     const bundle = completeBundle(dir);

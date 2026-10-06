@@ -1043,7 +1043,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "list_policies",
-            "List the deterministic built-in policy catalog, including stable pack, policy, category, language, capability, and semantic-hash metadata. Does not construct or query a workspace analyzer.",
+            "List the deterministic host-configured policy catalog (empty before rules are supplied), including stable pack, policy, category, language, capability, and semantic-hash metadata. Does not construct or query a workspace analyzer.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -1056,7 +1056,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             // than written out, so a schema bump cannot leave this text stale
             // the way "schema-2" did through versions 3 and 4.
             &format!(
-                "Evaluate built-in policy selections and/or explicit workspace-relative .rqlp \
+                "Evaluate host-configured policy selections and/or explicit workspace-relative .rqlp \
                  files against the active immutable workspace snapshot. Returns the canonical \
                  schema-{} report and computed policy status.",
                 brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION,
@@ -1087,7 +1087,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional built-in pack ids. Selectors intersect: with policy_ids or policy_categories, only policies in this pack that also satisfy those run."
+                        "description": "Optional host-configured pack ids. Selectors intersect: with policy_ids or policy_categories, only policies in this pack that also satisfy those run."
                     },
                     "policy_categories": {
                         "type": "array",
@@ -1099,7 +1099,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional built-in policy categories. Selectors intersect: with policy_packs or policy_ids, only policies in this category that also satisfy those run."
+                        "description": "Optional host-configured policy categories. Selectors intersect: with policy_packs or policy_ids, only policies in this category that also satisfy those run."
                     },
                     "policy_ids": {
                         "type": "array",
@@ -1111,7 +1111,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Optional stable built-in policy ids. Selectors intersect: with policy_packs or policy_categories, an id outside them selects nothing and is an error."
+                        "description": "Optional stable host-configured policy ids. Selectors intersect: with policy_packs or policy_categories, an id outside them selects nothing and is an error."
                     },
                     "suppression_file": {
                         "type": "string",

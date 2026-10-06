@@ -110,10 +110,22 @@ fn register_bifrost_semantic_model_packs(
 
 /// Conservative pack-consumer profile for this exact engine build.
 ///
-/// This describes supported document formats, not workspace analysis coverage.
-/// Capability requirements remain unsupported until explicitly advertised.
+/// Capabilities describe reviewed global operations. They do not guarantee a
+/// complete result for every workspace, language, model set, or query budget.
+/// Unknown requirements remain unsupported, independently of pack acquisition.
 pub fn open_pack_engine_profile() -> serde_json::Value {
     use sha2::{Digest, Sha256};
+
+    let mut capabilities = Vec::new();
+    if extension::PUBLISHED_OPERATIONS.iter().any(|operation| {
+        operation.id == "structural.query"
+            && operation.support == extension::CapabilitySupport::Complete
+    }) {
+        capabilities.push("structural-match");
+    }
+    if rql::query::schema::ALL_QUERY_STEP_OPS.contains(&rql::query::schema::QueryStepOp::CfgExits) {
+        capabilities.push("normal-and-exceptional-exit");
+    }
 
     let mut model_set = Sha256::new();
     for pack in semantic_packs::BIFROST_EMBEDDED_PACKS.packs() {
@@ -138,7 +150,7 @@ pub fn open_pack_engine_profile() -> serde_json::Value {
             "release_index": [semantic_packs::release_bundle::RELEASE_BUNDLE_SCHEMA_VERSION],
             "runtime": [],
         },
-        "capabilities": [],
+        "capabilities": capabilities,
     })
 }
 

@@ -5,9 +5,10 @@ name: policy-scan-smoke
 # therefore fail the dogfood or pollute its baseline. This workflow writes both
 # fixtures at run time into an untracked directory instead.
 
-# Leg B asserts that a planted finding trips the action's default gate, so
-# this smoke depends on the severities in bifrost.code-smells as much as on
-# the action itself. The pack is in the path filter because a severity
+# Leg B asserts that a planted finding trips the action's default gate. The
+# v0.13 core uses an explicit host-authored rule after verifying its empty
+# catalog; legacy engines retain bifrost.code-smells. The pack is in the path
+# filter because a severity
 # demotion is exactly what silently turns leg B into a no-op: #2641 moved the
 # *-in-loop family to note, the planted fixture stopped gating, and nothing
 # re-ran this workflow until an unrelated change touched the action.
@@ -68,6 +69,11 @@ jobs:
         with:
           shared-key: policy-scan-smoke
 
+      - name: Install Node.js for the core host-rule contract
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
       - name: Build the policy runner
         run: cargo build --locked --bin bifrost
 
@@ -106,6 +112,53 @@ jobs:
           }
           EOF
 
+      - name: Select the version-bound host rule source
+        id: rule-source
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFile } from 'node:child_process';
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+          import { promisify } from 'node:util';
+          const execute = promisify(execFile);
+          const binary = path.resolve('target/debug', process.platform === 'win32' ? 'bifrost.exe' : 'bifrost');
+          const { stdout: version } = await execute(binary, ['--version']);
+          const coreWithoutRules = /^bifrost 0\.13\.0(?:\s|$)/u.test(version);
+          await fs.appendFile(process.env.GITHUB_OUTPUT, `core_without_rules=${coreWithoutRules}\n`);
+          let packs = 'bifrost.code-smells';
+          let files = '';
+          if (coreWithoutRules) {
+            const { stdout: identity } = await execute('git', ['log', '-1', '--format=%H', '--',
+              'src', 'crates', 'resources', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/config.toml']);
+            const receipt = path.join(process.env.RUNNER_TEMP, 'policy-action-core-status.json');
+            const { stdout } = await execute(process.execPath, ['scripts/public/verify-core-without-rules.mjs',
+              binary, identity.trim(), receipt], { timeout: 120_000 });
+            console.log(stdout.trim());
+            // Host-authored evaluator/action fixture, not product-pack admission.
+            const policy = `(policy
+              :schema-version 1 :id "host.smoke.dynamic-evaluation"
+              :name "Host action smoke" :message "Review dynamic evaluation" :severity warning
+              :analysis (analysis :type match :selector
+                (rql :schema-version 1 (language typescript (call :callee (name "eval"))))))\n`;
+            for (const fixture of ['clean', 'finding']) {
+              await fs.writeFile(path.join('smoke-fixture', fixture, 'host-smoke.rqlp'), policy);
+            }
+            packs = '';
+            files = 'host-smoke.rqlp';
+          }
+          await fs.appendFile(process.env.GITHUB_OUTPUT, `policy_packs=${packs}\npolicy_files=${files}\n`);
+          NODE
+
+      - name: Retain the core rule-delivery receipt
+        if: steps.rule-source.outputs.core_without_rules == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: policy-action-core-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/policy-action-core-status.json
+          if-no-files-found: error
+          retention-days: 14
+
       # Leg A: a clean workspace must select the local binary, exit 0, and
       # write a SARIF report.
       - name: Scan the clean fixture
@@ -113,6 +166,8 @@ jobs:
         uses: ./.github/actions/policy-scan
         with:
           version: local
+          policy-packs: ${{ steps.rule-source.outputs.policy_packs }}
+          policy-files: ${{ steps.rule-source.outputs.policy_files }}
           working-directory: smoke-fixture/clean
           sarif-file: clean.sarif
           upload: 'false'
@@ -158,6 +213,8 @@ jobs:
         uses: ./.github/actions/policy-scan
         with:
           version: local
+          policy-packs: ${{ steps.rule-source.outputs.policy_packs }}
+          policy-files: ${{ steps.rule-source.outputs.policy_files }}
           working-directory: smoke-fixture/clean
           sarif-file: cached-clean.sarif
           upload: 'false'
@@ -181,6 +238,8 @@ jobs:
         uses: ./.github/actions/policy-scan
         with:
           version: local
+          policy-packs: ${{ steps.rule-source.outputs.policy_packs }}
+          policy-files: ${{ steps.rule-source.outputs.policy_files }}
           working-directory: smoke-fixture/finding
           sarif-file: finding.sarif
           upload: 'false'
@@ -207,6 +266,9 @@ jobs:
           set -euo pipefail
           mkdir -p smoke-fixture/orphan/.bifrost
           cp smoke-fixture/clean/main.ts smoke-fixture/orphan/main.ts
+          if test -f smoke-fixture/clean/host-smoke.rqlp; then
+            cp smoke-fixture/clean/host-smoke.rqlp smoke-fixture/orphan/host-smoke.rqlp
+          fi
           jq '
             .runs[0].results[0] as $finding
             | {
@@ -232,6 +294,8 @@ jobs:
         uses: ./.github/actions/policy-scan
         with:
           version: local
+          policy-packs: ${{ steps.rule-source.outputs.policy_packs }}
+          policy-files: ${{ steps.rule-source.outputs.policy_files }}
           working-directory: smoke-fixture/orphan
           sarif-file: orphan.sarif
           upload: 'false'

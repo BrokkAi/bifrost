@@ -133,9 +133,12 @@ require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/000
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0011-native-compatibility.sql
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-policy src/lib.rs
-for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifest.json; do
-  require_archive_file brokk-bifrost-policy "${policy_manifest#"$repo_root/crates/bifrost-policy/"}"
-done
+policy_archive_files=$(tar -tzf "$(archive_for brokk-bifrost-policy)" | sed 's@^[^/]*/@@')
+if grep -Eq '^policy-packs/' <<<"$policy_archive_files"; then
+  echo "Policy engine archive contains product rule fixtures:" >&2
+  grep -E '^policy-packs/' <<<"$policy_archive_files" >&2
+  exit 1
+fi
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
@@ -200,13 +203,10 @@ for policy_manifest in "$repo_root"/crates/bifrost-policy/policy-packs/*/manifes
     | sed "s@^$repo_root/crates/bifrost-policy/@@" \
     | LC_ALL=C sort > "$checked_in_policy_files"
   if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
-    echo "Built-in policy manifest does not match the checked-in .rqlp inventory: $policy_manifest" >&2
+    echo "Regression fixture manifest does not match its .rqlp inventory: $policy_manifest" >&2
     diff -u "$manifest_policy_files" "$checked_in_policy_files" >&2 || true
     exit 1
   fi
-  while IFS= read -r required_file; do
-    require_archive_file brokk-bifrost-policy "$required_file"
-  done < "$checked_in_policy_files"
 done
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
@@ -297,6 +297,8 @@ fn main() {
     let _: fn(&RustAnalyzer, &CodeUnit) -> Result<Option<Vec<CodeUnit>>, _> =
         RustAnalyzer::rust_trait_member_implementations;
     let profile = brokk_bifrost::open_pack_engine_profile();
+    let catalog = brokk_bifrost::policy::built_in_policy_catalog().expect("core catalog");
+    assert!(catalog.document().packs.is_empty(), "published engine implicitly shipped product rules");
     assert_eq!(profile["engine_version"], brokk_bifrost::BIFROST_VERSION);
     assert_eq!(
         profile["build_identity"],
