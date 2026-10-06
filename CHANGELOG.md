@@ -5,7 +5,7 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## [0.13.0] - 2026-10-02
+## [0.13.0] - 2026-10-06
 
 ### Added
 

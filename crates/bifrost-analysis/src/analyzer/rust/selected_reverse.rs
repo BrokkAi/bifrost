@@ -711,7 +711,9 @@ mod tests {
     #[test]
     fn reverse_usages_retained_bytes_are_independent_of_workspace_size() {
         use crate::analyzer::store::resolution_operation::heap_pin_bytes;
-        let measurements = [4, 32].map(|files| {
+        // Repeat with warm process state: fixed first-use allocations in the
+        // first small fixture must not hide retention in the larger fixture.
+        let measurements = [4, 32, 4, 32].map(|files| {
             let mut builder = InlineTestProject::with_language(Language::Rust).file(
                 "Cargo.toml",
                 "[package]\nname='heap'\nversion='0.1.0'\nedition='2021'\n",
@@ -737,9 +739,18 @@ mod tests {
                 .analyzer_store()
                 .resolution_shared_name_cache()
                 .clone();
-            let shared_names_before = shared_names.allocated_bytes();
+            let root_file = fixture.file("src/lib.rs");
+            let structural_key = rust
+                .inner
+                .structural_snapshot_key(&root_file, &rust.indexed_source(&root_file).unwrap())
+                .unwrap();
             let outcome =
                 with_rust_selected_reverse_queries(&rust, &CancellationToken::new(), |queries| {
+                    assert!(
+                        rust.inner.structural_cache().get(&structural_key).is_none(),
+                        "only newly cached facts may be subtracted from request growth"
+                    );
+                    let shared_names_before = shared_names.allocated_bytes();
                     let before = heap_pin_bytes();
                     let rows = queries.inverse_for(&[target])?;
                     assert!(
@@ -766,6 +777,20 @@ mod tests {
             let cache_release =
                 crate::analyzer::store::reader_eviction_bytes_for_test() - eviction_before_drop;
             let total_release = before_drop - heap_pin_bytes();
+            let structural_facts = rust
+                .inner
+                .structural_cache()
+                .take_for_heap_test(&structural_key)
+                .expect("reverse classification caches the root file's structural facts");
+            assert_eq!(
+                std::sync::Arc::strong_count(&structural_facts),
+                1,
+                "the completed request must release its structural snapshot"
+            );
+            let before_structural_drop = heap_pin_bytes();
+            drop(structural_facts);
+            let structural_release = before_structural_drop - heap_pin_bytes();
+            assert!(structural_release > 0);
             // ReaderPool::checkin evicts the idle point reader with this same
             // selection. That shared cache is not owned by the outer request.
             // Count its actual destructor releases separately, using the same
@@ -776,37 +801,34 @@ mod tests {
                 total_release - cache_release,
                 cache_release,
                 cache_growth,
+                structural_release,
             )
         });
         eprintln!(
-            "reverse Rust bytes (files, request growth, request-owned releases, shared reader eviction releases, capped cache growth): {measurements:?}"
+            "reverse Rust bytes (files, request growth, request-owned releases, shared reader eviction releases, shared-name cache growth, structural cache entry releases): {measurements:?}"
         );
-        // The request-owned release is no longer a proxy for retention, and it
-        // grows with the workspace on purpose. `ReadySelectedResolution::drop`
-        // trims the operation rebaser to its transient mounts before handing
-        // the operation back, so a request now frees the identity inventory it
-        // built instead of leaving it on the reader: with the trim this release
-        // is 40,906 bytes at four unrelated files and 120,284 at thirty-two,
-        // and without it 15,806 and 18,768. What must not grow is what survives
-        // that release, outside the byte-capped interior cache.
-        let retained_outside = measurements.map(|row| (row.1 - row.4) - row.2);
-        assert!(
-            retained_outside[1] <= retained_outside[0] + 4096,
-            "workspace growth must not retain inventory: {retained_outside:?} from {measurements:?}"
-        );
-        // The live heap one request occupies outside the capped caches is
-        // what the whole-selection completion sweep grew: it produced
-        // and pinned one interior per selected mount, about 5.5 MiB of real
-        // heap each, so a workspace eight times larger cost eight times the
-        // peak, and none of it was released while the source held them. The
-        // cache is the only structure that may still hold one entry per file,
-        // and its explicit cap is what bounds that.
-        let files_added = measurements[1].0 - measurements[0].0;
-        let outside_cache = measurements.map(|row| row.1 - row.4);
-        assert!(
-            outside_cache[1] <= outside_cache[0] + 32 * 1024,
-            "a reverse request's live heap outside the capped caches must not grow with {files_added} unrelated files: {measurements:?}"
-        );
+        // This fixture also enlarges the queried root file with module
+        // declarations. Its decoded FileFacts remain in the existing bounded
+        // structural cache, not in the request's identity inventory. Subtract
+        // their actual destructor releases after capturing the original heap,
+        // just as shared-name growth and reader eviction are attributed above.
+        let retained_outside = measurements.map(|row| row.1 - row.4 - row.5 - row.2);
+        // Pin the live heap as well as what survives request disposal. The
+        // existing bounded caches are the only retained structures allowed
+        // to grow with the workspace, and both comparisons keep the original
+        // allowances.
+        let outside_cache = measurements.map(|row| row.1 - row.4 - row.5);
+        for [small, large] in [[0, 1], [2, 3]] {
+            assert!(
+                retained_outside[large] <= retained_outside[small] + 4096,
+                "workspace growth must not retain inventory with cold or warm process state: {retained_outside:?} from {measurements:?}"
+            );
+            let files_added = measurements[large].0 - measurements[small].0;
+            assert!(
+                outside_cache[large] <= outside_cache[small] + 32 * 1024,
+                "a reverse request's live heap outside the capped caches must not grow with {files_added} unrelated files: {measurements:?}"
+            );
+        }
     }
 
     #[test]

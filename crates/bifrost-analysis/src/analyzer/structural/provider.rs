@@ -422,6 +422,23 @@ impl StructuralFactsCache {
         self.cache.insert(key, facts);
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_for_heap_test(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
+        let facts = self.cache.get(key)?;
+        let capacity = self
+            .cache
+            .policy()
+            .max_capacity()
+            .expect("structural facts have an explicit byte cap");
+        assert!(u64::from(weigh_entry(key, &facts)) <= capacity);
+        // Called only after the original heap measurement. Hand the entry's
+        // ownership to the test so its destructor can attribute actual bytes
+        // without counting cache maintenance as request-owned releases.
+        self.cache.invalidate(key);
+        self.cache.run_pending_tasks();
+        Some(facts)
+    }
+
     fn record_extraction(&self) {
         self.extractions.fetch_add(1, Ordering::Relaxed);
     }

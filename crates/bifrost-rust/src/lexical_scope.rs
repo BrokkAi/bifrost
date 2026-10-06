@@ -213,6 +213,56 @@ static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static RUST_SCOPE_INDEXES: OnceLock<Cache<Arc<str>, Arc<RustLexicalScopeIndex>>> = OnceLock::new();
 static RUST_SCOPE_INDEX_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+std::thread_local! {
+    static FIXTURE_TREE_PARSE_COUNTS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Count actual parses and requests made synchronously by one fixture. The
+/// existing aggregate counters still cover workers in integration tests.
+#[cfg(test)]
+pub(crate) fn with_rust_tree_parse_counts_for_test<T>(
+    fixture: impl FnOnce() -> T,
+) -> (T, (usize, usize)) {
+    struct Reset<'a>(&'a std::cell::Cell<Option<(usize, usize)>>);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.0.set(None);
+        }
+    }
+    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
+        assert!(
+            counts.get().is_none(),
+            "one parse observer per fixture thread"
+        );
+        counts.set(Some((0, 0)));
+        let reset = Reset(counts);
+        let result = fixture();
+        let observed = counts.get().expect("fixture parse observer is active");
+        drop(reset);
+        (result, observed)
+    })
+}
+
+#[cfg(test)]
+fn record_fixture_tree_parse() {
+    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
+        if let Some((parses, requests)) = counts.get() {
+            counts.set(Some((parses + 1, requests)));
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_fixture_tree_parse_request() {
+    FIXTURE_TREE_PARSE_COUNTS.with(|counts| {
+        if let Some((parses, requests)) = counts.get() {
+            counts.set(Some((parses, requests + 1)));
+        }
+    });
+}
+
 fn rust_scope_index_cache() -> &'static Cache<Arc<str>, Arc<RustLexicalScopeIndex>> {
     RUST_SCOPE_INDEXES.get_or_init(|| {
         Cache::builder()
@@ -281,6 +331,8 @@ fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
 
 pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_fixture_tree_parse();
     RUST_TREE_PARSED_BYTES.fetch_add(source.len(), Ordering::Relaxed);
     let mut parser = Parser::new();
     parser
@@ -309,6 +361,8 @@ pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
 /// parse to several threads.
 pub fn parse_rust_tree(source: &str) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_fixture_tree_parse_request();
     let cache = rust_tree_cache();
     if let Some(cached) = cache.get(source) {
         return cached;
@@ -329,6 +383,11 @@ pub fn parse_rust_tree(source: &str) -> Option<Tree> {
 pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        record_fixture_tree_parse_request();
+        record_fixture_tree_parse();
+    }
     RUST_TREE_PARSED_BYTES.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
     parse_source_region(&tree_sitter_rust::LANGUAGE.into(), source, start, end)
 }
@@ -338,6 +397,11 @@ pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<
 pub(crate) fn parse_rust_range_tree(source: &str, range: tree_sitter::Range) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        record_fixture_tree_parse_request();
+        record_fixture_tree_parse();
+    }
     RUST_TREE_PARSED_BYTES.fetch_add(
         range.end_byte.saturating_sub(range.start_byte),
         Ordering::Relaxed,
@@ -1409,6 +1473,39 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    #[test]
+    fn parse_observers_exclude_concurrent_fixture_work() {
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers = [1, 3].map(|expected| {
+                let ready = &ready;
+                scope.spawn(move || {
+                    let (_, counts) = with_rust_tree_parse_counts_for_test(|| {
+                        let source = "fn observed() {}";
+                        for _ in 0..expected {
+                            assert!(parse_rust_region_tree(source, 0, source.len()).is_some());
+                        }
+                        // Both fixtures have parsed while both observers are
+                        // active, so an aggregate counter cannot pin either.
+                        ready.wait();
+                    });
+                    assert_eq!(counts, (expected, expected));
+                })
+            });
+            for worker in workers {
+                worker
+                    .join()
+                    .expect("fixture parse observer is independent");
+            }
+        });
+        let (_, counts) = with_rust_tree_parse_counts_for_test(|| {});
+        assert_eq!(
+            counts,
+            (0, 0),
+            "a finished fixture leaves no active observer"
+        );
+    }
 
     #[test]
     fn parameter_attributes_do_not_create_lexical_bindings() {

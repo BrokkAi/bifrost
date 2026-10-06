@@ -7607,11 +7607,10 @@ wrap! { pub mod first; nested! { pub mod child; } }
 wrap! { pub mod second; }
 stringify! { pub mod route_only; }
 "#;
-        crate::lexical_scope::reset_rust_tree_parse_counters_for_test();
-        let parsed = parse_fixture(source);
+        let (parsed, (parses, requests)) =
+            crate::lexical_scope::with_rust_tree_parse_counts_for_test(|| parse_fixture(source));
         assert_eq!(
-            crate::lexical_scope::rust_tree_parse_request_count_for_test(),
-            4,
+            requests, 4,
             "one raw-tree parse for each primary or nested macro invocation"
         );
         // Four replay trees plus one enumeration attempt for each of the
@@ -7625,8 +7624,7 @@ stringify! { pub mod route_only; }
         // request counter above; the request count is replay's alone, and it
         // is what pins that no interior is replayed twice.
         assert_eq!(
-            crate::lexical_scope::rust_tree_parse_count_for_test(),
-            7,
+            parses, 7,
             "declaration and route projections share the same four replay trees"
         );
         let source_facts = parsed.source_facts.as_ref().expect("source facts");

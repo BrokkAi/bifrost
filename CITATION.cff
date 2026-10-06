@@ -10,7 +10,7 @@ contact:
   - name: "Brokk, Inc."
     website: "https://brokk.ai"
 version: "0.13.0"
-date-released: "2026-10-02"
+date-released: "2026-10-06"
 repository-code: "https://github.com/BrokkAi/bifrost"
 repository-artifact: "https://github.com/BrokkAi/bifrost/releases"
 url: "https://bifrost.brokk.ai/"

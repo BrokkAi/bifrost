@@ -948,20 +948,38 @@ mod tests {
         commit_all(&repo, "base");
         write(root, "src/value.py", "def value():\n    return 2\n");
         let target = commit_all(&repo, "target");
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
-
-        let result = missing_tests_at_root(
+        // Pin cancellation of the file graph, after diff preparation. A
+        // cancelled request may instead stop at a contended cache-build lock
+        // during preparation, before its changed functions are known.
+        let mut work = prepare_missing_tests_at_root(
             root,
-            None,
             MissingTestsParams {
                 base: None,
                 target: Some(target.to_string()),
             },
             &DiffAnalysisOptions::default(),
-            &cancellation,
+            &CancellationToken::default(),
         )
-        .expect("cancelled missing tests evidence");
+        .expect("prepare changed functions before cancelling the graph");
+        let target_context = build_target_file_dependency_analyzer(&work.prepared, None)
+            .expect("prepare the target analyzer before cancelling the graph");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let evidence = collect_target_evidence(
+            target_context.analyzer(),
+            &target_diff_paths(&work.prepared),
+            &cancellation,
+        );
+        assert!(evidence.graph_cancelled);
+        assert!(evidence.graph.is_none());
+        apply_file_graph_incompleteness(&mut work.candidates, &evidence);
+        let result = finish_missing_tests(
+            work,
+            MissingTestsMode::FileImportsThenExactUsages,
+            evidence.graph_cancelled,
+            evidence.graph_incomplete,
+            evidence.unresolved,
+        );
 
         assert!(result.missing_functions.is_empty());
         assert_eq!(1, result.indeterminate_functions.len());

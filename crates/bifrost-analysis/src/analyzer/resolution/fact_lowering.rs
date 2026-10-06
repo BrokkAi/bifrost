@@ -1102,36 +1102,33 @@ fn lower_scope_timelines_and_paths(
 /// So [`lower_for_test`] records the catalog it produced, under the mount it
 /// produced it at, and these read it back. A fixture that lowers the same
 /// fragment twice keeps the later catalog, which is the one it is about to ask
-/// about. Nothing here exists outside a test binary.
+/// about. Catalogs belong to the calling fixture thread: concurrent fixtures
+/// may reuse one fragment ordinal while lowering different facts. Nothing
+/// here exists outside tests or the test-support feature.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod fixture_names {
     use super::super::local_identity::ResolutionIdentityCatalog;
     use super::*;
     use crate::hash::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::cell::RefCell;
 
-    fn catalogs() -> &'static Mutex<HashMap<u32, std::sync::Arc<ResolutionIdentityCatalog>>> {
-        static CATALOGS: OnceLock<Mutex<HashMap<u32, std::sync::Arc<ResolutionIdentityCatalog>>>> =
-            OnceLock::new();
-        CATALOGS.get_or_init(|| Mutex::new(HashMap::default()))
+    std::thread_local! {
+        static CATALOGS: RefCell<HashMap<u32, std::sync::Arc<ResolutionIdentityCatalog>>> =
+            RefCell::new(HashMap::default());
     }
 
     pub(crate) fn record(catalog: &ResolutionIdentityCatalog) {
-        catalogs()
-            .lock()
-            .expect("the fixture catalog table is not poisoned")
-            .insert(
+        CATALOGS.with(|catalogs| {
+            catalogs.borrow_mut().insert(
                 catalog.fragment().ordinal(),
                 std::sync::Arc::new(catalog.clone()),
             );
+        });
     }
 
     fn catalog(fragment: BindingFragmentId) -> std::sync::Arc<ResolutionIdentityCatalog> {
-        catalogs()
-            .lock()
-            .expect("the fixture catalog table is not poisoned")
-            .get(&fragment.ordinal())
-            .cloned()
+        CATALOGS
+            .with(|catalogs| catalogs.borrow().get(&fragment.ordinal()).cloned())
             .unwrap_or_else(|| {
                 panic!("no fixture lowered {fragment}, so nothing numbered its identities")
             })
@@ -1175,11 +1172,7 @@ pub(crate) mod fixture_names {
             let Some(ordinal) = semantic.ordinal() else {
                 return Ok(None);
             };
-            let Some(catalog) = catalogs()
-                .lock()
-                .expect("the fixture catalog table is not poisoned")
-                .get(&ordinal)
-                .cloned()
+            let Some(catalog) = CATALOGS.with(|catalogs| catalogs.borrow().get(&ordinal).cloned())
             else {
                 return Ok(None);
             };
@@ -7096,6 +7089,47 @@ mod tests {
             scope.start_byte,
             scope.end_byte,
         ));
+    }
+
+    #[test]
+    fn concurrent_fixtures_keep_catalogs_for_their_own_thread() {
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let workers = [3, 4].map(|declaration| {
+                let ready = &ready;
+                scope.spawn(move || {
+                    let fragment = BindingFragmentId::for_test(b"concurrent-fixture-catalog");
+                    let mut facts = nested_type_body_facts(ResolutionNamespace::Callable);
+                    add_scope_wide_declaration(
+                        &mut facts,
+                        declaration,
+                        2,
+                        2,
+                        ResolutionSiteKind::CallableDeclaration,
+                        ResolutionBinderKind::Callable,
+                        ResolutionNamespace::Callable,
+                    );
+                    let (lowered, catalog) =
+                        lower_lexical_for_test(fragment, Language::Java, &facts);
+                    let site = ResolutionSiteId::new(declaration);
+                    let expected_path = catalog
+                        .path_for_identity(binder_path_identity(site))
+                        .expect("the fixture's own catalog contains its method binder");
+                    let direct = semantic(&lowered, declaration, LoweredSemanticRole::Definition);
+                    // Both catalogs have been recorded before either fixture
+                    // asks for its own path. A shared table loses one binder.
+                    ready.wait();
+                    assert_eq!(binder_path_id(fragment, site), expected_path);
+                    let answer = resolve_with_coverage(lowered, 2);
+                    assert_eq!(answer.targets(), &[direct]);
+                })
+            });
+            for worker in workers {
+                worker
+                    .join()
+                    .expect("concurrent fixture preserves its catalog");
+            }
+        });
     }
 
     #[test]
