@@ -118,11 +118,13 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.ok(requiredStart >= 0 && requiredEnd > requiredStart, "required asset loop must be present");
   const requiredAssets = workflow.slice(requiredStart, requiredEnd);
   for (const asset of [
-    "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz",
-    "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256",
+    "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz",
+    "bifrost-semantic-pack-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256",
   ]) {
-    assert.ok(requiredAssets.includes(asset), `missing required semantic-pack asset ${asset}`);
+    assert.ok(requiredAssets.includes(asset), `missing required installer asset ${asset}`);
   }
+  assert.ok(!workflow.includes("bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"),
+    "engine release must not require the retired assembled pack content");
   assert.ok(workflow.includes('.digest // ""'));
   assert.match(workflow, /\^sha256:\[0-9a-f\]\{64\}\$/u);
   assert.ok(workflow.includes('expected="${digest#sha256:}"'));

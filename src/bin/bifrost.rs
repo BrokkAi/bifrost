@@ -1,12 +1,14 @@
 // jemalloc is the binary's global allocator wherever it builds (every target
-// except MSVC, which keeps the system allocator). Measured on the whole tract
+// except MSVC and Android, which keep the system allocator). The allocator's
+// Android build requires libgcc, absent from modern LLVM-based NDKs.
+// Measured on the whole tract
 // usage graph (2026-09-25, lane a2, #2771): at matched host load, about 20
 // percent less wall and CPU than the system allocator, peak RSS unchanged
 // (1.27 to 1.28 GiB against 1.29 to 1.31 GiB). Replies were byte-equal on the
 // whole graph and the rooted generated-file graph, and equal on 800 point
 // requests apart from process-local SegmentId numbers in diagnostics.
 // Evidence: /mnt/optane/lane-receipts/bifrost-sg-a2/alloc/report.txt.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "android")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

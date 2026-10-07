@@ -375,9 +375,14 @@ jobs:
       - name: Verify GNU/Linux ELF contract
         shell: bash
         run: bash scripts/public/verify-linux-release-elf.sh "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" x86_64-unknown-linux-gnu
-      - name: Verify shipped LSP compatibility identity
+      - name: Set up Node for shipped engine compatibility
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Verify shipped MCP compatibility and legacy LSP diagnostic
         run: >-
-          python3 scripts/public/verify-lsp-compatibility.py
+          node scripts/public/verify-engine-compatibility.mjs
           "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}"
           --engine-version "${{ needs.preflight.outputs.version }}"
       - name: Stage Unix archive
@@ -629,6 +634,15 @@ jobs:
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
           args: --release --locked --out dist
           rust-toolchain: '1.97.1'
+      - name: Set up Python for staged wheel smoke
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install and exercise exact Python wheel
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: python scripts/public/verify-python-wheel.py --wheel-directory dist --kind client --version "$RELEASE_VERSION"
       - name: Upload exact Python wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -641,7 +655,7 @@ jobs:
     name: build uv CLI wheel (${{ matrix.target }})
     needs: [preflight, notices]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -695,6 +709,20 @@ jobs:
           args: --release --locked --out dist
           rust-toolchain: '1.97.1'
           working-directory: packaging/bifrost-cli
+      - name: Set up Python for staged CLI wheel smoke
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Set up Node for staged CLI wheel protocol probe
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Install and exercise exact CLI wheel
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: python scripts/public/verify-python-wheel.py --wheel-directory packaging/bifrost-cli/dist --kind cli --version "$RELEASE_VERSION"
       - name: Upload exact uv CLI wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:

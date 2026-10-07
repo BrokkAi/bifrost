@@ -76,6 +76,16 @@ function stepBlocks(job) {
   return starts.map((start, index) => job.slice(start, starts[index + 1] ?? job.length));
 }
 
+readinessTest("every staged Python wheel is installed and exercised before upload", () => {
+  for (const [jobName, kind] of [["python-wheels", "client"], ["uv-wheels", "cli"]]) {
+    const job = jobBlock(readiness, jobName);
+    const smoke = job.indexOf(`--kind ${kind}`);
+    assert.ok(smoke > 0, `${jobName} must exercise its installed staged wheel`);
+    assert.match(job, /python-version: ['"]?3\.12/u);
+    assert.ok(smoke < job.indexOf("- name: Upload exact"), `${jobName} smoke must precede upload`);
+  }
+});
+
 test("release triggers stay independent from source projection", () => {
   assert.match(release, /^  push:\n    tags:/mu);
   assert.match(release, /^  workflow_dispatch:/mu);
@@ -724,12 +734,12 @@ readinessTest("release readiness separates pinned GNU builds from portable binar
   }
 
   const compatibilityVerifier = linuxBuild.indexOf(
-    "python3 scripts/public/verify-lsp-compatibility.py",
+    "node scripts/public/verify-engine-compatibility.mjs",
   );
   const linuxStaging = linuxBuild.indexOf("- name: Stage Unix archive");
   assert.ok(
     compatibilityVerifier >= 0 && compatibilityVerifier < linuxStaging,
-    "the exact shipped binary must prove its structured LSP identity before archive staging",
+    "the exact shipped binary must prove its MCP identity and legacy LSP diagnostic before archive staging",
   );
   assert.match(
     linuxBuild,

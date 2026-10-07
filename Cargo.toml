@@ -232,8 +232,9 @@ tar = { version = "0.4.44", default-features = false }
 libc = "0.2"
 
 # The `bifrost` binary's global allocator (src/bin/bifrost.rs). jemalloc does
-# not build for MSVC targets, which keep the system allocator.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# not build for MSVC, and its Android linkage requires libgcc absent from modern
+# NDKs. Those targets keep the system allocator.
+[target.'cfg(not(any(target_env = "msvc", target_os = "android")))'.dependencies]
 tikv-jemallocator = "0.7.0"
 
 # Full debuginfo made every dev test binary ~600 MB, so target/ grew by
