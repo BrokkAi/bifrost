@@ -11,7 +11,9 @@ permissions:
 jobs:
   unit-doctests:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A cold runner needs compilation, all workspace libraries, and doctests.
+    # Keep that coverage independent of whether a dependency cache is available.
+    timeout-minutes: 90
     # Exact public compilation passed on 16 GiB with two compiler jobs.
     # Bound overlapping rustc/link processes; test scheduling stays unchanged.
     env:
@@ -47,6 +49,9 @@ jobs:
       - name: Install uv for source-owned sidecar tests
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --version 0.9.140 --locked
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -56,7 +61,9 @@ jobs:
       - name: Run source-owned unit tests
         env:
           JAVA_HOME: ''
-        run: /usr/bin/time -v cargo test --workspace --lib --locked
+        # One outer scheduler covers every library; Cargo runs libraries serially.
+        # Preserve the ordinary ignored-test selection and expose first failures.
+        run: /usr/bin/time -v cargo nextest run --workspace --lib --locked --max-fail 100 --retries 0
 
       - name: Record runner storage after unit tests
         if: always()
