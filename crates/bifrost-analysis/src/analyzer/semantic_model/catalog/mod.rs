@@ -154,7 +154,13 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// and leave ordered multiple inheritance unavailable to C3 (#4860).
 /// 53: Kotlin native declarations retain named-only fixed parameters after a
 /// positional vararg. Older generated signatures allow invalid positional tails.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 54;
+/// 54: Scala source artifacts retain the exact declaration identity when a
+/// repeated parameter list is followed by another list, while withholding only
+/// the unrepresentable flat signature.
+/// 55: the persisted Scala warning is declaration-scoped and keeps its source
+/// location without becoming a file-level source entry. Old dual-subject
+/// diagnostics cannot satisfy the release reject accounting contract.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 55;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

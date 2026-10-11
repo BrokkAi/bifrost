@@ -4905,6 +4905,91 @@ mod tests {
         assert!(verify_release_bundle(&first).is_err());
     }
 
+    #[test]
+    fn scala_repeated_parameter_list_warning_round_trips_through_release_bundle() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture
+            .path()
+            .join("scala-repeated-parameter-lists-sources.jar");
+        write_zip(
+            &artifact,
+            &[(
+                "sample/RepeatedLists.scala",
+                r#"package sample
+trait RepeatedLists {
+  def ordinaryAfter(values: String*)(suffix: String): String = suffix
+  def contextualAfter(values: String*)(implicit suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+"#,
+            )],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("scala-repeated-parameter-lists.json");
+        let pinned = pinned_spec(
+            "scala-repeated-parameter-lists-fixture",
+            "2.13.16",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "scala-repeated-parameter-lists-sources.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/scala-repeated-parameter-lists.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "sample.RepeatedLists".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let output = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &output,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: artifact,
+            }],
+        )
+        .unwrap();
+
+        let pack_rejects = &bundle.rejects.packs[0];
+        assert_eq!(pack_rejects.completeness, Completeness::Partial);
+        assert_eq!(pack_rejects.suppressed_rejects, 0);
+        assert_eq!(pack_rejects.rejects.len(), 2);
+        for declaration in [
+            "sample.RepeatedLists.ordinaryAfter",
+            "sample.RepeatedLists.contextualAfter",
+        ] {
+            let reject = pack_rejects
+                .rejects
+                .iter()
+                .find(|reject| reject.declaration.as_deref() == Some(declaration))
+                .expect("repeated parameter-list release warning");
+            assert_eq!(reject.severity, ReleaseRejectSeverity::Warning);
+            assert_eq!(reject.code, "scala.signature.repeated_parameter_list");
+            assert_eq!(
+                reject.location.as_deref(),
+                Some("sample/RepeatedLists.scala")
+            );
+            assert!(reject.source_entry.is_none());
+            assert!(
+                reject
+                    .message
+                    .contains("flat external signature cannot represent")
+            );
+        }
+        let accounting =
+            extraction_accounting(&pack_rejects.rejects, pack_rejects.suppressed_rejects);
+        assert!(accounting.warning_only_and_fully_accounted());
+        assert_eq!(accounting.gaps.len(), 2);
+        assert!(accounting.source_entries.is_empty());
+        assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+    }
+
     /// Change only the synthetic fixture's recorded producer provenance.
     /// Every compiled pack, observation and reject remains intact and checked.
     fn rewrite_fixture_generator(root: &Path, generator: ReleaseGenerator) -> ReleaseBundleIndex {

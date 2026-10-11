@@ -510,7 +510,7 @@ fn scala_entry_facts(
                 severity: ProducerDiagnosticSeverity::Warning,
                 code: "scala.signature.repeated_parameter_list".to_owned(),
                 location: Some(entry_name.to_owned()),
-                source_entry: Some(entry_name.to_owned().into_boxed_str()),
+                source_entry: None,
                 declaration: Some(declaration.fq_name()),
                 message: "Scala callable has a repeated parameter list followed by another parameter list; the flat external signature cannot represent that list boundary, so formal binding was withheld".to_owned(),
             }]);
@@ -1507,10 +1507,7 @@ trait RepeatedLists {
                 .iter()
                 .find(|diagnostic| diagnostic.declaration.as_deref() == Some(declaration))
                 .expect("unrepresentable signature warning");
-            assert_eq!(
-                diagnostic.source_entry.as_deref(),
-                Some("sample/RepeatedLists.scala")
-            );
+            assert!(diagnostic.source_entry.is_none());
             assert_eq!(
                 diagnostic.location.as_deref(),
                 Some("sample/RepeatedLists.scala")
