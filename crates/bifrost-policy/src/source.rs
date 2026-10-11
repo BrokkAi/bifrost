@@ -141,6 +141,16 @@ pub struct PolicySourceEdit {
     pub new_text: String,
 }
 
+/// The source-preserving result of configuring identical selectors in a
+/// relational assertion policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicySourceConfiguration {
+    /// The exact edits against the caller's unchanged source bytes.
+    pub edits: Vec<PolicySourceEdit>,
+    /// The bytes produced by applying `edits` to the original source.
+    pub configured_source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySourceFix {
     pub title: String,
@@ -284,6 +294,346 @@ pub fn parse_rqlp_source(
 ) -> Result<ParsedRqlpDocument, PolicySourceError> {
     let expr = parse_rqlp_expr(source)?;
     Decoder::new(identity).decode_document(&expr)
+}
+
+/// Configure the same inline selector expression in a set of relational
+/// assertion bindings.
+///
+/// This is deliberately source-oriented: the input remains unchanged, the
+/// returned edits point at parser-owned byte ranges, and the edited bytes are
+/// parsed again before the result is returned. Each target must be the
+/// template's semantic empty form `(except X X)`, so an existing predicate
+/// cannot be silently replaced. The replacement is applied identically to all
+/// requested bindings, which is the invariant required by paired selection
+/// and effect bindings.
+pub fn configure_identical_relational_selectors(
+    source: &str,
+    identity: PolicySourceIdentity,
+    binding_names: &[&str],
+    replacement_source: &str,
+) -> Result<PolicySourceConfiguration, PolicySourceError> {
+    validate_policy_source_identity(&identity).map_err(|error| {
+        source_error(
+            "configuration-invalid-source-identity",
+            0..source.len(),
+            error.to_string(),
+        )
+    })?;
+    if binding_names.len() < 2 {
+        return Err(source_error(
+            "configuration-needs-paired-bindings",
+            0..source.len(),
+            "selector configuration requires at least two relational bindings",
+        ));
+    }
+
+    let mut requested = HashSet::with_capacity(binding_names.len());
+    for name in binding_names {
+        if name.is_empty() || !requested.insert(*name) {
+            return Err(source_error(
+                "configuration-invalid-binding-list",
+                0..source.len(),
+                "selector configuration binding names must be non-empty and distinct",
+            ));
+        }
+    }
+
+    parse_configuration_expression(replacement_source)?;
+    parse_rqlp_source(source, identity.clone())?;
+    let root = parse_rqlp_expr(source)?;
+    let targets = relational_selector_targets(&root, &requested, source.len())?;
+
+    let mut edits = Vec::with_capacity(binding_names.len());
+    let mut languages = HashSet::new();
+    let mut schemas = HashSet::new();
+    for name in binding_names {
+        let target = targets.get(*name).ok_or_else(|| {
+            source_error(
+                "configuration-target-not-found",
+                0..source.len(),
+                format!("relational binding `{name}` was not found"),
+            )
+        })?;
+        languages.insert(target.language.clone());
+        schemas.insert(target.schema_version);
+        edits.push(PolicySourceEdit {
+            range: target.range.clone(),
+            new_text: replacement_source.to_owned(),
+        });
+    }
+    if languages.len() != 1 || schemas.len() != 1 {
+        return Err(source_error(
+            "configuration-selector-context-mismatch",
+            edits
+                .first()
+                .map_or_else(|| 0..source.len(), |edit| edit.range.clone()),
+            "configured relational bindings must use the same language and RQL schema",
+        ));
+    }
+
+    let configured_source = apply_source_edits(source, &edits);
+    parse_rqlp_source(&configured_source, identity)?;
+
+    Ok(PolicySourceConfiguration {
+        edits,
+        configured_source,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RelationalSelectorTarget {
+    range: Range<usize>,
+    language: String,
+    schema_version: Option<u32>,
+}
+
+fn relational_selector_targets(
+    root: &Expr,
+    requested: &HashSet<&str>,
+    source_len: usize,
+) -> Result<HashMap<String, RelationalSelectorTarget>, PolicySourceError> {
+    let policy_fields = RecordCursor::parse(
+        root,
+        PolicyRecord::Policy,
+        DecodeContext::policy(PolicyAnalysisKind::Match),
+    )?;
+    let analysis_expr = policy_fields.required("analysis");
+    let analysis_fields = RecordCursor::parse(
+        analysis_expr,
+        PolicyRecord::Analysis,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let analysis_kind =
+        schema_analysis_kind(decode_analysis_type(analysis_fields.required("type"))?);
+    if analysis_kind != PolicyAnalysisKind::Assertion {
+        return Err(source_error(
+            "configuration-requires-relational-assertion",
+            analysis_expr.range.clone(),
+            "identical selector configuration requires an assertion analysis",
+        ));
+    }
+
+    let mut targets = HashMap::with_capacity(requested.len());
+    for entry in analysis_fields.variadic() {
+        let head = list_head(entry)?;
+        if !PolicyRecord::Bind.labels().contains(&head) {
+            continue;
+        }
+        let fields = RecordCursor::parse(
+            entry,
+            PolicyRecord::Bind,
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+        )?;
+        let binding_name: RowBindingName =
+            parse_identifier(fields.required("name"), "row binding name")?;
+        let name = binding_name.as_str();
+        if !requested.contains(name) {
+            continue;
+        }
+        if targets.contains_key(name) {
+            return Err(source_error(
+                "configuration-duplicate-binding",
+                entry.range.clone(),
+                format!("relational binding `{name}` occurs more than once"),
+            ));
+        }
+
+        let query_expr = fields.required("query");
+        let query_fields = RecordCursor::parse(
+            query_expr,
+            PolicyRecord::Rql,
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+        )?;
+        let query = query_fields.positional(0).ok_or_else(|| {
+            source_error(
+                "configuration-missing-query",
+                query_expr.range.clone(),
+                format!("relational binding `{name}` has no inline RQL query"),
+            )
+        })?;
+        let (except, language) = find_single_configuration_selector(query, name)?;
+        assert!(
+            except.range.start <= except.range.end && except.range.end <= source_len,
+            "typed selector parser returned an invalid source span: {:?}",
+            except.range
+        );
+        targets.insert(
+            name.to_owned(),
+            RelationalSelectorTarget {
+                range: except.range.clone(),
+                language,
+                schema_version: query_fields
+                    .get("schema-version")
+                    .and_then(Expr::as_number)
+                    .and_then(|value| u32::try_from(value).ok()),
+            },
+        );
+    }
+
+    let missing = requested
+        .iter()
+        .find(|name| !targets.contains_key(**name))
+        .copied();
+    if let Some(name) = missing {
+        return Err(source_error(
+            "configuration-target-not-found",
+            0..source_len,
+            format!("relational binding `{name}` was not found"),
+        ));
+    }
+    Ok(targets)
+}
+
+fn find_single_configuration_selector<'a>(
+    query: &'a Expr,
+    binding_name: &str,
+) -> Result<(&'a Expr, String), PolicySourceError> {
+    let mut stack = vec![(query, None::<&str>)];
+    let mut matches = Vec::new();
+    while let Some((current, inherited_language)) = stack.pop() {
+        let language = if is_expr_head(current, "language") {
+            current
+                .as_list()
+                .and_then(|items| items.get(1))
+                .and_then(Expr::as_symbol)
+        } else {
+            inherited_language
+        };
+        if is_expr_head(current, "except") {
+            let language = language.ok_or_else(|| {
+                source_error(
+                    "configuration-selector-context-mismatch",
+                    current.range.clone(),
+                    format!("binding `{binding_name}` has an `except` outside a language query"),
+                )
+            })?;
+            matches.push((current, language.to_owned()));
+        }
+        if let Some(children) = current.as_sequence() {
+            for child in children.iter().rev() {
+                stack.push((child, language));
+            }
+        }
+    }
+
+    let (selector, language) = match matches.as_slice() {
+        [(selector, language)] => (*selector, language.clone()),
+        [] => {
+            return Err(source_error(
+                "configuration-target-not-found",
+                query.range.clone(),
+                format!("binding `{binding_name}` has no typed `except` selector"),
+            ));
+        }
+        _ => {
+            return Err(source_error(
+                "configuration-target-ambiguous",
+                query.range.clone(),
+                format!("binding `{binding_name}` has more than one typed `except` selector"),
+            ));
+        }
+    };
+    let items = selector.as_list().expect("the selector head is `except`");
+    if items.len() != 3 || !exprs_equal_ignoring_ranges(&items[1], &items[2]) {
+        return Err(source_error(
+            "configuration-target-not-empty",
+            selector.range.clone(),
+            format!("binding `{binding_name}` does not contain an empty `(except X X)` selector"),
+        ));
+    }
+    Ok((selector, language))
+}
+
+fn parse_configuration_expression(source: &str) -> Result<Expr, PolicySourceError> {
+    if source.len() > MAX_RQLP_SOURCE_BYTES {
+        return Err(source_error(
+            "configuration-source-too-large",
+            0..source.len(),
+            format!(
+                "selector replacement is too large: {} bytes exceeds {}",
+                source.len(),
+                MAX_RQLP_SOURCE_BYTES
+            ),
+        ));
+    }
+    let parsed = parse_sexp_with_limits(
+        source,
+        SexpParseLimits::new(MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES),
+    )
+    .map_err(|error| source_error("configuration-invalid-selector", error.range, error.message))?;
+    if let Some(error) = parsed.incomplete {
+        return Err(source_error(
+            "configuration-incomplete-selector",
+            error.range,
+            error.message,
+        ));
+    }
+    parsed.expr.ok_or_else(|| {
+        source_error(
+            "configuration-missing-selector",
+            source.len()..source.len(),
+            "selector replacement must contain one expression",
+        )
+    })
+}
+
+fn is_expr_head(expr: &Expr, expected: &str) -> bool {
+    expr.as_list()
+        .and_then(|items| items.first())
+        .and_then(Expr::as_symbol)
+        == Some(expected)
+}
+
+fn exprs_equal_ignoring_ranges(left: &Expr, right: &Expr) -> bool {
+    let mut pairs = vec![(left, right)];
+    while let Some((left, right)) = pairs.pop() {
+        match (&left.kind, &right.kind) {
+            (ExprKind::List(left), ExprKind::List(right))
+            | (ExprKind::Vector(left), ExprKind::Vector(right)) => {
+                if left.len() != right.len() {
+                    return false;
+                }
+                for (left, right) in left.iter().zip(right).rev() {
+                    pairs.push((left, right));
+                }
+            }
+            (ExprKind::String(left), ExprKind::String(right))
+            | (ExprKind::Symbol(left), ExprKind::Symbol(right)) => {
+                if left != right {
+                    return false;
+                }
+            }
+            (ExprKind::Number(left), ExprKind::Number(right)) if left == right => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn apply_source_edits(source: &str, edits: &[PolicySourceEdit]) -> String {
+    let mut ordered = edits.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    for edit in &ordered {
+        assert!(
+            edit.range.start <= edit.range.end && edit.range.end <= source.len(),
+            "typed selector parser returned an invalid source span: {:?}",
+            edit.range
+        );
+    }
+    for pair in ordered.windows(2) {
+        assert!(
+            pair[0].range.end <= pair[1].range.start,
+            "typed selector parser returned overlapping source spans: {:?} and {:?}",
+            pair[0].range,
+            pair[1].range
+        );
+    }
+    let mut configured = source.to_owned();
+    ordered.sort_by_key(|edit| std::cmp::Reverse((edit.range.start, edit.range.end)));
+    for edit in ordered {
+        configured.replace_range(edit.range.clone(), &edit.new_text);
+    }
+    configured
 }
 
 /// Parse a standalone endpoint-set under selector defaults inherited from its
@@ -7354,6 +7704,259 @@ mod tests {
                       :observed-operand (argument :index 0))])
                   {extra}))"#
         )
+    }
+
+    fn relational_configuration_policy(
+        selected_language: &str,
+        selected_selector: &str,
+        effect_language: &str,
+        effect_selector: &str,
+    ) -> String {
+        format!(
+            r#"(policy :schema-version 1 :id "test.configuration" :name "Configuration"
+              :message "M" :severity warning
+              :analysis (analysis :type assertion
+                (bind :name selected :query (rql :schema-version 1
+                  (language {selected_language} {selected_selector})))
+                (bind :name effect :query (rql :schema-version 1
+                  (language {effect_language}
+                    (procedure-effects {effect_selector}))))
+                (join :left selected :right effect :on ((id procedure_id)))
+                (group :name selected-boundary :by (selected.id)
+                  (aggregate :name network-effects :op count
+                    :where ((effect.effect_id eq "bifrost.network_io")
+                            (effect.derivation eq declared))))
+                (assert :group selected-boundary :value network-effects
+                  :cardinality (exactly 0))))"#,
+            selected_language = selected_language,
+            selected_selector = selected_selector,
+            effect_language = effect_language,
+            effect_selector = effect_selector,
+        )
+    }
+
+    #[test]
+    fn configures_identical_relational_selectors_from_typed_ranges() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let replacement = "(enclosing-decl (function :name \"total\"))";
+        let source = relational_configuration_policy("typescript", empty, "typescript", empty);
+        let original = source.clone();
+
+        let configured = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            replacement,
+        )
+        .expect("the two empty selectors configure");
+
+        assert_eq!(
+            source, original,
+            "configuration must not mutate original bytes"
+        );
+        assert_eq!(configured.edits.len(), 2);
+        assert!(
+            configured
+                .edits
+                .iter()
+                .all(|edit| edit.new_text == replacement)
+        );
+
+        let original_semantic = parse(&source)
+            .expect("the original policy parses")
+            .to_inline_local_canonical_semantic_json()
+            .expect("the original policy is closed and inline");
+        let configured_semantic = parse(&configured.configured_source)
+            .expect("the configured policy parses")
+            .to_inline_local_canonical_semantic_json()
+            .expect("the configured policy is closed and inline");
+
+        let mut original_without_bindings = original_semantic.clone();
+        let mut configured_without_bindings = configured_semantic.clone();
+        original_without_bindings
+            .pointer_mut("/analysis/plan")
+            .and_then(|plan| plan.as_object_mut())
+            .expect("the original policy has a relational plan")
+            .remove("bindings");
+        configured_without_bindings
+            .pointer_mut("/analysis/plan")
+            .and_then(|plan| plan.as_object_mut())
+            .expect("the configured policy has a relational plan")
+            .remove("bindings");
+        assert_eq!(
+            original_without_bindings, configured_without_bindings,
+            "configuration must not change joins, groups, assertions, limits, or metadata"
+        );
+
+        let original_bindings = original_semantic
+            .pointer("/analysis/plan/bindings")
+            .and_then(|bindings| bindings.as_array())
+            .expect("the original policy has binding projections");
+        let configured_bindings = configured_semantic
+            .pointer("/analysis/plan/bindings")
+            .and_then(|bindings| bindings.as_array())
+            .expect("the configured policy has binding projections");
+        assert_eq!(original_bindings.len(), configured_bindings.len());
+        for (original_binding, configured_binding) in
+            original_bindings.iter().zip(configured_bindings)
+        {
+            assert_eq!(original_binding["name"], configured_binding["name"]);
+            let name = original_binding["name"]
+                .as_str()
+                .expect("binding names are strings");
+            let mut original_without_query = original_binding.clone();
+            let mut configured_without_query = configured_binding.clone();
+            original_without_query
+                .as_object_mut()
+                .expect("binding projections are objects")
+                .remove("query");
+            configured_without_query
+                .as_object_mut()
+                .expect("binding projections are objects")
+                .remove("query");
+            assert_eq!(
+                original_without_query, configured_without_query,
+                "configuration must preserve non-selector fields of binding `{name}`"
+            );
+            assert_ne!(
+                original_binding["query"], configured_binding["query"],
+                "configuration must change the selected selector in binding `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_a_nonempty_original_selector() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let selected =
+            "(except (enclosing-decl (function :name \"old\")) (enclosing-decl (function)))";
+        let source = relational_configuration_policy("typescript", selected, "typescript", empty);
+
+        let error = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            "(enclosing-decl (function :name \"total\"))",
+        )
+        .expect_err("a nonempty template predicate must not be replaced");
+
+        assert_eq!(error.diagnostic.code, "configuration-target-not-empty");
+    }
+
+    #[test]
+    fn configuration_rejects_missing_or_duplicate_targets() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let source = relational_configuration_policy("typescript", empty, "typescript", empty);
+
+        let missing = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "missing"],
+            "(enclosing-decl (function :name \"total\"))",
+        )
+        .expect_err("unknown binding must be rejected");
+        assert_eq!(missing.diagnostic.code, "configuration-target-not-found");
+
+        let duplicate = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "selected"],
+            "(enclosing-decl (function :name \"total\"))",
+        )
+        .expect_err("duplicate binding names must be rejected");
+        assert_eq!(
+            duplicate.diagnostic.code,
+            "configuration-invalid-binding-list"
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_different_typed_language_contexts() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let source = relational_configuration_policy("typescript", empty, "javascript", empty);
+
+        let error = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            "(enclosing-decl (function :name \"total\"))",
+        )
+        .expect_err("paired bindings must use one language context");
+
+        assert_eq!(
+            error.diagnostic.code,
+            "configuration-selector-context-mismatch"
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_invalid_or_oversized_replacement_before_editing() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let source = relational_configuration_policy("typescript", empty, "typescript", empty);
+
+        let invalid = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            "(enclosing-decl",
+        )
+        .expect_err("an incomplete replacement must be rejected");
+        assert_eq!(invalid.diagnostic.code, "configuration-incomplete-selector");
+
+        let oversized = "x".repeat(MAX_RQLP_SOURCE_BYTES + 1);
+        let error = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            &oversized,
+        )
+        .expect_err("an oversized atom must be rejected before parsing");
+        assert_eq!(error.diagnostic.code, "configuration-source-too-large");
+    }
+
+    #[test]
+    fn configuration_rejects_ambiguous_nested_except_selectors() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let nested = "(except (enclosing-decl (function)) (except (enclosing-decl (function)) (enclosing-decl (function))))";
+        let source = relational_configuration_policy("typescript", nested, "typescript", empty);
+
+        let error = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            "(enclosing-decl (function :name \"total\"))",
+        )
+        .expect_err("a nested except must not make the target ambiguous by accident");
+        assert_eq!(error.diagnostic.code, "configuration-target-ambiguous");
+    }
+
+    #[test]
+    fn configuration_uses_byte_ranges_through_unicode_source_and_replacement() {
+        let empty = "(except (enclosing-decl (function)) (enclosing-decl (function)))";
+        let source = relational_configuration_policy("typescript", empty, "typescript", empty)
+            .replace(":name \"Configuration\"", ":name \"Configuraci\u{f3}n\"");
+        let replacement = "(enclosing-decl (function :name \"na\u{ef}ve\"))";
+
+        let configured = configure_identical_relational_selectors(
+            &source,
+            PolicySourceIdentity::new("test.configuration"),
+            &["selected", "effect"],
+            replacement,
+        )
+        .expect("Unicode before and inside the replacement must preserve byte spans");
+
+        assert!(
+            configured
+                .edits
+                .iter()
+                .all(|edit| source.is_char_boundary(edit.range.start)
+                    && source.is_char_boundary(edit.range.end))
+        );
+        assert!(configured.configured_source.contains("Configuraci\u{f3}n"));
+        assert_eq!(
+            configured.configured_source.matches("na\u{ef}ve").count(),
+            2
+        );
     }
 
     #[test]

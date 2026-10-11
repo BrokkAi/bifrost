@@ -39,9 +39,9 @@ use brokk_bifrost::policy::{
     PolicyFailOn, PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
     PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, policy_source_identity,
-    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
-    write_policy_sarif_for_outcome,
+    configure_identical_relational_selectors, escape_terminal_text, evaluate_policy_inputs,
+    explain_policy_inputs, policy_source_identity, rank_policy_near_misses,
+    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif_for_outcome,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -52,6 +52,7 @@ use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use brokk_bifrost::{CancellationToken, ToolOutput};
 use code_query_repl::run_code_query_repl;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
@@ -294,6 +295,7 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
             }
         }
         Some("policy-source-identity") => run_policy_source_identity_command(&args[1..]),
+        Some("configure-policy") => run_policy_configuration_command(&args[1..]),
         Some("prepare-open-packs") => match run_prepare_open_packs(&args[1..]) {
             Ok(result) => Ok(result),
             Err(message) => {
@@ -350,6 +352,83 @@ fn policy_source_identity_json(args: &[String]) -> Result<Value, String> {
             "authored_hash": "PolicyRegistry::register_policy_bytes_deferred",
             "resolved": "PolicyRegistry::register_policy_bytes",
         },
+        "engine_version": brokk_bifrost::BIFROST_VERSION,
+        "build_identity": brokk_bifrost::BIFROST_BUILD_IDENTITY,
+    }))
+}
+
+/// Repository-owned configuration for identical empty relational selectors.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicySelectorConfiguration {
+    schema_version: u32,
+    binding_names: Vec<String>,
+    selector: String,
+}
+
+fn run_policy_configuration_command(args: &[String]) -> Result<CliRunResult, String> {
+    println!("{}", policy_configuration_json(args)?);
+    Ok(CliRunResult::Complete)
+}
+
+fn policy_configuration_json(args: &[String]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("usage: bifrost configure-policy SOURCE_ID POLICY_FILE CONFIG_FILE".to_owned());
+    }
+    let source = read_bounded_policy_source(Path::new(&args[1]))?;
+    let configuration = read_bounded_policy_source(Path::new(&args[2]))?;
+    let config: PolicySelectorConfiguration = serde_json::from_slice(&configuration)
+        .map_err(|error| format!("invalid policy configuration: {error}"))?;
+    if config.schema_version != 1 {
+        return Err(format!(
+            "unsupported policy configuration schema {}",
+            config.schema_version
+        ));
+    }
+    let original = std::str::from_utf8(&source)
+        .map_err(|error| format!("policy source is not UTF-8: {error}"))?;
+    let original_identity = policy_source_identity(PolicySourceIdentity::new(&args[0]), &source)
+        .map_err(|error| format!("cannot validate original policy identity: {error}"))?;
+    let names: Vec<_> = config.binding_names.iter().map(String::as_str).collect();
+    let configured = configure_identical_relational_selectors(
+        original,
+        PolicySourceIdentity::new(&args[0]),
+        &names,
+        &config.selector,
+    )
+    .map_err(|error| format!("cannot configure policy `{}`: {error}", args[0]))?;
+    let configured_identity = policy_source_identity(
+        PolicySourceIdentity::new(&args[0]),
+        configured.configured_source.as_bytes(),
+    )
+    .map_err(|error| format!("cannot validate configured policy identity: {error}"))?;
+    let edits: Vec<_> = configured
+        .edits
+        .iter()
+        .map(|edit| {
+            json!({
+                "start": edit.range.start, "end": edit.range.end, "replacement": edit.new_text,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "format": "bifrost_policy_source_configuration/v1",
+        "source_id": args[0],
+        "original": {
+            "sha256": format!("{:x}", Sha256::digest(&source)),
+            "size_bytes": source.len(), "authored_hash": original_identity.authored_hash.to_string(),
+        },
+        "configuration": {
+            "sha256": format!("{:x}", Sha256::digest(&configuration)),
+            "size_bytes": configuration.len(),
+        },
+        "configured": {
+            "sha256": format!("{:x}", Sha256::digest(configured.configured_source.as_bytes())),
+            "size_bytes": configured.configured_source.len(),
+            "source": configured.configured_source,
+            "authored_hash": configured_identity.authored_hash.to_string(),
+        },
+        "edits": edits,
         "engine_version": brokk_bifrost::BIFROST_VERSION,
         "build_identity": brokk_bifrost::BIFROST_BUILD_IDENTITY,
     }))
@@ -2642,6 +2721,9 @@ USAGE:
     bifrost policy-source-identity SOURCE_ID POLICY_FILE
                                Print production policy authoring identities without a workspace
                                or built-in/open pack catalog
+    bifrost configure-policy SOURCE_ID POLICY_FILE CONFIG_FILE
+                               Print configured policy bytes and identities from a repository-owned
+                               JSON selector configuration; preserve the original policy file
     bifrost prepare-open-packs --cache-dir DIR --receipt-path FILE --env-path FILE
                                Select packs and write a typed outcome; accepts --request-path FILE
     bifrost install-semantic-packs BUNDLE_DIR CACHE_ROOT
@@ -2903,6 +2985,121 @@ mod portable_runtime_cli_tests {
         let error = policy_source_identity_json(&args)
             .expect_err("the bounded reader must refuse an oversized source");
         assert!(error.contains("exceeds the 262144-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn policy_configuration_reports_pinned_bytes_without_mutating_the_template() {
+        let fixture = tempdir().expect("policy configuration fixture");
+        let policy = fixture.path().join("policy.rqlp");
+        let config = fixture.path().join("config.json");
+        let source = r#"(policy :schema-version 1 :id "test.configuration" :name "Configuration"
+          :message "M" :severity warning
+          :analysis (analysis :type assertion
+            (bind :name selected :query (rql :schema-version 1
+              (language typescript (except (enclosing-decl (function)) (enclosing-decl (function))))))
+            (bind :name effect :query (rql :schema-version 1
+              (language typescript (procedure-effects
+                (except (enclosing-decl (function)) (enclosing-decl (function)))))))
+            (join :left selected :right effect :on ((id procedure_id)))
+            (group :name boundary :by (selected.id)
+              (aggregate :name effects :op count
+                :where ((effect.effect_id eq "bifrost.network_io") (effect.derivation eq declared))))
+            (assert :group boundary :value effects :cardinality (exactly 0))))"#;
+        let configuration = r#"{"schema_version":1,"binding_names":["selected","effect"],"selector":"(enclosing-decl (function :name \"total\"))"}"#;
+        fs::write(&policy, source).expect("write original");
+        fs::write(&config, configuration).expect("write config");
+        let args = vec![
+            "test.configuration".to_owned(),
+            policy.to_string_lossy().into_owned(),
+            config.to_string_lossy().into_owned(),
+        ];
+        let output = policy_configuration_json(&args).expect("typed policy configuration");
+        assert_eq!(output["format"], "bifrost_policy_source_configuration/v1");
+        assert_eq!(
+            output["original"]["sha256"],
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(
+            output["configuration"]["sha256"],
+            format!("{:x}", Sha256::digest(configuration.as_bytes()))
+        );
+        let configured = output["configured"]["source"]
+            .as_str()
+            .expect("configured bytes");
+        assert_eq!(
+            output["configured"]["sha256"],
+            format!("{:x}", Sha256::digest(configured.as_bytes()))
+        );
+        assert_eq!(output["configured"]["size_bytes"], configured.len());
+        assert_ne!(
+            output["original"]["authored_hash"],
+            output["configured"]["authored_hash"]
+        );
+        assert_eq!(
+            fs::read_to_string(&policy).expect("original preserved"),
+            source
+        );
+        assert_eq!(output["edits"].as_array().expect("edits").len(), 2);
+    }
+
+    #[test]
+    fn policy_configuration_refuses_unknown_fields_and_schema_before_source_edits() {
+        let fixture = tempdir().expect("policy configuration fixture");
+        let policy = fixture.path().join("policy.rqlp");
+        let config = fixture.path().join("config.json");
+        fs::write(&policy, "unchanged source").expect("write original");
+        let args = vec![
+            "test.configuration".to_owned(),
+            policy.to_string_lossy().into_owned(),
+            config.to_string_lossy().into_owned(),
+        ];
+        for (input, diagnostic) in [
+            (
+                r#"{"schema_version":1,"binding_names":["selected","effect"],"selector":"(function)","engine_profile":{}}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"schema_version":2,"binding_names":["selected","effect"],"selector":"(function)"}"#,
+                "unsupported policy configuration schema 2",
+            ),
+        ] {
+            fs::write(&config, input).expect("write config");
+            let error = policy_configuration_json(&args).expect_err("strict config rejection");
+            assert!(error.contains(diagnostic), "{error}");
+            assert_eq!(
+                fs::read_to_string(&policy).expect("read original"),
+                "unchanged source"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_configuration_rejects_invalid_source_identities() {
+        let fixture = tempdir().expect("policy configuration fixture");
+        let policy = fixture.path().join("policy.rqlp");
+        let config = fixture.path().join("config.json");
+        fs::write(&policy, "unchanged source").expect("write original");
+        fs::write(
+            &config,
+            r#"{"schema_version":1,"binding_names":["selected","effect"],"selector":"(function)"}"#,
+        )
+        .expect("write config");
+        for identity in [String::new(), "bad\nidentity".to_owned(), "x".repeat(1025)] {
+            let args = vec![
+                identity,
+                policy.to_string_lossy().into_owned(),
+                config.to_string_lossy().into_owned(),
+            ];
+            let error = policy_configuration_json(&args).expect_err("invalid source identity");
+            assert!(
+                error.contains("cannot validate original policy identity"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read_to_string(&policy).expect("original preserved"),
+                "unchanged source"
+            );
+        }
     }
 
     fn authored_release_bundle(root: &Path) -> PathBuf {
